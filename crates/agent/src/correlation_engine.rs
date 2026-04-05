@@ -1291,6 +1291,36 @@ fn builtin_rules() -> Vec<CorrelationRule> {
             min_confidence: 0.85,
             severity: Severity::High,
         },
+        // CL-035: DNS recon burst + encrypted exfil (v3 combined convergence pattern)
+        // Attacker discovered DnsRecon is NEVER detected. Spams 50+ DNS queries
+        // then exfiltrates via encrypted channel. This was the 8% attacker win strategy.
+        CorrelationRule {
+            id: "CL-035".into(),
+            name: "Selfplay: DNS Recon Burst to Encrypted Exfiltration".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Network),
+                    kind_patterns: vec![
+                        "dns_tunneling".into(),
+                        "dns.query".into(),
+                        "outbound_anomaly".into(),
+                    ],
+                    entity_must_match: false,
+                },
+                RuleStage {
+                    layer: Some(Layer::Network),
+                    kind_patterns: vec![
+                        "data_exfiltration".into(),
+                        "data_exfil_ebpf".into(),
+                        "outbound_anomaly".into(),
+                    ],
+                    entity_must_match: false,
+                },
+            ],
+            window_secs: 600,
+            min_confidence: 0.90,
+            severity: Severity::Critical,
+        },
     ]
 }
 
@@ -1407,7 +1437,7 @@ mod tests {
     #[test]
     fn engine_starts_empty() {
         let engine = CorrelationEngine::new();
-        assert_eq!(engine.rule_count(), 34);
+        assert_eq!(engine.rule_count(), 35);
         assert_eq!(engine.pending_count(), 0);
     }
 
