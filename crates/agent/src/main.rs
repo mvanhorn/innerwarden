@@ -28,6 +28,7 @@ mod decision_cooldown;
 mod decision_honeypot;
 mod decision_skill_actions;
 mod decisions;
+mod defender_brain;
 mod environment_profile;
 mod fail2ban;
 mod firmware_tick;
@@ -408,6 +409,10 @@ struct AgentState {
     baseline: baseline::BaselineStore,
     /// Playbook engine: automated response sequences.
     playbook_engine: playbook::PlaybookEngine,
+    /// AlphaZero-trained defender brain: neural decision engine.
+    defender_brain: defender_brain::DefenderBrain,
+    /// History of brain suggestions for dashboard + FP audit.
+    brain_history: defender_brain::BrainHistory,
     /// Selective packet capture on incidents.
     pcap_capture: pcap_capture::PcapCapture,
     /// V10 neural scoring model — replaced by autoencoder (anomaly_engine).
@@ -1000,6 +1005,10 @@ async fn main() -> Result<()> {
         correlation_engine: correlation_engine::CorrelationEngine::new(),
         baseline: baseline::BaselineStore::load(&cli.data_dir),
         playbook_engine: playbook::PlaybookEngine::new(&cli.data_dir),
+        defender_brain: defender_brain::DefenderBrain::load(
+            &cli.data_dir.join("defender-brain.json").to_string_lossy(),
+        ),
+        brain_history: defender_brain::BrainHistory::new(500),
         pcap_capture: pcap_capture::PcapCapture::new(&cli.data_dir),
         scoring_engine: scoring::ScoringEngine::new(0.95),
         last_firmware_incident_at: None,
@@ -2132,6 +2141,7 @@ async fn process_incidents(
             cfg,
             state,
             &mut decision,
+            data_dir,
         );
 
         if incident_honeypot_suggestion::maybe_defer_honeypot_to_operator(
@@ -2855,6 +2865,8 @@ mod tests {
             correlation_engine: correlation_engine::CorrelationEngine::new(),
             baseline: baseline::BaselineStore::new(),
             playbook_engine: playbook::PlaybookEngine::new(std::path::Path::new("/nonexistent")),
+            defender_brain: defender_brain::DefenderBrain::new(),
+            brain_history: defender_brain::BrainHistory::new(100),
             pcap_capture: pcap_capture::PcapCapture::new(data_dir),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,
@@ -3113,6 +3125,8 @@ mod tests {
             correlation_engine: correlation_engine::CorrelationEngine::new(),
             baseline: baseline::BaselineStore::new(),
             playbook_engine: playbook::PlaybookEngine::new(std::path::Path::new("/nonexistent")),
+            defender_brain: defender_brain::DefenderBrain::new(),
+            brain_history: defender_brain::BrainHistory::new(100),
             pcap_capture: pcap_capture::PcapCapture::new(dir.path()),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,
@@ -3266,6 +3280,8 @@ mod tests {
             correlation_engine: correlation_engine::CorrelationEngine::new(),
             baseline: baseline::BaselineStore::new(),
             playbook_engine: playbook::PlaybookEngine::new(std::path::Path::new("/nonexistent")),
+            defender_brain: defender_brain::DefenderBrain::new(),
+            brain_history: defender_brain::BrainHistory::new(100),
             pcap_capture: pcap_capture::PcapCapture::new(dir.path()),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,
@@ -3394,6 +3410,8 @@ mod tests {
             correlation_engine: correlation_engine::CorrelationEngine::new(),
             baseline: baseline::BaselineStore::new(),
             playbook_engine: playbook::PlaybookEngine::new(std::path::Path::new("/nonexistent")),
+            defender_brain: defender_brain::DefenderBrain::new(),
+            brain_history: defender_brain::BrainHistory::new(100),
             pcap_capture: pcap_capture::PcapCapture::new(dir.path()),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,
@@ -3534,6 +3552,8 @@ mod tests {
             correlation_engine: correlation_engine::CorrelationEngine::new(),
             baseline: baseline::BaselineStore::new(),
             playbook_engine: playbook::PlaybookEngine::new(std::path::Path::new("/nonexistent")),
+            defender_brain: defender_brain::DefenderBrain::new(),
+            brain_history: defender_brain::BrainHistory::new(100),
             pcap_capture: pcap_capture::PcapCapture::new(dir.path()),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,
@@ -3651,6 +3671,8 @@ mod tests {
             correlation_engine: correlation_engine::CorrelationEngine::new(),
             baseline: baseline::BaselineStore::new(),
             playbook_engine: playbook::PlaybookEngine::new(std::path::Path::new("/nonexistent")),
+            defender_brain: defender_brain::DefenderBrain::new(),
+            brain_history: defender_brain::BrainHistory::new(100),
             pcap_capture: pcap_capture::PcapCapture::new(dir.path()),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,
@@ -3780,6 +3802,8 @@ mod tests {
             correlation_engine: correlation_engine::CorrelationEngine::new(),
             baseline: baseline::BaselineStore::new(),
             playbook_engine: playbook::PlaybookEngine::new(std::path::Path::new("/nonexistent")),
+            defender_brain: defender_brain::DefenderBrain::new(),
+            brain_history: defender_brain::BrainHistory::new(100),
             pcap_capture: pcap_capture::PcapCapture::new(dir.path()),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,

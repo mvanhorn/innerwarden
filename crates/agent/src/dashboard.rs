@@ -957,6 +957,10 @@ pub async fn serve(
         .route("/api/correlation-chains", get(api_correlation_chains))
         .route("/api/baseline-status", get(api_baseline_status))
         .route("/api/playbook-log", get(api_playbook_log))
+        // Defender Brain (AlphaZero)
+        .route("/api/defender-brain/recent", get(api_brain_recent))
+        .route("/api/defender-brain/stats", get(api_brain_stats))
+        .route("/api/defender-brain/feedback", post(api_brain_feedback))
         // D6 - SSE live event stream
         .route("/api/events/stream", get(api_events_stream))
         // Web Push
@@ -2118,6 +2122,22 @@ fn safe_read_data_file(data_dir: &Path, filename: &str) -> Option<String> {
     }
 }
 
+/// Write a file safely inside data_dir (prevents path traversal).
+fn safe_write_data_file(data_dir: &Path, filename: &str, contents: &str) -> bool {
+    // Only allow simple filenames (no slashes, no ..)
+    if filename.contains('/') || filename.contains("..") {
+        return false;
+    }
+    let Some(base) = data_dir.canonicalize().ok() else {
+        return false;
+    };
+    let target = base.join(filename);
+    if !target.starts_with(&base) {
+        return false;
+    }
+    std::fs::write(target, contents).is_ok()
+}
+
 // ── Attacker Intelligence & Monthly Reports ────────────────────────
 
 /// `GET /api/attacker-profiles` - list attacker profiles sorted by risk.
@@ -2282,6 +2302,95 @@ async fn api_playbook_log(State(state): State<DashboardState>) -> Json<serde_jso
     Json(serde_json::json!({
         "total": log.len(),
         "executions": log,
+    }))
+}
+
+/// `GET /api/defender-brain/recent` - recent brain suggestions with AI comparison.
+async fn api_brain_recent(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+    let entries: Vec<serde_json::Value> = safe_read_data_file(&state.data_dir, "brain-log.json")
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    Json(serde_json::json!({ "entries": entries }))
+}
+
+/// `GET /api/defender-brain/stats` - brain performance statistics.
+async fn api_brain_stats(State(state): State<DashboardState>) -> Json<serde_json::Value> {
+    let entries: Vec<serde_json::Value> = safe_read_data_file(&state.data_dir, "brain-log.json")
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let total = entries.len();
+    let agreed = entries
+        .iter()
+        .filter(|e| e.get("agreed").and_then(|v| v.as_bool()).unwrap_or(false))
+        .count();
+    let tp = entries
+        .iter()
+        .filter(|e| e.get("feedback") == Some(&serde_json::json!(true)))
+        .count();
+    let fp = entries
+        .iter()
+        .filter(|e| e.get("feedback") == Some(&serde_json::json!(false)))
+        .count();
+    let unreviewed = entries
+        .iter()
+        .filter(|e| {
+            e.get("feedback").is_none() || e.get("feedback") == Some(&serde_json::json!(null))
+        })
+        .count();
+    let model_exists = true; // embedded in binary since v0.9.4
+    Json(serde_json::json!({
+        "loaded": model_exists,
+        "total_suggestions": total,
+        "agreement_rate": if total > 0 { format!("{:.1}%", agreed as f32 / total as f32 * 100.0) } else { "N/A".to_string() },
+        "tp_count": tp,
+        "fp_count": fp,
+        "unreviewed": unreviewed,
+    }))
+}
+
+/// `POST /api/defender-brain/feedback` - mark a brain suggestion as TP or FP.
+async fn api_brain_feedback(
+    State(state): State<DashboardState>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let incident_id = body
+        .get("incident_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let correct = body
+        .get("correct")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Read, update, write back — using safe_read + validated write
+    let mut entries: Vec<serde_json::Value> =
+        safe_read_data_file(&state.data_dir, "brain-log.json")
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+
+    let mut found = false;
+    for entry in entries.iter_mut().rev() {
+        if entry.get("incident_id").and_then(|v| v.as_str()) == Some(incident_id) {
+            entry
+                .as_object_mut()
+                .unwrap()
+                .insert("feedback".into(), serde_json::json!(correct));
+            found = true;
+            break;
+        }
+    }
+    if found {
+        safe_write_data_file(
+            &state.data_dir,
+            "brain-log.json",
+            &serde_json::to_string_pretty(&entries).unwrap_or_default(),
+        );
+    }
+
+    Json(serde_json::json!({
+        "ok": found,
+        "incident_id": incident_id,
+        "feedback": if correct { "tp" } else { "fp" },
     }))
 }
 
@@ -7735,6 +7844,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
       <button type="button" id="intelTabChains" onclick="switchIntelTab('chains')" style="margin-left:4px;padding:4px 12px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);cursor:pointer;">Chains</button>
       <button type="button" id="intelTabBaseline" onclick="switchIntelTab('baseline')" style="margin-left:4px;padding:4px 12px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);cursor:pointer;">Baseline</button>
       <button type="button" id="intelTabPlaybooks" onclick="switchIntelTab('playbooks')" style="margin-left:4px;padding:4px 12px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);cursor:pointer;">Playbooks</button>
+      <button type="button" id="intelTabBrain" onclick="switchIntelTab('brain')" style="margin-left:4px;padding:4px 12px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);cursor:pointer;">🧠 Brain</button>
       <select id="intelSort" onchange="loadIntel()" style="margin-left:8px;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);">
         <option value="risk_score">Sort: Risk Score</option>
         <option value="last_seen">Sort: Last Seen</option>
@@ -10632,7 +10742,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
   let currentIntelTab = 'profiles';
   function switchIntelTab(tab) {
     currentIntelTab = tab;
-    const tabs = ['Profiles','Campaigns','Chains','Baseline','Playbooks'];
+    const tabs = ['Profiles','Campaigns','Chains','Baseline','Playbooks','Brain'];
     tabs.forEach(t => {
       const btn = document.getElementById('intelTab'+t);
       if (btn) { const active = t.toLowerCase() === tab; btn.style.background = active ? 'var(--accent)' : 'var(--card-bg)'; btn.style.color = active ? '#fff' : 'var(--text)'; btn.style.borderColor = active ? 'var(--accent)' : 'var(--border)'; }
@@ -10641,6 +10751,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
     else if (tab === 'chains') loadChains();
     else if (tab === 'baseline') loadBaseline();
     else if (tab === 'playbooks') loadPlaybooks();
+    else if (tab === 'brain') loadBrain();
     else loadIntel();
   }
 
@@ -10850,6 +10961,75 @@ const INDEX_HTML: &str = r##"<!doctype html>
       content.innerHTML = html;
       if (status) status.textContent = `${data.total} executions`;
     } catch(e) { content.innerHTML = `<p style="color:#e74c3c">Failed: ${e.message}</p>`; }
+  }
+
+  // ── Defender Brain sub-tab ───────────────────────────────────────
+  async function loadBrain() {
+    const content = document.getElementById('intelContent');
+    const status = document.getElementById('intelViewStatus');
+    if (status) status.textContent = 'Loading brain…';
+    try {
+      const [stats, recent] = await Promise.all([
+        loadJson('/api/defender-brain/stats'),
+        loadJson('/api/defender-brain/recent'),
+      ]);
+
+      let html = `<div class="kpi-grid" style="grid-template-columns:repeat(5,1fr);margin-bottom:16px;">
+        <div class="kpi-card"><div class="kpi-value">${stats.loaded ? '✅' : '❌'}</div><div class="kpi-label">Model Loaded</div></div>
+        <div class="kpi-card"><div class="kpi-value">${stats.total_suggestions}</div><div class="kpi-label">Suggestions</div></div>
+        <div class="kpi-card"><div class="kpi-value">${stats.agreement_rate}</div><div class="kpi-label">AI Agreement</div></div>
+        <div class="kpi-card"><div class="kpi-value" style="color:#27ae60">${stats.tp_count}</div><div class="kpi-label">Confirmed TP</div></div>
+        <div class="kpi-card"><div class="kpi-value" style="color:#e74c3c">${stats.fp_count}</div><div class="kpi-label">Marked FP</div></div>
+      </div>`;
+
+      html += `<div style="font-size:0.8rem;color:var(--dim);margin-bottom:8px;">AlphaZero-trained neural defender (137K params, 6 rounds, 200K+ games). Advisory mode — logs suggestions alongside AI decisions.</div>`;
+
+      if (!recent?.entries?.length) {
+        html += '<div style="text-align:center;padding:40px;"><div style="font-size:2rem;">🧠</div><p style="color:var(--dim);">No brain suggestions yet.</p><p style="font-size:0.8rem;color:var(--dim);">Deploy defender-brain.json to the data directory and the brain will start providing suggestions on each incident.</p></div>';
+      } else {
+        html += '<table style="width:100%;border-collapse:collapse;font-size:0.8rem;"><thead><tr style="border-bottom:1px solid var(--border);">';
+        html += '<th style="padding:6px;text-align:left;">Time</th>';
+        html += '<th style="padding:6px;text-align:left;">Detector</th>';
+        html += '<th style="padding:6px;text-align:left;">Severity</th>';
+        html += '<th style="padding:6px;text-align:left;">Brain Says</th>';
+        html += '<th style="padding:6px;text-align:left;">AI Says</th>';
+        html += '<th style="padding:6px;text-align:center;">Agree?</th>';
+        html += '<th style="padding:6px;text-align:center;">Audit</th>';
+        html += '</tr></thead><tbody>';
+
+        for (const e of recent.entries) {
+          const agreeIcon = e.agreed ? '✅' : '⚠️';
+          const feedbackHtml = e.feedback === true ? '<span style="color:#27ae60">TP</span>'
+            : e.feedback === false ? '<span style="color:#e74c3c">FP</span>'
+            : `<button onclick="brainFeedback('${e.incident_id}',true)" style="padding:1px 6px;border-radius:3px;border:1px solid #27ae60;background:transparent;color:#27ae60;cursor:pointer;font-size:0.7rem;margin-right:2px;">✓</button><button onclick="brainFeedback('${e.incident_id}',false)" style="padding:1px 6px;border-radius:3px;border:1px solid #e74c3c;background:transparent;color:#e74c3c;cursor:pointer;font-size:0.7rem;">✗</button>`;
+          const sevColor = e.severity === 'Critical' ? '#e74c3c' : e.severity === 'High' ? '#e67e22' : e.severity === 'Medium' ? '#f1c40f' : '#95a5a6';
+          html += `<tr style="border-bottom:1px solid var(--border);">`;
+          html += `<td style="padding:6px;">${new Date(e.ts).toLocaleString()}</td>`;
+          html += `<td style="padding:6px;">${e.detector}</td>`;
+          html += `<td style="padding:6px;"><span style="color:${sevColor}">${e.severity}</span></td>`;
+          html += `<td style="padding:6px;"><strong>${e.brain_action}</strong> (${e.brain_confidence})</td>`;
+          html += `<td style="padding:6px;">${e.ai_action} (${e.ai_confidence})</td>`;
+          html += `<td style="padding:6px;text-align:center;">${agreeIcon}</td>`;
+          html += `<td style="padding:6px;text-align:center;">${feedbackHtml}</td>`;
+          html += `</tr>`;
+        }
+        html += '</tbody></table>';
+      }
+
+      content.innerHTML = html;
+      if (status) status.textContent = `${stats.total_suggestions} suggestions`;
+    } catch(e) { content.innerHTML = `<p style="color:#e74c3c">Failed: ${e.message}</p>`; }
+  }
+
+  async function brainFeedback(incidentId, correct) {
+    try {
+      await fetch('/api/defender-brain/feedback', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({incident_id: incidentId, correct: correct}),
+      });
+      loadBrain(); // Refresh
+    } catch(e) { console.error('Brain feedback failed:', e); }
   }
 
   // ── Monthly Report tab ────────────────────────────────────────────

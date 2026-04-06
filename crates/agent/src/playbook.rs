@@ -396,7 +396,7 @@ fn builtin_playbooks() -> Vec<Playbook> {
             name: "Data Exfiltration Response".into(),
             trigger: PlaybookTrigger {
                 detector: "data_exfil_ebpf".into(),
-                min_severity: "critical".into(),
+                min_severity: "high".into(), // V4: lowered from critical — AlphaZero showed exfil bypasses at High
                 chain_rule: String::new(),
             },
             steps: vec![
@@ -411,6 +411,68 @@ fn builtin_playbooks() -> Vec<Playbook> {
                 PlaybookStep {
                     action: "notify".into(),
                     params: [("channels".into(), "telegram,slack".into())]
+                        .into_iter()
+                        .collect(),
+                },
+                PlaybookStep {
+                    action: "escalate".into(),
+                    params: [("to".into(), "critical".into())].into_iter().collect(),
+                },
+            ],
+            run_in_dry_run: false,
+        },
+        // V4 AlphaZero: outbound_anomaly was a top exfil vector
+        Playbook {
+            id: "pb-outbound-anomaly".into(),
+            name: "Outbound Anomaly Response".into(),
+            trigger: PlaybookTrigger {
+                detector: "outbound_anomaly".into(),
+                min_severity: "high".into(),
+                chain_rule: String::new(),
+            },
+            steps: vec![
+                PlaybookStep {
+                    action: "block_ip".into(),
+                    params: HashMap::new(),
+                },
+                PlaybookStep {
+                    action: "capture_forensics".into(),
+                    params: HashMap::new(),
+                },
+                PlaybookStep {
+                    action: "notify".into(),
+                    params: [("channels".into(), "telegram,slack".into())]
+                        .into_iter()
+                        .collect(),
+                },
+            ],
+            run_in_dry_run: false,
+        },
+        // V4 AlphaZero: sudo_abuse with destructive commands was #1 attacker technique
+        Playbook {
+            id: "pb-destructive-command".into(),
+            name: "Destructive Command Response".into(),
+            trigger: PlaybookTrigger {
+                detector: "sudo_abuse".into(),
+                min_severity: "high".into(),
+                chain_rule: String::new(),
+            },
+            steps: vec![
+                PlaybookStep {
+                    action: "kill_process".into(),
+                    params: HashMap::new(),
+                },
+                PlaybookStep {
+                    action: "suspend_user_sudo".into(),
+                    params: HashMap::new(),
+                },
+                PlaybookStep {
+                    action: "capture_forensics".into(),
+                    params: HashMap::new(),
+                },
+                PlaybookStep {
+                    action: "notify".into(),
+                    params: [("channels".into(), "telegram,slack,webhook".into())]
                         .into_iter()
                         .collect(),
                 },
