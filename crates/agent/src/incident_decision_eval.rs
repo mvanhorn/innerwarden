@@ -114,6 +114,8 @@ pub(crate) fn apply_correlation_boost_and_log_decision(
 }
 
 /// Build 72-dim feature vector for the defender brain from incident + agent state.
+/// Enriched with IP reputation, attacker profile, correlation, baseline — gives
+/// the brain enough context to distinguish real attacks from FPs.
 fn build_brain_features(
     incident: &innerwarden_core::incident::Incident,
     state: &AgentState,
@@ -121,6 +123,17 @@ fn build_brain_features(
     use innerwarden_core::event::Severity;
 
     let mut f = [0.0f32; 72];
+
+    // Extract IP from incident entities or incident_id
+    let ip = incident.entities.iter()
+        .find(|e| e.r#type == innerwarden_core::entities::EntityType::Ip)
+        .map(|e| e.value.as_str())
+        .or_else(|| {
+            let parts: Vec<&str> = incident.incident_id.split(':').collect();
+            if parts.len() >= 2 && parts[1].contains('.') { Some(parts[1]) } else { None }
+        });
+
+    let det = incident.incident_id.split(':').next().unwrap_or("");
 
     // [0-3] severity
     match incident.severity {
@@ -130,18 +143,77 @@ fn build_brain_features(
         Severity::Critical => f[3] = 1.0,
     }
 
-    // [5] composite score — use next_chain_id as proxy for chains detected
-    // (completed_chains is private, but chain_id counter reflects activity)
-    f[5] = 0.0; // Will be enriched when scoring integration is complete
+    // [4] total incidents from this IP (from attacker profile)
+    if let Some(ip_str) = ip {
+        if let Some(profile) = state.attacker_profiles.get(ip_str) {
+            f[4] = (profile.total_incidents as f32 / 50.0).min(1.0);
+            // [5] risk score from attacker profile (0-100 normalized)
+            f[5] = profile.risk_score as f32 / 100.0;
+            // [6] number of distinct detectors that flagged this IP
+            f[6] = (profile.detectors_triggered.len() as f32 / 10.0).min(1.0);
+            // [7] recurrence: how many times this IP has been seen
+            f[7] = (profile.visit_dates.len() as f32 / 10.0).min(1.0);
+        }
 
-    // [12-17] detector flags from incident_id prefix
-    let det = incident.incident_id.split(':').next().unwrap_or("");
+        // [8] is this IP already blocked?
+        f[8] = if state.blocklist.contains(ip_str) { 1.0 } else { 0.0 };
+
+        // [9] IP reputation from local cache
+        if let Some(rep) = state.ip_reputations.get(ip_str) {
+            f[9] = (rep.reputation_score / 100.0).min(1.0);
+        }
+
+        // [10] is internal/private IP?
+        let is_internal = ip_str.starts_with("10.") || ip_str.starts_with("192.168.")
+            || ip_str.starts_with("172.") || ip_str.starts_with("127.");
+        f[10] = if is_internal { 1.0 } else { 0.0 };
+    }
+
+    // [11] blocked IPs count as proxy for correlation activity
+    f[11] = (state.blocklist.len() as f32 / 20.0).min(1.0);
+
+    // [12-17] detector flags
     f[12] = if det == "ssh_bruteforce" { 1.0 } else { 0.0 };
     f[13] = if det == "reverse_shell" { 1.0 } else { 0.0 };
     f[14] = if det == "privesc" { 1.0 } else { 0.0 };
     f[15] = if det == "ransomware" { 1.0 } else { 0.0 };
     f[16] = if det == "log_tampering" { 1.0 } else { 0.0 };
     f[17] = if det == "web_shell" { 1.0 } else { 0.0 };
+
+    // [18-23] more detector flags
+    f[18] = if det == "data_exfil_ebpf" || det == "data_exfil_cmd" { 1.0 } else { 0.0 };
+    f[19] = if det == "c2_callback" { 1.0 } else { 0.0 };
+    f[20] = if det == "dns_tunneling" || det == "dns_tunneling_ebpf" { 1.0 } else { 0.0 };
+    f[21] = if det == "credential_stuffing" || det == "distributed_ssh" { 1.0 } else { 0.0 };
+    f[22] = if det == "rootkit" { 1.0 } else { 0.0 };
+    f[23] = if det == "neural_anomaly" { 1.0 } else { 0.0 };
+
+    // [24] baseline maturity (is baseline learning complete?)
+    f[24] = if state.baseline.is_mature() { 1.0 } else { 0.0 };
+
+    // [25] baseline anomaly recently?
+    f[25] = if state.last_baseline_anomaly_ts.map_or(false, |ts| {
+        (chrono::Utc::now() - ts).num_seconds() < 300
+    }) { 1.0 } else { 0.0 };
+
+    // [26] autoencoder anomaly recently?
+    f[26] = if state.last_autoencoder_anomaly_ts.map_or(false, |ts| {
+        (chrono::Utc::now() - ts).num_seconds() < 300
+    }) { 1.0 } else { 0.0 };
+
+    // [27] total blocked IPs (how active is the defense?)
+    f[27] = (state.blocklist.len() as f32 / 50.0).min(1.0);
+
+    // [28] hour of day (normalized, for off-hours detection)
+    f[28] = chrono::Timelike::hour(&chrono::Utc::now()) as f32 / 24.0;
+
+    // [29] is this a known FP pattern? (neural_anomaly with low maturity)
+    f[29] = if det == "neural_anomaly" {
+        if let Some(evidence) = incident.evidence.get(0) {
+            let maturity = evidence.get("maturity").and_then(|v| v.as_f64()).unwrap_or(1.0);
+            if maturity < 0.5 { 1.0 } else { 0.0 } // low maturity = likely FP
+        } else { 0.0 }
+    } else { 0.0 };
 
     f
 }
