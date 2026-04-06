@@ -49,7 +49,7 @@ hkdf = "0.12"
 bytes = "1"
 
 redis = { version = "1.2", features = ["tokio-comp", "aio"], optional = true }
-redb = "3"
+redb = "4"
 
 [features]
 default = []
