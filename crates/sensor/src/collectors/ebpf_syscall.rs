@@ -1519,10 +1519,13 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
                     let uid = read_u32!(data, 12..16);
                     let cgroup_id = read_u64!(data, 24..32);
                     let comm = bytes_to_string(&data[32..96]);
-                    let addr = read_u32!(data, 96..100);
+                    let addr_raw = read_u32!(data, 96..100);
                     let port = read_u16!(data, 100..102);
 
-                    let ip = Ipv4Addr::from(addr);
+                    // sin_addr.s_addr is in network byte order (big-endian).
+                    // read_u32! uses from_ne_bytes (little-endian on x86),
+                    // so we need to swap back to get the correct IP.
+                    let ip = Ipv4Addr::from(addr_raw.to_be());
 
                     if ip.is_loopback() || ip.is_private() || ip.is_unspecified() {
                         continue;
@@ -1816,15 +1819,16 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
                     let uid = read_u32!(data, 8..12);
                     let family = read_u16!(data, 12..14);
                     let port = read_u16!(data, 16..18);
-                    let addr = read_u32!(data, 20..24);
+                    let addr_raw = read_u32!(data, 20..24);
                     let cgroup_id = read_u64!(data, 24..32);
                     let comm = bytes_to_string(&data[32..96]);
 
-                    let ip = std::net::Ipv4Addr::from(addr);
+                    // Network byte order → host byte order
+                    let ip = std::net::Ipv4Addr::from(addr_raw.to_be());
                     let container_id = resolve_container_id(pid);
 
                     // Low ports or INADDR_ANY are more suspicious
-                    let severity = if port < 1024 || addr == 0 {
+                    let severity = if port < 1024 || addr_raw == 0 {
                         Severity::High
                     } else {
                         Severity::Medium
