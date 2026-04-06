@@ -1751,7 +1751,8 @@ fn friendly_detector_name(detector: &str) -> &str {
         "rootkit" => "timing anomalies (cloud noise)",
         "firmware_integrity" => "firmware checks (cloud noise)",
         "sigma" => "Sigma rule matches",
-        "neural_anomaly" => "AI anomaly detections",
+        "neural_anomaly" => "AI spider sense detections",
+        "correlated_anomaly" => "AI + statistical convergence alerts",
         "process_tree" => "process chain alerts",
         "user_creation" => "user creation events",
         "sensitive_write" => "sensitive file writes",
@@ -2978,7 +2979,11 @@ fn simple_detector_lookup(detector: &str) -> (&'static str, &'static str) {
         "process_tree" => ("\u{1f333}", "Suspicious program chain detected. {action}"),
         "neural_anomaly" => (
             "\u{1f9e0}",
-            "Unusual behavior pattern detected by AI. {action}",
+            "AI spider sense triggered — unusual pattern detected. {action}",
+        ),
+        "correlated_anomaly" => (
+            "\u{1f9e0}\u{26a1}",
+            "Two independent AI systems flagged unusual activity. {action}",
         ),
         _ => ("\u{26a0}\u{fe0f}", "Suspicious activity detected. {action}"),
     }
@@ -3076,7 +3081,8 @@ fn simple_detector_label(detector: &str) -> &'static str {
         "discovery_burst" => "Reconnaissance",
         "suspicious_execution" => "Suspicious Execution",
         "sigma" => "Known Attack Pattern",
-        "neural_anomaly" => "AI Anomaly",
+        "neural_anomaly" => "AI Spider Sense",
+        "correlated_anomaly" => "AI + Statistical Convergence",
         _ => "Threat Detected",
     }
 }

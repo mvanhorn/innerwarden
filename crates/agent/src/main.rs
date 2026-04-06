@@ -348,6 +348,9 @@ struct AgentState {
     environment_profile: environment_profile::EnvironmentProfile,
     /// Neural autoencoder anomaly engine — learns "normal" and flags novel patterns.
     anomaly_engine: neural_lifecycle::AnomalyEngine,
+    /// Neural incidents pending processing — buffered here because the agent
+    /// cannot append to the sensor's incidents file (different user).
+    neural_incidents: Vec<innerwarden_core::incident::Incident>,
     /// In-memory trust rules: set of "detector:action" strings.
     /// Loaded from data_dir/trust-rules.json at startup; updated live when operator clicks "Always".
     trust_rules: std::collections::HashSet<String>,
@@ -910,6 +913,7 @@ async fn main() -> Result<()> {
             data_dir: cli.data_dir.clone(),
             ..Default::default()
         }),
+        neural_incidents: Vec::new(),
         trust_rules: load_trust_rules(&cli.data_dir),
         crowdsec: if cfg.crowdsec.enabled {
             info!(url = %cfg.crowdsec.url, "CrowdSec integration enabled");
@@ -1841,7 +1845,14 @@ async fn process_incidents(
         .pending_honeypot_choices
         .retain(|_, choice| choice.expires_at > now);
 
-    if new_incidents.entries.is_empty() {
+    // Drain neural incidents (autoencoder) into the processing pipeline.
+    // These couldn't be written to the sensor's file (different user).
+    let neural = std::mem::take(&mut state.neural_incidents);
+    if !neural.is_empty() {
+        info!(count = neural.len(), "processing buffered neural incidents");
+    }
+
+    if new_incidents.entries.is_empty() && neural.is_empty() {
         return 0;
     }
 
@@ -1911,7 +1922,10 @@ async fn process_incidents(
     let mut handled = 0;
     let mut ai_calls_this_tick: usize = 0;
 
-    for incident in &new_incidents.entries {
+    let all_incidents: Vec<&innerwarden_core::incident::Incident> =
+        new_incidents.entries.iter().chain(neural.iter()).collect();
+
+    for incident in &all_incidents {
         state.telemetry.observe_incident(incident);
 
         // VirusTotal enrichment: when YARA scanner detects a binary, check its
@@ -2816,6 +2830,7 @@ mod tests {
             ),
             environment_profile: environment_profile::EnvironmentProfile::default(),
             anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
+            neural_incidents: Vec::new(),
             trust_rules: std::collections::HashSet::new(),
             crowdsec: None,
             abuseipdb: None,
@@ -3073,6 +3088,7 @@ mod tests {
             ),
             environment_profile: environment_profile::EnvironmentProfile::default(),
             anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
+            neural_incidents: Vec::new(),
             trust_rules: std::collections::HashSet::new(),
             crowdsec: None,
             abuseipdb: None,
@@ -3225,6 +3241,7 @@ mod tests {
             ),
             environment_profile: environment_profile::EnvironmentProfile::default(),
             anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
+            neural_incidents: Vec::new(),
             trust_rules: std::collections::HashSet::new(),
             crowdsec: None,
             abuseipdb: None,
@@ -3352,6 +3369,7 @@ mod tests {
             ),
             environment_profile: environment_profile::EnvironmentProfile::default(),
             anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
+            neural_incidents: Vec::new(),
             trust_rules: std::collections::HashSet::new(),
             crowdsec: None,
             abuseipdb: None,
@@ -3491,6 +3509,7 @@ mod tests {
             ),
             environment_profile: environment_profile::EnvironmentProfile::default(),
             anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
+            neural_incidents: Vec::new(),
             trust_rules: std::collections::HashSet::new(),
             crowdsec: None,
             abuseipdb: None,
@@ -3607,6 +3626,7 @@ mod tests {
             ),
             environment_profile: environment_profile::EnvironmentProfile::default(),
             anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
+            neural_incidents: Vec::new(),
             trust_rules: std::collections::HashSet::new(),
             crowdsec: None,
             abuseipdb: None,
@@ -3735,6 +3755,7 @@ mod tests {
             ),
             environment_profile: environment_profile::EnvironmentProfile::default(),
             anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
+            neural_incidents: Vec::new(),
             trust_rules: std::collections::HashSet::new(),
             crowdsec: None,
             abuseipdb: None,
