@@ -197,7 +197,11 @@ impl TelegramClient {
             )),
             alerts_this_hour: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             alert_counter_hour: Arc::new(std::sync::atomic::AtomicU32::new(
-                chrono::Utc::now().format("%H").to_string().parse().unwrap_or(0),
+                chrono::Utc::now()
+                    .format("%H")
+                    .to_string()
+                    .parse()
+                    .unwrap_or(0),
             )),
         })
     }
@@ -407,11 +411,16 @@ impl TelegramClient {
     /// Returns Ok(()) silently if the hourly cap is reached.
     pub async fn send_alert_html(&self, html: &str) -> anyhow::Result<()> {
         use std::sync::atomic::Ordering;
-        let current_hour: u32 = chrono::Utc::now().format("%H").to_string().parse().unwrap_or(0);
+        let current_hour: u32 = chrono::Utc::now()
+            .format("%H")
+            .to_string()
+            .parse()
+            .unwrap_or(0);
         let stored_hour = self.alert_counter_hour.load(Ordering::Relaxed);
         if current_hour != stored_hour {
             self.alerts_this_hour.store(0, Ordering::Relaxed);
-            self.alert_counter_hour.store(current_hour, Ordering::Relaxed);
+            self.alert_counter_hour
+                .store(current_hour, Ordering::Relaxed);
         }
         let count = self.alerts_this_hour.fetch_add(1, Ordering::Relaxed);
         if count >= MAX_ALERTS_PER_HOUR {
