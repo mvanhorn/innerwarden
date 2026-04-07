@@ -761,7 +761,7 @@ enum ConfigureCommand {
 
         /// Dry-run mode: true = log only, false = execute for real
         #[arg(long)]
-        dry_run: Option<String>,
+        dry_run: Option<bool>,
     },
 
     /// Set notification sensitivity level.
@@ -1385,15 +1385,9 @@ fn main() -> Result<()> {
                     )
                 }
             }
-            Some(ConfigureCommand::Responder {
-                enable,
-                ref dry_run,
-            }) => commands::responder::cmd_configure_responder(
-                &cli,
-                *enable,
-                false,
-                dry_run.as_deref().map(|val| val != "false"),
-            ),
+            Some(ConfigureCommand::Responder { enable, dry_run }) => {
+                commands::responder::cmd_configure_responder(&cli, *enable, false, *dry_run)
+            }
             Some(ConfigureCommand::Sensitivity { ref level }) => {
                 commands::ops::cmd_configure_sensitivity(&cli, level)
             }
