@@ -71,7 +71,6 @@ enum Command {
     // =======================================================================
     // New grouped commands (primary UX)
     // =======================================================================
-
     /// Query status, incidents, decisions, reports, and metrics.
     ///
     /// All read-only operations that fetch data without changing state.
@@ -183,7 +182,6 @@ enum Command {
     // =======================================================================
     // Top-level commands (not grouped)
     // =======================================================================
-
     /// First-time setup wizard.
     ///
     /// Scans your machine, configures AI, Telegram notifications, the
@@ -262,7 +260,6 @@ enum Command {
     // =======================================================================
     // Hidden backward-compatibility aliases (old command names still work)
     // =======================================================================
-
     #[clap(hide = true)]
     Status {
         target: Option<String>,
@@ -1688,12 +1685,7 @@ fn dispatch_config(cli: &Cli, command: &Option<ConfigAllCommand>) -> Result<()> 
             ref url,
             ref min_severity,
             no_test,
-        }) => commands::notify::cmd_configure_webhook(
-            cli,
-            url.as_deref(),
-            min_severity,
-            *no_test,
-        ),
+        }) => commands::notify::cmd_configure_webhook(cli, url.as_deref(), min_severity, *no_test),
         Some(ConfigAllCommand::Dashboard {
             ref user,
             ref password,
@@ -1704,9 +1696,7 @@ fn dispatch_config(cli: &Cli, command: &Option<ConfigAllCommand>) -> Result<()> 
         Some(ConfigAllCommand::Digest { ref hour }) => {
             commands::notify::cmd_configure_digest(cli, hour)
         }
-        Some(ConfigAllCommand::Budget { max }) => {
-            commands::notify::cmd_configure_budget(cli, *max)
-        }
+        Some(ConfigAllCommand::Budget { max }) => commands::notify::cmd_configure_budget(cli, *max),
         Some(ConfigAllCommand::TestAlert { ref channel }) => {
             commands::notify::cmd_test_alert(cli, channel.as_deref())
         }
@@ -1769,14 +1759,7 @@ fn dispatch_module(cli: &Cli, command: &ModuleCommand) -> Result<()> {
             enable,
             force,
             yes,
-        } => commands::module::cmd_module_install(
-            cli,
-            source,
-            modules_dir,
-            *enable,
-            *force,
-            *yes,
-        ),
+        } => commands::module::cmd_module_install(cli, source, modules_dir, *enable, *force, *yes),
         ModuleCommand::Uninstall {
             ref id,
             ref modules_dir,
@@ -1867,7 +1850,9 @@ fn main() -> Result<()> {
             println!();
             Ok(())
         }
-        Command::Get { command: Some(ref command) } => match command {
+        Command::Get {
+            command: Some(ref command),
+        } => match command {
             GetCommand::Status {
                 ref target,
                 ref modules_dir,
@@ -1893,9 +1878,12 @@ fn main() -> Result<()> {
                     commands::history::cmd_incidents(&cli, *days, severity, &cli.data_dir.clone())
                 }
             }
-            GetCommand::Decisions { days, ref action } => {
-                commands::history::cmd_decisions(&cli, *days, action.as_deref(), &cli.data_dir.clone())
-            }
+            GetCommand::Decisions { days, ref action } => commands::history::cmd_decisions(
+                &cli,
+                *days,
+                action.as_deref(),
+                &cli.data_dir.clone(),
+            ),
             GetCommand::Report { ref date } => {
                 commands::status::cmd_report(&cli, date, &cli.data_dir.clone())
             }
@@ -1917,7 +1905,9 @@ fn main() -> Result<()> {
             println!();
             Ok(())
         }
-        Command::Action { command: Some(ref command) } => match command {
+        Command::Action {
+            command: Some(ref command),
+        } => match command {
             ActionCommand::Block { ref ip, ref reason } => {
                 commands::response::cmd_block(&cli, ip, reason, &cli.data_dir.clone())
             }
@@ -1933,7 +1923,9 @@ fn main() -> Result<()> {
             println!();
             Ok(())
         }
-        Command::Trust { command: Some(ref command) } => match command {
+        Command::Trust {
+            command: Some(ref command),
+        } => match command {
             TrustCommand::Add { ref ip, ref user } => {
                 commands::response::cmd_allowlist_add(&cli, ip.as_deref(), user.as_deref())
             }
@@ -1958,7 +1950,9 @@ fn main() -> Result<()> {
             println!();
             Ok(())
         }
-        Command::System { command: Some(ref command) } => match command {
+        Command::System {
+            command: Some(ref command),
+        } => match command {
             SystemCommand::Doctor => commands::ops::cmd_doctor(&cli, &registry),
             SystemCommand::PipelineTest { wait } => {
                 commands::ops::cmd_pipeline_test(&cli, *wait, &cli.data_dir.clone())
@@ -1976,7 +1970,12 @@ fn main() -> Result<()> {
                 if *status {
                     commands::watchdog::cmd_watchdog_status(&cli, &cli.data_dir.clone())
                 } else {
-                    commands::watchdog::cmd_watchdog(&cli, *threshold, *notify, &cli.data_dir.clone())
+                    commands::watchdog::cmd_watchdog(
+                        &cli,
+                        *threshold,
+                        *notify,
+                        &cli.data_dir.clone(),
+                    )
                 }
             }
             SystemCommand::Export {
@@ -1994,7 +1993,9 @@ fn main() -> Result<()> {
                 output.as_deref(),
                 &cli.data_dir.clone(),
             ),
-            SystemCommand::Backup { ref output } => commands::ops::cmd_backup(&cli, output.as_deref()),
+            SystemCommand::Backup { ref output } => {
+                commands::ops::cmd_backup(&cli, output.as_deref())
+            }
             SystemCommand::Gdpr { ref action } => match action {
                 GdprCommand::Export {
                     ref entity,
