@@ -49,6 +49,16 @@ pub(crate) async fn try_handle_obvious_incident(
         return false;
     };
 
+    // Never auto-block operator IPs or trusted IPs.
+    if state.operator_ips.contains(ip) || cfg.allowlist.trusted_ips.iter().any(|t| t == ip) {
+        info!(
+            ip,
+            incident_id = %incident.incident_id,
+            "obvious gate: skipping auto-block for trusted/operator IP"
+        );
+        return false;
+    }
+
     info!(
         incident_id = %incident.incident_id,
         "skipping AI for obvious incident: {detector} from {ip}"

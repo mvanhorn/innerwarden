@@ -1064,6 +1064,12 @@ async fn main() -> Result<()> {
         redis_reader: None,
     };
 
+    // Seed operator IPs from allowlist.trusted_ips — these must NEVER be blocked.
+    for tip in &cfg.allowlist.trusted_ips {
+        state.operator_ips.insert(tip.clone());
+        info!(ip = %tip, "startup: trusted IP added to operator protection");
+    }
+
     // Seed operator IPs from active SSH sessions (who -i).
     if let Ok(output) = std::process::Command::new("who").arg("-i").output() {
         let who_out = String::from_utf8_lossy(&output.stdout);

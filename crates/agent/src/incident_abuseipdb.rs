@@ -46,6 +46,16 @@ pub(crate) async fn try_handle_abuseipdb_autoblock(
         return false;
     }
 
+    // Never auto-block operator IPs or trusted IPs.
+    if state.operator_ips.contains(&ip) || cfg.allowlist.trusted_ips.iter().any(|t| t == &ip) {
+        info!(
+            ip = %ip,
+            incident_id = %incident.incident_id,
+            "AbuseIPDB auto-block skipped: trusted/operator IP"
+        );
+        return false;
+    }
+
     if cloud_safelist::is_cloud_provider_ip(&ip) {
         let provider = cloud_safelist::identify_provider(&ip).unwrap_or("Unknown Cloud");
         warn!(
