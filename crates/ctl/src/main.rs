@@ -33,10 +33,17 @@ use innerwarden_core::audit::{append_admin_action, current_operator, AdminAction
 #[derive(Parser)]
 #[command(
     name = "innerwarden",
-    about = "InnerWarden control plane - manage capabilities",
-    long_about = "Activate and manage InnerWarden capabilities.\n\n\
-                  Run 'innerwarden list' to see available capabilities.\n\
-                  Run 'innerwarden enable <id>' to activate one."
+    about = "InnerWarden — self-defending security for Linux and macOS",
+    long_about = "8 commands to protect your server:\n\n\
+                  \x20 get       Query status, incidents, decisions, reports\n\
+                  \x20 stream    Monitor events in real-time\n\
+                  \x20 action    Block or unblock IPs\n\
+                  \x20 trust     Manage trusted IPs, users, and suppressions\n\
+                  \x20 config    Configure AI, notifications, integrations\n\
+                  \x20 system    Diagnostics, hardening, tuning, data export\n\
+                  \x20 module    Install and manage security modules\n\
+                  \x20 agent     Connect and manage AI agents\n\n\
+                  Getting started:  innerwarden setup"
 )]
 struct Cli {
     /// Path to sensor config (config.toml)
@@ -61,6 +68,170 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    // =======================================================================
+    // New grouped commands (primary UX)
+    // =======================================================================
+
+    /// Query status, incidents, decisions, reports, and metrics.
+    ///
+    /// All read-only operations that fetch data without changing state.
+    ///
+    /// Examples:
+    ///   innerwarden get status
+    ///   innerwarden get incidents --days 2
+    ///   innerwarden get decisions --action block_ip
+    ///   innerwarden get report --date yesterday
+    ///   innerwarden get metrics
+    ///   innerwarden get sensors
+    Get {
+        #[command(subcommand)]
+        command: Option<GetCommand>,
+    },
+
+    /// Stream new incidents and events in real time.
+    ///
+    /// Polls JSONL files and prints new entries as they arrive. Ctrl-C to stop.
+    ///
+    /// Examples:
+    ///   innerwarden stream
+    ///   innerwarden stream --type events
+    ///   innerwarden stream --interval 5
+    Stream {
+        /// What to stream: incidents or events (default: incidents)
+        #[arg(long, default_value = "incidents")]
+        r#type: String,
+
+        /// Poll interval in seconds (default: 2)
+        #[arg(long, default_value = "2")]
+        interval: u64,
+    },
+
+    /// Manual response actions (block/unblock IPs).
+    ///
+    /// Examples:
+    ///   innerwarden action block 1.2.3.4 --reason "investigation"
+    ///   innerwarden action unblock 1.2.3.4 --reason "false positive"
+    Action {
+        #[command(subcommand)]
+        command: Option<ActionCommand>,
+    },
+
+    /// Manage trusted entities and suppression rules.
+    ///
+    /// Examples:
+    ///   innerwarden trust add --ip 10.0.0.1
+    ///   innerwarden trust remove --user deploy
+    ///   innerwarden trust list
+    ///   innerwarden trust suppress firmware:trust_degraded
+    ///   innerwarden trust unsuppress firmware:trust_degraded
+    ///   innerwarden trust suppressions
+    Trust {
+        #[command(subcommand)]
+        command: Option<TrustCommand>,
+    },
+
+    /// Configure AI, notifications, integrations, and mesh.
+    ///
+    /// Run without arguments for an interactive menu.
+    ///
+    /// Examples:
+    ///   innerwarden config ai
+    ///   innerwarden config telegram
+    ///   innerwarden config cloudflare
+    ///   innerwarden config mesh enable
+    Config {
+        #[command(subcommand)]
+        command: Option<ConfigAllCommand>,
+    },
+
+    /// System health, tuning, security, and data management.
+    ///
+    /// Examples:
+    ///   innerwarden system doctor
+    ///   innerwarden system harden
+    ///   innerwarden system test
+    ///   innerwarden system export incidents
+    ///   innerwarden system backup
+    System {
+        #[command(subcommand)]
+        command: Option<SystemCommand>,
+    },
+
+    /// Module management commands
+    Module {
+        #[command(subcommand)]
+        command: ModuleCommand,
+    },
+
+    /// AI agent management — install, scan, connect, monitor agents.
+    ///
+    /// Run without arguments for an interactive menu.
+    ///
+    /// Examples:
+    ///   innerwarden agent                    (interactive menu)
+    ///   innerwarden agent add <name>         (install an agent)
+    ///   innerwarden agent scan               (find running agents)
+    ///   innerwarden agent status             (view connected agents)
+    ///   innerwarden agent connect            (auto-detect and connect)
+    ///   innerwarden agent connect 1234       (connect a specific PID)
+    ///   innerwarden agent disconnect ag-0001 (disconnect an agent)
+    Agent {
+        #[command(subcommand)]
+        command: Option<AgentCommand>,
+    },
+
+    // =======================================================================
+    // Top-level commands (not grouped)
+    // =======================================================================
+
+    /// First-time setup wizard.
+    ///
+    /// Scans your machine, configures AI, Telegram notifications, the
+    /// responder, and enables the most relevant modules for your setup.
+    ///
+    /// Examples:
+    ///   innerwarden setup
+    ///   innerwarden setup --mode advanced
+    Setup {
+        /// Setup mode: basic (default) or advanced
+        #[arg(long, default_value = "basic", value_parser = ["basic", "advanced"])]
+        mode: String,
+    },
+
+    /// Check for a newer release and optionally upgrade all binaries.
+    ///
+    /// Examples:
+    ///   innerwarden upgrade
+    ///   innerwarden upgrade --check
+    ///   innerwarden upgrade --yes
+    Upgrade {
+        /// Only check if an update is available; do not install
+        #[arg(long)]
+        check: bool,
+
+        /// Skip interactive confirmation prompt
+        #[arg(long)]
+        yes: bool,
+
+        /// Send a Telegram notification if a new version is available
+        #[arg(long)]
+        notify: bool,
+
+        /// Directory where binaries are installed
+        #[arg(long, default_value = "/usr/local/bin")]
+        install_dir: PathBuf,
+    },
+
+    /// Generate shell completions for bash, zsh, or fish.
+    ///
+    /// Examples:
+    ///   innerwarden completions bash >> ~/.bashrc
+    ///   innerwarden completions zsh  >> ~/.zshrc
+    Completions {
+        /// Shell to generate completions for: bash, zsh, or fish
+        shell: String,
+    },
+
     /// Activate a capability
     Enable {
         /// Capability ID (run 'innerwarden list' to see options)
@@ -88,533 +259,190 @@ enum Command {
     /// List all capabilities with their current status
     List,
 
-    /// Show system status or the full activity history for an IP or user.
-    ///
-    /// With no arguments: global overview of services, capabilities, and modules.
-    /// With an IP or username: chronological timeline of events, incidents, and
-    /// decisions for that entity (terminal equivalent of the dashboard journey panel).
-    ///
-    /// Examples:
-    ///   innerwarden status
-    ///   innerwarden status block-ip
-    ///   innerwarden status 203.0.113.10
-    ///   innerwarden status root --days 7
-    Status {
-        /// Capability ID, IP address, or username to inspect (omit for global overview)
-        target: Option<String>,
+    // =======================================================================
+    // Hidden backward-compatibility aliases (old command names still work)
+    // =======================================================================
 
-        /// Directory to scan for installed modules (used in global overview)
+    #[clap(hide = true)]
+    Status {
+        target: Option<String>,
         #[arg(long, default_value = "/etc/innerwarden/modules")]
         modules_dir: PathBuf,
-
-        /// How many days back to search when looking up an entity (default: 3)
         #[arg(long, default_value = "3")]
         days: u64,
     },
 
-    /// Simple daily commands for common day-to-day operations.
-    ///
-    /// Keeps the most used actions easy to remember. Advanced workflows
-    /// remain available via the full command set.
-    ///
-    /// Examples:
-    ///   innerwarden daily
-    ///   innerwarden daily status
-    ///   innerwarden daily threats --live
-    ///   innerwarden daily actions --days 7
-    ///   innerwarden daily agent scan
-    ///   innerwarden daily agent connect
-    ///   innerwarden quick status
+    #[clap(hide = true)]
     #[command(visible_aliases = ["quick", "day"])]
     Daily {
         #[command(subcommand)]
         command: Option<DailyCommand>,
     },
 
-    /// Scan system configuration and suggest security hardening improvements.
-    ///
-    /// Checks SSH, firewall, kernel, permissions, updates, Docker, and
-    /// services. Prints actionable recommendations - never applies changes.
-    ///
-    /// Examples:
-    ///   innerwarden harden
-    ///   innerwarden harden --verbose
+    #[clap(hide = true)]
     Harden {
-        /// Show all passed checks in addition to findings
         #[arg(long)]
         verbose: bool,
     },
 
-    /// Run system diagnostics and print fix hints for any issues found
+    #[clap(hide = true)]
     Doctor,
 
-    /// Scan this machine and recommend the best modules for your setup.
-    ///
-    /// Runs a quick system probe, scores each module, and shows a clear
-    /// priority list.  Type a module name or number at the prompt to read
-    /// its detailed docs.
+    #[clap(hide = true)]
     Scan {
-        /// Directory to look for module docs (default: ./modules or
-        /// /usr/local/share/innerwarden/modules)
         #[arg(long, default_value = "")]
         modules_dir: String,
     },
 
-    /// First-time setup wizard.
-    ///
-    /// Scans your machine, configures AI, Telegram notifications, the
-    /// responder, and enables the most relevant modules for your setup.
-    ///
-    /// Examples:
-    ///   innerwarden setup
-    ///   innerwarden setup --mode advanced
-    Setup {
-        /// Setup mode: basic (default) or advanced
-        #[arg(long, default_value = "basic", value_parser = ["basic", "advanced"])]
-        mode: String,
-    },
-
-    /// Show welcome animation (called by installer).
     #[clap(hide = true)]
     Welcome,
 
-    /// Export MITRE ATT&CK Navigator layer showing detection coverage.
-    ///
-    /// Output can be loaded into https://mitre-attack.github.io/attack-navigator/
-    ///
-    /// Examples:
-    ///   innerwarden navigator > coverage.json
-    ///   innerwarden navigator --output coverage.json
+    #[clap(hide = true)]
     Navigator {
-        /// Write to file instead of stdout.
         #[arg(short, long)]
         output: Option<String>,
     },
 
-    /// Check for a newer release and optionally upgrade all binaries.
-    ///
-    /// Add to cron for automatic update checks:
-    ///   0 8 * * * innerwarden upgrade --check --notify 2>/dev/null
-    ///
-    /// Examples:
-    ///   innerwarden upgrade              # check + install interactively
-    ///   innerwarden upgrade --check      # just check, don't install
-    ///   innerwarden upgrade --check --notify  # check + Telegram alert if new version
-    ///   innerwarden upgrade --yes        # install without confirmation
-    Upgrade {
-        /// Only check if an update is available; do not install
-        #[arg(long)]
-        check: bool,
-
-        /// Skip interactive confirmation prompt
-        #[arg(long)]
-        yes: bool,
-
-        /// Send a Telegram notification if a new version is available (for cron use)
-        #[arg(long)]
-        notify: bool,
-
-        /// Directory where binaries are installed
-        #[arg(long, default_value = "/usr/local/bin")]
-        install_dir: PathBuf,
-    },
-
-    /// Configure notification channels (Telegram, Slack, webhook, dashboard).
-    ///
-    /// Run without arguments to see an interactive menu.
-    ///
-    /// Examples:
-    ///   innerwarden notify telegram
-    ///   innerwarden notify slack --webhook-url https://hooks.slack.com/...
-    ///   innerwarden notify test
+    #[clap(hide = true)]
     Notify {
         #[command(subcommand)]
         command: Option<NotifyCommand>,
     },
 
-    /// Configure system components (AI provider, responder mode).
-    ///
-    /// Run without arguments to see an interactive menu.
-    ///
-    /// Examples:
-    ///   innerwarden configure ai
-    ///   innerwarden configure ai openai --key sk-...
-    ///   innerwarden configure ai groq --key gsk-...
-    ///   innerwarden configure responder --enable --dry-run false
+    #[clap(hide = true)]
     Configure {
         #[command(subcommand)]
         command: Option<ConfigureCommand>,
     },
 
-    /// Configure external integrations (GeoIP, AbuseIPDB, Cloudflare, watchdog).
-    ///
-    /// Run without arguments to see an interactive menu.
-    ///
-    /// Examples:
-    ///   innerwarden integrate geoip
-    ///   innerwarden integrate abuseipdb --api-key <key>
+    #[clap(hide = true)]
     Integrate {
         #[command(subcommand)]
         command: Option<IntegrateCommand>,
     },
 
-    /// Collaborative defense mesh network.
-    ///
-    /// Share threat intelligence with other Inner Warden nodes.
-    /// Attacking one server protects all others.
-    ///
-    /// Examples:
-    ///   innerwarden mesh enable
-    ///   innerwarden mesh add-peer https://peer:8790
-    ///   innerwarden mesh status
+    #[clap(hide = true)]
     Mesh {
         #[command(subcommand)]
         command: MeshCommand,
     },
 
-    /// Module management commands
-    Module {
-        #[command(subcommand)]
-        command: ModuleCommand,
-    },
-
-    /// Print the daily security report in the terminal.
-    ///
-    /// Reads the Markdown summary generated by innerwarden-agent and displays it.
-    /// No need to open the dashboard.
-    ///
-    /// Examples:
-    ///   innerwarden report
-    ///   innerwarden report --date yesterday
-    ///   innerwarden report --date 2026-03-14
+    #[clap(hide = true)]
     Report {
-        /// Date to show: today, yesterday, or YYYY-MM-DD (default: today)
         #[arg(long, default_value = "today")]
         date: String,
     },
 
-    /// Check if the agent is healthy and alert via Telegram if it appears stuck.
-    ///
-    /// The agent writes a telemetry file every 30 seconds. If the latest entry
-    /// is older than the threshold, the agent may be stuck or crashed.
-    ///
-    /// Add to cron for continuous monitoring:
-    ///   */10 * * * * innerwarden watchdog
-    ///
-    /// Use --status to show the cron schedule and last-run time without
-    /// running a health check.
-    ///
-    /// Examples:
-    ///   innerwarden watchdog
-    ///   innerwarden watchdog --threshold 600
-    ///   innerwarden watchdog --notify
-    ///   innerwarden watchdog --status
+    #[clap(hide = true)]
     Watchdog {
-        /// How many seconds of silence before reporting unhealthy (default: 300)
         #[arg(long, default_value = "300")]
         threshold: u64,
-
-        /// Send a Telegram alert when the agent appears unhealthy
         #[arg(long)]
         notify: bool,
-
-        /// Show watchdog cron schedule and last-run info instead of running a check
         #[arg(long)]
         status: bool,
     },
 
-    /// Interactively tune detector thresholds based on recent noise and signal.
-    ///
-    /// Reads telemetry + incidents from the last 7 days, computes noise/signal
-    /// ratio per detector, and suggests adjusted thresholds.  Applies changes
-    /// to sensor.toml on confirmation.
-    ///
-    /// Examples:
-    ///   innerwarden tune
-    ///   innerwarden tune --days 14
-    ///   innerwarden tune --yes        # apply suggestions without prompting
+    #[clap(hide = true)]
     Tune {
-        /// How many days of history to analyse (default: 7)
         #[arg(long, default_value = "7")]
         days: u64,
-
-        /// Apply suggested changes without interactive prompts
         #[arg(long)]
         yes: bool,
     },
 
-    /// Show which collectors are active and their event counts today.
-    ///
-    /// Reads the latest telemetry snapshot to show how many events each
-    /// data source has contributed today. Useful to verify collectors are working.
-    ///
-    /// Examples:
-    ///   innerwarden sensor-status
-    #[clap(name = "sensor-status")]
+    #[clap(hide = true, name = "sensor-status")]
     SensorStatus,
 
-    /// Export events, incidents, or decisions to CSV or JSON.
-    ///
-    /// Examples:
-    ///   innerwarden export incidents
-    ///   innerwarden export decisions --from 2026-03-01 --to 2026-03-15
-    ///   innerwarden export events --format csv --output /tmp/events.csv
+    #[clap(hide = true)]
     Export {
-        /// What to export: events, incidents, or decisions
         #[arg(default_value = "incidents")]
         kind: String,
-
-        /// Start date (YYYY-MM-DD, default: today)
         #[arg(long)]
         from: Option<String>,
-
-        /// End date inclusive (YYYY-MM-DD, default: today)
         #[arg(long)]
         to: Option<String>,
-
-        /// Output format: json or csv (default: json)
         #[arg(long, default_value = "json")]
         format: String,
-
-        /// Output file (default: stdout)
         #[arg(long)]
         output: Option<PathBuf>,
     },
 
-    /// Stream new incidents and events in real time (like tail -f).
-    ///
-    /// Polls the JSONL files every 2 seconds and prints new entries as they arrive.
-    /// Press Ctrl-C to stop.
-    ///
-    /// Examples:
-    ///   innerwarden tail
-    ///   innerwarden tail --type events
-    ///   innerwarden tail --type incidents
+    #[clap(hide = true)]
     Tail {
-        /// What to stream: incidents or events (default: incidents)
         #[arg(long, default_value = "incidents")]
         r#type: String,
-
-        /// Poll interval in seconds (default: 2)
         #[arg(long, default_value = "2")]
         interval: u64,
     },
 
-    /// List recent security incidents detected on this host.
-    ///
-    /// Shows threats from today (and optionally yesterday) with severity,
-    /// IP address, title and time. No need to open the dashboard.
-    ///
-    /// Examples:
-    ///   innerwarden incidents
-    ///   innerwarden incidents --days 2
-    ///   innerwarden incidents --severity critical
-    /// List recent security incidents detected on this host.
-    ///
-    /// Shows threats from today (and optionally yesterday) with severity,
-    /// IP address, title and time. No need to open the dashboard.
-    ///
-    /// Examples:
-    ///   innerwarden incidents
-    ///   innerwarden incidents --live
-    ///   innerwarden incidents --days 2
-    ///   innerwarden incidents --severity high
+    #[clap(hide = true)]
     Incidents {
-        /// How many days back to look (default: 1 = today only)
         #[arg(long, default_value = "1")]
         days: u64,
-
-        /// Filter by minimum severity: low, medium, high, critical (default: low = all)
         #[arg(long, default_value = "low")]
         severity: String,
-
-        /// Stream new incidents in real time (like tail -f but formatted)
         #[arg(long)]
         live: bool,
     },
 
-    /// Block an IP address at the firewall and record it in the audit trail.
-    ///
-    /// Uses the same block skill configured in agent.toml (ufw/iptables/nftables).
-    /// Requires sudo. The block is recorded in decisions-YYYY-MM-DD.jsonl.
-    ///
-    /// Examples:
-    ///   innerwarden block 1.2.3.4 --reason "manual block after investigation"
+    #[clap(hide = true)]
     Block {
-        /// IP address to block
         ip: String,
-
-        /// Reason for the block (required - kept in audit trail)
         #[arg(long)]
         reason: String,
     },
 
-    /// Remove a previously blocked IP from the firewall.
-    ///
-    /// Reverses a block created by InnerWarden (manual or AI-initiated).
-    /// The unblock is recorded in decisions-YYYY-MM-DD.jsonl.
-    ///
-    /// Examples:
-    ///   innerwarden unblock 1.2.3.4 --reason "false positive"
+    #[clap(hide = true)]
     Unblock {
-        /// IP address to unblock
         ip: String,
-
-        /// Reason for removing the block (required - kept in audit trail)
         #[arg(long)]
         reason: String,
     },
 
-    /// Show recent decisions made by InnerWarden (blocks, suspensions, ignores).
-    ///
-    /// Shows what the agent decided and whether it executed or was in dry-run mode.
-    /// Useful for auditing: "what did InnerWarden actually do?"
-    ///
-    /// Examples:
-    ///   innerwarden decisions
-    ///   innerwarden decisions --days 7
-    ///   innerwarden decisions --action block_ip
+    #[clap(hide = true)]
     Decisions {
-        /// How many days back to look (default: 1 = today only)
         #[arg(long, default_value = "1")]
         days: u64,
-
-        /// Filter by action: block_ip, suspend_user_sudo, ignore, monitor, honeypot
         #[arg(long)]
         action: Option<String>,
     },
 
-    /// Show the full activity history for an IP or user (hidden alias for 'status <entity>').
-    ///
-    /// Examples:
-    ///   innerwarden entity 203.0.113.10
-    ///   innerwarden entity root
-    ///   innerwarden entity 203.0.113.10 --days 7
     #[clap(hide = true)]
     Entity {
-        /// IP address or username to look up
         target: String,
-
-        /// How many days back to search (default: 3)
         #[arg(long, default_value = "3")]
         days: u64,
     },
 
-    /// Generate shell completions for bash, zsh, or fish.
-    ///
-    /// Prints the completion script to stdout. Source it in your shell config
-    /// to get tab-completion for all innerwarden commands and flags.
-    ///
-    /// Examples:
-    ///   innerwarden completions bash >> ~/.bashrc
-    ///   innerwarden completions zsh  >> ~/.zshrc
-    ///   innerwarden completions fish > ~/.config/fish/completions/innerwarden.fish
-    Completions {
-        /// Shell to generate completions for: bash, zsh, or fish
-        shell: String,
-    },
-
-    /// Manage trusted IPs, CIDRs, and users that skip automated response.
-    ///
-    /// Allowlisted entities are still logged and notified via webhook/Telegram/Slack
-    /// but the AI gate is skipped - no automated skill (block, suspend, etc.) is
-    /// ever executed for them.
-    ///
-    /// Examples:
-    ///   innerwarden allowlist add --ip 10.0.0.1
-    ///   innerwarden allowlist add --ip 192.168.0.0/24
-    ///   innerwarden allowlist add --user deploy
-    ///   innerwarden allowlist remove --ip 10.0.0.1
-    ///   innerwarden allowlist list
+    #[clap(hide = true)]
     Allowlist {
         #[command(subcommand)]
         command: AllowlistCommand,
     },
 
-    /// Inject a synthetic incident and verify the full pipeline responds.
-    ///
-    /// Writes a fake SSH brute-force incident using a documentation-range IP
-    /// (RFC 5737: 198.51.100.123) and waits for the agent to produce a
-    /// decision.  Safe to run on production - uses dry-run defaults and a
-    /// non-routable IP.
-    ///
-    /// Examples:
-    ///   innerwarden test
-    ///   innerwarden test --wait 20
-    #[clap(name = "test")]
+    #[clap(hide = true, name = "test")]
     PipelineTest {
-        /// Maximum seconds to wait for the agent to respond (default: 12)
         #[arg(long, default_value = "12")]
         wait: u64,
     },
 
-    /// Back up InnerWarden configuration files to a tar.gz archive.
-    ///
-    /// Creates a compressed archive containing config.toml, agent.toml,
-    /// and agent.env from /etc/innerwarden/. Requires sudo (configs are
-    /// owned by root:innerwarden).
-    ///
-    /// Examples:
-    ///   innerwarden backup
-    ///   innerwarden backup --output /tmp/my-backup.tar.gz
+    #[clap(hide = true)]
     Backup {
-        /// Output path for the archive (default: secure temp file in system temp dir)
         #[arg(long)]
         output: Option<PathBuf>,
     },
 
-    /// Show detailed metrics from today's telemetry snapshot.
-    ///
-    /// Reads the latest telemetry file and displays events processed,
-    /// incidents detected, decisions made, AI latency, and agent uptime.
-    ///
-    /// Examples:
-    ///   innerwarden metrics
+    #[clap(hide = true)]
     Metrics,
 
-    /// GDPR data subject operations (export & erase).
-    ///
-    /// Export all data matching an entity (IP or username), or erase it
-    /// in compliance with the GDPR right to erasure (Art. 17).
-    ///
-    /// Examples:
-    ///   innerwarden gdpr export --entity 203.0.113.10
-    ///   innerwarden gdpr export --entity root --output /tmp/root-data.jsonl
-    ///   innerwarden gdpr erase --entity 203.0.113.10
-    ///   innerwarden gdpr erase --entity root --yes
+    #[clap(hide = true)]
     Gdpr {
         #[command(subcommand)]
         action: GdprCommand,
     },
 
-    /// AI agent management — install, scan, connect, monitor agents.
-    ///
-    /// Run without arguments for an interactive menu.
-    ///
-    /// Examples:
-    ///   innerwarden agent                    (interactive menu)
-    ///   innerwarden agent add <name>         (install an agent)
-    ///   innerwarden agent scan               (find running agents)
-    ///   innerwarden agent status             (view connected agents)
-    ///   innerwarden agent connect            (auto-detect and connect)
-    ///   innerwarden agent connect 1234       (connect a specific PID)
-    ///   innerwarden agent disconnect ag-0001 (disconnect an agent)
-    Agent {
-        #[command(subcommand)]
-        command: Option<AgentCommand>,
-    },
-
-    /// Suppress or unsuppress incident types from alerting.
-    ///
-    /// Suppressed patterns are matched against incident IDs.
-    /// Matching incidents are silently logged but generate no alerts,
-    /// decisions, or notifications.
-    ///
-    /// Examples:
-    ///   innerwarden suppress add firmware:trust_degraded
-    ///   innerwarden suppress add "ssh_bruteforce:192.168.1.0"
-    ///   innerwarden suppress remove firmware:trust_degraded
-    ///   innerwarden suppress list
+    #[clap(hide = true)]
     Suppress {
         #[command(subcommand)]
         command: SuppressCommand,
@@ -1261,6 +1089,712 @@ enum GdprCommand {
 }
 
 // ---------------------------------------------------------------------------
+// New grouped command enums (UX refactor: 8 top-level groups)
+// ---------------------------------------------------------------------------
+
+/// Read and query operations — everything that fetches data without changing state.
+#[derive(Subcommand)]
+enum GetCommand {
+    /// Global system overview (services, capabilities, modules, today's activity).
+    ///
+    /// With no arguments: global overview.
+    /// With a target: chronological timeline for that IP or user.
+    ///
+    /// Examples:
+    ///   innerwarden get status
+    ///   innerwarden get status 203.0.113.10
+    ///   innerwarden get status root --days 7
+    Status {
+        /// IP address or username to inspect (omit for global overview)
+        target: Option<String>,
+
+        /// Directory to scan for installed modules (used in global overview)
+        #[arg(long, default_value = "/etc/innerwarden/modules")]
+        modules_dir: PathBuf,
+
+        /// How many days back to search when looking up an entity (default: 3)
+        #[arg(long, default_value = "3")]
+        days: u64,
+    },
+
+    /// List recent security incidents detected on this host.
+    ///
+    /// Examples:
+    ///   innerwarden get incidents
+    ///   innerwarden get incidents --days 2
+    ///   innerwarden get incidents --severity high
+    Incidents {
+        /// How many days back to look (default: 1 = today only)
+        #[arg(long, default_value = "1")]
+        days: u64,
+
+        /// Filter by minimum severity: low, medium, high, critical
+        #[arg(long, default_value = "low")]
+        severity: String,
+
+        /// Stream new incidents in real time (Ctrl-C to stop)
+        #[arg(long)]
+        live: bool,
+    },
+
+    /// Show recent decisions made by InnerWarden (blocks, suspensions, ignores).
+    ///
+    /// Examples:
+    ///   innerwarden get decisions
+    ///   innerwarden get decisions --days 7
+    ///   innerwarden get decisions --action block_ip
+    Decisions {
+        /// How many days back to look (default: 1 = today only)
+        #[arg(long, default_value = "1")]
+        days: u64,
+
+        /// Filter by action: block_ip, suspend_user_sudo, ignore, monitor, honeypot
+        #[arg(long)]
+        action: Option<String>,
+    },
+
+    /// Print the daily security report in the terminal.
+    ///
+    /// Examples:
+    ///   innerwarden get report
+    ///   innerwarden get report --date yesterday
+    Report {
+        /// Date to show: today, yesterday, or YYYY-MM-DD (default: today)
+        #[arg(long, default_value = "today")]
+        date: String,
+    },
+
+    /// Show detailed metrics from today's telemetry snapshot.
+    ///
+    /// Examples:
+    ///   innerwarden get metrics
+    Metrics,
+
+    /// Show which collectors are active and their event counts today.
+    ///
+    /// Examples:
+    ///   innerwarden get sensors
+    Sensors,
+
+    /// Show the full activity history for an IP or user.
+    ///
+    /// Examples:
+    ///   innerwarden get entity 203.0.113.10
+    ///   innerwarden get entity root --days 7
+    #[clap(hide = true)]
+    Entity {
+        /// IP address or username to look up
+        target: String,
+
+        /// How many days back to search (default: 3)
+        #[arg(long, default_value = "3")]
+        days: u64,
+    },
+}
+
+/// Manual response actions — block or unblock IPs.
+#[derive(Subcommand)]
+enum ActionCommand {
+    /// Block an IP address at the firewall and record it in the audit trail.
+    ///
+    /// Examples:
+    ///   innerwarden action block 1.2.3.4 --reason "manual block after investigation"
+    Block {
+        /// IP address to block
+        ip: String,
+
+        /// Reason for the block (required - kept in audit trail)
+        #[arg(long)]
+        reason: String,
+    },
+
+    /// Remove a previously blocked IP from the firewall.
+    ///
+    /// Examples:
+    ///   innerwarden action unblock 1.2.3.4 --reason "false positive"
+    Unblock {
+        /// IP address to unblock
+        ip: String,
+
+        /// Reason for removing the block (required - kept in audit trail)
+        #[arg(long)]
+        reason: String,
+    },
+}
+
+/// Trust management — allowlist and suppression operations.
+#[derive(Subcommand)]
+enum TrustCommand {
+    /// Add a trusted IP, CIDR, or user to the allowlist.
+    ///
+    /// Examples:
+    ///   innerwarden trust add --ip 10.0.0.1
+    ///   innerwarden trust add --user deploy
+    Add {
+        /// IP address or CIDR range to trust
+        #[arg(long)]
+        ip: Option<String>,
+
+        /// Username to trust
+        #[arg(long)]
+        user: Option<String>,
+    },
+
+    /// Remove an IP, CIDR, or user from the allowlist.
+    ///
+    /// Examples:
+    ///   innerwarden trust remove --ip 10.0.0.1
+    Remove {
+        /// IP address or CIDR to remove
+        #[arg(long)]
+        ip: Option<String>,
+
+        /// Username to remove
+        #[arg(long)]
+        user: Option<String>,
+    },
+
+    /// Show all currently trusted IPs, CIDRs, and users.
+    List,
+
+    /// Suppress an incident pattern from alerting.
+    ///
+    /// Examples:
+    ///   innerwarden trust suppress firmware:trust_degraded
+    Suppress {
+        /// Pattern to match against incident IDs (substring match)
+        pattern: String,
+    },
+
+    /// Remove a suppression pattern (re-enable alerting).
+    ///
+    /// Examples:
+    ///   innerwarden trust unsuppress firmware:trust_degraded
+    Unsuppress {
+        /// Pattern to remove
+        pattern: String,
+    },
+
+    /// Show all active suppression patterns.
+    Suppressions,
+}
+
+/// All configuration — AI, responder, notifications, integrations, mesh.
+#[derive(Subcommand)]
+enum ConfigAllCommand {
+    /// Configure AI provider and model.
+    ///
+    /// Examples:
+    ///   innerwarden config ai
+    ///   innerwarden config ai openai --key sk-...
+    Ai {
+        /// Provider name: openai, anthropic, groq, deepseek, mistral, xai, gemini, ollama, etc.
+        provider: Option<String>,
+
+        /// API key for the provider
+        #[arg(long)]
+        key: Option<String>,
+
+        /// Model to use (if omitted, the wizard fetches available models)
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Custom base URL for OpenAI-compatible APIs
+        #[arg(long)]
+        base_url: Option<String>,
+    },
+
+    /// Configure responder mode (enable/disable, dry-run).
+    ///
+    /// Examples:
+    ///   innerwarden config responder --enable --dry-run false
+    Responder {
+        /// Enable the responder
+        #[arg(long)]
+        enable: bool,
+
+        /// Dry-run mode: true = log only, false = execute for real
+        #[arg(long)]
+        dry_run: Option<bool>,
+    },
+
+    /// Set notification sensitivity level.
+    ///
+    /// Examples:
+    ///   innerwarden config sensitivity quiet
+    Sensitivity {
+        /// Level: quiet, normal, or verbose
+        level: String,
+    },
+
+    /// Configure two-factor authentication for sensitive actions.
+    ///
+    /// Examples:
+    ///   innerwarden config 2fa
+    #[command(name = "2fa")]
+    TwoFa,
+
+    /// Set up Telegram notifications.
+    ///
+    /// Examples:
+    ///   innerwarden config telegram
+    ///   innerwarden config telegram --token 123:ABC --chat-id 456789
+    Telegram {
+        /// Bot token from @BotFather
+        #[arg(long)]
+        token: Option<String>,
+
+        /// Your Telegram chat ID
+        #[arg(long)]
+        chat_id: Option<String>,
+
+        /// Skip the test message after configuring
+        #[arg(long)]
+        no_test: bool,
+    },
+
+    /// Set up Slack notifications.
+    ///
+    /// Examples:
+    ///   innerwarden config slack
+    ///   innerwarden config slack --webhook-url https://hooks.slack.com/services/...
+    Slack {
+        /// Slack Incoming Webhook URL
+        #[arg(long)]
+        webhook_url: Option<String>,
+
+        /// Minimum severity to notify: low, medium, high, critical
+        #[arg(long, default_value = "high")]
+        min_severity: String,
+
+        /// Skip the test message after configuring
+        #[arg(long)]
+        no_test: bool,
+    },
+
+    /// Set up HTTP webhook notifications.
+    ///
+    /// Examples:
+    ///   innerwarden config webhook --url https://hooks.example.com/notify
+    Webhook {
+        /// Webhook URL
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Minimum severity to forward
+        #[arg(long, default_value = "high")]
+        min_severity: String,
+
+        /// Skip the test request after configuring
+        #[arg(long)]
+        no_test: bool,
+    },
+
+    /// Set up the local security dashboard.
+    ///
+    /// Examples:
+    ///   innerwarden config dashboard
+    Dashboard {
+        /// Dashboard username (default: admin)
+        #[arg(long, default_value = "admin")]
+        user: String,
+
+        /// Dashboard password
+        #[arg(long)]
+        password: Option<String>,
+    },
+
+    /// Set up browser Web Push notifications.
+    ///
+    /// Examples:
+    ///   innerwarden config web-push
+    #[clap(name = "web-push")]
+    WebPush {
+        /// VAPID subject
+        #[arg(long)]
+        subject: Option<String>,
+    },
+
+    /// Configure the daily Telegram digest hour.
+    ///
+    /// Examples:
+    ///   innerwarden config digest 9
+    ///   innerwarden config digest off
+    Digest {
+        /// Hour (0-23) for daily digest, or "off" to disable
+        hour: String,
+    },
+
+    /// Configure the daily Telegram notification budget.
+    ///
+    /// Examples:
+    ///   innerwarden config budget 5
+    Budget {
+        /// Max immediate notifications per day
+        max: u32,
+    },
+
+    /// Send a test alert to all configured notification channels.
+    ///
+    /// Examples:
+    ///   innerwarden config test-alert
+    #[clap(name = "test-alert")]
+    TestAlert {
+        /// Only test a specific channel: telegram, slack, or webhook
+        #[arg(long)]
+        channel: Option<String>,
+    },
+
+    /// Enable GeoIP country/ISP enrichment.
+    ///
+    /// Examples:
+    ///   innerwarden config geoip
+    Geoip,
+
+    /// Set up AbuseIPDB IP reputation enrichment.
+    ///
+    /// Examples:
+    ///   innerwarden config abuseipdb --api-key <key>
+    Abuseipdb {
+        /// AbuseIPDB API key
+        #[arg(long)]
+        api_key: Option<String>,
+
+        /// Auto-block IPs with abuse confidence score >= this threshold
+        #[arg(long)]
+        auto_block_threshold: Option<u8>,
+    },
+
+    /// Push blocked IPs to Cloudflare edge via IP Access Rules API.
+    ///
+    /// Examples:
+    ///   innerwarden config cloudflare --zone-id <id> --api-token <token>
+    Cloudflare {
+        /// Cloudflare Zone ID
+        #[arg(long)]
+        zone_id: Option<String>,
+
+        /// Cloudflare API token
+        #[arg(long)]
+        api_token: Option<String>,
+    },
+
+    /// Set up automatic health monitoring via cron (watchdog).
+    ///
+    /// Examples:
+    ///   innerwarden config watchdog --interval 5
+    Watchdog {
+        /// How often to check (minutes, default: 10)
+        #[arg(long, default_value = "10")]
+        interval: u64,
+    },
+
+    /// Collaborative defense mesh network sub-commands.
+    ///
+    /// Examples:
+    ///   innerwarden config mesh enable
+    ///   innerwarden config mesh add-peer https://peer:8790
+    ///   innerwarden config mesh status
+    Mesh {
+        #[command(subcommand)]
+        command: MeshCommand,
+    },
+}
+
+/// System health, tuning, security, and data management.
+#[derive(Subcommand)]
+enum SystemCommand {
+    /// Run system diagnostics and print fix hints for any issues found.
+    Doctor,
+
+    /// Inject a synthetic incident and verify the full pipeline responds.
+    ///
+    /// Examples:
+    ///   innerwarden system test
+    ///   innerwarden system test --wait 20
+    #[clap(name = "test")]
+    PipelineTest {
+        /// Maximum seconds to wait for the agent to respond (default: 12)
+        #[arg(long, default_value = "12")]
+        wait: u64,
+    },
+
+    /// Scan system configuration and suggest security hardening improvements.
+    ///
+    /// Examples:
+    ///   innerwarden system harden
+    ///   innerwarden system harden --verbose
+    Harden {
+        /// Show all passed checks in addition to findings
+        #[arg(long)]
+        verbose: bool,
+    },
+
+    /// Interactively tune detector thresholds based on recent noise and signal.
+    ///
+    /// Examples:
+    ///   innerwarden system tune
+    ///   innerwarden system tune --days 14
+    Tune {
+        /// How many days of history to analyse (default: 7)
+        #[arg(long, default_value = "7")]
+        days: u64,
+
+        /// Apply suggested changes without interactive prompts
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// Scan this machine and recommend the best modules for your setup.
+    ///
+    /// Examples:
+    ///   innerwarden system scan
+    Scan {
+        /// Directory to look for module docs
+        #[arg(long, default_value = "")]
+        modules_dir: String,
+    },
+
+    /// Check agent health and alert via Telegram if it appears stuck.
+    ///
+    /// Examples:
+    ///   innerwarden system watchdog
+    ///   innerwarden system watchdog --threshold 600
+    Watchdog {
+        /// How many seconds of silence before reporting unhealthy (default: 300)
+        #[arg(long, default_value = "300")]
+        threshold: u64,
+
+        /// Send a Telegram alert when the agent appears unhealthy
+        #[arg(long)]
+        notify: bool,
+
+        /// Show watchdog cron schedule and last-run info
+        #[arg(long)]
+        status: bool,
+    },
+
+    /// Export events, incidents, or decisions to CSV or JSON.
+    ///
+    /// Examples:
+    ///   innerwarden system export incidents
+    ///   innerwarden system export decisions --from 2026-03-01
+    Export {
+        /// What to export: events, incidents, or decisions
+        #[arg(default_value = "incidents")]
+        kind: String,
+
+        /// Start date (YYYY-MM-DD)
+        #[arg(long)]
+        from: Option<String>,
+
+        /// End date inclusive (YYYY-MM-DD)
+        #[arg(long)]
+        to: Option<String>,
+
+        /// Output format: json or csv
+        #[arg(long, default_value = "json")]
+        format: String,
+
+        /// Output file (default: stdout)
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Back up InnerWarden configuration files to a tar.gz archive.
+    ///
+    /// Examples:
+    ///   innerwarden system backup
+    Backup {
+        /// Output path for the archive
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+
+    /// GDPR data subject operations (export & erase).
+    ///
+    /// Examples:
+    ///   innerwarden system gdpr export --entity 203.0.113.10
+    ///   innerwarden system gdpr erase --entity root --yes
+    Gdpr {
+        #[command(subcommand)]
+        action: GdprCommand,
+    },
+
+    /// Export MITRE ATT&CK Navigator layer showing detection coverage.
+    ///
+    /// Examples:
+    ///   innerwarden system navigator > coverage.json
+    Navigator {
+        /// Write to file instead of stdout.
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch helpers (extracted to avoid bloating main match)
+// ---------------------------------------------------------------------------
+
+fn dispatch_config(cli: &Cli, command: &Option<ConfigAllCommand>) -> Result<()> {
+    match command {
+        None => commands::ops::cmd_configure_menu(cli),
+        Some(ConfigAllCommand::Ai {
+            ref provider,
+            ref key,
+            ref model,
+            ref base_url,
+        }) => {
+            if provider.is_none() {
+                commands::ai::cmd_configure_ai_interactive(cli)
+            } else {
+                commands::ai::cmd_configure_ai(
+                    cli,
+                    provider.as_deref().unwrap(),
+                    key.as_deref(),
+                    model.as_deref(),
+                    base_url.as_deref(),
+                )
+            }
+        }
+        Some(ConfigAllCommand::Responder { enable, dry_run }) => {
+            commands::responder::cmd_configure_responder(cli, *enable, false, *dry_run)
+        }
+        Some(ConfigAllCommand::Sensitivity { ref level }) => {
+            commands::ops::cmd_configure_sensitivity(cli, level)
+        }
+        Some(ConfigAllCommand::TwoFa) => commands::ops::cmd_configure_2fa(cli),
+        Some(ConfigAllCommand::Telegram {
+            ref token,
+            ref chat_id,
+            no_test,
+        }) => commands::notify::cmd_configure_telegram(
+            cli,
+            token.as_deref(),
+            chat_id.as_deref(),
+            *no_test,
+        ),
+        Some(ConfigAllCommand::Slack {
+            ref webhook_url,
+            ref min_severity,
+            no_test,
+        }) => commands::notify::cmd_configure_slack(
+            cli,
+            webhook_url.as_deref(),
+            min_severity,
+            *no_test,
+        ),
+        Some(ConfigAllCommand::Webhook {
+            ref url,
+            ref min_severity,
+            no_test,
+        }) => commands::notify::cmd_configure_webhook(
+            cli,
+            url.as_deref(),
+            min_severity,
+            *no_test,
+        ),
+        Some(ConfigAllCommand::Dashboard {
+            ref user,
+            ref password,
+        }) => commands::notify::cmd_configure_dashboard(cli, user, password.as_deref()),
+        Some(ConfigAllCommand::WebPush { ref subject }) => {
+            commands::notify::cmd_notify_web_push_setup(cli, subject.as_deref())
+        }
+        Some(ConfigAllCommand::Digest { ref hour }) => {
+            commands::notify::cmd_configure_digest(cli, hour)
+        }
+        Some(ConfigAllCommand::Budget { max }) => {
+            commands::notify::cmd_configure_budget(cli, *max)
+        }
+        Some(ConfigAllCommand::TestAlert { ref channel }) => {
+            commands::notify::cmd_test_alert(cli, channel.as_deref())
+        }
+        Some(ConfigAllCommand::Geoip) => commands::integrations::cmd_configure_geoip(cli),
+        Some(ConfigAllCommand::Abuseipdb {
+            ref api_key,
+            auto_block_threshold,
+        }) => commands::integrations::cmd_configure_abuseipdb(
+            cli,
+            api_key.as_deref(),
+            *auto_block_threshold,
+        ),
+        Some(ConfigAllCommand::Cloudflare {
+            ref zone_id,
+            ref api_token,
+        }) => commands::integrations::cmd_configure_cloudflare(
+            cli,
+            zone_id.as_deref(),
+            api_token.as_deref(),
+        ),
+        Some(ConfigAllCommand::Watchdog { interval }) => {
+            commands::integrations::cmd_configure_watchdog(cli, *interval)
+        }
+        Some(ConfigAllCommand::Mesh { ref command }) => match command {
+            MeshCommand::Enable => commands::mesh::cmd_mesh_enable(cli),
+            MeshCommand::Disable => commands::mesh::cmd_mesh_disable(cli),
+            MeshCommand::AddPeer {
+                ref endpoint,
+                ref label,
+            } => commands::mesh::cmd_mesh_add_peer(cli, endpoint, label.as_deref()),
+            MeshCommand::Status => commands::mesh::cmd_mesh_status(cli),
+        },
+    }
+}
+
+fn dispatch_module(cli: &Cli, command: &ModuleCommand) -> Result<()> {
+    match command {
+        ModuleCommand::Validate { ref path, strict } => {
+            commands::module::cmd_module_validate(path, *strict)
+        }
+        ModuleCommand::Enable { ref path, yes } => {
+            commands::module::cmd_module_enable(cli, path, *yes)
+        }
+        ModuleCommand::Disable { ref path, yes } => {
+            commands::module::cmd_module_disable(cli, path, *yes)
+        }
+        ModuleCommand::Search { ref query } => {
+            commands::module::cmd_module_search(query.as_deref())
+        }
+        ModuleCommand::List { ref modules_dir } => {
+            commands::module::cmd_module_list(cli, modules_dir)
+        }
+        ModuleCommand::Status {
+            ref id,
+            ref modules_dir,
+        } => commands::module::cmd_module_status(cli, id, modules_dir),
+        ModuleCommand::Install {
+            ref source,
+            ref modules_dir,
+            enable,
+            force,
+            yes,
+        } => commands::module::cmd_module_install(
+            cli,
+            source,
+            modules_dir,
+            *enable,
+            *force,
+            *yes,
+        ),
+        ModuleCommand::Uninstall {
+            ref id,
+            ref modules_dir,
+            yes,
+        } => commands::module::cmd_module_uninstall(cli, id, modules_dir, *yes),
+        ModuleCommand::Publish {
+            ref path,
+            ref output,
+        } => commands::module::cmd_module_publish(path, output.as_deref()),
+        ModuleCommand::UpdateAll {
+            ref modules_dir,
+            check,
+            yes,
+        } => commands::module::cmd_module_update_all(cli, modules_dir, *check, *yes),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -1322,37 +1856,170 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
-        Command::Daily { ref command } => {
-            commands::core::cmd_daily(&cli, &registry, command.as_ref())
+        // ===================================================================
+        // New grouped commands
+        // ===================================================================
+        Command::Get { command: None } => {
+            use clap::CommandFactory;
+            let mut app = Cli::command();
+            let sub = app.find_subcommand_mut("get").unwrap();
+            sub.print_help()?;
+            println!();
+            Ok(())
         }
-        Command::Harden { verbose } => harden::cmd_harden(verbose),
-        Command::Doctor => commands::ops::cmd_doctor(&cli, &registry),
+        Command::Get { command: Some(ref command) } => match command {
+            GetCommand::Status {
+                ref target,
+                ref modules_dir,
+                days,
+            } => match target {
+                None => commands::status::cmd_status_global(&cli, &registry, modules_dir),
+                Some(ref t) => {
+                    if registry.get(t).is_some() {
+                        commands::status::cmd_status(&cli, &registry, t)
+                    } else {
+                        commands::history::cmd_entity(&cli, t, *days, &cli.data_dir.clone())
+                    }
+                }
+            },
+            GetCommand::Incidents {
+                days,
+                ref severity,
+                live,
+            } => {
+                if *live {
+                    commands::history::cmd_incidents_live(&cli, severity, &cli.data_dir.clone())
+                } else {
+                    commands::history::cmd_incidents(&cli, *days, severity, &cli.data_dir.clone())
+                }
+            }
+            GetCommand::Decisions { days, ref action } => {
+                commands::history::cmd_decisions(&cli, *days, action.as_deref(), &cli.data_dir.clone())
+            }
+            GetCommand::Report { ref date } => {
+                commands::status::cmd_report(&cli, date, &cli.data_dir.clone())
+            }
+            GetCommand::Metrics => commands::status::cmd_metrics(&cli, &cli.data_dir.clone()),
+            GetCommand::Sensors => commands::status::cmd_sensor_status(&cli, &cli.data_dir.clone()),
+            GetCommand::Entity { ref target, days } => {
+                commands::history::cmd_entity(&cli, target, *days, &cli.data_dir.clone())
+            }
+        },
+        Command::Stream {
+            ref r#type,
+            interval,
+        } => commands::history::cmd_tail(&cli, r#type, interval, &cli.data_dir.clone()),
+        Command::Action { command: None } => {
+            use clap::CommandFactory;
+            let mut app = Cli::command();
+            let sub = app.find_subcommand_mut("action").unwrap();
+            sub.print_help()?;
+            println!();
+            Ok(())
+        }
+        Command::Action { command: Some(ref command) } => match command {
+            ActionCommand::Block { ref ip, ref reason } => {
+                commands::response::cmd_block(&cli, ip, reason, &cli.data_dir.clone())
+            }
+            ActionCommand::Unblock { ref ip, ref reason } => {
+                commands::response::cmd_unblock(&cli, ip, reason, &cli.data_dir.clone())
+            }
+        },
+        Command::Trust { command: None } => {
+            use clap::CommandFactory;
+            let mut app = Cli::command();
+            let sub = app.find_subcommand_mut("trust").unwrap();
+            sub.print_help()?;
+            println!();
+            Ok(())
+        }
+        Command::Trust { command: Some(ref command) } => match command {
+            TrustCommand::Add { ref ip, ref user } => {
+                commands::response::cmd_allowlist_add(&cli, ip.as_deref(), user.as_deref())
+            }
+            TrustCommand::Remove { ref ip, ref user } => {
+                commands::response::cmd_allowlist_remove(&cli, ip.as_deref(), user.as_deref())
+            }
+            TrustCommand::List => commands::response::cmd_allowlist_list(&cli),
+            TrustCommand::Suppress { ref pattern } => {
+                commands::response::cmd_suppress_add(&cli, pattern)
+            }
+            TrustCommand::Unsuppress { ref pattern } => {
+                commands::response::cmd_suppress_remove(&cli, pattern)
+            }
+            TrustCommand::Suppressions => commands::response::cmd_suppress_list(&cli),
+        },
+        Command::Config { ref command } => dispatch_config(&cli, command),
+        Command::System { command: None } => {
+            use clap::CommandFactory;
+            let mut app = Cli::command();
+            let sub = app.find_subcommand_mut("system").unwrap();
+            sub.print_help()?;
+            println!();
+            Ok(())
+        }
+        Command::System { command: Some(ref command) } => match command {
+            SystemCommand::Doctor => commands::ops::cmd_doctor(&cli, &registry),
+            SystemCommand::PipelineTest { wait } => {
+                commands::ops::cmd_pipeline_test(&cli, *wait, &cli.data_dir.clone())
+            }
+            SystemCommand::Harden { verbose } => harden::cmd_harden(*verbose),
+            SystemCommand::Tune { days, yes } => {
+                commands::ops::cmd_tune(&cli, *days, *yes, &cli.data_dir.clone())
+            }
+            SystemCommand::Scan { ref modules_dir } => scan::cmd_scan(modules_dir),
+            SystemCommand::Watchdog {
+                threshold,
+                notify,
+                status,
+            } => {
+                if *status {
+                    commands::watchdog::cmd_watchdog_status(&cli, &cli.data_dir.clone())
+                } else {
+                    commands::watchdog::cmd_watchdog(&cli, *threshold, *notify, &cli.data_dir.clone())
+                }
+            }
+            SystemCommand::Export {
+                ref kind,
+                ref from,
+                ref to,
+                ref format,
+                ref output,
+            } => commands::history::cmd_export(
+                &cli,
+                kind,
+                from.as_deref(),
+                to.as_deref(),
+                format,
+                output.as_deref(),
+                &cli.data_dir.clone(),
+            ),
+            SystemCommand::Backup { ref output } => commands::ops::cmd_backup(&cli, output.as_deref()),
+            SystemCommand::Gdpr { ref action } => match action {
+                GdprCommand::Export {
+                    ref entity,
+                    ref output,
+                } => commands::history::cmd_gdpr_export(&cli.data_dir, entity, output.as_deref()),
+                GdprCommand::Erase { ref entity, yes } => {
+                    commands::history::cmd_gdpr_erase(&cli.data_dir, entity, *yes)
+                }
+            },
+            SystemCommand::Navigator { ref output } => {
+                commands::status::cmd_navigator(output.as_deref())
+            }
+        },
+
+        // ===================================================================
+        // Top-level commands (not grouped)
+        // ===================================================================
         Command::Setup { ref mode } => commands::setup::cmd_setup(&cli, mode),
-        Command::Welcome => commands::core::cmd_welcome(),
-        Command::Navigator { ref output } => commands::status::cmd_navigator(output.as_deref()),
-        Command::Scan { ref modules_dir } => scan::cmd_scan(modules_dir),
         Command::Upgrade {
             check,
             yes,
             notify,
             ref install_dir,
         } => commands::update::cmd_upgrade(&cli, check, yes, notify, install_dir),
-        Command::List => commands::core::cmd_list(&cli, &registry),
-        Command::Status {
-            ref target,
-            ref modules_dir,
-            days,
-        } => match target {
-            None => commands::status::cmd_status_global(&cli, &registry, modules_dir),
-            Some(ref t) => {
-                // Check if it looks like a capability ID first; fall back to entity lookup
-                if registry.get(t).is_some() {
-                    commands::status::cmd_status(&cli, &registry, t)
-                } else {
-                    commands::history::cmd_entity(&cli, t, days, &cli.data_dir.clone())
-                }
-            }
-        },
+        Command::Completions { ref shell } => commands::ops::cmd_completions(shell),
         Command::Enable {
             ref capability,
             ref params,
@@ -1365,6 +2032,35 @@ fn main() -> Result<()> {
             ref capability,
             yes,
         } => commands::capability::cmd_disable(&cli, &registry, capability, yes),
+        Command::List => commands::core::cmd_list(&cli, &registry),
+        Command::Module { ref command } => dispatch_module(&cli, command),
+        Command::Agent { ref command } => commands::agent::cmd_agent(&cli, command.as_ref()),
+
+        // ===================================================================
+        // Hidden backward-compatibility aliases
+        // ===================================================================
+        Command::Daily { ref command } => {
+            commands::core::cmd_daily(&cli, &registry, command.as_ref())
+        }
+        Command::Harden { verbose } => harden::cmd_harden(verbose),
+        Command::Doctor => commands::ops::cmd_doctor(&cli, &registry),
+        Command::Welcome => commands::core::cmd_welcome(),
+        Command::Navigator { ref output } => commands::status::cmd_navigator(output.as_deref()),
+        Command::Scan { ref modules_dir } => scan::cmd_scan(modules_dir),
+        Command::Status {
+            ref target,
+            ref modules_dir,
+            days,
+        } => match target {
+            None => commands::status::cmd_status_global(&cli, &registry, modules_dir),
+            Some(ref t) => {
+                if registry.get(t).is_some() {
+                    commands::status::cmd_status(&cli, &registry, t)
+                } else {
+                    commands::history::cmd_entity(&cli, t, days, &cli.data_dir.clone())
+                }
+            }
+        },
         Command::Configure { ref command } => match command {
             None => commands::ops::cmd_configure_menu(&cli),
             Some(ConfigureCommand::Ai {
@@ -1474,55 +2170,6 @@ fn main() -> Result<()> {
             } => commands::mesh::cmd_mesh_add_peer(&cli, endpoint, label.as_deref()),
             MeshCommand::Status => commands::mesh::cmd_mesh_status(&cli),
         },
-        Command::Module { ref command } => match command {
-            ModuleCommand::Validate { ref path, strict } => {
-                commands::module::cmd_module_validate(path, *strict)
-            }
-            ModuleCommand::Enable { ref path, yes } => {
-                commands::module::cmd_module_enable(&cli, path, *yes)
-            }
-            ModuleCommand::Disable { ref path, yes } => {
-                commands::module::cmd_module_disable(&cli, path, *yes)
-            }
-            ModuleCommand::Search { ref query } => {
-                commands::module::cmd_module_search(query.as_deref())
-            }
-            ModuleCommand::List { ref modules_dir } => {
-                commands::module::cmd_module_list(&cli, modules_dir)
-            }
-            ModuleCommand::Status {
-                ref id,
-                ref modules_dir,
-            } => commands::module::cmd_module_status(&cli, id, modules_dir),
-            ModuleCommand::Install {
-                ref source,
-                ref modules_dir,
-                enable,
-                force,
-                yes,
-            } => commands::module::cmd_module_install(
-                &cli,
-                source,
-                modules_dir,
-                *enable,
-                *force,
-                *yes,
-            ),
-            ModuleCommand::Uninstall {
-                ref id,
-                ref modules_dir,
-                yes,
-            } => commands::module::cmd_module_uninstall(&cli, id, modules_dir, *yes),
-            ModuleCommand::Publish {
-                ref path,
-                ref output,
-            } => commands::module::cmd_module_publish(path, output.as_deref()),
-            ModuleCommand::UpdateAll {
-                ref modules_dir,
-                check,
-                yes,
-            } => commands::module::cmd_module_update_all(&cli, modules_dir, *check, *yes),
-        },
         Command::Incidents {
             days,
             ref severity,
@@ -1583,7 +2230,6 @@ fn main() -> Result<()> {
         Command::Entity { ref target, days } => {
             commands::history::cmd_entity(&cli, target, days, &cli.data_dir.clone())
         }
-        Command::Completions { ref shell } => commands::ops::cmd_completions(shell),
         Command::Allowlist { ref command } => match command {
             AllowlistCommand::Add { ref ip, ref user } => {
                 commands::response::cmd_allowlist_add(&cli, ip.as_deref(), user.as_deref())
@@ -1616,7 +2262,6 @@ fn main() -> Result<()> {
                 commands::history::cmd_gdpr_erase(&cli.data_dir, entity, *yes)
             }
         },
-        Command::Agent { ref command } => commands::agent::cmd_agent(&cli, command.as_ref()),
     }
 }
 
