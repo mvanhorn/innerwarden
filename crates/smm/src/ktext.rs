@@ -165,7 +165,10 @@ pub fn check_kernel_text() -> CheckResult {
             parts.push(format!("BTF sha256:{:.16}…", h));
         }
         if let Some(ref h) = state.kallsyms_addr_hash {
-            parts.push(format!("kallsyms-addr sha256:{:.16}…, {} text symbols", h, state.text_symbol_count));
+            parts.push(format!(
+                "kallsyms-addr sha256:{:.16}…, {} text symbols",
+                h, state.text_symbol_count
+            ));
         }
         return CheckResult {
             id: "KTEXT-001",

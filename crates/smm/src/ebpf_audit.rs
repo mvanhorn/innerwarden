@@ -66,7 +66,13 @@ impl BpfInventory {
         // Hash the inventory for baseline comparison.
         let mut hasher = Sha256::new();
         for prog in &programs {
-            hasher.update(format!("{}:{}:{}:{}\n", prog.id, prog.prog_type, prog.name, prog.tag).as_bytes());
+            hasher.update(
+                format!(
+                    "{}:{}:{}:{}\n",
+                    prog.id, prog.prog_type, prog.name, prog.tag
+                )
+                .as_bytes(),
+            );
         }
         let inventory_hash = hex::encode(hasher.finalize());
 
@@ -274,7 +280,10 @@ mod tests {
     fn sensitive_detection() {
         assert!(is_sensitive("kprobe", "my_hook"));
         assert!(is_sensitive("lsm", "security_check"));
-        assert!(is_sensitive("tracepoint", "tracepoint/syscalls/sys_enter_open"));
+        assert!(is_sensitive(
+            "tracepoint",
+            "tracepoint/syscalls/sys_enter_open"
+        ));
         assert!(is_sensitive("xdp", "firewall"));
         // cgroup types are sensitive (contains "cgroup").
         assert!(is_sensitive("cgroup_skb", ""));
@@ -284,8 +293,20 @@ mod tests {
     #[test]
     fn inventory_hash_deterministic() {
         let progs = vec![
-            BpfProgram { id: 1, prog_type: "kprobe".into(), name: "test".into(), tag: "abc".into(), sensitive: true },
-            BpfProgram { id: 2, prog_type: "xdp".into(), name: "fw".into(), tag: "def".into(), sensitive: true },
+            BpfProgram {
+                id: 1,
+                prog_type: "kprobe".into(),
+                name: "test".into(),
+                tag: "abc".into(),
+                sensitive: true,
+            },
+            BpfProgram {
+                id: 2,
+                prog_type: "xdp".into(),
+                name: "fw".into(),
+                tag: "def".into(),
+                sensitive: true,
+            },
         ];
 
         let mut h1 = Sha256::new();

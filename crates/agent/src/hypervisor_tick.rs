@@ -24,7 +24,9 @@ pub(crate) async fn process_hypervisor_tick(
     };
 
     // Cache environment for other modules (firmware_tick uses this).
-    let prev_env = state.hypervisor_environment.replace(report.environment.clone());
+    let prev_env = state
+        .hypervisor_environment
+        .replace(report.environment.clone());
 
     // Feed correlation engine with hypervisor events.
     for check in &report.checks {
@@ -238,7 +240,11 @@ pub(crate) async fn process_hypervisor_tick(
     );
 }
 
-fn write_incidents(data_dir: &Path, today: &str, incidents: &[innerwarden_core::incident::Incident]) {
+fn write_incidents(
+    data_dir: &Path,
+    today: &str,
+    incidents: &[innerwarden_core::incident::Incident],
+) {
     use std::io::Write;
     let path = data_dir.join(format!("incidents-{today}.jsonl"));
     match std::fs::OpenOptions::new()

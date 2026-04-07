@@ -155,8 +155,11 @@ impl MeasurementChain {
     /// Compare two chains and return which measurements differ.
     pub fn diff(&self, other: &MeasurementChain) -> Vec<ChainDiff> {
         let mut diffs = Vec::new();
-        let other_map: BTreeMap<&str, &Measurement> =
-            other.measurements.iter().map(|m| (m.target.as_str(), m)).collect();
+        let other_map: BTreeMap<&str, &Measurement> = other
+            .measurements
+            .iter()
+            .map(|m| (m.target.as_str(), m))
+            .collect();
 
         for m in &self.measurements {
             match other_map.get(m.target.as_str()) {
@@ -183,8 +186,11 @@ impl MeasurementChain {
         }
 
         // Check for targets that were in baseline but missing now.
-        let current_targets: BTreeMap<&str, &Measurement> =
-            self.measurements.iter().map(|m| (m.target.as_str(), m)).collect();
+        let current_targets: BTreeMap<&str, &Measurement> = self
+            .measurements
+            .iter()
+            .map(|m| (m.target.as_str(), m))
+            .collect();
         for m in &other.measurements {
             if !current_targets.contains_key(m.target.as_str()) {
                 diffs.push(ChainDiff {
@@ -232,21 +238,15 @@ fn find_alternative(target: &str) -> Option<std::path::PathBuf> {
             "/boot/vmlinuz",
             &[
                 "/boot/vmlinuz-linux",
-                "/boot/Image",        // ARM
-                "/boot/Image.gz",     // ARM compressed
+                "/boot/Image",    // ARM
+                "/boot/Image.gz", // ARM compressed
             ],
         ),
         (
             "/sbin/init",
-            &[
-                "/usr/lib/systemd/systemd",
-                "/lib/systemd/systemd",
-            ],
+            &["/usr/lib/systemd/systemd", "/lib/systemd/systemd"],
         ),
-        (
-            "/usr/bin/apt",
-            &["/usr/bin/apt-get"],
-        ),
+        ("/usr/bin/apt", &["/usr/bin/apt-get"]),
     ];
 
     for (pat, alts) in alternatives {

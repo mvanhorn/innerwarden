@@ -60,9 +60,7 @@ fn read_cpuid_hypervisor() -> (bool, Option<String>, u32) {
         .map(|s| s.trim().to_string());
 
     // Build vendor string from available sources.
-    let vendor = sysfs_type
-        .or(dmi_product.clone())
-        .or(dmi_vendor);
+    let vendor = sysfs_type.or(dmi_product.clone()).or(dmi_vendor);
 
     // On x86, CPUID leaf 0x40000000 gives max hypervisor leaf.
     // We can't execute CPUID directly in no_std-free Rust on all platforms,
@@ -171,7 +169,11 @@ pub fn check_cpuid_consistency() -> CheckResult {
 
     if has_hypervisor && (has_vmx || has_svm) {
         // VM with nested virtualization — unusual but not necessarily malicious.
-        let virt_type = if has_vmx { "VMX (Intel VT-x)" } else { "SVM (AMD-V)" };
+        let virt_type = if has_vmx {
+            "VMX (Intel VT-x)"
+        } else {
+            "SVM (AMD-V)"
+        };
         return CheckResult {
             id: "HV-002",
             name: "CPUID Consistency",
@@ -192,7 +194,14 @@ pub fn check_cpuid_consistency() -> CheckResult {
             .trim()
             .to_lowercase();
         let cloud_indicators = [
-            "virtual", "vm", "kvm", "qemu", "ec2", "google", "azure", "digitalocean",
+            "virtual",
+            "vm",
+            "kvm",
+            "qemu",
+            "ec2",
+            "google",
+            "azure",
+            "digitalocean",
         ];
         let hidden_vm = cloud_indicators.iter().any(|ind| dmi_product.contains(ind));
 

@@ -128,10 +128,7 @@ pub fn check_pcr_values() -> CheckResult {
     }
 
     // Check SHA-256 bank first, fall back to SHA-1.
-    let bank = info
-        .pcrs
-        .get("sha256")
-        .or_else(|| info.pcrs.get("sha1"));
+    let bank = info.pcrs.get("sha256").or_else(|| info.pcrs.get("sha1"));
 
     let Some(pcrs) = bank else {
         return CheckResult {

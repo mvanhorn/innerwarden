@@ -29,16 +29,15 @@ mod decision_honeypot;
 mod decision_skill_actions;
 mod decisions;
 mod defender_brain;
+mod dna_inline;
 mod environment_profile;
 mod fail2ban;
 mod firmware_tick;
 mod forensics;
-mod hypervisor_tick;
-mod dna_inline;
-mod killchain_inline;
 mod geoip;
 mod honeypot_always_on;
 mod honeypot_post_session;
+mod hypervisor_tick;
 mod incident_abuseipdb;
 mod incident_action_report;
 mod incident_advisory;
@@ -62,6 +61,7 @@ mod incident_prelude;
 mod incident_reputation;
 mod ioc;
 mod ip_reputation;
+mod killchain_inline;
 mod mesh;
 mod mitre;
 mod narrative;
@@ -437,7 +437,8 @@ struct AgentState {
     /// Threat DNA engine — behavioral fingerprinting, anomaly detection, attack chain tracking.
     dna_state: dna_inline::DnaState,
     /// Shared deep security snapshot for dashboard API.
-    deep_security_snapshot: Option<std::sync::Arc<std::sync::RwLock<dashboard::DeepSecuritySnapshot>>>,
+    deep_security_snapshot:
+        Option<std::sync::Arc<std::sync::RwLock<dashboard::DeepSecuritySnapshot>>>,
     /// Timestamp of last DNA state persistence.
     last_dna_save: std::time::Instant,
     /// IPs of active operator SSH sessions (trusted_users). Never blocked.
@@ -2738,7 +2739,11 @@ async fn process_narrative_tick(
             || ev.kind == "auth.login_success"
             || ev.kind == "auth.session_opened"
         {
-            let method = ev.details.get("method").and_then(|v| v.as_str()).unwrap_or("");
+            let method = ev
+                .details
+                .get("method")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if method == "publickey" {
                 let ip = ev
                     .details
@@ -2747,8 +2752,15 @@ async fn process_narrative_tick(
                     .and_then(|v| v.as_str());
                 if let Some(ip) = ip {
                     if state.operator_ips.insert(ip.to_string()) {
-                        let user = ev.details.get("user").and_then(|v| v.as_str()).unwrap_or("?");
-                        info!(user, ip, "operator session detected (publickey) — IP whitelisted");
+                        let user = ev
+                            .details
+                            .get("user")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?");
+                        info!(
+                            user,
+                            ip, "operator session detected (publickey) — IP whitelisted"
+                        );
                     }
                 }
             }
@@ -2829,7 +2841,10 @@ async fn process_narrative_tick(
         let snap = dashboard::DeepSecuritySnapshot {
             firmware_trust_score: None, // updated by firmware_tick
             firmware_last_audit: None,
-            hypervisor_environment: state.hypervisor_environment.as_ref().map(|e| format!("{e:?}")),
+            hypervisor_environment: state
+                .hypervisor_environment
+                .as_ref()
+                .map(|e| format!("{e:?}")),
             hypervisor_trust_score: None, // updated by hypervisor_tick
             killchain_pids_tracked: kc_tracked,
             killchain_pre_chains: kc_pre,
@@ -3033,18 +3048,20 @@ mod tests {
             pcap_capture: pcap_capture::PcapCapture::new(data_dir),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,
-        last_hypervisor_incident_at: None,
-        hypervisor_environment: None,
-        killchain_tracker: innerwarden_killchain::tracker::PidTracker::new(),
-        last_killchain_cleanup: std::time::Instant::now(),
-        dna_state: dna_inline::DnaState::new(
-            &std::path::PathBuf::from("/var/lib/innerwarden/dna"),
-            3, 3.0, 300,
-        ),
-        last_dna_save: std::time::Instant::now(),
-        deep_security_snapshot: None,
+            last_hypervisor_incident_at: None,
+            hypervisor_environment: None,
+            killchain_tracker: innerwarden_killchain::tracker::PidTracker::new(),
+            last_killchain_cleanup: std::time::Instant::now(),
+            dna_state: dna_inline::DnaState::new(
+                &std::path::PathBuf::from("/var/lib/innerwarden/dna"),
+                3,
+                3.0,
+                300,
+            ),
+            last_dna_save: std::time::Instant::now(),
+            deep_security_snapshot: None,
             operator_ips: std::collections::HashSet::new(),
-        suppressed_incident_ids: std::collections::HashSet::new(),
+            suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
@@ -3304,18 +3321,20 @@ mod tests {
             pcap_capture: pcap_capture::PcapCapture::new(dir.path()),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,
-        last_hypervisor_incident_at: None,
-        hypervisor_environment: None,
-        killchain_tracker: innerwarden_killchain::tracker::PidTracker::new(),
-        last_killchain_cleanup: std::time::Instant::now(),
-        dna_state: dna_inline::DnaState::new(
-            &std::path::PathBuf::from("/var/lib/innerwarden/dna"),
-            3, 3.0, 300,
-        ),
-        last_dna_save: std::time::Instant::now(),
-        deep_security_snapshot: None,
+            last_hypervisor_incident_at: None,
+            hypervisor_environment: None,
+            killchain_tracker: innerwarden_killchain::tracker::PidTracker::new(),
+            last_killchain_cleanup: std::time::Instant::now(),
+            dna_state: dna_inline::DnaState::new(
+                &std::path::PathBuf::from("/var/lib/innerwarden/dna"),
+                3,
+                3.0,
+                300,
+            ),
+            last_dna_save: std::time::Instant::now(),
+            deep_security_snapshot: None,
             operator_ips: std::collections::HashSet::new(),
-        suppressed_incident_ids: std::collections::HashSet::new(),
+            suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
@@ -3470,18 +3489,20 @@ mod tests {
             pcap_capture: pcap_capture::PcapCapture::new(dir.path()),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,
-        last_hypervisor_incident_at: None,
-        hypervisor_environment: None,
-        killchain_tracker: innerwarden_killchain::tracker::PidTracker::new(),
-        last_killchain_cleanup: std::time::Instant::now(),
-        dna_state: dna_inline::DnaState::new(
-            &std::path::PathBuf::from("/var/lib/innerwarden/dna"),
-            3, 3.0, 300,
-        ),
-        last_dna_save: std::time::Instant::now(),
-        deep_security_snapshot: None,
+            last_hypervisor_incident_at: None,
+            hypervisor_environment: None,
+            killchain_tracker: innerwarden_killchain::tracker::PidTracker::new(),
+            last_killchain_cleanup: std::time::Instant::now(),
+            dna_state: dna_inline::DnaState::new(
+                &std::path::PathBuf::from("/var/lib/innerwarden/dna"),
+                3,
+                3.0,
+                300,
+            ),
+            last_dna_save: std::time::Instant::now(),
+            deep_security_snapshot: None,
             operator_ips: std::collections::HashSet::new(),
-        suppressed_incident_ids: std::collections::HashSet::new(),
+            suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
@@ -3611,18 +3632,20 @@ mod tests {
             pcap_capture: pcap_capture::PcapCapture::new(dir.path()),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,
-        last_hypervisor_incident_at: None,
-        hypervisor_environment: None,
-        killchain_tracker: innerwarden_killchain::tracker::PidTracker::new(),
-        last_killchain_cleanup: std::time::Instant::now(),
-        dna_state: dna_inline::DnaState::new(
-            &std::path::PathBuf::from("/var/lib/innerwarden/dna"),
-            3, 3.0, 300,
-        ),
-        last_dna_save: std::time::Instant::now(),
-        deep_security_snapshot: None,
+            last_hypervisor_incident_at: None,
+            hypervisor_environment: None,
+            killchain_tracker: innerwarden_killchain::tracker::PidTracker::new(),
+            last_killchain_cleanup: std::time::Instant::now(),
+            dna_state: dna_inline::DnaState::new(
+                &std::path::PathBuf::from("/var/lib/innerwarden/dna"),
+                3,
+                3.0,
+                300,
+            ),
+            last_dna_save: std::time::Instant::now(),
+            deep_security_snapshot: None,
             operator_ips: std::collections::HashSet::new(),
-        suppressed_incident_ids: std::collections::HashSet::new(),
+            suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
@@ -3764,18 +3787,20 @@ mod tests {
             pcap_capture: pcap_capture::PcapCapture::new(dir.path()),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,
-        last_hypervisor_incident_at: None,
-        hypervisor_environment: None,
-        killchain_tracker: innerwarden_killchain::tracker::PidTracker::new(),
-        last_killchain_cleanup: std::time::Instant::now(),
-        dna_state: dna_inline::DnaState::new(
-            &std::path::PathBuf::from("/var/lib/innerwarden/dna"),
-            3, 3.0, 300,
-        ),
-        last_dna_save: std::time::Instant::now(),
-        deep_security_snapshot: None,
+            last_hypervisor_incident_at: None,
+            hypervisor_environment: None,
+            killchain_tracker: innerwarden_killchain::tracker::PidTracker::new(),
+            last_killchain_cleanup: std::time::Instant::now(),
+            dna_state: dna_inline::DnaState::new(
+                &std::path::PathBuf::from("/var/lib/innerwarden/dna"),
+                3,
+                3.0,
+                300,
+            ),
+            last_dna_save: std::time::Instant::now(),
+            deep_security_snapshot: None,
             operator_ips: std::collections::HashSet::new(),
-        suppressed_incident_ids: std::collections::HashSet::new(),
+            suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
@@ -3894,18 +3919,20 @@ mod tests {
             pcap_capture: pcap_capture::PcapCapture::new(dir.path()),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,
-        last_hypervisor_incident_at: None,
-        hypervisor_environment: None,
-        killchain_tracker: innerwarden_killchain::tracker::PidTracker::new(),
-        last_killchain_cleanup: std::time::Instant::now(),
-        dna_state: dna_inline::DnaState::new(
-            &std::path::PathBuf::from("/var/lib/innerwarden/dna"),
-            3, 3.0, 300,
-        ),
-        last_dna_save: std::time::Instant::now(),
-        deep_security_snapshot: None,
+            last_hypervisor_incident_at: None,
+            hypervisor_environment: None,
+            killchain_tracker: innerwarden_killchain::tracker::PidTracker::new(),
+            last_killchain_cleanup: std::time::Instant::now(),
+            dna_state: dna_inline::DnaState::new(
+                &std::path::PathBuf::from("/var/lib/innerwarden/dna"),
+                3,
+                3.0,
+                300,
+            ),
+            last_dna_save: std::time::Instant::now(),
+            deep_security_snapshot: None,
             operator_ips: std::collections::HashSet::new(),
-        suppressed_incident_ids: std::collections::HashSet::new(),
+            suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
@@ -4036,18 +4063,20 @@ mod tests {
             pcap_capture: pcap_capture::PcapCapture::new(dir.path()),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,
-        last_hypervisor_incident_at: None,
-        hypervisor_environment: None,
-        killchain_tracker: innerwarden_killchain::tracker::PidTracker::new(),
-        last_killchain_cleanup: std::time::Instant::now(),
-        dna_state: dna_inline::DnaState::new(
-            &std::path::PathBuf::from("/var/lib/innerwarden/dna"),
-            3, 3.0, 300,
-        ),
-        last_dna_save: std::time::Instant::now(),
-        deep_security_snapshot: None,
+            last_hypervisor_incident_at: None,
+            hypervisor_environment: None,
+            killchain_tracker: innerwarden_killchain::tracker::PidTracker::new(),
+            last_killchain_cleanup: std::time::Instant::now(),
+            dna_state: dna_inline::DnaState::new(
+                &std::path::PathBuf::from("/var/lib/innerwarden/dna"),
+                3,
+                3.0,
+                300,
+            ),
+            last_dna_save: std::time::Instant::now(),
+            deep_security_snapshot: None,
             operator_ips: std::collections::HashSet::new(),
-        suppressed_incident_ids: std::collections::HashSet::new(),
+            suppressed_incident_ids: std::collections::HashSet::new(),
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,

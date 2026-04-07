@@ -158,10 +158,7 @@ pub fn check_kvm_modules() -> CheckResult {
     }
 
     // Check that module set is expected (kvm + kvm_intel or kvm_amd).
-    let expected: BTreeSet<&str> = ["kvm", "kvm_intel", "kvm_amd"]
-        .iter()
-        .copied()
-        .collect();
+    let expected: BTreeSet<&str> = ["kvm", "kvm_intel", "kvm_amd"].iter().copied().collect();
     let unexpected: Vec<&String> = modules
         .iter()
         .filter(|m| !expected.contains(m.as_str()))

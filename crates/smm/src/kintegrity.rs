@@ -93,10 +93,7 @@ fn read_modules() -> BTreeSet<String> {
 }
 
 /// Compare current kernel state against baseline.
-pub fn detect_kernel_drift(
-    current: &KernelState,
-    baseline: &KernelState,
-) -> Vec<KernelDrift> {
+pub fn detect_kernel_drift(current: &KernelState, baseline: &KernelState) -> Vec<KernelDrift> {
     let mut drifts = Vec::new();
 
     // Kernel version changed.
@@ -122,10 +119,7 @@ pub fn detect_kernel_drift(
     }
 
     // New modules loaded.
-    let new_modules: Vec<&String> = current
-        .modules
-        .difference(&baseline.modules)
-        .collect();
+    let new_modules: Vec<&String> = current.modules.difference(&baseline.modules).collect();
     if !new_modules.is_empty() {
         drifts.push(KernelDrift {
             component: "modules".into(),
@@ -144,10 +138,7 @@ pub fn detect_kernel_drift(
     }
 
     // Modules removed (could be rootkit hiding itself).
-    let removed_modules: Vec<&String> = baseline
-        .modules
-        .difference(&current.modules)
-        .collect();
+    let removed_modules: Vec<&String> = baseline.modules.difference(&current.modules).collect();
     if !removed_modules.is_empty() {
         drifts.push(KernelDrift {
             component: "modules".into(),
@@ -378,7 +369,9 @@ mod tests {
 
         let drifts = detect_kernel_drift(&current, &baseline);
         assert!(drifts.iter().any(|d| d.detail.contains("suspicious_mod")));
-        assert!(drifts.iter().any(|d| d.detail.contains("nf_tables") && d.detail.contains("disappeared")));
+        assert!(drifts
+            .iter()
+            .any(|d| d.detail.contains("nf_tables") && d.detail.contains("disappeared")));
     }
 
     #[test]
@@ -396,7 +389,9 @@ mod tests {
         current.kallsyms_hash = Some("modified_hash".into());
 
         let drifts = detect_kernel_drift(&current, &baseline);
-        assert!(drifts.iter().any(|d| d.component == "kallsyms" && d.severity == KernelDriftSeverity::Critical));
+        assert!(drifts
+            .iter()
+            .any(|d| d.component == "kallsyms" && d.severity == KernelDriftSeverity::Critical));
     }
 
     #[test]

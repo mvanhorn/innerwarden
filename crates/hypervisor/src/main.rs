@@ -19,8 +19,10 @@ fn main() {
         Environment::UnknownHypervisor => "\x1b[31;1mUNKNOWN HYPERVISOR\x1b[0m".to_string(),
     };
     println!("  Environment: {env_str}");
-    println!("  VM Score:    {}/100 ({} evidence signals)",
-        report.vm_verdict.score, report.vm_verdict.evidence_count);
+    println!(
+        "  VM Score:    {}/100 ({} evidence signals)",
+        report.vm_verdict.score, report.vm_verdict.evidence_count
+    );
     if let Some(ref brand) = report.vm_verdict.brand {
         println!("  VM Brand:    \x1b[36m{brand}\x1b[0m");
     }
@@ -42,15 +44,26 @@ fn main() {
         } else {
             String::new()
         };
-        println!("  {color}{icon}\x1b[0m [{id}] {name}{conf}", id = check.id, name = check.name);
+        println!(
+            "  {color}{icon}\x1b[0m [{id}] {name}{conf}",
+            id = check.id,
+            name = check.name
+        );
         println!("    {color}{detail}\x1b[0m", detail = check.detail);
         println!();
     }
 
     // Probe evidence.
-    let positive_probes: Vec<_> = report.probe_results.iter().filter(|p| p.score > 0).collect();
+    let positive_probes: Vec<_> = report
+        .probe_results
+        .iter()
+        .filter(|p| p.score > 0)
+        .collect();
     if !positive_probes.is_empty() {
-        println!("  \x1b[1m── VM Evidence ({} signals) ──\x1b[0m", positive_probes.len());
+        println!(
+            "  \x1b[1m── VM Evidence ({} signals) ──\x1b[0m",
+            positive_probes.len()
+        );
         println!();
         for p in &positive_probes {
             let color = if p.score >= 80 {
@@ -71,10 +84,26 @@ fn main() {
     }
 
     // Summary.
-    let secure = report.checks.iter().filter(|c| c.status == CheckStatus::Secure).count();
-    let warnings = report.checks.iter().filter(|c| c.status == CheckStatus::Warning).count();
-    let critical = report.checks.iter().filter(|c| c.status == CheckStatus::Critical).count();
-    let unavail = report.checks.iter().filter(|c| c.status == CheckStatus::Unavailable).count();
+    let secure = report
+        .checks
+        .iter()
+        .filter(|c| c.status == CheckStatus::Secure)
+        .count();
+    let warnings = report
+        .checks
+        .iter()
+        .filter(|c| c.status == CheckStatus::Warning)
+        .count();
+    let critical = report
+        .checks
+        .iter()
+        .filter(|c| c.status == CheckStatus::Critical)
+        .count();
+    let unavail = report
+        .checks
+        .iter()
+        .filter(|c| c.status == CheckStatus::Unavailable)
+        .count();
 
     println!("  ──────────────────────────────────────────");
     println!(

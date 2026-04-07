@@ -26,9 +26,8 @@ use crate::{confidence, CheckResult, CheckStatus};
 pub const NUM_QUANTILES: usize = 9;
 
 /// Quantile positions (avoid 0.0 and 1.0 for robustness against outliers).
-pub const QUANTILE_POSITIONS: [f64; NUM_QUANTILES] = [
-    0.11, 0.22, 0.33, 0.44, 0.56, 0.67, 0.78, 0.89, 0.95,
-];
+pub const QUANTILE_POSITIONS: [f64; NUM_QUANTILES] =
+    [0.11, 0.22, 0.33, 0.44, 0.56, 0.67, 0.78, 0.89, 0.95];
 
 /// Default p-value threshold for anomaly detection.
 /// Paper found 10^-10 optimal. We use 10^-8 for slightly more sensitivity.
@@ -388,8 +387,7 @@ fn chi_squared_p_value(x: f64, k: usize) -> f64 {
     let k_f = k as f64;
 
     // Wilson-Hilferty approximation: transform chi-squared to ~N(0,1).
-    let z = ((x / k_f).powf(1.0 / 3.0) - (1.0 - 2.0 / (9.0 * k_f)))
-        / (2.0 / (9.0 * k_f)).sqrt();
+    let z = ((x / k_f).powf(1.0 / 3.0) - (1.0 - 2.0 / (9.0 * k_f))) / (2.0 / (9.0 * k_f)).sqrt();
 
     // Standard normal survival function (1 - CDF) via error function approximation.
     let p = 0.5 * erfc(z / core::f64::consts::SQRT_2);
@@ -401,8 +399,7 @@ fn erfc(x: f64) -> f64 {
     let t = 1.0 / (1.0 + 0.3275911 * x.abs());
     let poly = t
         * (0.254829592
-            + t * (-0.284496736
-                + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+            + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
     let result = poly * (-x * x).exp();
     if x >= 0.0 {
         result
@@ -448,7 +445,10 @@ pub fn check_timing_traces(
     let mut analyzed = 0;
 
     for batch in batches {
-        let func_model = model.functions.iter().find(|f| f.function == batch.function);
+        let func_model = model
+            .functions
+            .iter()
+            .find(|f| f.function == batch.function);
         let Some(fm) = func_model else {
             continue; // no baseline for this function
         };
@@ -467,14 +467,20 @@ pub fn check_timing_traces(
             name: "Trace of the Times",
             status: CheckStatus::Unavailable,
             confidence: 0.0,
-            detail: "insufficient timing data for analysis (need >= 100 samples per function)".into(),
+            detail: "insufficient timing data for analysis (need >= 100 samples per function)"
+                .into(),
         };
     }
 
     if !anomalies.is_empty() {
         let funcs: Vec<String> = anomalies
             .iter()
-            .map(|a| format!("{} (z={:.1}, p={:.2e})", a.function, a.max_z_score, a.p_value))
+            .map(|a| {
+                format!(
+                    "{} (z={:.1}, p={:.2e})",
+                    a.function, a.max_z_score, a.p_value
+                )
+            })
             .collect();
 
         CheckResult {
@@ -577,8 +583,7 @@ mod tests {
         assert!(
             !analysis.anomalous,
             "normal data should not be flagged. p={}, d2={}",
-            analysis.p_value,
-            analysis.mahalanobis_d2,
+            analysis.p_value, analysis.mahalanobis_d2,
         );
     }
 
@@ -597,9 +602,7 @@ mod tests {
         assert!(
             analysis.anomalous,
             "hooked function (3x slower) should be detected. p={}, d2={}, max_z={}",
-            analysis.p_value,
-            analysis.mahalanobis_d2,
-            analysis.max_z_score,
+            analysis.p_value, analysis.mahalanobis_d2, analysis.max_z_score,
         );
     }
 

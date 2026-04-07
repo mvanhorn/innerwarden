@@ -149,12 +149,14 @@ pub fn check_interrupt_analysis() -> CheckResult {
     let (imbalance, detail_imbalance) = if cpu_counts.len() > 1 {
         let max = cpu_counts.iter().max().copied().unwrap_or(1);
         let min = cpu_counts.iter().min().copied().unwrap_or(1);
-        let ratio = if min > 0 { max as f64 / min as f64 } else { 0.0 };
+        let ratio = if min > 0 {
+            max as f64 / min as f64
+        } else {
+            0.0
+        };
         (
             ratio,
-            format!(
-                "CPU interrupt balance: {ratio:.1}x (max={max}, min={min})",
-            ),
+            format!("CPU interrupt balance: {ratio:.1}x (max={max}, min={min})",),
         )
     } else {
         (1.0, "single CPU".into())
@@ -234,9 +236,7 @@ pub fn check_descriptor_tables() -> CheckResult {
                 name: "Descriptor Tables (SIDT/SGDT)",
                 status: CheckStatus::Warning,
                 confidence: confidence(0.6, 0.7),
-                detail: format!(
-                    "IDT base NOT in kernel space — possible VM relocation. {detail}"
-                ),
+                detail: format!("IDT base NOT in kernel space — possible VM relocation. {detail}"),
             };
         }
 

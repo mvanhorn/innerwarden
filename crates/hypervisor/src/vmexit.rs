@@ -75,12 +75,24 @@ impl VmExitStats {
 
 /// Exit reasons that indicate potential VM escape attempts.
 const SUSPICIOUS_EXIT_REASONS: &[(&str, &str)] = &[
-    ("io_exits", "I/O port access from guest (potential hardware probing)"),
+    (
+        "io_exits",
+        "I/O port access from guest (potential hardware probing)",
+    ),
     ("mmio_exits", "Memory-mapped I/O from guest"),
     ("signal_exits", "Host signal during VM execution"),
-    ("halt_exits", "Excessive HLT instructions (may indicate DoS)"),
-    ("insn_emulation_fail", "Failed instruction emulation (exploit probe)"),
-    ("pf_fixed", "Page fault fixups (may indicate memory probing)"),
+    (
+        "halt_exits",
+        "Excessive HLT instructions (may indicate DoS)",
+    ),
+    (
+        "insn_emulation_fail",
+        "Failed instruction emulation (exploit probe)",
+    ),
+    (
+        "pf_fixed",
+        "Page fault fixups (may indicate memory probing)",
+    ),
 ];
 
 // ── Check function ──────────────────────────────────────────────────────
@@ -125,7 +137,11 @@ pub fn check_vm_exit_stats() -> CheckResult {
     }
 
     // Check for instruction emulation failures (strong escape indicator).
-    let emul_fail = stats.by_reason.get("insn_emulation_fail").copied().unwrap_or(0);
+    let emul_fail = stats
+        .by_reason
+        .get("insn_emulation_fail")
+        .copied()
+        .unwrap_or(0);
     if emul_fail > 10 {
         return CheckResult {
             id: "VMEXIT-001",

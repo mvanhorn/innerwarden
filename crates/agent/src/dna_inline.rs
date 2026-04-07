@@ -22,7 +22,12 @@ pub(crate) struct DnaState {
 }
 
 impl DnaState {
-    pub fn new(dna_dir: &Path, min_sequence: usize, anomaly_threshold: f64, session_timeout_secs: i64) -> Self {
+    pub fn new(
+        dna_dir: &Path,
+        min_sequence: usize,
+        anomaly_threshold: f64,
+        session_timeout_secs: i64,
+    ) -> Self {
         std::fs::create_dir_all(dna_dir).ok();
         Self {
             store: DnaStore::load(dna_dir).expect("dna: failed to initialize store"),
@@ -53,10 +58,14 @@ pub(crate) fn process_events(
 
         // Feed anomaly detector with per-process behavior.
         if !comm.is_empty() {
-            let alerts = dna.anomaly_detector.process_events(&comm, std::slice::from_ref(&atom_key), now);
+            let alerts =
+                dna.anomaly_detector
+                    .process_events(&comm, std::slice::from_ref(&atom_key), now);
             for alert in &alerts {
                 let kind = match alert.alert_type {
-                    innerwarden_dna::anomaly::AnomalyType::BehaviorDeviation => "dna.behavior_deviation",
+                    innerwarden_dna::anomaly::AnomalyType::BehaviorDeviation => {
+                        "dna.behavior_deviation"
+                    }
                     innerwarden_dna::anomaly::AnomalyType::RateSpike => "dna.rate_spike",
                     innerwarden_dna::anomaly::AnomalyType::NewBehavior => "dna.new_behavior",
                 };
@@ -74,15 +83,16 @@ pub(crate) fn process_events(
 
         // Build/update behavior session by source IP.
         if let Some(ref ip) = source_ip {
-            let session = dna.sessions.entry(ip.clone()).or_insert_with(|| {
-                BehaviorSequence {
+            let session = dna
+                .sessions
+                .entry(ip.clone())
+                .or_insert_with(|| BehaviorSequence {
                     source_ip: ip.clone(),
                     atoms: Vec::new(),
                     first_seen: event.ts,
                     last_seen: event.ts,
                     pids: Vec::new(),
-                }
-            });
+                });
             session.atoms.push(atom);
             session.last_seen = event.ts;
         }
@@ -90,7 +100,8 @@ pub(crate) fn process_events(
 
     // Close stale sessions and fingerprint them.
     let timeout = chrono::Duration::seconds(dna.session_timeout_secs);
-    let stale_ips: Vec<String> = dna.sessions
+    let stale_ips: Vec<String> = dna
+        .sessions
         .iter()
         .filter(|(_, s)| now - s.last_seen > timeout)
         .map(|(ip, _)| ip.clone())
@@ -125,7 +136,9 @@ pub(crate) fn process_incidents(
         }
 
         // Extract IP from entities.
-        let ip = incident.entities.iter()
+        let ip = incident
+            .entities
+            .iter()
             .find(|e| e.r#type == innerwarden_core::entities::EntityType::Ip)
             .map(|e| e.value.clone())
             .unwrap_or_default();
@@ -133,10 +146,15 @@ pub(crate) fn process_incidents(
             continue;
         }
 
-        let advanced = dna.chain_tracker.ingest_incident(&ip, detector, incident.ts);
+        let advanced = dna
+            .chain_tracker
+            .ingest_incident(&ip, detector, incident.ts);
         if advanced {
             if let Some(chain) = dna.chain_tracker.get_chain(&ip) {
-                let kind = format!("dna.attack_chain.{}", chain.chain_level.to_string().to_lowercase());
+                let kind = format!(
+                    "dna.attack_chain.{}",
+                    chain.chain_level.to_string().to_lowercase()
+                );
                 let corr = correlation_engine::CorrelationEngine::dna_event(
                     &kind,
                     serde_json::json!({
@@ -178,7 +196,9 @@ fn event_to_atom(
         .and_then(|v| v.as_str())
         .map(String::from)
         .or_else(|| {
-            event.entities.iter()
+            event
+                .entities
+                .iter()
                 .find(|e| e.r#type == innerwarden_core::entities::EntityType::Ip)
                 .map(|e| e.value.clone())
         });

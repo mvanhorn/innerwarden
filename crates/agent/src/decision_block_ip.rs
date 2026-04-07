@@ -22,7 +22,10 @@ pub(crate) async fn execute_block_ip_decision(
 
     // Safeguard: never block operator IPs (active SSH sessions from trusted_users).
     if state.operator_ips.contains(ip) {
-        info!(ip, "operator IP protected — skipping block (active trusted session)");
+        info!(
+            ip,
+            "operator IP protected — skipping block (active trusted session)"
+        );
         return (
             format!("skipped: {ip} is an active operator session"),
             false,

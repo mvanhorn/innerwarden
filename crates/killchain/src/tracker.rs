@@ -2,9 +2,9 @@
 //! Processes eBPF events, accumulates bit flags per PID, and emits
 //! pre-chain warnings and full-match incidents.
 
-use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use tracing::{debug, info};
 
 use crate::bridge;
@@ -80,10 +80,7 @@ impl PidTracker {
             None => return vec![],
         };
 
-        let uid = details
-            .get("uid")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
+        let uid = details.get("uid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
         let comm = details
             .get("comm")
@@ -91,14 +88,9 @@ impl PidTracker {
             .unwrap_or("unknown")
             .to_string();
 
-        let ts_str = event
-            .get("ts")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let ts_str = event.get("ts").and_then(|v| v.as_str()).unwrap_or("");
 
-        let ts: DateTime<Utc> = ts_str
-            .parse()
-            .unwrap_or_else(|_| Utc::now());
+        let ts: DateTime<Utc> = ts_str.parse().unwrap_or_else(|_| Utc::now());
 
         let host = event
             .get("host")
@@ -177,9 +169,10 @@ impl PidTracker {
         };
 
         // 3. Create or update PidChainState
-        let state = self.pids.entry(pid).or_insert_with(|| {
-            PidChainState::new(pid, uid, comm.clone(), host.clone(), ts)
-        });
+        let state = self
+            .pids
+            .entry(pid)
+            .or_insert_with(|| PidChainState::new(pid, uid, comm.clone(), host.clone(), ts));
 
         // Build chain event and merge flag
         let chain_event = ChainEvent {
@@ -362,10 +355,7 @@ impl PidTracker {
                     format!("Check for persistence: crontab -l -u {}", uid),
                 ];
                 if c2.is_some() {
-                    recommended.insert(
-                        0,
-                        format!("Block C2 IP: innerwarden block {}", c2_ip),
-                    );
+                    recommended.insert(0, format!("Block C2 IP: innerwarden block {}", c2_ip));
                 }
 
                 let mut entities: Vec<Value> = Vec::new();
@@ -402,7 +392,12 @@ impl PidTracker {
             }
         }
 
-        debug!(pid, flags = current_flags, events = incidents.len(), "event processed");
+        debug!(
+            pid,
+            flags = current_flags,
+            events = incidents.len(),
+            "event processed"
+        );
         incidents
     }
 
@@ -509,14 +504,13 @@ mod tests {
             json!({"dst_ip": "185.234.1.1", "dst_port": 4444}),
         );
         let incidents = tracker.process_event(&connect);
-        assert!(incidents.is_empty(), "single flag should not trigger anything");
+        assert!(
+            incidents.is_empty(),
+            "single flag should not trigger anything"
+        );
 
         // Step 2: dup2(stdin) — this is 2/3 for reverse_shell -> pre-chain
-        let dup_stdin = make_event(
-            "process.fd_redirect",
-            1234,
-            json!({"newfd": 0}),
-        );
+        let dup_stdin = make_event("process.fd_redirect", 1234, json!({"newfd": 0}));
         let incidents = tracker.process_event(&dup_stdin);
         // Should have at least one pre-chain incident
         let pre_chains: Vec<&Value> = incidents
@@ -544,11 +538,7 @@ mod tests {
             .contains("Kill chain forming"));
 
         // Step 3: dup2(stdout) — this is 3/3 -> full match
-        let dup_stdout = make_event(
-            "process.fd_redirect",
-            1234,
-            json!({"newfd": 1}),
-        );
+        let dup_stdout = make_event("process.fd_redirect", 1234, json!({"newfd": 1}));
         let incidents = tracker.process_event(&dup_stdout);
         let full_matches: Vec<&Value> = incidents
             .iter()
@@ -622,11 +612,7 @@ mod tests {
         let mut tracker = PidTracker::new();
 
         let ptrace = make_event("process.ptrace_attach", 3000, json!({}));
-        let mprotect = make_event(
-            "memory.mprotect_exec",
-            3000,
-            json!({"rwx": true}),
-        );
+        let mprotect = make_event("memory.mprotect_exec", 3000, json!({"rwx": true}));
 
         tracker.process_event(&ptrace);
         let incidents = tracker.process_event(&mprotect);
@@ -791,11 +777,7 @@ mod tests {
     fn mprotect_without_rwx_ignored() {
         let mut tracker = PidTracker::new();
 
-        let mprotect_no_rwx = make_event(
-            "memory.mprotect_exec",
-            800,
-            json!({"rwx": false}),
-        );
+        let mprotect_no_rwx = make_event("memory.mprotect_exec", 800, json!({"rwx": false}));
         let incidents = tracker.process_event(&mprotect_no_rwx);
         assert!(incidents.is_empty());
         assert!(
@@ -804,11 +786,7 @@ mod tests {
         );
 
         // Also test missing rwx field
-        let mprotect_missing = make_event(
-            "memory.mprotect_exec",
-            801,
-            json!({}),
-        );
+        let mprotect_missing = make_event("memory.mprotect_exec", 801, json!({}));
         let incidents = tracker.process_event(&mprotect_missing);
         assert!(incidents.is_empty());
         assert!(tracker.get_state(801).is_none());

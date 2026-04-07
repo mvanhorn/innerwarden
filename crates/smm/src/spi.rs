@@ -23,7 +23,12 @@ pub struct SpiBaseline {
 /// Returns the path to the dumped image. This is a READ-ONLY operation.
 pub fn dump_flash(output: &Path) -> anyhow::Result<PathBuf> {
     let status = Command::new("flashrom")
-        .args(["--programmer", "internal", "--read", output.to_str().unwrap()])
+        .args([
+            "--programmer",
+            "internal",
+            "--read",
+            output.to_str().unwrap(),
+        ])
         .output()?;
 
     if !status.status.success() {
@@ -47,10 +52,7 @@ pub fn hash_image(path: &Path) -> anyhow::Result<SpiBaseline> {
 }
 
 /// Compare a current flash dump against a stored baseline.
-pub fn verify_against_baseline(
-    current: &SpiBaseline,
-    baseline: &SpiBaseline,
-) -> CheckResult {
+pub fn verify_against_baseline(current: &SpiBaseline, baseline: &SpiBaseline) -> CheckResult {
     if current.sha256 == baseline.sha256 {
         CheckResult {
             id: "SPI-001",

@@ -20,11 +20,7 @@ impl RedisClient {
     /// Connect to Redis and create the consumer group if it does not exist.
     ///
     /// Uses `XGROUP CREATE ... MKSTREAM` to ensure both the stream and group exist.
-    pub async fn connect(
-        url: &str,
-        events_stream: &str,
-        incidents_stream: &str,
-    ) -> Result<Self> {
+    pub async fn connect(url: &str, events_stream: &str, incidents_stream: &str) -> Result<Self> {
         let client = redis::Client::open(url)
             .with_context(|| format!("Failed to parse Redis URL: {}", url))?;
 
@@ -206,10 +202,7 @@ impl RedisClient {
             .await
             .context("XADD to incidents stream failed")?;
 
-        debug!(
-            "Published incident to '{}'",
-            self.incidents_stream
-        );
+        debug!("Published incident to '{}'", self.incidents_stream);
 
         Ok(())
     }

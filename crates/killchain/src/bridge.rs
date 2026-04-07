@@ -4,8 +4,8 @@
 //! accumulated PID chain state, filtering out private/reserved addresses
 //! so that only actionable public C2 IPs surface in incidents.
 
-use crate::types::PidChainState;
 use crate::patterns::CHAIN_SOCKET;
+use crate::types::PidChainState;
 
 /// Returns `(ip, port)` if the PID has the CHAIN_SOCKET flag set,
 /// a stored `last_connect_ip`, and the IP is publicly routable.
@@ -83,13 +83,8 @@ mod tests {
     use chrono::Utc;
 
     fn make_state(flags: u32, ip: Option<&str>, port: Option<u16>) -> PidChainState {
-        let mut state = PidChainState::new(
-            1000,
-            1000,
-            "test".into(),
-            "testhost".into(),
-            Utc::now(),
-        );
+        let mut state =
+            PidChainState::new(1000, 1000, "test".into(), "testhost".into(), Utc::now());
         state.flags = flags;
         state.last_connect_ip = ip.map(|s| s.to_string());
         state.last_connect_port = port;

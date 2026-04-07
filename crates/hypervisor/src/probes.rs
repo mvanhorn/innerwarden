@@ -68,10 +68,7 @@ pub fn compute_verdict(probes: &[ProbeResult]) -> VmVerdict {
 
     // Weighted score: score * confidence.
     let total_weight: f64 = probes.iter().map(|p| p.confidence).sum();
-    let weighted_score: f64 = probes
-        .iter()
-        .map(|p| p.score as f64 * p.confidence)
-        .sum();
+    let weighted_score: f64 = probes.iter().map(|p| p.score as f64 * p.confidence).sum();
     let final_score = if total_weight > 0.0 {
         (weighted_score / total_weight) as u32
     } else {
@@ -225,8 +222,14 @@ fn probe_dmi_chassis() -> ProbeResult {
                 description: "DMI chassis type",
                 score: if is_vm_chassis { 50 } else { 0 },
                 confidence: 0.6,
-                detail: format!("chassis_type={chassis_type} ({})",
-                    if is_vm_chassis { "Other/Unknown — common in VMs" } else { "physical chassis" }),
+                detail: format!(
+                    "chassis_type={chassis_type} ({})",
+                    if is_vm_chassis {
+                        "Other/Unknown — common in VMs"
+                    } else {
+                        "physical chassis"
+                    }
+                ),
                 brand: None,
             }
         }
@@ -288,7 +291,10 @@ fn probe_hypervisor_dir() -> ProbeResult {
             score: 100,
             confidence: 0.99,
             detail: format!("/sys/hypervisor exists. type={:?}", hv_type),
-            brand: hv_type.as_ref().and_then(|t| match_vm_string(t)).map(Into::into),
+            brand: hv_type
+                .as_ref()
+                .and_then(|t| match_vm_string(t))
+                .map(Into::into),
         }
     } else {
         ProbeResult {
@@ -360,9 +366,7 @@ fn probe_systemd_detect_virt() -> ProbeResult {
 fn probe_hwmon() -> ProbeResult {
     let hwmon_dir = Path::new("/sys/class/hwmon");
     let count = if hwmon_dir.exists() {
-        fs::read_dir(hwmon_dir)
-            .map(|d| d.count())
-            .unwrap_or(0)
+        fs::read_dir(hwmon_dir).map(|d| d.count()).unwrap_or(0)
     } else {
         0
     };
@@ -437,7 +441,11 @@ fn probe_mac_address() -> ProbeResult {
             confidence: 0.85,
             detail: format!(
                 "VM MAC prefix: {} ({})",
-                found.iter().map(|(b, m)| format!("{b}: {m}")).collect::<Vec<_>>().join(", "),
+                found
+                    .iter()
+                    .map(|(b, m)| format!("{b}: {m}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 brand,
             ),
             brand: Some(brand.into()),
@@ -597,7 +605,11 @@ fn probe_kernel_modules() -> ProbeResult {
             confidence: 0.9,
             detail: format!(
                 "VM modules: {}",
-                found.iter().map(|(b, m)| format!("{m} ({b})")).collect::<Vec<_>>().join(", ")
+                found
+                    .iter()
+                    .map(|(b, m)| format!("{m} ({b})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             brand: Some(brand.into()),
         }
@@ -714,7 +726,11 @@ fn probe_qemu_fw_cfg() -> ProbeResult {
         } else {
             "no QEMU fw_cfg".into()
         },
-        brand: if exists { Some("QEMU/KVM".into()) } else { None },
+        brand: if exists {
+            Some("QEMU/KVM".into())
+        } else {
+            None
+        },
     }
 }
 
@@ -746,8 +762,10 @@ fn probe_acpi_tables() -> ProbeResult {
                 if data.len() > 16 {
                     let oem = String::from_utf8_lossy(&data[10..16]);
                     if let Some(brand) = match_vm_string(&oem) {
-                        found_brand =
-                            Some((brand, format!("{} OEM={}", entry.file_name().to_string_lossy(), oem.trim())));
+                        found_brand = Some((
+                            brand,
+                            format!("{} OEM={}", entry.file_name().to_string_lossy(), oem.trim()),
+                        ));
                         break;
                     }
                 }

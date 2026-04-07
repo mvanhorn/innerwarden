@@ -247,8 +247,19 @@ pub fn diff_features(current: &CpuFeatures, baseline: &CpuFeatures) -> Vec<Featu
 fn is_security_critical(flag: &str) -> bool {
     matches!(
         flag,
-        "smep" | "smap" | "nx" | "umip" | "shstk" | "ibt" | "ibrs" | "ibpb"
-            | "stibp" | "ssbd" | "pan" | "bti" | "mte"
+        "smep"
+            | "smap"
+            | "nx"
+            | "umip"
+            | "shstk"
+            | "ibt"
+            | "ibrs"
+            | "ibpb"
+            | "stibp"
+            | "ssbd"
+            | "pan"
+            | "bti"
+            | "mte"
     )
 }
 
@@ -285,15 +296,29 @@ pub fn check_cpu_security_features() -> CheckResult {
 
     match features.arch.as_str() {
         "x86_64" => {
-            if !sf.smep { missing.push("SMEP"); }
-            if !sf.smap { missing.push("SMAP"); }
-            if !sf.nx { missing.push("NX"); }
-            if !sf.spectre_mitigations { missing.push("Spectre mitigations"); }
-            if !sf.pti { missing.push("PTI (Meltdown)"); }
+            if !sf.smep {
+                missing.push("SMEP");
+            }
+            if !sf.smap {
+                missing.push("SMAP");
+            }
+            if !sf.nx {
+                missing.push("NX");
+            }
+            if !sf.spectre_mitigations {
+                missing.push("Spectre mitigations");
+            }
+            if !sf.pti {
+                missing.push("PTI (Meltdown)");
+            }
         }
         "aarch64" => {
-            if !sf.pan { missing.push("PAN"); }
-            if !sf.bti { missing.push("BTI"); }
+            if !sf.pan {
+                missing.push("PAN");
+            }
+            if !sf.bti {
+                missing.push("BTI");
+            }
         }
         _ => {}
     }
@@ -345,7 +370,9 @@ pub fn check_hypervisor() -> CheckResult {
                 name: "Hypervisor Detection",
                 status: CheckStatus::Secure,
                 confidence: confidence(0.4, 0.9),
-                detail: format!("hypervisor detected: {vendor}. Known vendor — expected if running in a VM."),
+                detail: format!(
+                    "hypervisor detected: {vendor}. Known vendor — expected if running in a VM."
+                ),
             },
             None => CheckResult {
                 id: "CPU-002",
@@ -420,7 +447,9 @@ Features	: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid
         current.flags.remove("smep"); // attacker disabled SMEP
 
         let diffs = diff_features(&current, &baseline);
-        assert!(diffs.iter().any(|d| d.flag == "smep" && d.critical && d.kind == FeatureDiffKind::Removed));
+        assert!(diffs
+            .iter()
+            .any(|d| d.flag == "smep" && d.critical && d.kind == FeatureDiffKind::Removed));
     }
 
     #[test]

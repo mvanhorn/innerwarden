@@ -98,12 +98,7 @@ pub fn check_microcode() -> CheckResult {
     };
 
     let core_count = state.revisions.len();
-    let first_rev = state
-        .revisions
-        .values()
-        .next()
-        .cloned()
-        .unwrap_or_default();
+    let first_rev = state.revisions.values().next().cloned().unwrap_or_default();
 
     if !state.uniform {
         // Different microcode on different cores = very suspicious.

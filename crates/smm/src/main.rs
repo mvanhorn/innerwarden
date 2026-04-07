@@ -53,7 +53,10 @@ fn cmd_drift() {
             baseline::DriftSeverity::Suspicious => ("?", "\x1b[33m"),
             baseline::DriftSeverity::Critical => ("!", "\x1b[31m"),
         };
-        println!("  {color}{icon}\x1b[0m {}: {color}{}\x1b[0m", d.component, d.detail);
+        println!(
+            "  {color}{icon}\x1b[0m {}: {color}{}\x1b[0m",
+            d.component, d.detail
+        );
     }
 }
 
@@ -122,10 +125,26 @@ fn cmd_audit(args: &[String]) {
     }
 
     // Summary.
-    let secure = report.checks.iter().filter(|c| c.status == CheckStatus::Secure).count();
-    let warnings = report.checks.iter().filter(|c| c.status == CheckStatus::Warning).count();
-    let critical = report.checks.iter().filter(|c| c.status == CheckStatus::Critical).count();
-    let unavailable = report.checks.iter().filter(|c| c.status == CheckStatus::Unavailable).count();
+    let secure = report
+        .checks
+        .iter()
+        .filter(|c| c.status == CheckStatus::Secure)
+        .count();
+    let warnings = report
+        .checks
+        .iter()
+        .filter(|c| c.status == CheckStatus::Warning)
+        .count();
+    let critical = report
+        .checks
+        .iter()
+        .filter(|c| c.status == CheckStatus::Critical)
+        .count();
+    let unavailable = report
+        .checks
+        .iter()
+        .filter(|c| c.status == CheckStatus::Unavailable)
+        .count();
 
     println!("  ──────────────────────────────────────────");
     println!(
@@ -140,9 +159,13 @@ fn cmd_audit(args: &[String]) {
     if critical > 0 || !report.correlated_threats.is_empty() {
         println!();
         if report.trust_score < 0.1 {
-            println!("  \x1b[31;1m⚠ FIRMWARE INTEGRITY COMPROMISED — investigate immediately.\x1b[0m");
+            println!(
+                "  \x1b[31;1m⚠ FIRMWARE INTEGRITY COMPROMISED — investigate immediately.\x1b[0m"
+            );
         } else if report.trust_score < 0.5 {
-            println!("  \x1b[31m⚠ Firmware trust degraded — review correlated threats above.\x1b[0m");
+            println!(
+                "  \x1b[31m⚠ Firmware trust degraded — review correlated threats above.\x1b[0m"
+            );
         }
     }
 

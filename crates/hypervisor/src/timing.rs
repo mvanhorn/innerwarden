@@ -83,7 +83,11 @@ fn counter_frequency_hz() -> u64 {
                 options(nostack, nomem),
             );
         }
-        if freq > 0 { freq } else { 24_000_000 } // fallback: 24 MHz (common ARM)
+        if freq > 0 {
+            freq
+        } else {
+            24_000_000
+        } // fallback: 24 MHz (common ARM)
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {

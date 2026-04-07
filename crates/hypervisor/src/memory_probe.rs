@@ -46,7 +46,9 @@ fn rdcycles() -> u64 {
         cnt
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    { 0 }
+    {
+        0
+    }
 }
 
 /// Memory probe result.

@@ -73,10 +73,7 @@ pub(crate) fn write_incidents(data_dir: &Path, incidents: &[serde_json::Value]) 
                     let _ = writeln!(f, "{line}");
                 }
             }
-            info!(
-                count = incidents.len(),
-                "killchain: emitted incidents"
-            );
+            info!(count = incidents.len(), "killchain: emitted incidents");
         }
         Err(e) => warn!(error = %e, "killchain: failed to write incidents"),
     }
@@ -102,10 +99,7 @@ pub(crate) fn notify_telegram(
             .get("title")
             .and_then(|t| t.as_str())
             .unwrap_or("Kill chain detected");
-        let summary = inc
-            .get("summary")
-            .and_then(|s| s.as_str())
-            .unwrap_or("");
+        let summary = inc.get("summary").and_then(|s| s.as_str()).unwrap_or("");
         let pattern = inc
             .get("evidence")
             .and_then(|e| e.get("pattern"))

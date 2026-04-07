@@ -24,10 +24,7 @@ pub struct CorrelatedThreat {
 }
 
 /// Run correlation rules against an audit report + optional drift report.
-pub fn correlate(
-    report: &FirmwareReport,
-    drift: Option<&DriftReport>,
-) -> Vec<CorrelatedThreat> {
+pub fn correlate(report: &FirmwareReport, drift: Option<&DriftReport>) -> Vec<CorrelatedThreat> {
     let mut threats = Vec::new();
 
     // Rule 1: SMM Rootkit Pattern
@@ -77,10 +74,9 @@ fn rule_smm_rootkit(report: &FirmwareReport) -> Option<CorrelatedThreat> {
         .checks
         .iter()
         .find(|c| c.id == "SMM-001" && c.status == CheckStatus::Critical);
-    let smi_anomaly = report
-        .checks
-        .iter()
-        .find(|c| c.id == "SMI-001" && matches!(c.status, CheckStatus::Critical | CheckStatus::Warning));
+    let smi_anomaly = report.checks.iter().find(|c| {
+        c.id == "SMI-001" && matches!(c.status, CheckStatus::Critical | CheckStatus::Warning)
+    });
 
     match (smram_unlocked, smi_anomaly) {
         (Some(smram), Some(smi)) => {
@@ -116,10 +112,7 @@ fn rule_smm_rootkit(report: &FirmwareReport) -> Option<CorrelatedThreat> {
 }
 
 /// Firmware tamper: ACPI drift + SMI count jump + no BIOS update.
-fn rule_firmware_tamper(
-    report: &FirmwareReport,
-    drift: &DriftReport,
-) -> Option<CorrelatedThreat> {
+fn rule_firmware_tamper(report: &FirmwareReport, drift: &DriftReport) -> Option<CorrelatedThreat> {
     let acpi_drifts: Vec<&str> = drift
         .drifts
         .iter()
@@ -127,15 +120,9 @@ fn rule_firmware_tamper(
         .map(|d| d.component.as_str())
         .collect();
 
-    let smi_drift = drift
-        .drifts
-        .iter()
-        .any(|d| d.component == "SMI");
+    let smi_drift = drift.drifts.iter().any(|d| d.component == "SMI");
 
-    let bios_changed = drift
-        .drifts
-        .iter()
-        .any(|d| d.component == "BIOS");
+    let bios_changed = drift.drifts.iter().any(|d| d.component == "BIOS");
 
     // ACPI changed + SMI jumped + BIOS NOT updated = suspicious
     if !acpi_drifts.is_empty() && smi_drift && !bios_changed {
@@ -164,12 +151,13 @@ fn rule_firmware_tamper(
 
     // ACPI changed alone without BIOS update = low-medium suspicion
     if !acpi_drifts.is_empty() && !bios_changed {
-        let check = report
-            .checks
-            .iter()
-            .find(|c| c.id == "ACPI-001");
+        let check = report.checks.iter().find(|c| c.id == "ACPI-001");
         let evidence = vec![
-            format!("{} ACPI table(s) changed: {}", acpi_drifts.len(), acpi_drifts.join(", ")),
+            format!(
+                "{} ACPI table(s) changed: {}",
+                acpi_drifts.len(),
+                acpi_drifts.join(", ")
+            ),
             "BIOS version unchanged".into(),
         ];
         let _ = check; // reference for future enrichment
@@ -263,15 +251,18 @@ fn rule_stealth_persistence(drift: &DriftReport) -> Option<CorrelatedThreat> {
 
 /// LKM rootkit installation: kallsyms changed + suspicious module or eBPF spike.
 fn rule_lkm_rootkit(report: &FirmwareReport) -> Option<CorrelatedThreat> {
-    let kallsyms_issue = report.checks.iter().find(|c| {
-        c.id == "KERN-002" && c.status == CheckStatus::Warning
-    });
-    let module_issue = report.checks.iter().find(|c| {
-        c.id == "KERN-001" && c.status == CheckStatus::Critical
-    });
-    let ebpf_issue = report.checks.iter().find(|c| {
-        c.id == "EBPF-001" && c.status == CheckStatus::Warning
-    });
+    let kallsyms_issue = report
+        .checks
+        .iter()
+        .find(|c| c.id == "KERN-002" && c.status == CheckStatus::Warning);
+    let module_issue = report
+        .checks
+        .iter()
+        .find(|c| c.id == "KERN-001" && c.status == CheckStatus::Critical);
+    let ebpf_issue = report
+        .checks
+        .iter()
+        .find(|c| c.id == "EBPF-001" && c.status == CheckStatus::Warning);
 
     let mut evidence = Vec::new();
     if let Some(k) = kallsyms_issue {
@@ -304,15 +295,18 @@ fn rule_lkm_rootkit(report: &FirmwareReport) -> Option<CorrelatedThreat> {
 
 /// Hardware-level attack: microcode mismatch + CPU feature anomaly.
 fn rule_hardware_attack(report: &FirmwareReport) -> Option<CorrelatedThreat> {
-    let ucode_critical = report.checks.iter().find(|c| {
-        c.id == "UCODE-001" && c.status == CheckStatus::Critical
-    });
-    let cpu_warning = report.checks.iter().find(|c| {
-        c.id == "CPU-001" && c.status == CheckStatus::Warning
-    });
-    let hv_unknown = report.checks.iter().find(|c| {
-        c.id == "CPU-002" && c.status == CheckStatus::Warning
-    });
+    let ucode_critical = report
+        .checks
+        .iter()
+        .find(|c| c.id == "UCODE-001" && c.status == CheckStatus::Critical);
+    let cpu_warning = report
+        .checks
+        .iter()
+        .find(|c| c.id == "CPU-001" && c.status == CheckStatus::Warning);
+    let hv_unknown = report
+        .checks
+        .iter()
+        .find(|c| c.id == "CPU-002" && c.status == CheckStatus::Warning);
 
     let mut evidence = Vec::new();
     if let Some(u) = ucode_critical {
@@ -351,9 +345,10 @@ fn rule_inline_hooking(report: &FirmwareReport) -> Option<CorrelatedThreat> {
     let timing_anomaly = report.checks.iter().find(|c| {
         c.id == "CHRONO-001" && matches!(c.status, CheckStatus::Critical | CheckStatus::Warning)
     });
-    let kallsyms_changed = report.checks.iter().find(|c| {
-        c.id == "KERN-002" && c.status == CheckStatus::Warning
-    });
+    let kallsyms_changed = report
+        .checks
+        .iter()
+        .find(|c| c.id == "KERN-002" && c.status == CheckStatus::Warning);
 
     let mut evidence = Vec::new();
     if let Some(k) = ktext_changed {

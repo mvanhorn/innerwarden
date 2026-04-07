@@ -68,10 +68,7 @@ pub fn process_lsm_blocked(event: &Value, tracker: &PidTracker) -> Option<Value>
                 })
                 .collect();
 
-            let incident_id = format!(
-                "kill_chain:blocked:{}:{}:{}",
-                pattern_name, pid, ts
-            );
+            let incident_id = format!("kill_chain:blocked:{}:{}:{}", pattern_name, pid, ts);
 
             let title = format!(
                 "Kill chain BLOCKED: {} (PID {}, {})",
@@ -84,17 +81,13 @@ pub fn process_lsm_blocked(event: &Value, tracker: &PidTracker) -> Option<Value>
                 pid, comm, pattern_name, filename
             );
 
-            let mut recommended_checks = vec![
-                format!("Investigate process tree: pstree -p {}", pid),
-            ];
+            let mut recommended_checks =
+                vec![format!("Investigate process tree: pstree -p {}", pid)];
             if c2_ip != "unknown" {
                 recommended_checks.push(format!("Block C2 IP: innerwarden block {}", c2_ip));
             }
             recommended_checks.push("Check for lateral movement from this host".to_string());
-            recommended_checks.push(format!(
-                "Review user account uid={} for compromise",
-                uid
-            ));
+            recommended_checks.push(format!("Review user account uid={} for compromise", uid));
 
             let mut entities = Vec::new();
             if c2_ip != "unknown" {
@@ -137,15 +130,9 @@ pub fn process_lsm_blocked(event: &Value, tracker: &PidTracker) -> Option<Value>
         }
         None => {
             // 6. State NOT found: build basic incident with just the event data
-            let incident_id = format!(
-                "kill_chain:blocked:UNKNOWN:{}:{}",
-                pid, ts
-            );
+            let incident_id = format!("kill_chain:blocked:UNKNOWN:{}:{}", pid, ts);
 
-            let title = format!(
-                "Kill chain BLOCKED: UNKNOWN (PID {}, {})",
-                pid, comm
-            );
+            let title = format!("Kill chain BLOCKED: UNKNOWN (PID {}, {})", pid, comm);
 
             let summary = format!(
                 "Kernel LSM blocked execve() for PID {} ({}) but no chain state was found in \

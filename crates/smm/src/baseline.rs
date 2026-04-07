@@ -176,8 +176,11 @@ pub fn detect_drift(baseline: &FirmwareBaseline) -> DriftReport {
 
     // ACPI table drift.
     let current_acpi = acpi::hash_tables();
-    let baseline_map: BTreeMap<&str, &AcpiTableBaseline> =
-        baseline.acpi_tables.iter().map(|t| (t.name.as_str(), t)).collect();
+    let baseline_map: BTreeMap<&str, &AcpiTableBaseline> = baseline
+        .acpi_tables
+        .iter()
+        .map(|t| (t.name.as_str(), t))
+        .collect();
 
     for table in &current_acpi {
         match baseline_map.get(table.name.as_str()) {

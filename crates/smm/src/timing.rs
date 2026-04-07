@@ -194,7 +194,9 @@ fn run_workload(workload: Workload) {
 fn workload_cpu() {
     let mut x: u64 = 0xDEAD_BEEF;
     for _ in 0..10_000 {
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
     }
     // Prevent optimization.
     std::hint::black_box(x);
@@ -225,7 +227,11 @@ fn compute_profile(name: &str, samples: Vec<TimingSample>) -> TimingProfile {
     let n = cycles.len() as f64;
 
     let mean = cycles.iter().sum::<u64>() as f64 / n;
-    let variance = cycles.iter().map(|&c| (c as f64 - mean).powi(2)).sum::<f64>() / n;
+    let variance = cycles
+        .iter()
+        .map(|&c| (c as f64 - mean).powi(2))
+        .sum::<f64>()
+        / n;
     let stddev = variance.sqrt();
     let max = cycles.iter().copied().max().unwrap_or(0);
     let min = cycles.iter().copied().min().unwrap_or(0);
@@ -591,6 +597,9 @@ mod tests {
             "jitter ratio {} should reflect the spike",
             profile.jitter_ratio
         );
-        assert!(profile.outlier_count >= 1, "should detect at least 1 outlier");
+        assert!(
+            profile.outlier_count >= 1,
+            "should detect at least 1 outlier"
+        );
     }
 }
