@@ -240,6 +240,7 @@ jobs:
             maiconburn/innerwarden-agent:${{ steps.version.outputs.version }}
 
       - name: Build and push agent-openclaw image
+        continue-on-error: true  # OpenClaw upstream may break; don't block the release
         uses: docker/build-push-action@v6
         with:
           context: docker
