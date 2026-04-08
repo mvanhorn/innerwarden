@@ -416,6 +416,9 @@ pub struct AnomalyEngine {
     config: AnomalyConfig,
     /// Cooldown per source to prevent spam.
     cooldowns: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+    /// Last computed anomaly score (0.0-1.0), updated by observe().
+    /// Used by the agent to push to the BPF NEURAL_SCORE map for kernel enforcement.
+    last_score: f32,
 }
 
 impl AnomalyEngine {
@@ -469,6 +472,7 @@ impl AnomalyEngine {
             training_cycles: cycles,
             config,
             cooldowns: std::collections::HashMap::new(),
+            last_score: 0.0,
         }
     }
 
@@ -544,10 +548,16 @@ impl AnomalyEngine {
                 self.cooldowns.retain(|_, t| *t > cutoff);
             }
 
+            self.last_score = score;
             Some((score, weighted))
         } else {
             None
         }
+    }
+
+    /// Get the latest anomaly score (0.0-1.0). Used to push to BPF NEURAL_SCORE map.
+    pub fn latest_score(&self) -> f32 {
+        self.last_score
     }
 
     /// Run nightly training on recent events.

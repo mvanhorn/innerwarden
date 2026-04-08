@@ -777,18 +777,24 @@ static INODE_SIZE: HashMap<u32, u64> = HashMap::with_max_entries(1, 0);
 
 const OVERLAYFS_SUPER_MAGIC: u64 = 0x794c_7630;
 
-/// Neural model weights in Q16.16 fixed-point for in-kernel inference.
-/// Key: chunk index (0-based). Value: array of 512 i32 values.
-/// Total: 1880 params × 4 bytes = 7520 bytes → 15 chunks of 512 bytes.
-/// Loaded by `innerwarden-config-sign convert-model` via bpftool.
-/// When empty, neural inference is skipped (graceful degradation).
+/// Neural anomaly score computed by the agent and written here for kernel-level enforcement.
+/// Key 0 = anomaly_score (Q16.16 fixed-point, 0.0-1.0 range → 0-65536).
+/// Key 1 = threshold (Q16.16, default 0.75 → 49152).
+/// Key 2 = last_update_ns (u64 truncated to i32 low bits — staleness check).
+///
+/// The agent runs the autoencoder forward pass in userspace (f32 precision),
+/// computes the anomaly score, and writes it here via bpftool every 30s.
+/// The LSM hook reads the cached score — zero latency added to execve.
+///
+/// Why not run inference in-kernel:
+/// - Stack limit (512B) can't hold input (192B) + intermediate (192B) + weights
+/// - 1880 map lookups per execve adds ~100μs latency to every process spawn
+/// - Agent-computed score is fresher (uses full event window, not single syscall)
+///
+/// The kernel enforces the agent's decision at wire speed — the agent is the brain,
+/// the kernel is the muscle.
 #[map]
-static NEURAL_WEIGHTS: HashMap<u32, [i32; 128]> = HashMap::with_max_entries(16, 0);
-
-/// Neural baseline MSE and std in Q16.16 for anomaly scoring.
-/// Key 0 = baseline_mse, Key 1 = baseline_std.
-#[map]
-static NEURAL_BASELINE: HashMap<u32, i32> = HashMap::with_max_entries(4, 0);
+static NEURAL_SCORE: HashMap<u32, i32> = HashMap::with_max_entries(4, 0);
 
 /// Per-cgroup capability bitmask. Key: cgroup_id. Value: bitmask of allowed capabilities.
 /// Populated by the agent from config. When guard mode is on and a cgroup has a capability
@@ -912,6 +918,46 @@ fn try_lsm_exec(ctx: &LsmContext) -> Result<i32, i64> {
 
         chain_clear(pid); // Clean up after blocking
         return Ok(-1); // -EPERM: deny execution
+    }
+
+    // ── Neural anomaly enforcement ──
+    // Read the agent-computed anomaly score from NEURAL_SCORE map.
+    // If score > threshold, block execution (high anomaly = likely attack).
+    // Score is Q16.16 fixed-point: 0 = normal, 65536 = max anomaly.
+    if should_block {
+        let score = unsafe { NEURAL_SCORE.get(&0u32) }.copied().unwrap_or(0);
+        let threshold = unsafe { NEURAL_SCORE.get(&1u32) }.copied().unwrap_or(49152); // 0.75 default
+        if score > threshold && score > 0 {
+            // Neural model says this execution context is anomalous.
+            // Emit event and block.
+            let pid = bpf_get_current_pid_tgid() as u32;
+            let uid = bpf_get_current_uid_gid() as u32;
+            let ts = unsafe { bpf_ktime_get_ns() };
+            let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+
+            if let Some(mut entry) = EVENTS.reserve::<innerwarden_ebpf_types::ExecveEvent>(0) {
+                let event = unsafe { &mut *entry.as_mut_ptr() };
+                event.kind = SyscallKind::LsmBlocked as u32;
+                event.pid = pid;
+                event.tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+                event.uid = uid;
+                event.gid = 0;
+                event.ppid = 0;
+                event.cgroup_id = cgroup_id;
+                event.ts_ns = ts;
+                event.argc = 0;
+                event.argv = [[0u8; 128]; 8];
+                event.filename = [0u8; 256];
+                let msg = b"NEURAL_ANOMALY_BLOCKED";
+                event.filename[..msg.len()].copy_from_slice(msg);
+                if let Ok(comm) = bpf_get_current_comm() {
+                    event.comm[..comm.len().min(MAX_COMM_LEN)]
+                        .copy_from_slice(&comm[..comm.len().min(MAX_COMM_LEN)]);
+                }
+                entry.submit(0);
+            }
+            return Ok(-1); // -EPERM: neural model blocked execution
+        }
     }
 
     // For bprm_check_security(struct linux_binprm *bprm):

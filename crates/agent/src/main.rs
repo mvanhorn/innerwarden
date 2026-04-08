@@ -1455,6 +1455,49 @@ async fn main() -> Result<()> {
                         }
                     }
 
+                    // ── Neural score → BPF map (Active Defence) ──
+                    // Write the latest anomaly score to the kernel's NEURAL_SCORE map
+                    // so the LSM hook can enforce ML-based decisions at wire speed.
+                    #[cfg(target_os = "linux")]
+                    {
+                        let score = state.anomaly_engine.latest_score();
+                        if score > 0.0 {
+                            let score_fixed = (score * 65536.0) as i32; // Q16.16
+                            let threshold_fixed = (0.75_f32 * 65536.0) as i32; // default 0.75
+                            const NEURAL_SCORE_PIN: &str = "/sys/fs/bpf/innerwarden/neural_score";
+                            if std::path::Path::new(NEURAL_SCORE_PIN).exists() {
+                                // Write score (key 0)
+                                let _ = tokio::process::Command::new("sudo")
+                                    .args([
+                                        "bpftool", "map", "update", "pinned", NEURAL_SCORE_PIN,
+                                        "key", "0", "0", "0", "0",
+                                        "value",
+                                        &(score_fixed as u32 & 0xff).to_string(),
+                                        &((score_fixed as u32 >> 8) & 0xff).to_string(),
+                                        &((score_fixed as u32 >> 16) & 0xff).to_string(),
+                                        &((score_fixed as u32 >> 24) & 0xff).to_string(),
+                                        "any",
+                                    ])
+                                    .output()
+                                    .await;
+                                // Write threshold (key 1)
+                                let _ = tokio::process::Command::new("sudo")
+                                    .args([
+                                        "bpftool", "map", "update", "pinned", NEURAL_SCORE_PIN,
+                                        "key", "1", "0", "0", "0",
+                                        "value",
+                                        &(threshold_fixed as u32 & 0xff).to_string(),
+                                        &((threshold_fixed as u32 >> 8) & 0xff).to_string(),
+                                        &((threshold_fixed as u32 >> 16) & 0xff).to_string(),
+                                        &((threshold_fixed as u32 >> 24) & 0xff).to_string(),
+                                        "any",
+                                    ])
+                                    .output()
+                                    .await;
+                            }
+                        }
+                    }
+
                     // ── Safeguard: flush AbuseIPDB delayed report queue ──
                     {
                         let report_cutoff = chrono::Utc::now() - chrono::Duration::seconds(ABUSEIPDB_REPORT_DELAY_SECS);
