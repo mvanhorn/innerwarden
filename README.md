@@ -64,12 +64,10 @@ Installs in 10 seconds. Starts in observe-only mode. Dry-run by default. You dec
 <p align="center">
   <img src="docs/images/innerwarden-demo.gif" alt="InnerWarden dashboard demo — sensors, threats, investigation, attacker intelligence" width="820">
 </p>
-<p align="center">
-  https://github.com/user-attachments/assets/b55967a6-a2d0-4158-9007-05e689d5bf0c
-</p>
-<p align="center">
-  https://github.com/user-attachments/assets/6ea1e124-52c2-48fe-8600-4b2f3d670116
-</p>
+
+https://github.com/user-attachments/assets/b55967a6-a2d0-4158-9007-05e689d5bf0c
+
+https://github.com/user-attachments/assets/6ea1e124-52c2-48fe-8600-4b2f3d670116
 
 ---
 
