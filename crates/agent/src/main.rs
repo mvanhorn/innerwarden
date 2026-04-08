@@ -1382,6 +1382,40 @@ async fn main() -> Result<()> {
                         }
                     }
 
+                    // Defender brain daily retrain — at 3:30 AM UTC (after autoencoder at 3 AM).
+                    // Reads brain-log.json (features + AI decisions), fine-tunes policy head.
+                    {
+                        let now_utc = chrono::Utc::now();
+                        if now_utc.hour() == 3 && now_utc.minute() >= 30 {
+                            let today_key = format!("brain_retrain:{}", now_utc.format("%Y-%m-%d"));
+                            if !state.store.has_cooldown(state_store::CooldownTable::Decision, &today_key) {
+                                info!("defender brain: triggering daily retrain");
+                                match state.defender_brain.retrain_from_log(&cli.data_dir) {
+                                    Some((entries, accuracy)) => {
+                                        info!(
+                                            entries,
+                                            accuracy = format!("{:.1}%", accuracy * 100.0),
+                                            "defender brain: retrain complete"
+                                        );
+                                        state.brain_stats.last_retrain =
+                                            Some(now_utc.to_rfc3339());
+                                        state.brain_stats.last_retrain_accuracy = Some(accuracy);
+                                        state.brain_stats.last_retrain_entries = Some(entries);
+                                        state.brain_stats.total_since_retrain = 0;
+                                        state.brain_stats.agreed_since_retrain = 0;
+                                        state.brain_stats.save(&cli.data_dir);
+                                    }
+                                    None => info!("defender brain: retrain skipped (not enough data)"),
+                                }
+                                state.store.set_cooldown(
+                                    state_store::CooldownTable::Decision,
+                                    &today_key,
+                                    now_utc,
+                                );
+                            }
+                        }
+                    }
+
                     // Trim in-memory structures to prevent unbounded memory growth
                     state.blocklist.trim_if_needed(10_000);
                     let cutoff_2h = chrono::Utc::now() - chrono::Duration::hours(2);
@@ -2833,17 +2867,38 @@ async fn process_narrative_tick(
     // Feed events into cross-layer correlation engine and baseline learning
     for ev in &events_entries {
         let corr_event = correlation_engine::CorrelationEngine::classify_event(ev);
+        let ev_entities = corr_event.entities.clone();
         state.correlation_engine.observe(corr_event);
         let anomalies = state.baseline.observe_event(ev);
         if !anomalies.is_empty() {
             state.last_baseline_anomaly_ts = Some(chrono::Utc::now());
         }
-        for anomaly in anomalies {
+        for anomaly in &anomalies {
             info!(
                 anomaly_type = ?anomaly.anomaly_type,
                 description = %anomaly.description,
                 "baseline anomaly detected"
             );
+
+            // Inject baseline anomalies into correlation engine.
+            let kind = match anomaly.anomaly_type {
+                crate::baseline::AnomalyType::EventRateDrop => "baseline.silence",
+                crate::baseline::AnomalyType::EventRateSpike => "baseline.rate_spike",
+                crate::baseline::AnomalyType::ProcessLineage => "baseline.new_process",
+                crate::baseline::AnomalyType::UserLoginTime => "baseline.unusual_login",
+                crate::baseline::AnomalyType::NewDestination => "baseline.new_destination",
+            };
+            let baseline_corr = correlation_engine::CorrelationEngine::baseline_event(
+                kind,
+                anomaly.severity.clone(),
+                ev_entities.clone(),
+                serde_json::json!({
+                    "description": anomaly.description,
+                    "expected": anomaly.expected,
+                    "observed": anomaly.observed,
+                }),
+            );
+            state.correlation_engine.observe(baseline_corr);
         }
     }
 
@@ -2870,6 +2925,7 @@ async fn process_narrative_tick(
             &mut state.dna_state,
             &events_entries,
             &mut state.correlation_engine,
+            &mut state.attacker_profiles,
         );
 
         // Periodic DNA state persistence (every 5 min).
@@ -2881,9 +2937,46 @@ async fn process_narrative_tick(
 
     // Feed events through DDoS shield (rate limiting, SYN tracking, escalation).
     if let Some(ref mut shield) = state.shield_state {
-        let (_drops, shield_incidents) = shield_inline::process_events(shield, &events_entries);
+        // Build risk score lookup for pre-emptive rate limiting.
+        let ip_risks: std::collections::HashMap<String, u8> = state
+            .attacker_profiles
+            .iter()
+            .filter(|(_, p)| p.risk_score > 60)
+            .map(|(ip, p)| (ip.clone(), p.risk_score))
+            .collect();
+        let (_drops, shield_incidents, shield_blocked) =
+            shield_inline::process_events(shield, &events_entries, &ip_risks);
         shield_inline::write_incidents(data_dir, &shield_incidents);
         shield_inline::notify_telegram(&state.telegram_client, &shield_incidents);
+        // Sync: register shield blocks in agent blocklist and attacker intel.
+        for ip in &shield_blocked {
+            state.blocklist.insert(ip.clone());
+            // Enrich attacker profiles with shield block data.
+            let profile = state
+                .attacker_profiles
+                .entry(ip.clone())
+                .or_insert_with(|| attacker_intel::new_profile(ip, chrono::Utc::now()));
+            attacker_intel::observe_shield_block(profile, "shield:rate_limit");
+        }
+        // Inject shield escalation incidents into correlation engine.
+        for inc in &shield_incidents {
+            if let Some(title) = inc.get("title").and_then(|t| t.as_str()) {
+                let kind = if title.contains("Critical") {
+                    "shield.escalation.critical"
+                } else if title.contains("UnderAttack") {
+                    "shield.escalation.under_attack"
+                } else if title.contains("Elevated") {
+                    "shield.escalation.elevated"
+                } else {
+                    "shield.escalation.transition"
+                };
+                let corr = correlation_engine::CorrelationEngine::shield_event(
+                    kind,
+                    inc.clone(),
+                );
+                state.correlation_engine.observe(corr);
+            }
+        }
     }
 
     narrative_anomaly::process_anomalies(data_dir, &today, &events_entries, state);

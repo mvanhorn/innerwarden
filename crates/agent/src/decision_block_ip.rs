@@ -79,15 +79,37 @@ pub(crate) async fn execute_block_ip_decision(
     let mut any_success = false;
 
     // Layer 1: XDP wire-speed drop (if available).
-    if let Some(xdp_skill) = state.skill_registry.get("block-ip-xdp") {
-        let xdp_result = xdp_skill.execute(&ctx, cfg.responder.dry_run).await;
-        if xdp_result.success {
-            layers_applied.push("XDP");
-            any_success = true;
-            // Track for TTL expiration (with per-IP adaptive TTL).
-            state
-                .xdp_block_times
-                .insert(ip.to_string(), (chrono::Utc::now(), block_ttl_secs));
+    // Prefer shield's XdpManager (unified blocklist) over standalone skill.
+    let xdp_blocked = if let Some(ref mut shield) = state.shield_state {
+        let reason = format!("agent:block:{}", incident.incident_id);
+        match shield.xdp.add_to_blocklist(ip, &reason) {
+            Ok(()) => {
+                layers_applied.push("XDP");
+                any_success = true;
+                state
+                    .xdp_block_times
+                    .insert(ip.to_string(), (chrono::Utc::now(), block_ttl_secs));
+                true
+            }
+            Err(e) => {
+                warn!(ip, error = %e, "shield XDP blocklist add failed, falling back to skill");
+                false
+            }
+        }
+    } else {
+        false
+    };
+    // Fallback: use standalone XDP skill if shield is not active.
+    if !xdp_blocked {
+        if let Some(xdp_skill) = state.skill_registry.get("block-ip-xdp") {
+            let xdp_result = xdp_skill.execute(&ctx, cfg.responder.dry_run).await;
+            if xdp_result.success {
+                layers_applied.push("XDP");
+                any_success = true;
+                state
+                    .xdp_block_times
+                    .insert(ip.to_string(), (chrono::Utc::now(), block_ttl_secs));
+            }
         }
     }
 

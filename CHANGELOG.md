@@ -11,6 +11,57 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.10.0] - 2026-04-08
+
+### Added
+- **Supervised defender brain with agreement tracking** (Feature 006) — brain observes every AI decision and logs agreement/disagreement. Foundation for online learning and AI override.
+- **72-dimensional brain-log** — agent records enriched feature vectors to `brain-log.jsonl` for offline model retraining.
+- **Autoencoder as decision signal** — converted from standalone detector to integrated decision signal in the agent pipeline.
+- **Shield migrated into monorepo** — `innerwarden-shield` now lives as `crates/shield` in the workspace.
+- **Dynamic operator IP protection** — active SSH sessions from trusted operators get session-based expiry protection; agent never auto-blocks the operator.
+- **CTL restructured** — CLI reorganized from 40 flat commands to 8 intent-based groups (`get`, `stream`, `action`, `trust`, `config`, `system`, `module`, `agent`) for better discoverability. Old commands still work as aliases.
+
+### Changed
+- **Autoencoder trains on clean traffic only** — excludes blocked IPs from training data to prevent model poisoning.
+- **Live feed uses rolling 24h window** — shows only real external attacks with attacker IP (today + yesterday).
+- **Unified XDP blocklist** — shield and agent skill share one source of truth via `XdpManager`. IPv6 support added. XDP now covers 20 detectors (was 5).
+- **Defender brain upgraded to V5 50M** — 3.1M training steps, [72→128→64→30] architecture, with daily retrain at 3:30 AM UTC from production decisions.
+- **Cross-module correlation** — baseline anomalies, autoencoder scores, and shield escalation now feed the correlation engine. 4 new rules: CL-044 Silence After Compromise, CL-045 Coordinated Volume Attack, CL-046 Neural-Confirmed Attack, CL-047 Attacker IP Rotation.
+- **Shield ↔ Attacker Intel bidirectional** — shield blocks enrich attacker profiles (risk score, block count); known high-risk IPs (risk > 60) get 2x tighter rate limits pre-emptively.
+- **DNA Cross-IP tracking** — behavioral fingerprint index detects same attacker across different IPs (VPN/Tor rotation). Emits `dna.ip_rotation` correlation event. No other IDS does this.
+- **Attacker intel risk scores in decision pipeline** — IPs with risk > 50 get confidence boost in AI triage, reducing latency and API costs for repeat offenders.
+- **README fully updated** — all stats aligned (49 detectors, 47 correlation rules, 2361 tests), CLI examples use new command groups, architecture diagram corrected.
+- **Website fully updated** — stats, CLI commands, meta tags, and SEO schema version aligned across 25 files.
+- **GitHub About & Topics updated** — description includes 46 correlation rules + 65 MITRE techniques; added mitre-attack, behavioral-analysis, kill-chain topics.
+
+### Fixed
+- **Notification spam reduced** — 3 critical fixes: gate repeated alerts, suppress non-threat group summaries, rate-limit action reports.
+- **Auto-block gates respect operator/trusted IPs** — prevents lockout during active management sessions.
+- **Security: XSS in dashboard** — attacker IPs in onclick handlers now escaped via `esc()` function.
+- **Security: russh 0.58→0.59** — removes vulnerable `libcrux-sha3` dependency.
+- **CI stability** — flaky timing test ignored in CI, dead_code allows for BrainStats, clean deny.toml.
+
+---
+
+## [0.9.4] - 2026-04-06
+
+### Added
+- **Consolidated satellite modules into workspace** — killchain, dna, hypervisor, smm migrated from standalone repos to `crates/`. Single build, single CI, unified versioning.
+- **Neural model advisory-only mode** — autoencoder observes and scores but never blocks or notifies. Safe ramp-up.
+- **Operator IP protection** — never blocks active trusted SSH sessions (publickey detection).
+- **AlphaZero defender brain embedded** — IWD1 binary (538KB) integrated as advisory decision signal with dashboard UI + FP audit + API endpoints.
+
+### Changed
+- **Dashboard UX overhaul** — defender brain panel, FP audit view, action config improvements.
+
+### Fixed
+- **Dashboard JS fixes** — duplicate `esc()` declaration, broken script tag in template literal, HTTP actions with auth.
+- **eBPF connect/accept IP byte order** corrected.
+- **Security: safe_write_data_file for brain-log** (CodeQL CWE-22 path traversal).
+- **Dependencies updated** — fancy-regex 0.17, redb 4.0, redis 1.2, russh yanked version resolved.
+
+---
+
 ## [0.9.3] - 2026-04-06
 
 ### Added

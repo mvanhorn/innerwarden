@@ -2395,6 +2395,13 @@ async fn api_brain_stats(State(state): State<DashboardState>) -> Json<serde_json
         })
         .count();
     let model_exists = true; // embedded in binary since v0.9.4
+
+    // Load retrain stats from brain-stats.json
+    let brain_stats: serde_json::Value =
+        safe_read_data_file(&state.data_dir, "brain-stats.json")
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(serde_json::json!({}));
+
     Json(serde_json::json!({
         "loaded": model_exists,
         "total_suggestions": total,
@@ -2402,6 +2409,10 @@ async fn api_brain_stats(State(state): State<DashboardState>) -> Json<serde_json
         "tp_count": tp,
         "fp_count": fp,
         "unreviewed": unreviewed,
+        "last_retrain": brain_stats.get("last_retrain"),
+        "last_retrain_accuracy": brain_stats.get("last_retrain_accuracy"),
+        "last_retrain_entries": brain_stats.get("last_retrain_entries"),
+        "daily_agreement": brain_stats.get("daily_agreement"),
     }))
 }
 
@@ -10727,7 +10738,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
         const lastSeen = p.last_seen ? new Date(p.last_seen).toLocaleDateString() : '—';
         const patternBadge = pattern === 'regular_scanner' ? '🔄' : pattern === 'targeted' ? '🎯' : pattern === 'opportunistic' ? '🎲' : '❓';
 
-        html += `<tr style="border-bottom:1px solid var(--border);cursor:pointer;" onclick="showProfileDetail('${p.ip}')">
+        html += `<tr style="border-bottom:1px solid var(--border);cursor:pointer;" onclick="showProfileDetail('${esc(p.ip)}')">
           <td style="padding:6px;">${riskBar}</td>
           <td style="padding:6px;font-family:monospace;">${p.ip}</td>
           <td style="padding:6px;">${country}</td>
@@ -10788,6 +10799,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
         <table style="font-size:0.8rem;"><tbody>
           <tr><td style="padding:2px 8px;color:var(--dim);">Incidents</td><td>${p.total_incidents}</td></tr>
           <tr><td style="padding:2px 8px;color:var(--dim);">Blocks</td><td>${p.total_blocks}</td></tr>
+          <tr><td style="padding:2px 8px;color:var(--dim);">Shield Blocks</td><td>${p.shield_blocks || 0}${p.shield_last_blocked ? ' (last: ' + new Date(p.shield_last_blocked).toLocaleString() + ')' : ''}</td></tr>
           <tr><td style="padding:2px 8px;color:var(--dim);">Honeypot</td><td>${p.total_honeypot_diversions} diversions, ${p.honeypot_sessions} sessions</td></tr>
           <tr><td style="padding:2px 8px;color:var(--dim);">Max Severity</td><td style="font-weight:600;">${p.max_severity}</td></tr>
         </tbody></table>
@@ -10907,7 +10919,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
             <div>
               <div style="font-size:0.75rem;color:var(--dim);margin-bottom:4px;">Member IPs (${c.member_ips.length})</div>
               <div style="display:flex;flex-wrap:wrap;gap:4px;">
-                ${c.member_ips.map(ip=>`<span onclick="switchIntelTab('profiles');setTimeout(()=>showProfileDetail('${ip}'),100)" style="padding:2px 8px;border-radius:4px;background:var(--border);font-family:monospace;font-size:0.75rem;cursor:pointer;">${ip}</span>`).join('')}
+                ${c.member_ips.map(ip=>`<span onclick="switchIntelTab('profiles');setTimeout(()=>showProfileDetail('${esc(ip)}'),100)" style="padding:2px 8px;border-radius:4px;background:var(--border);font-family:monospace;font-size:0.75rem;cursor:pointer;">${esc(ip)}</span>`).join('')}
               </div>
               ${c.countries.length ? `<div style="font-size:0.7rem;color:var(--dim);margin-top:4px;">Countries: ${c.countries.join(', ')}</div>` : ''}
             </div>
@@ -11077,6 +11089,10 @@ const INDEX_HTML: &str = r##"<!doctype html>
         loadJson('/api/defender-brain/recent'),
       ]);
 
+      const retrainInfo = stats.last_retrain
+        ? `Last retrain: ${new Date(stats.last_retrain).toLocaleDateString()} (${esc(String(((stats.last_retrain_accuracy||0)*100).toFixed(1)))}% accuracy, ${stats.last_retrain_entries||0} entries)`
+        : 'No retrain yet — daily retrain runs at 3:30 AM UTC';
+
       let html = `<div class="kpi-grid" style="grid-template-columns:repeat(auto-fit,minmax(120px,1fr));margin-bottom:16px;">
         <div class="kpi-card"><div class="kpi-value">${stats.loaded ? '✅' : '❌'}</div><div class="kpi-label">Model Loaded</div></div>
         <div class="kpi-card"><div class="kpi-value">${stats.total_suggestions}</div><div class="kpi-label">Suggestions</div></div>
@@ -11085,7 +11101,8 @@ const INDEX_HTML: &str = r##"<!doctype html>
         <div class="kpi-card"><div class="kpi-value" style="color:var(--danger)">${stats.fp_count}</div><div class="kpi-label">Marked FP</div></div>
       </div>`;
 
-      html += `<div style="font-size:0.8rem;color:var(--dim);margin-bottom:8px;">AlphaZero-trained neural defender (137K params, 6 rounds, 200K+ games). Advisory mode — logs suggestions alongside AI decisions.</div>`;
+      html += `<div style="font-size:0.8rem;color:var(--dim);margin-bottom:8px;">V5 50M defender brain (19K params, 3.1M train steps). Daily retrain from production decisions at 3:30 AM UTC.</div>`;
+      html += `<div style="font-size:0.75rem;color:var(--dim);margin-bottom:12px;">${retrainInfo}</div>`;
 
       if (!recent?.entries?.length) {
         html += '<div style="text-align:center;padding:40px;"><div style="font-size:2rem;">🧠</div><p style="color:var(--muted);">No brain suggestions yet.</p><p style="font-size:0.8rem;color:var(--muted);">The AlphaZero defender model is loaded and ready. Suggestions will appear here as incidents are processed and the brain evaluates each one alongside the AI provider.</p></div>';

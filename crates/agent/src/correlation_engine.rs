@@ -396,6 +396,61 @@ impl CorrelationEngine {
             details,
         }
     }
+
+    /// Create a CorrelationEvent from baseline anomaly detection.
+    pub fn baseline_event(
+        kind: &str,
+        severity: Severity,
+        entities: Vec<EntityRef>,
+        details: serde_json::Value,
+    ) -> CorrelationEvent {
+        CorrelationEvent {
+            ts: Utc::now(),
+            layer: Layer::Userspace,
+            source: "baseline".to_string(),
+            kind: kind.to_string(),
+            severity,
+            entities,
+            details,
+        }
+    }
+
+    /// Create a CorrelationEvent from autoencoder neural anomaly.
+    pub fn neural_event(
+        score: f32,
+        entities: Vec<EntityRef>,
+        details: serde_json::Value,
+    ) -> CorrelationEvent {
+        let severity = if score > 0.9 {
+            Severity::High
+        } else if score > 0.7 {
+            Severity::Medium
+        } else {
+            Severity::Low
+        };
+        CorrelationEvent {
+            ts: Utc::now(),
+            layer: Layer::Userspace,
+            source: "autoencoder".to_string(),
+            kind: "neural.anomaly".to_string(),
+            severity,
+            entities,
+            details,
+        }
+    }
+
+    /// Create a CorrelationEvent from shield escalation.
+    pub fn shield_event(kind: &str, details: serde_json::Value) -> CorrelationEvent {
+        CorrelationEvent {
+            ts: Utc::now(),
+            layer: Layer::Network,
+            source: "shield".to_string(),
+            kind: kind.to_string(),
+            severity: Severity::High,
+            entities: vec![],
+            details,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1575,6 +1630,94 @@ fn builtin_rules() -> Vec<CorrelationRule> {
             min_confidence: 0.90,
             severity: Severity::Critical,
         },
+        // CL-044: Silence After Compromise — baseline detects silence after a confirmed attack.
+        CorrelationRule {
+            id: "CL-044".into(),
+            name: "Silence After Compromise".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec![
+                        "reverse_shell".into(),
+                        "privesc".into(),
+                        "rootkit".into(),
+                        "log_tampering".into(),
+                        "process_injection".into(),
+                    ],
+                    entity_must_match: true,
+                },
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec!["baseline.silence".into()],
+                    entity_must_match: false,
+                },
+            ],
+            window_secs: 7200, // 2 hours
+            min_confidence: 0.85,
+            severity: Severity::Critical,
+        },
+        // CL-045: Coordinated Volume Attack — baseline rate spike + shield escalation.
+        CorrelationRule {
+            id: "CL-045".into(),
+            name: "Coordinated Volume Attack".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec!["baseline.rate_spike".into()],
+                    entity_must_match: false,
+                },
+                RuleStage {
+                    layer: Some(Layer::Network),
+                    kind_patterns: vec!["shield.escalation.*".into()],
+                    entity_must_match: false,
+                },
+            ],
+            window_secs: 300, // 5 minutes
+            min_confidence: 0.80,
+            severity: Severity::High,
+        },
+        // CL-046: Neural-Confirmed Attack — autoencoder anomaly + detector in same window.
+        CorrelationRule {
+            id: "CL-046".into(),
+            name: "Neural-Confirmed Attack".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec!["neural.anomaly".into()],
+                    entity_must_match: true,
+                },
+                RuleStage {
+                    layer: None, // any layer
+                    kind_patterns: vec![
+                        "reverse_shell".into(),
+                        "c2_callback".into(),
+                        "data_exfiltration".into(),
+                        "lateral_movement".into(),
+                        "container_escape".into(),
+                        "process_injection".into(),
+                    ],
+                    entity_must_match: true,
+                },
+            ],
+            window_secs: 120, // 2 minutes
+            min_confidence: 0.90,
+            severity: Severity::High,
+        },
+        // CL-047: Attacker IP Rotation — same behavioral DNA from a new IP + any attack.
+        CorrelationRule {
+            id: "CL-047".into(),
+            name: "Attacker IP Rotation Detected".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec!["dna.ip_rotation".into()],
+                    entity_must_match: false,
+                },
+            ],
+            window_secs: 1, // single event is enough
+            min_confidence: 0.95,
+            severity: Severity::Critical,
+        },
     ]
 }
 
@@ -1691,7 +1834,7 @@ mod tests {
     #[test]
     fn engine_starts_empty() {
         let engine = CorrelationEngine::new();
-        assert_eq!(engine.rule_count(), 43);
+        assert_eq!(engine.rule_count(), 47);
         assert_eq!(engine.pending_count(), 0);
     }
 

@@ -536,6 +536,213 @@ impl DefenderBrain {
     }
 }
 
+/// Map an AI action string (from brain-log) to action index.
+fn ai_action_to_index(action: &str) -> Option<usize> {
+    if action.contains("BlockIp") {
+        Some(1)
+    } else if action.contains("KillProcess") {
+        Some(2)
+    } else if action.contains("SuspendUser") {
+        Some(3)
+    } else if action.contains("Honeypot") {
+        Some(4)
+    } else if action.contains("Ignore") {
+        Some(0)
+    } else if action.contains("Monitor") {
+        Some(7) // alert
+    } else if action.contains("Escalate") {
+        Some(9)
+    } else {
+        None
+    }
+}
+
+impl DefenderBrain {
+    /// Retrain the policy head using supervised data from brain-log.json.
+    ///
+    /// Reads (features, ai_action) pairs, maps ai_action to target index,
+    /// and fine-tunes the policy head via backpropagation. Trunk and value
+    /// head are frozen — only the policy mapping is updated.
+    ///
+    /// Returns (entries_used, accuracy) or None if not enough data.
+    pub fn retrain_from_log(&mut self, data_dir: &std::path::Path) -> Option<(u64, f32)> {
+        if !self.loaded {
+            return None;
+        }
+
+        let log_path = data_dir.join("brain-log.json");
+        let data = std::fs::read_to_string(&log_path).ok()?;
+        let entries: Vec<serde_json::Value> = serde_json::from_str(&data).ok()?;
+
+        if entries.len() < 20 {
+            info!("brain retrain: only {} entries, need >= 20", entries.len());
+            return None;
+        }
+
+        // Extract (features, target_action_index) pairs
+        let mut samples: Vec<([f32; 72], usize)> = Vec::new();
+        for entry in &entries {
+            let features_val = entry.get("features").and_then(|v| v.as_array())?;
+            if features_val.len() != 72 {
+                continue;
+            }
+            let mut features = [0.0f32; 72];
+            for (i, v) in features_val.iter().enumerate() {
+                features[i] = v.as_f64().unwrap_or(0.0) as f32;
+            }
+
+            let ai_action = entry.get("ai_action").and_then(|v| v.as_str())?;
+            if let Some(target) = ai_action_to_index(ai_action) {
+                samples.push((features, target));
+            }
+        }
+
+        if samples.len() < 20 {
+            info!(
+                "brain retrain: only {} usable samples, need >= 20",
+                samples.len()
+            );
+            return None;
+        }
+
+        let lr = 0.01f32;
+        let epochs = 10;
+        let num_actions = 30;
+        let mut correct = 0u64;
+        let total = samples.len() as u64;
+
+        for _epoch in 0..epochs {
+            correct = 0;
+            for (features, target) in &samples {
+                // Forward through frozen trunk
+                let mut x = features.to_vec();
+                for layer in &self.trunk {
+                    x = forward_relu(layer, &x);
+                }
+
+                // Forward through policy head
+                let mut px = x.clone();
+                let mut intermediates = vec![x.clone()]; // save activations for backprop
+                for (i, layer) in self.policy_head.iter().enumerate() {
+                    if i < self.policy_head.len() - 1 {
+                        px = forward_relu(layer, &px);
+                    } else {
+                        px = forward_linear(layer, &px);
+                    }
+                    intermediates.push(px.clone());
+                }
+
+                // Softmax + cross-entropy gradient
+                let probs = softmax(&px);
+                let predicted = probs
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                if predicted == *target {
+                    correct += 1;
+                }
+
+                // dL/d_logits = probs - one_hot(target)
+                let mut grad: Vec<f32> = probs.clone();
+                if *target < num_actions {
+                    grad[*target] -= 1.0;
+                }
+
+                // Backprop through policy head (reverse order)
+                let num_policy_layers = self.policy_head.len();
+                for (i, layer) in self.policy_head.iter_mut().enumerate().rev() {
+                    let input = &intermediates[i];
+                    let is_relu = i < num_policy_layers - 1;
+
+                    // Apply ReLU derivative if not last layer
+                    if is_relu {
+                        let output = &intermediates[i + 1];
+                        for (g, o) in grad.iter_mut().zip(output) {
+                            if *o <= 0.0 {
+                                *g = 0.0;
+                            }
+                        }
+                    }
+
+                    // Update weights and biases
+                    let mut grad_input = vec![0.0f32; input.len()];
+                    for (j, (w_row, &g)) in
+                        layer.weights.iter_mut().zip(grad.iter()).enumerate()
+                    {
+                        layer.biases[j] -= lr * g;
+                        for (k, w) in w_row.iter_mut().enumerate() {
+                            grad_input[k] += *w * g;
+                            *w -= lr * g * input[k];
+                        }
+                    }
+                    grad = grad_input;
+                }
+            }
+        }
+
+        let accuracy = correct as f32 / total as f32;
+        info!(
+            entries = total,
+            accuracy = format!("{:.1}%", accuracy * 100.0),
+            epochs = epochs,
+            "brain retrain complete"
+        );
+
+        // Export updated weights to disk (hot-reload next restart)
+        if let Some(iwd1) = self.export_iwd1() {
+            let brain_path = data_dir.join("defender-brain-retrained.bin");
+            if let Err(e) = std::fs::write(&brain_path, &iwd1) {
+                warn!("failed to save retrained brain: {e}");
+            } else {
+                info!(
+                    size_kb = iwd1.len() / 1024,
+                    "retrained brain saved to {}",
+                    brain_path.display()
+                );
+            }
+        }
+
+        Some((total, accuracy))
+    }
+
+    /// Export current weights as IWD1 binary.
+    fn export_iwd1(&self) -> Option<Vec<u8>> {
+        if !self.loaded {
+            return None;
+        }
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"IWD1");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+
+        for section in [&self.trunk, &self.policy_head, &self.value_head] {
+            buf.extend_from_slice(&(section.len() as u32).to_le_bytes());
+            for layer in section {
+                let rows = layer.weights.len() as u32;
+                let cols = if layer.weights.is_empty() {
+                    0u32
+                } else {
+                    layer.weights[0].len() as u32
+                };
+                buf.extend_from_slice(&rows.to_le_bytes());
+                buf.extend_from_slice(&cols.to_le_bytes());
+                for row in &layer.weights {
+                    for &w in row {
+                        buf.extend_from_slice(&w.to_le_bytes());
+                    }
+                }
+                for &b in &layer.biases {
+                    buf.extend_from_slice(&b.to_le_bytes());
+                }
+            }
+        }
+
+        Some(buf)
+    }
+}
+
 /// ReLU forward pass.
 fn forward_relu(layer: &Layer, input: &[f32]) -> Vec<f32> {
     layer
@@ -580,6 +787,55 @@ mod tests {
         let brain = DefenderBrain::new();
         assert!(!brain.is_loaded());
         assert!(brain.suggest(&[0.0; 72]).is_none());
+    }
+
+    #[test]
+    fn embedded_iwd1_loads_and_suggests() {
+        let brain = DefenderBrain::from_iwd1(MODEL_BYTES).expect("IWD1 should parse");
+        assert!(brain.loaded);
+
+        // Scenario: SSH brute-force (high severity, active kill chain)
+        let mut features = [0.0f32; 72];
+        features[0] = 5.0; // 5 low-severity detections
+        features[2] = 1.0; // 1 high-severity detection
+        features[5] = 0.7; // high composite score
+        features[6] = 0.3; // kill chain active
+        features[12] = 1.0; // ssh_bruteforce flag
+
+        let suggestion = brain.suggest(&features).unwrap();
+        assert!(suggestion.confidence > 0.0);
+        assert!(suggestion.value >= -1.0 && suggestion.value <= 1.0);
+        eprintln!(
+            "V5 suggestion: {} ({:.1}%), value={:.3}, top3: {:?}",
+            suggestion.action_name, suggestion.confidence * 100.0, suggestion.value, suggestion.top_actions
+        );
+    }
+
+    #[test]
+    fn embedded_iwd1_varied_scenarios() {
+        let brain = DefenderBrain::from_iwd1(MODEL_BYTES).expect("IWD1 should parse");
+
+        // Scenario 1: quiet (no threats)
+        let quiet = brain.suggest(&[0.0; 72]).unwrap();
+        // Scenario 2: ransomware (critical)
+        let mut ransom = [0.0f32; 72];
+        ransom[3] = 1.0; // critical severity
+        ransom[5] = 0.95;
+        ransom[15] = 1.0; // ransomware flag
+        let ransom_s = brain.suggest(&ransom).unwrap();
+        // Scenario 3: port scan (low)
+        let mut scan = [0.0f32; 72];
+        scan[0] = 10.0; // many low detections
+        scan[5] = 0.2;
+        let scan_s = brain.suggest(&scan).unwrap();
+
+        eprintln!("Quiet: {} ({:.1}%)", quiet.action_name, quiet.confidence * 100.0);
+        eprintln!("Ransomware: {} ({:.1}%)", ransom_s.action_name, ransom_s.confidence * 100.0);
+        eprintln!("Port scan: {} ({:.1}%)", scan_s.action_name, scan_s.confidence * 100.0);
+
+        // V5 50M: trained on self-play, not production data.
+        // Currently suggests same action for all scenarios (low confidence).
+        // Will improve once retrained with supervised production decisions.
     }
 
     #[test]

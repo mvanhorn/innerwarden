@@ -44,6 +44,21 @@ impl ResponseSkill for BlockIpXdp {
             "credential_stuffing",
             "c2_callback",
             "distributed_ssh",
+            "reverse_shell",
+            "lateral_movement",
+            "data_exfiltration",
+            "data_exfil_ebpf",
+            "ransomware",
+            "process_injection",
+            "container_escape",
+            "web_shell",
+            "dns_tunneling",
+            "crypto_miner",
+            "packet_flood",
+            "fileless",
+            "web_scan",
+            "ssh_key_injection",
+            "suspicious_login",
         ]
     }
 

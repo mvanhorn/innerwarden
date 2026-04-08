@@ -61,13 +61,17 @@ impl ShieldState {
 }
 
 /// Process a batch of sensor events through the shield pipeline.
-/// Returns the number of drops and any new incidents.
+/// Returns the number of drops, any new incidents, and IPs that were blocked by the shield.
+/// `ip_risk_scores` provides attacker intel risk scores (0-100) for known IPs;
+/// IPs with risk > 60 get 2x tighter rate limits (pre-emptive defense).
 pub(crate) fn process_events(
     shield: &mut ShieldState,
     events: &[innerwarden_core::event::Event],
-) -> (u64, Vec<serde_json::Value>) {
+    ip_risk_scores: &std::collections::HashMap<String, u8>,
+) -> (u64, Vec<serde_json::Value>, Vec<String>) {
     let mut drops = 0u64;
     let mut incidents = Vec::new();
+    let mut blocked_ips = Vec::new();
     let now = chrono::Utc::now();
 
     for event in events {
@@ -93,13 +97,20 @@ pub(crate) fn process_events(
             continue;
         }
 
+        // Known high-risk IPs get tighter rate limits (pre-emptive defense).
+        // Reduces effective bytes by 2x so they hit the limit faster.
+        let risk = ip_risk_scores.get(ip).copied().unwrap_or(0);
+        let effective_bytes = {
+            let raw = event
+                .details
+                .get("bytes")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(64);
+            if risk > 60 { raw * 2 } else { raw }
+        };
+
         // Feed rate limiter
-        let bytes = event
-            .details
-            .get("bytes")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(64);
-        let decision = shield.rate_limiter.process_packet(ip, bytes, now);
+        let decision = shield.rate_limiter.process_packet(ip, effective_bytes, now);
 
         if matches!(decision, RateLimitDecision::Drop) {
             drops += 1;
@@ -107,6 +118,8 @@ pub(crate) fn process_events(
             let reason = format!("shield:rate_limit:{}", event.kind);
             if let Err(e) = shield.xdp.add_to_blocklist(ip, &reason) {
                 warn!(ip, error = %e, "shield: failed to add to XDP blocklist");
+            } else {
+                blocked_ips.push(ip.to_string());
             }
         }
 
@@ -223,7 +236,7 @@ pub(crate) fn process_events(
         }
     }
 
-    (drops, incidents)
+    (drops, incidents, blocked_ips)
 }
 
 /// Write shield incidents to the daily JSONL file.
