@@ -586,6 +586,16 @@ impl AnomalyEngine {
             );
         }
 
+        // Load blocked IPs from decisions files to exclude attack traffic.
+        // Training on clean data only produces a model that actually detects anomalies.
+        let blocked_ips = load_blocked_ips(&self.config.data_dir);
+        if !blocked_ips.is_empty() {
+            info!(
+                "anomaly: excluding {} blocked IPs from training data",
+                blocked_ips.len()
+            );
+        }
+
         // Collect events from JSONL files (last N days)
         let cutoff =
             chrono::Utc::now() - chrono::Duration::days(self.config.training_retention_days as i64);
@@ -595,6 +605,7 @@ impl AnomalyEngine {
         let entries = std::fs::read_dir(events_dir).map_err(|e| e.to_string())?;
 
         let mut total_events = 0u64;
+        let mut skipped_attack = 0u64;
         let mut event_window: Vec<Option<usize>> = Vec::new();
 
         for entry in entries.flatten() {
@@ -622,6 +633,23 @@ impl AnomalyEngine {
                     Err(_) => continue,
                 };
 
+                // Skip events from blocked IPs (attack traffic).
+                // Train only on clean traffic so the model learns what "normal" looks like.
+                if !blocked_ips.is_empty() {
+                    let ip = ev
+                        .get("details")
+                        .and_then(|d| {
+                            d.get("src_ip")
+                                .or_else(|| d.get("ip"))
+                                .and_then(|v| v.as_str())
+                        })
+                        .unwrap_or("");
+                    if blocked_ips.contains(ip) {
+                        skipped_attack += 1;
+                        continue;
+                    }
+                }
+
                 let kind = ev.get("kind").and_then(|v| v.as_str()).unwrap_or("");
                 let idx = kind_index(kind);
 
@@ -640,6 +668,13 @@ impl AnomalyEngine {
                     break;
                 }
             }
+        }
+
+        if skipped_attack > 0 {
+            info!(
+                "anomaly: skipped {} events from blocked IPs (attack traffic)",
+                skipped_attack
+            );
         }
 
         info!(
@@ -1178,4 +1213,62 @@ mod tests {
         assert!(ssh_count.is_some());
         assert_eq!(ssh_count.unwrap().2, 3);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Blocked IP loader for clean training
+// ---------------------------------------------------------------------------
+
+/// Load all IPs that were blocked from decisions JSONL files.
+/// Used by train_nightly to exclude attack traffic from training data.
+fn load_blocked_ips(data_dir: &Path) -> HashSet<String> {
+    let mut blocked = HashSet::new();
+
+    let entries = match std::fs::read_dir(data_dir) {
+        Ok(e) => e,
+        Err(_) => return blocked,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if !name.starts_with("decisions-") || !name.ends_with(".jsonl") {
+            continue;
+        }
+
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        for line in content.lines() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                let action = v
+                    .get("action_type")
+                    .or_else(|| v.get("action"))
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("");
+                if action.contains("block") {
+                    if let Some(ip) = v.get("target_ip").and_then(|i| i.as_str()) {
+                        if !ip.is_empty() {
+                            blocked.insert(ip.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Also load from blocked-ips.txt (written by sensor feedback loop)
+    let blocked_file = data_dir.join("blocked-ips.txt");
+    if let Ok(content) = std::fs::read_to_string(&blocked_file) {
+        for line in content.lines() {
+            let ip = line.trim();
+            if !ip.is_empty() && !ip.starts_with('#') {
+                blocked.insert(ip.to_string());
+            }
+        }
+    }
+
+    blocked
 }

@@ -84,6 +84,7 @@ mod reader;
 mod redis_reader;
 mod report;
 mod scoring;
+mod shield_inline;
 mod skills;
 mod slack;
 mod state_store;
@@ -416,6 +417,8 @@ struct AgentState {
     defender_brain: defender_brain::DefenderBrain,
     /// History of brain suggestions for dashboard + FP audit.
     brain_history: defender_brain::BrainHistory,
+    /// Brain evolution stats (agreement tracking, weekly trend).
+    brain_stats: defender_brain::BrainStats,
     /// Selective packet capture on incidents.
     pcap_capture: pcap_capture::PcapCapture,
     /// V10 neural scoring model — replaced by autoencoder (anomaly_engine).
@@ -436,6 +439,8 @@ struct AgentState {
     last_killchain_cleanup: std::time::Instant,
     /// Threat DNA engine — behavioral fingerprinting, anomaly detection, attack chain tracking.
     dna_state: dna_inline::DnaState,
+    /// DDoS Shield engine — rate limiting, SYN tracking, escalation, XDP blocking.
+    shield_state: Option<shield_inline::ShieldState>,
     /// Shared deep security snapshot for dashboard API.
     deep_security_snapshot:
         Option<std::sync::Arc<std::sync::RwLock<dashboard::DeepSecuritySnapshot>>>,
@@ -454,6 +459,9 @@ struct AgentState {
     last_baseline_anomaly_ts: Option<chrono::DateTime<chrono::Utc>>,
     /// Timestamp of last autoencoder anomaly detection (for score fusion with baseline).
     last_autoencoder_anomaly_ts: Option<chrono::DateTime<chrono::Utc>>,
+    /// Latest autoencoder anomaly score (0.0-1.0). Used as signal to boost confidence
+    /// in decisions made by other detectors. Reset each tick.
+    latest_anomaly_score: Option<f32>,
     /// Two-factor authentication state (pending actions, brute force protection).
     two_factor_state: two_factor::TwoFactorState,
     /// Redis stream reader for events (None when redis_url is not configured).
@@ -1040,6 +1048,7 @@ async fn main() -> Result<()> {
             &cli.data_dir.join("defender-brain.json").to_string_lossy(),
         ),
         brain_history: defender_brain::BrainHistory::new(500),
+        brain_stats: defender_brain::BrainStats::load(&cli.data_dir),
         pcap_capture: pcap_capture::PcapCapture::new(&cli.data_dir),
         scoring_engine: scoring::ScoringEngine::new(0.95),
         last_firmware_incident_at: None,
@@ -1055,6 +1064,15 @@ async fn main() -> Result<()> {
             cfg.dna.anomaly_threshold,
             cfg.dna.session_timeout_secs,
         ),
+        shield_state: if cfg.shield.enabled {
+            Some(shield_inline::ShieldState::new(
+                &cli.data_dir.join("shield"),
+                &cfg.shield.bpf_path,
+                cfg.shield.dry_run,
+            ))
+        } else {
+            None
+        },
         last_dna_save: std::time::Instant::now(),
         deep_security_snapshot: Some(deep_security_snapshot.clone()),
         operator_ips: std::collections::HashMap::new(),
@@ -1063,6 +1081,7 @@ async fn main() -> Result<()> {
         threat_feed: None, // initialized below if configured
         last_baseline_anomaly_ts: None,
         last_autoencoder_anomaly_ts: None,
+        latest_anomaly_score: None,
         two_factor_state: two_factor::TwoFactorState::new(),
         #[cfg(feature = "redis-reader")]
         redis_reader: None,
@@ -2860,6 +2879,13 @@ async fn process_narrative_tick(
         }
     }
 
+    // Feed events through DDoS shield (rate limiting, SYN tracking, escalation).
+    if let Some(ref mut shield) = state.shield_state {
+        let (_drops, shield_incidents) = shield_inline::process_events(shield, &events_entries);
+        shield_inline::write_incidents(data_dir, &shield_incidents);
+        shield_inline::notify_telegram(&state.telegram_client, &shield_incidents);
+    }
+
     narrative_anomaly::process_anomalies(data_dir, &today, &events_entries, state);
 
     narrative_incident_ingest::ingest_new_incidents(data_dir, &today, state)?;
@@ -3085,6 +3111,7 @@ mod tests {
             playbook_engine: playbook::PlaybookEngine::new(std::path::Path::new("/nonexistent")),
             defender_brain: defender_brain::DefenderBrain::new(),
             brain_history: defender_brain::BrainHistory::new(100),
+            brain_stats: defender_brain::BrainStats::default(),
             pcap_capture: pcap_capture::PcapCapture::new(data_dir),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,
@@ -3099,6 +3126,7 @@ mod tests {
                 300,
             ),
             last_dna_save: std::time::Instant::now(),
+            shield_state: None,
             deep_security_snapshot: None,
             operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
@@ -3106,6 +3134,7 @@ mod tests {
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
+            latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,
@@ -3359,6 +3388,7 @@ mod tests {
             playbook_engine: playbook::PlaybookEngine::new(std::path::Path::new("/nonexistent")),
             defender_brain: defender_brain::DefenderBrain::new(),
             brain_history: defender_brain::BrainHistory::new(100),
+            brain_stats: defender_brain::BrainStats::default(),
             pcap_capture: pcap_capture::PcapCapture::new(dir.path()),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,
@@ -3373,6 +3403,7 @@ mod tests {
                 300,
             ),
             last_dna_save: std::time::Instant::now(),
+            shield_state: None,
             deep_security_snapshot: None,
             operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
@@ -3380,6 +3411,7 @@ mod tests {
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
+            latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,
@@ -3528,6 +3560,7 @@ mod tests {
             playbook_engine: playbook::PlaybookEngine::new(std::path::Path::new("/nonexistent")),
             defender_brain: defender_brain::DefenderBrain::new(),
             brain_history: defender_brain::BrainHistory::new(100),
+            brain_stats: defender_brain::BrainStats::default(),
             pcap_capture: pcap_capture::PcapCapture::new(dir.path()),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,
@@ -3542,6 +3575,7 @@ mod tests {
                 300,
             ),
             last_dna_save: std::time::Instant::now(),
+            shield_state: None,
             deep_security_snapshot: None,
             operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
@@ -3549,6 +3583,7 @@ mod tests {
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
+            latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,
@@ -3672,6 +3707,7 @@ mod tests {
             playbook_engine: playbook::PlaybookEngine::new(std::path::Path::new("/nonexistent")),
             defender_brain: defender_brain::DefenderBrain::new(),
             brain_history: defender_brain::BrainHistory::new(100),
+            brain_stats: defender_brain::BrainStats::default(),
             pcap_capture: pcap_capture::PcapCapture::new(dir.path()),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,
@@ -3686,6 +3722,7 @@ mod tests {
                 300,
             ),
             last_dna_save: std::time::Instant::now(),
+            shield_state: None,
             deep_security_snapshot: None,
             operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
@@ -3693,6 +3730,7 @@ mod tests {
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
+            latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,
@@ -3828,6 +3866,7 @@ mod tests {
             playbook_engine: playbook::PlaybookEngine::new(std::path::Path::new("/nonexistent")),
             defender_brain: defender_brain::DefenderBrain::new(),
             brain_history: defender_brain::BrainHistory::new(100),
+            brain_stats: defender_brain::BrainStats::default(),
             pcap_capture: pcap_capture::PcapCapture::new(dir.path()),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,
@@ -3842,6 +3881,7 @@ mod tests {
                 300,
             ),
             last_dna_save: std::time::Instant::now(),
+            shield_state: None,
             deep_security_snapshot: None,
             operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
@@ -3849,6 +3889,7 @@ mod tests {
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
+            latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,
@@ -3961,6 +4002,7 @@ mod tests {
             playbook_engine: playbook::PlaybookEngine::new(std::path::Path::new("/nonexistent")),
             defender_brain: defender_brain::DefenderBrain::new(),
             brain_history: defender_brain::BrainHistory::new(100),
+            brain_stats: defender_brain::BrainStats::default(),
             pcap_capture: pcap_capture::PcapCapture::new(dir.path()),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,
@@ -3975,6 +4017,7 @@ mod tests {
                 300,
             ),
             last_dna_save: std::time::Instant::now(),
+            shield_state: None,
             deep_security_snapshot: None,
             operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
@@ -3982,6 +4025,7 @@ mod tests {
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
+            latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,
@@ -4106,6 +4150,7 @@ mod tests {
             playbook_engine: playbook::PlaybookEngine::new(std::path::Path::new("/nonexistent")),
             defender_brain: defender_brain::DefenderBrain::new(),
             brain_history: defender_brain::BrainHistory::new(100),
+            brain_stats: defender_brain::BrainStats::default(),
             pcap_capture: pcap_capture::PcapCapture::new(dir.path()),
             scoring_engine: scoring::ScoringEngine::new(0.95),
             last_firmware_incident_at: None,
@@ -4120,6 +4165,7 @@ mod tests {
                 300,
             ),
             last_dna_save: std::time::Instant::now(),
+            shield_state: None,
             deep_security_snapshot: None,
             operator_ips: std::collections::HashMap::new(),
             last_operator_refresh: std::time::Instant::now(),
@@ -4127,6 +4173,7 @@ mod tests {
             threat_feed: None,
             last_baseline_anomaly_ts: None,
             last_autoencoder_anomaly_ts: None,
+            latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
             #[cfg(feature = "redis-reader")]
             redis_reader: None,

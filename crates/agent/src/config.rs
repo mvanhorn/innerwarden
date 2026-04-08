@@ -62,6 +62,9 @@ pub struct AgentConfig {
     /// Threat DNA behavioral fingerprinting (innerwarden-dna)
     #[serde(default)]
     pub dna: DnaConfig,
+    /// DDoS Shield — rate limiting, SYN tracking, escalation (innerwarden-shield)
+    #[serde(default)]
+    pub shield: ShieldConfig,
     /// Security settings (2FA, etc.)
     #[serde(default)]
     pub security: Option<SecurityConfig>,
@@ -256,6 +259,37 @@ fn default_dna_anomaly_threshold() -> f64 {
 }
 fn default_dna_session_timeout() -> i64 {
     300
+}
+
+/// DDoS Shield — inline rate limiting, SYN tracking, auto-escalation.
+#[derive(Debug, Deserialize)]
+pub struct ShieldConfig {
+    /// Enable inline shield processing. Default: true.
+    #[serde(default = "default_shield_enabled")]
+    pub enabled: bool,
+    /// BPF pin path for XDP maps. Default: /sys/fs/bpf/innerwarden.
+    #[serde(default = "default_shield_bpf_path")]
+    pub bpf_path: String,
+    /// Dry-run mode: skip actual bpftool calls. Default: false.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+impl Default for ShieldConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bpf_path: default_shield_bpf_path(),
+            dry_run: false,
+        }
+    }
+}
+
+fn default_shield_enabled() -> bool {
+    true
+}
+fn default_shield_bpf_path() -> String {
+    "/sys/fs/bpf/innerwarden".to_string()
 }
 
 /// Mesh network config - mirrors innerwarden_mesh::MeshConfig

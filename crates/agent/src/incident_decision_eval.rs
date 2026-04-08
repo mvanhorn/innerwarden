@@ -41,6 +41,30 @@ pub(crate) fn apply_correlation_boost_and_log_decision(
         );
     }
 
+    // Autoencoder signal boost: if the neural model also flagged unusual activity
+    // in this time window, boost confidence by up to 10%.
+    // This makes the autoencoder a "silent intuition" that reinforces real detections.
+    if let Some(anomaly_score) = state.latest_anomaly_score.take() {
+        if anomaly_score > 0.7 {
+            let boost = (anomaly_score - 0.7) * 0.33; // 0.7→0%, 1.0→10%
+            let new_conf = (decision.confidence + boost).min(1.0);
+            if new_conf > decision.confidence {
+                info!(
+                    incident_id = %incident.incident_id,
+                    anomaly_score = format!("{:.3}", anomaly_score),
+                    boost = format!("{:.3}", boost),
+                    "autoencoder signal: neural model agrees — confidence boosted"
+                );
+                decision.confidence = new_conf;
+                decision.reason = format!(
+                    "{} [neural: {:.0}% anomaly]",
+                    decision.reason,
+                    anomaly_score * 100.0
+                );
+            }
+        }
+    }
+
     info!(
         incident_id = %incident.incident_id,
         action = ?decision.action,
@@ -89,6 +113,7 @@ pub(crate) fn apply_correlation_boost_and_log_decision(
                 ai_confidence: decision.confidence,
                 agreed: brain_agrees,
                 feedback: None,
+                features: features.to_vec(),
             };
 
             // Persist to file for dashboard access
@@ -99,9 +124,9 @@ pub(crate) fn apply_correlation_boost_and_log_decision(
                 .unwrap_or_default();
             if let Ok(v) = serde_json::to_value(&log_entry) {
                 entries.push(v);
-                // Keep last 500 entries
-                if entries.len() > 500 {
-                    entries.drain(0..entries.len() - 500);
+                // Keep last 10000 entries (includes features for training)
+                if entries.len() > 10000 {
+                    entries.drain(0..entries.len() - 10000);
                 }
                 if let Err(e) = std::fs::write(
                     &log_path,
@@ -111,9 +136,16 @@ pub(crate) fn apply_correlation_boost_and_log_decision(
                 }
             }
 
+            // Track agreement for brain evolution stats
+            let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            state.brain_stats.record(brain_agrees, &today);
+
             state.brain_history.record(log_entry);
         }
     }
+
+    // Persist brain stats every call (lightweight — just a small JSON)
+    state.brain_stats.save(data_dir);
 }
 
 /// Build 72-dim feature vector for the defender brain from incident + agent state.

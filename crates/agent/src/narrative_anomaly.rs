@@ -2,93 +2,35 @@ use tracing::info;
 
 use crate::AgentState;
 
-/// Friendly event kind for user-facing messages.
-fn friendly_event_kind(kind: &str) -> &str {
-    match kind {
-        "http.request" => "HTTP traffic",
-        "dns.query" => "DNS activity",
-        "ssh.login_failed" => "SSH login attempts",
-        "shell.command_exec" => "command execution",
-        "file.read_access" => "file access",
-        "file.write" => "file modification",
-        "process.exec" => "process execution",
-        "network.connect" => "network connections",
-        "suricata.alert" => "network traffic",
-        _ => kind,
-    }
-}
-
-/// Process autoencoder anomalies and baseline+autoencoder fused incidents.
+/// Process autoencoder observations and baseline+autoencoder fused incidents.
+///
+/// The autoencoder acts as a SIGNAL, not a standalone detector.
+/// It observes events silently and stores the latest anomaly score in state.
+/// Other detectors can use this score to boost confidence in their decisions.
+/// Only the baseline+autoencoder FUSION generates incidents (two independent
+/// detection systems agreeing = high confidence).
 pub(crate) fn process_anomalies(
     _data_dir: &std::path::Path,
     _today: &str,
     events_entries: &[innerwarden_core::event::Event],
     state: &mut AgentState,
 ) {
-    // ── Autoencoder anomaly detection ────────────────────────────────────
+    // ── Autoencoder observation (silent — no incidents) ──────────────────
     for ev in events_entries {
-        if let Some((score, weighted)) = state.anomaly_engine.observe(ev) {
+        // Feed every event to the autoencoder; it updates its sliding window
+        // and returns a score only when the window is full and score > threshold.
+        if let Some((score, _weighted)) = state.anomaly_engine.observe(ev) {
             state.last_autoencoder_anomaly_ts = Some(chrono::Utc::now());
+            // Store the latest high score for enrichment by other detectors.
+            // This is read by the AI decision pipeline to boost confidence.
+            state.latest_anomaly_score = Some(score);
+
             info!(
                 score = format!("{:.3}", score),
-                weighted = format!("{:.3}", weighted),
                 maturity = format!("{:.2}", state.anomaly_engine.maturity),
                 kind = %ev.kind,
-                "autoencoder anomaly detected"
+                "autoencoder signal (silent — enrichment only)"
             );
-
-            let pct = (score * 100.0) as u32;
-            let cycles = state.anomaly_engine.training_cycles;
-            let friendly_kind = friendly_event_kind(&ev.kind);
-
-            let severity = if score > 0.9 {
-                innerwarden_core::event::Severity::Critical
-            } else if score > 0.8 {
-                innerwarden_core::event::Severity::High
-            } else {
-                innerwarden_core::event::Severity::Medium
-            };
-
-            let title = if score > 0.9 {
-                format!("AI Spider Sense: highly unusual {friendly_kind} — {pct}% anomaly")
-            } else if score > 0.8 {
-                format!("AI Spider Sense: unusual {friendly_kind} pattern — {pct}% anomaly")
-            } else {
-                format!("AI Spider Sense: {friendly_kind} anomaly detected — {pct}%")
-            };
-
-            let summary = format!(
-                "InnerWarden's AI analyzed this against {cycles} days of learned behavior \
-                 for your server. This {friendly_kind} pattern is unlike anything seen before — \
-                 no rule covers this, only the neural model caught it."
-            );
-
-            let incident = innerwarden_core::incident::Incident {
-                ts: ev.ts,
-                host: ev.host.clone(),
-                incident_id: format!("neural_anomaly:{}:{}", pct, ev.ts.format("%Y-%m-%dT%H:%MZ")),
-                severity,
-                title,
-                summary,
-                evidence: serde_json::json!({
-                    "score": score,
-                    "weighted": weighted,
-                    "maturity": state.anomaly_engine.maturity,
-                    "training_cycles": cycles,
-                    "model": "autoencoder-48f",
-                    "trigger_event": ev.kind,
-                }),
-                recommended_checks: vec![
-                    "Review recent events around this timeframe".to_string(),
-                    "Check if rule-based detectors also flagged this".to_string(),
-                    "Compare with baseline event rates for anomalies".to_string(),
-                ],
-                tags: vec!["neural_model".to_string(), "autoencoder".to_string()],
-                entities: ev.entities.clone(),
-            };
-
-            // Push to agent buffer — avoids permission issues with sensor's file.
-            state.neural_incidents.push(incident);
         }
     }
 

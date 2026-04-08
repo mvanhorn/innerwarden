@@ -10,6 +10,7 @@ members = [
   "crates/hypervisor",
   "crates/killchain",
   "crates/dna",
+  "crates/shield",
 ]
 exclude = ["crates/sensor-ebpf"]
 # crates/sensor-ebpf compiles to bpfel-unknown-none target (separate build)

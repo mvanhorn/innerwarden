@@ -69,6 +69,104 @@ pub struct BrainLogEntry {
     pub agreed: bool,
     /// Operator feedback: None = unreviewed, true = correct, false = FP.
     pub feedback: Option<bool>,
+    /// The 72-dim feature vector used for this decision (for offline training).
+    pub features: Vec<f32>,
+}
+
+/// Persistent brain evolution stats (saved to brain-stats.json).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BrainStats {
+    /// Total decisions observed since last retrain.
+    pub total_since_retrain: u64,
+    /// Agreements since last retrain.
+    pub agreed_since_retrain: u64,
+    /// Rolling 7-day agreement percentages (one per day, last 56 days = 8 weeks).
+    pub daily_agreement: std::collections::VecDeque<(String, f32)>, // (date, pct)
+    /// Last retrain timestamp.
+    pub last_retrain: Option<String>,
+    /// Last retrain accuracy.
+    pub last_retrain_accuracy: Option<f32>,
+    /// Last retrain data points used.
+    pub last_retrain_entries: Option<u64>,
+    /// Current day's counters.
+    pub today_date: String,
+    pub today_agreed: u64,
+    pub today_total: u64,
+}
+
+impl Default for BrainStats {
+    fn default() -> Self {
+        Self {
+            total_since_retrain: 0,
+            agreed_since_retrain: 0,
+            daily_agreement: std::collections::VecDeque::new(),
+            last_retrain: None,
+            last_retrain_accuracy: None,
+            last_retrain_entries: None,
+            today_date: String::new(),
+            today_agreed: 0,
+            today_total: 0,
+        }
+    }
+}
+
+impl BrainStats {
+    pub fn load(data_dir: &std::path::Path) -> Self {
+        let path = data_dir.join("brain-stats.json");
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, data_dir: &std::path::Path) {
+        let path = data_dir.join("brain-stats.json");
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(&path, json);
+        }
+    }
+
+    /// Record a brain vs AI comparison.
+    pub fn record(&mut self, agreed: bool, today: &str) {
+        // Roll over day
+        if self.today_date != today {
+            if !self.today_date.is_empty() && self.today_total > 0 {
+                let pct = self.today_agreed as f32 / self.today_total as f32 * 100.0;
+                self.daily_agreement
+                    .push_back((self.today_date.clone(), pct));
+                // Keep 56 days (8 weeks)
+                while self.daily_agreement.len() > 56 {
+                    self.daily_agreement.pop_front();
+                }
+            }
+            self.today_date = today.to_string();
+            self.today_agreed = 0;
+            self.today_total = 0;
+        }
+
+        self.today_total += 1;
+        self.total_since_retrain += 1;
+        if agreed {
+            self.today_agreed += 1;
+            self.agreed_since_retrain += 1;
+        }
+    }
+
+    /// Current agreement percentage.
+    pub fn agreement_pct(&self) -> f32 {
+        if self.total_since_retrain == 0 {
+            return 0.0;
+        }
+        self.agreed_since_retrain as f32 / self.total_since_retrain as f32 * 100.0
+    }
+
+    /// Weekly trend (last 8 weeks, averaged per week).
+    pub fn weekly_trend(&self) -> Vec<f32> {
+        let days: Vec<f32> = self.daily_agreement.iter().map(|(_, pct)| *pct).collect();
+        days.chunks(7)
+            .map(|week| week.iter().sum::<f32>() / week.len() as f32)
+            .collect()
+    }
 }
 
 /// History of brain suggestions (ring buffer, last N).

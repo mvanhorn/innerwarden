@@ -21,6 +21,7 @@ innerwarden-smm = { path = "../smm" }
 innerwarden-hypervisor = { path = "../hypervisor" }
 innerwarden-killchain = { path = "../killchain" }
 innerwarden-dna = { path = "../dna" }
+innerwarden-shield = { path = "../shield" }
 anyhow = "1"
 dotenvy = "0.15"
 chrono = { version = "0.4", features = ["serde"] }
