@@ -138,7 +138,7 @@ pub(crate) fn process_events(
 
     // Escalation tick (every 5 ticks = 10s at 2s poll)
     shield.tick_counter += 1;
-    if shield.tick_counter % 5 == 0 {
+    if shield.tick_counter.is_multiple_of(5) {
         let syn_flagged = shield.syn_detector.get_flagged_ips();
         let rl_metrics = shield.rate_limiter.get_metrics();
 
@@ -200,7 +200,7 @@ pub(crate) fn process_events(
         }
 
         // Persist state every 30s (every 6 escalation ticks = 30 main ticks)
-        if shield.tick_counter % 30 == 0 {
+        if shield.tick_counter.is_multiple_of(30) {
             let state = innerwarden_shield::store::ShieldState {
                 escalation_state: shield.escalation.state(),
                 state_entered_at: shield.escalation.state_entered_at().to_rfc3339(),

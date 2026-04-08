@@ -74,7 +74,7 @@ pub struct BrainLogEntry {
 }
 
 /// Persistent brain evolution stats (saved to brain-stats.json).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct BrainStats {
     /// Total decisions observed since last retrain.
     pub total_since_retrain: u64,
@@ -92,22 +92,6 @@ pub struct BrainStats {
     pub today_date: String,
     pub today_agreed: u64,
     pub today_total: u64,
-}
-
-impl Default for BrainStats {
-    fn default() -> Self {
-        Self {
-            total_since_retrain: 0,
-            agreed_since_retrain: 0,
-            daily_agreement: std::collections::VecDeque::new(),
-            last_retrain: None,
-            last_retrain_accuracy: None,
-            last_retrain_entries: None,
-            today_date: String::new(),
-            today_agreed: 0,
-            today_total: 0,
-        }
-    }
 }
 
 impl BrainStats {
