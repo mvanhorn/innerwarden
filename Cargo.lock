@@ -1620,7 +1620,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-agent"
-version = "0.9.4"
+version = "0.10.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1667,7 +1667,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-agent-guard"
-version = "0.9.4"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1685,7 +1685,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-ctl"
-version = "0.9.4"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1709,7 +1709,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-dna"
-version = "0.9.4"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1729,14 +1729,14 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-ebpf-types"
-version = "0.9.4"
+version = "0.10.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "innerwarden-hypervisor"
-version = "0.9.4"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1750,7 +1750,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-killchain"
-version = "0.9.4"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1786,7 +1786,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-sensor"
-version = "0.9.4"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "aya",
@@ -1815,7 +1815,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-shield"
-version = "0.9.4"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1833,7 +1833,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden-smm"
-version = "0.9.4"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1848,7 +1848,7 @@ dependencies = [
 
 [[package]]
 name = "innerwarden_core"
-version = "0.9.4"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "chrono",

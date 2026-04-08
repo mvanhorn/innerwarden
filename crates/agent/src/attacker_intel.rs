@@ -68,6 +68,11 @@ pub struct AttackerProfile {
     // ── Behavioral DNA ──
     pub dna: AttackerDna,
 
+    // ── Shield / DDoS intel ──
+    pub shield_blocks: u32,
+    pub shield_escalation_hits: u32,
+    pub shield_last_blocked: Option<DateTime<Utc>>,
+
     // ── Mesh intel ──
     pub mesh_peer_confirmations: u32,
     pub mesh_signals_received: u32,
@@ -171,6 +176,9 @@ pub fn new_profile(ip: &str, ts: DateTime<Utc>) -> AttackerProfile {
             inter_visit_intervals: Vec::new(),
             pattern_class: "unknown".to_string(),
         },
+        shield_blocks: 0,
+        shield_escalation_hits: 0,
+        shield_last_blocked: None,
         mesh_peer_confirmations: 0,
         mesh_signals_received: 0,
         risk_score: 0,
@@ -456,7 +464,20 @@ pub fn compute_risk_score(profile: &mut AttackerProfile) {
         score += 5;
     }
 
+    // Shield DDoS involvement (+5 per block, max 10)
+    score += (profile.shield_blocks * 5).min(10);
+
     profile.risk_score = score.min(100) as u8;
+}
+
+/// Record a shield rate-limit block for this IP.
+pub fn observe_shield_block(profile: &mut AttackerProfile, reason: &str) {
+    profile.shield_blocks += 1;
+    profile.shield_last_blocked = Some(Utc::now());
+    if reason.contains("escalation") {
+        profile.shield_escalation_hits += 1;
+    }
+    profile.updated_at = Utc::now();
 }
 
 /// The consolidation tick: called from the slow loop every 5 minutes.

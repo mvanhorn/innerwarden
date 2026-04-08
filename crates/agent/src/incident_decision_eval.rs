@@ -41,6 +41,42 @@ pub(crate) fn apply_correlation_boost_and_log_decision(
         );
     }
 
+    // Attacker intel risk score boost: if this IP has a known risk profile,
+    // enrich the decision with context and boost confidence for repeat offenders.
+    {
+        let ip = incident
+            .entities
+            .iter()
+            .find(|e| e.r#type == innerwarden_core::entities::EntityType::Ip)
+            .map(|e| e.value.as_str());
+        if let Some(ip) = ip {
+            if let Some(profile) = state.attacker_profiles.get(ip) {
+                let risk = profile.risk_score;
+                if risk > 50 {
+                    let boost = (risk as f32 - 50.0) / 500.0; // 50→0%, 100→10%
+                    let new_conf = (decision.confidence + boost).min(1.0);
+                    if new_conf > decision.confidence {
+                        let pattern = &profile.dna.pattern_class;
+                        info!(
+                            incident_id = %incident.incident_id,
+                            ip,
+                            risk_score = risk,
+                            pattern = pattern.as_str(),
+                            visits = profile.visit_count,
+                            boost = format!("{:.3}", boost),
+                            "attacker intel: known threat — confidence boosted"
+                        );
+                        decision.confidence = new_conf;
+                        decision.reason = format!(
+                            "{} [intel: risk {}, {}, {} visits]",
+                            decision.reason, risk, pattern, profile.visit_count
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // Autoencoder signal boost: if the neural model also flagged unusual activity
     // in this time window, boost confidence by up to 10%.
     // This makes the autoencoder a "silent intuition" that reinforces real detections.

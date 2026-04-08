@@ -34,14 +34,16 @@ make check        # clippy + fmt
 make replay-qa    # validacao E2E
 ```
 
-## Estado (2026-04-04)
+## Estado (2026-04-08)
 
-- 49 detectors, 40 eBPF hooks, 65 MITRE IDs, 43 correlation rules (CL-001 to CL-043, includes 5 AlphaZero V4 discoveries + 3 hypervisor rules)
+- 49 detectors, 40 eBPF hooks, 65 MITRE IDs, 47 correlation rules (CL-001 to CL-047, includes 5 AlphaZero V4 discoveries + 3 hypervisor rules + 3 cross-module integration rules)
+- 2357 tests passing
 - Server producao: ver config local (nao expor no repo publico)
 - Branches: main = stable, develop = bleeding edge
 - CI: `make check` + `make test` + `make spec-check`
 - Licenca: Apache-2.0 (migrado de BUSL-1.1 em 2026-04-03)
-- Release atual: v0.9.2
+- Release atual: v0.10.0
+- CTL reestruturado: 8 grupos (get, stream, action, trust, config, system, module, agent)
 
 ## Convencoes
 

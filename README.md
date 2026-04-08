@@ -22,8 +22,8 @@ Installs in 10 seconds. Starts in observe-only mode. Dry-run by default. You dec
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange)
 ![eBPF Hooks](https://img.shields.io/badge/eBPF%20hooks-40-blueviolet)
 ![Detectors](https://img.shields.io/badge/detectors-49-blue)
-![Correlation Rules](https://img.shields.io/badge/correlation%20rules-40-purple)
-![Tests](https://img.shields.io/badge/tests-1482-brightgreen)
+![Correlation Rules](https://img.shields.io/badge/correlation%20rules-47-purple)
+![Tests](https://img.shields.io/badge/tests-2357-brightgreen)
 ![MITRE Coverage](https://img.shields.io/badge/MITRE%20ATT%26CK-65%20mappings-red)
 ![Sigma Rules](https://img.shields.io/badge/Sigma%20rules-208-blueviolet)
 ![Memory](https://img.shields.io/badge/memory-~150MB%20(full%20stack)-green)
@@ -52,7 +52,7 @@ Installs in 10 seconds. Starts in observe-only mode. Dry-run by default. You dec
 | Memory footprint | ~150 MB | ~60 MB | ~500 MB+ | ~50 MB |
 | License | Apache-2.0 | Apache-2.0 | GPL | AGPL |
 
-40 eBPF kernel hooks. 49 detectors. 22 collectors. 40 cross-layer correlation rules. 65 MITRE ATT&CK techniques (40% validated via Caldera). 208 Sigma community rules. Autoencoder anomaly detection. Behavioral DNA attacker fingerprinting. JA3/JA4 TLS fingerprinting. YARA + Sigma rule engines. 20 automated playbooks. Monthly threat reports. Mesh collaborative defense. No cloud. No dependencies. Just two Rust daemons and a CLI.
+40 eBPF kernel hooks. 49 detectors. 22 collectors. 47 cross-layer correlation rules. 65 MITRE ATT&CK techniques (40% validated via Caldera). 208 Sigma community rules. Autoencoder anomaly detection. Behavioral DNA attacker fingerprinting. JA3/JA4 TLS fingerprinting. YARA + Sigma rule engines. 20 automated playbooks. Monthly threat reports. Mesh collaborative defense. No cloud. No dependencies. Just two Rust daemons and a CLI.
 
 <p align="center">
   <a href="https://innerwarden.com/live">
@@ -138,7 +138,7 @@ Solo developer. Apache-2.0. If this project helps protect your servers, [give it
 │       └───────────┴───────────────┴─────────────┘                 │
 │                          │                                        │
 │                    ┌─────▼──────┐                                 │
-│                    │48 detectors│ + 8 YARA + 8 Sigma              │
+│                    │49 detectors│ + 8 YARA + 8 Sigma              │
 │                    │ stateful   │                                 │
 │                    └─────┬──────┘                                 │
 │                          │                                        │
@@ -152,7 +152,7 @@ Solo developer. Apache-2.0. If this project helps protect your servers, [give it
 │                   AGENT  │                                        │
 │                          ▼                                        │
 │     ┌──────────────────────────────────────────────┐              │
-│     │  40 Cross-Layer Correlation Rules            │              │
+│     │  47 Cross-Layer Correlation Rules            │              │
 │     │  + Kill Chain Tracker (7 stages per entity)  │              │
 │     └────────────────────┬─────────────────────────┘              │
 │                          ▼                                        │
@@ -198,12 +198,12 @@ Solo developer. Apache-2.0. If this project helps protect your servers, [give it
 ## What it does
 
 1. **Watches**: 20+ collectors across all layers — eBPF syscall tracing (40 kernel hooks including timestomp and log truncation), firmware integrity (ESP, UEFI, ACPI, MSR, SPI), memory forensics (/proc/maps RWX detection), native network capture (DNS queries, HTTP requests, JA3/JA4 TLS fingerprinting — no Suricata needed), filesystem real-time monitoring, cgroup resource abuse, kernel integrity (syscall table + eBPF inventory), plus auth.log, journald, Docker, nginx, osquery, CloudTrail
-2. **Detects**: 48 stateful detectors + 8 YARA malware rules + 8 Sigma log rules identify brute-force, credential stuffing, port scans, C2 callbacks, privilege escalation, container escapes, reverse shells (eBPF syscall sequence — impossible to evade), ransomware (entropy analysis), rootkits, DNS tunneling, data exfiltration (sensitive file read → outbound connect by PID), timestomping, log tampering, discovery bursts, and more. **65 MITRE ATT&CK techniques covered** across 14 tactics.
-3. **Correlates**: 40 cross-layer rules connect Firmware × Kernel × Userspace × Network × Honeypot events. Detects multi-stage attacks no single detector can see: firmware tampering → rootkit install, recon → brute force → data exfil, honeypot engagement → real attack on same IP. Kill chain tracker follows 7 attack stages per entity (IP, user, container).
+2. **Detects**: 49 stateful detectors + 8 YARA malware rules + 8 Sigma log rules identify brute-force, credential stuffing, port scans, C2 callbacks, privilege escalation, container escapes, reverse shells (eBPF syscall sequence — impossible to evade), ransomware (entropy analysis), rootkits, DNS tunneling, data exfiltration (sensitive file read → outbound connect by PID), timestomping, log tampering, discovery bursts, and more. **65 MITRE ATT&CK techniques covered** across 14 tactics.
+3. **Correlates**: 47 cross-layer rules connect Firmware × Kernel × Userspace × Network × Honeypot events. Baseline anomalies, neural scores, and DDoS shield state all feed the correlation engine. Detects multi-stage attacks no single detector can see: firmware tampering → rootkit install, recon → brute force → data exfil, honeypot engagement → real attack on same IP. Kill chain tracker follows 7 attack stages per entity (IP, user, container).
 4. **Learns**: baseline anomaly detection trains for 7 days then alerts on deviations — event rate drops (silence = compromise), new process lineages (nginx→sh), unusual login times, unknown network destinations. No rules needed.
 5. **Blocks at the kernel**: LSM enforcement stops reverse shells and /tmp execution before they run. XDP drops attack traffic at wire speed. 8 kill chain patterns detected and blocked without signatures. Blocks propagate to mesh peers.
 6. **Responds automatically**: 20 built-in playbooks covering every detector — ransomware, reverse shell, data exfil, malware, privilege escalation, kernel module load, process injection, persistence (SSH key, crontab, systemd), container escape, crypto miner, DNS tunneling, lateral movement, web shell, discovery burst, and more. Response sequences: kill process, block IP, suspend sudo, quarantine file, isolate network, capture forensics, pcap, notify, escalate
-7. **Fingerprints attackers**: behavioral DNA (SHA-256 of detectors + tools + targets + timing patterns), campaign detection via IOC clustering, recurrence tracking, risk scoring 0-100, monthly threat reports with MITRE heatmap
+7. **Fingerprints attackers**: behavioral DNA (SHA-256 of detectors + tools + targets + timing patterns), **cross-IP tracking** (same attacker detected across VPN/Tor rotations via fuzzy DNA matching — risk score and detector knowledge inherited automatically), campaign detection via IOC clustering, recurrence tracking, risk scoring 0-100, monthly threat reports with MITRE heatmap
 
 Everything is local, audited, and reversible.
 
@@ -254,7 +254,7 @@ Blocking is **layered**: a single block decision triggers XDP (instant kernel dr
 
 ## What it detects
 
-48 stateful detectors + 8 YARA rules + 8 Sigma rules covering the full attack lifecycle. Highlights:
+49 stateful detectors + 8 YARA rules + 8 Sigma rules covering the full attack lifecycle. Highlights:
 
 | Detector | Threat | MITRE |
 |----------|--------|-------|
@@ -316,13 +316,13 @@ Plus: `docker_anomaly`, `osquery_anomaly`, `suricata_alert`, `search_abuse`, `cr
 **Mesh network**: collaborative defense between nodes. Attack one server, all others block the IP automatically. Ed25519 signed signals, game-theory trust model (tit-for-tat), staging pool with TTL-based auto-reversal. No signal causes immediate action. Everything is scored and staged.
 
 ```bash
-innerwarden mesh enable
-innerwarden mesh add-peer https://peer-server:8790
+innerwarden config mesh enable
+innerwarden config mesh add-peer https://peer-server:8790
 ```
 
 Container-aware via cgroup ID. Zero performance overhead.
 
-**Agent**: reads incidents from JSONL or Redis Streams. Fast loop (2s): algorithm gate → enrichment (AbuseIPDB, GeoIP, CrowdSec, threat feeds) → VirusTotal hash check on YARA matches → AI triage → playbook evaluation → skill execution → pcap capture on High/Critical → audit trail. Slow loop (30s): cross-layer correlation (40 rules) → baseline learning → attacker intelligence consolidation (DNA + campaigns) → monthly report generation → narrative summary.
+**Agent**: reads incidents from JSONL or Redis Streams. Fast loop (2s): algorithm gate → enrichment (AbuseIPDB, GeoIP, CrowdSec, threat feeds) → VirusTotal hash check on YARA matches → AI triage → playbook evaluation → skill execution → pcap capture on High/Critical → audit trail. Slow loop (30s): cross-layer correlation (47 rules) → baseline learning → attacker intelligence consolidation (DNA + campaigns) → monthly report generation → narrative summary.
 
 Two Rust daemons. No external dependencies. ~150 MB RAM with all features active (sensor 32MB + agent 89MB + DNA 11MB + shield 9MB + killchain 7MB). Dashboard with 10 views: Sensors HUD, Threats investigation, Report, Health, Honeypot, Compliance (ISO 27001), Intelligence (Profiles, Campaigns, Chains, Baseline, Playbooks), Monthly Report. Live SSE feed, MITRE ATT&CK mapping, 20 integration cards. Sleeps after 15 min of inactivity.
 
@@ -375,16 +375,16 @@ Before enabling automatic responses, run Inner Warden in observe-only mode for a
 2. **Check for false positives**: make sure legitimate traffic (CI/CD systems, monitoring probes, your own scripts) is not being misidentified.
 3. **Configure your allowlist**: add trusted IPs and users so they are never acted upon:
    ```bash
-   innerwarden allowlist add --ip 10.0.0.0/8
-   innerwarden allowlist add --user deploy
+   innerwarden trust add --ip 10.0.0.0/8
+   innerwarden trust add --user deploy
    ```
 4. **Enable dry-run first**: when you enable the responder, keep `dry_run = true` so you can see what *would* happen without any actual effect:
    ```bash
-   innerwarden configure responder --enable
+   innerwarden config responder --enable
    ```
 5. **Go live only when you trust what you see**:
    ```bash
-   innerwarden configure responder --enable --dry-run false
+   innerwarden config responder --enable --dry-run false
    ```
 
 There is no rush. The system is designed to be useful in observe-only mode indefinitely.
@@ -471,7 +471,7 @@ See [AI Agent Protection docs](modules/openclaw-protection/docs/README.md) for f
 Scan your system and get actionable security recommendations without changing anything.
 
 ```
-$ innerwarden harden
+$ innerwarden system harden
 
   ✓ SSH
     ⚠  Password authentication is enabled [high]
@@ -528,7 +528,7 @@ curl https://live.innerwarden.com/api/live-feed/stream
 Let your server tell you what it needs.
 
 ```
-$ innerwarden scan
+$ innerwarden system scan
 
   sshd       running  → ssh-protection       ESSENTIAL    [NATIVE]
   docker     running  → container-security    RECOMMENDED  [NATIVE]
@@ -611,40 +611,15 @@ sudo systemctl restart innerwarden-agent          # Linux
 sudo launchctl kickstart -k system/com.innerwarden.agent  # macOS
 ```
 
-Run `innerwarden doctor` to validate your provider.
-
-### Daily mode (simple commands)
-
-For day-to-day operations, use the simplified command group:
-
-```bash
-innerwarden daily status
-innerwarden daily threats --live
-innerwarden daily actions
-innerwarden daily report
-innerwarden daily doctor
-innerwarden daily test
-
-# aliases
-innerwarden quick status
-innerwarden day threats
-```
-
-Agent connection is also available in daily mode and does not require PID:
-
-```bash
-innerwarden daily agent scan
-innerwarden daily agent connect          # auto-detect + choose
-innerwarden daily agent connect 1234     # explicit PID (optional)
-```
+Run `innerwarden system doctor` to validate your provider.
 
 ### After install
 
 ```bash
-innerwarden status     # verify services are running
-innerwarden doctor     # diagnose issues with fix hints
-innerwarden test       # inject a synthetic incident and verify the full pipeline responds
-innerwarden list       # see capabilities and modules
+innerwarden get status        # verify services are running
+innerwarden system doctor     # diagnose issues with fix hints
+innerwarden system test       # inject a synthetic incident and verify the full pipeline responds
+innerwarden list              # see capabilities and modules
 ```
 
 Enable response skills when ready:
@@ -657,11 +632,11 @@ innerwarden enable shell-audit       # shell command trail via auditd
 ### Configure notifications
 
 ```bash
-innerwarden notify telegram          # interactive wizard
-innerwarden notify slack --webhook-url https://hooks.slack.com/...
-innerwarden notify web-push --subject mailto:you@example.com
-innerwarden notify webhook --url https://hooks.example.com/notify
-innerwarden notify test              # verify all channels
+innerwarden config telegram          # interactive wizard
+innerwarden config slack             # Slack webhook setup
+innerwarden config web-push --subject mailto:you@example.com
+innerwarden config webhook --url https://hooks.example.com/notify
+innerwarden config test-alert        # verify all channels
 ```
 
 ### Go live
@@ -669,7 +644,7 @@ innerwarden notify test              # verify all channels
 After enabling skills, the responder is active but still in `dry_run = true`. When you trust the decisions:
 
 ```bash
-innerwarden configure responder --enable --dry-run false
+innerwarden config responder --enable --dry-run false
 ```
 
 ### Updates
@@ -679,28 +654,36 @@ innerwarden upgrade          # fetch + install latest (SHA-256 verified)
 innerwarden upgrade --check  # check without installing
 ```
 
-### Control plane
+### 8 commands to protect your server
 
 ```bash
-innerwarden list                                    # capabilities + modules
-innerwarden status                                  # services + active capabilities
-innerwarden doctor                                  # diagnostics with fix hints
-innerwarden enable block-ip                         # activate
-innerwarden enable block-ip --param backend=iptables
-innerwarden disable block-ip                        # deactivate and clean up
-innerwarden --dry-run enable block-ip               # preview
-innerwarden scan                                    # detect + recommend
-innerwarden harden                                  # security hardening advisor
-innerwarden harden --verbose                        # show all passed checks too
-innerwarden allowlist add --ip 10.0.0.0/8           # skip AI for trusted ranges
-innerwarden allowlist add --user deploy             # skip AI for trusted users
-innerwarden configure ai                            # interactive AI provider setup (12 providers)
-innerwarden configure responder --enable --dry-run false
-innerwarden backup                                  # archive configs to tar.gz
-innerwarden metrics                                 # events, decisions, AI latency, uptime
-innerwarden test                                    # verify full pipeline end-to-end
-innerwarden daily                                   # simplified day-to-day command set
-innerwarden daily agent connect                     # connect running agents without PID lookup
+innerwarden get status                              # services + today's activity
+innerwarden get incidents --days 2                  # recent threats
+innerwarden get decisions --action block_ip          # what was blocked and why
+innerwarden get report                              # daily security report
+
+innerwarden stream                                  # live event stream
+
+innerwarden action block 203.0.113.10               # manual IP block
+innerwarden action unblock 203.0.113.10             # remove block
+
+innerwarden trust add --ip 10.0.0.0/8               # skip AI for trusted ranges
+innerwarden trust add --user deploy                  # skip AI for trusted users
+
+innerwarden config ai                               # interactive AI provider setup (12 providers)
+innerwarden config responder --enable --dry-run false
+innerwarden config telegram                          # notification setup
+innerwarden config cloudflare --token YOUR_TOKEN     # edge blocking
+
+innerwarden system doctor                            # diagnostics with fix hints
+innerwarden system harden                            # security hardening advisor
+innerwarden system scan                              # detect + recommend modules
+innerwarden system test                              # verify full pipeline end-to-end
+innerwarden system backup                            # archive configs to tar.gz
+innerwarden system navigator                         # export MITRE ATT&CK coverage map
+
+innerwarden module install <url>                     # SHA-256 verified community modules
+innerwarden agent connect                            # connect to running agents
 ```
 
 ---

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use innerwarden_dna::anomaly::AnomalyDetector;
 use innerwarden_dna::attack_chain::AttackChainTracker;
@@ -19,6 +19,9 @@ pub(crate) struct DnaState {
     sessions: std::collections::HashMap<String, BehaviorSequence>,
     min_sequence: usize,
     session_timeout_secs: i64,
+    /// Inverted index: fuzzy_hash → list of IPs that exhibited this behavior.
+    /// Used for cross-IP tracking: same attacker, different IP.
+    pub dna_ip_index: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl DnaState {
@@ -36,6 +39,7 @@ impl DnaState {
             sessions: std::collections::HashMap::new(),
             min_sequence,
             session_timeout_secs,
+            dna_ip_index: std::collections::HashMap::new(),
         }
     }
 }
@@ -43,10 +47,16 @@ impl DnaState {
 /// Process sensor events through the DNA engine.
 /// Builds behavioral sequences, fingerprints them, detects anomalies,
 /// and feeds the correlation engine.
+/// `attacker_profiles` is used for cross-IP risk score inheritance when
+/// DNA detects the same attacker on a new IP.
 pub(crate) fn process_events(
     dna: &mut DnaState,
     events: &[innerwarden_core::event::Event],
     correlation_engine: &mut correlation_engine::CorrelationEngine,
+    attacker_profiles: &mut std::collections::HashMap<
+        String,
+        crate::attacker_intel::AttackerProfile,
+    >,
 ) {
     let now = chrono::Utc::now();
 
@@ -112,6 +122,86 @@ pub(crate) fn process_events(
             if session.atoms.len() >= dna.min_sequence {
                 let mut threat_dna = fingerprint::fingerprint(&session);
                 classifier::classify(&mut threat_dna);
+
+                // Cross-IP tracking: check if this behavioral fingerprint
+                // was seen from a different IP (attacker IP rotation).
+                let fuzzy = &threat_dna.fuzzy_hash;
+                let known_ips = dna.dna_ip_index.entry(fuzzy.clone()).or_default();
+
+                if !known_ips.contains(&ip) {
+                    // Check if OTHER IPs had this same behavior
+                    let previous_ips: Vec<String> = known_ips
+                        .iter()
+                        .filter(|prev| *prev != &ip)
+                        .cloned()
+                        .collect();
+
+                    if !previous_ips.is_empty() {
+                        // Inherit risk score from the highest-risk previous IP.
+                        let mut inherited_risk: u8 = 0;
+                        let mut inherited_detectors: Vec<String> = Vec::new();
+                        for prev_ip in &previous_ips {
+                            if let Some(prev_profile) = attacker_profiles.get(prev_ip) {
+                                if prev_profile.risk_score > inherited_risk {
+                                    inherited_risk = prev_profile.risk_score;
+                                }
+                                for d in &prev_profile.detectors_triggered {
+                                    if !inherited_detectors.contains(d) {
+                                        inherited_detectors.push(d.clone());
+                                    }
+                                }
+                            }
+                        }
+
+                        // Apply inheritance to the new IP's profile.
+                        if inherited_risk > 0 {
+                            let new_profile =
+                                attacker_profiles.entry(ip.clone()).or_insert_with(|| {
+                                    crate::attacker_intel::new_profile(&ip, chrono::Utc::now())
+                                });
+                            // Floor: new IP starts at least at the previous risk level.
+                            if new_profile.risk_score < inherited_risk {
+                                new_profile.risk_score = inherited_risk;
+                            }
+                            // Inherit detector knowledge.
+                            for d in &inherited_detectors {
+                                new_profile.detectors_triggered.insert(d.clone());
+                            }
+                            info!(
+                                new_ip = %ip,
+                                inherited_risk,
+                                inherited_detectors = ?inherited_detectors,
+                                "dna: risk score inherited from previous IP"
+                            );
+                        }
+
+                        info!(
+                            new_ip = %ip,
+                            previous_ips = ?previous_ips,
+                            fuzzy_hash = %fuzzy,
+                            "dna: IP rotation detected — same behavioral DNA from different IP"
+                        );
+
+                        // Emit correlation event for cross-IP tracking.
+                        let corr = correlation_engine::CorrelationEngine::dna_event(
+                            "dna.ip_rotation",
+                            serde_json::json!({
+                                "new_ip": ip,
+                                "previous_ips": previous_ips,
+                                "fuzzy_hash": fuzzy,
+                                "atoms_count": session.atoms.len(),
+                                "inherited_risk": inherited_risk,
+                            }),
+                        );
+                        correlation_engine.observe(corr);
+                    }
+
+                    known_ips.push(ip.clone());
+                    // Cap index entries per hash
+                    if known_ips.len() > 50 {
+                        known_ips.drain(0..known_ips.len() - 50);
+                    }
+                }
 
                 let is_new = dna.store.insert(threat_dna);
                 if is_new {

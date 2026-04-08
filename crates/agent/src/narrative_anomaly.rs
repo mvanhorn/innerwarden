@@ -1,5 +1,6 @@
 use tracing::info;
 
+use crate::correlation_engine;
 use crate::AgentState;
 
 /// Process autoencoder observations and baseline+autoencoder fused incidents.
@@ -31,6 +32,20 @@ pub(crate) fn process_anomalies(
                 kind = %ev.kind,
                 "autoencoder signal (silent — enrichment only)"
             );
+
+            // Inject into correlation engine so neural anomalies can participate
+            // in cross-layer chain detection (e.g. CL-046 Neural-Confirmed Attack).
+            let entities = ev.entities.clone();
+            let corr_event = correlation_engine::CorrelationEngine::neural_event(
+                score,
+                entities,
+                serde_json::json!({
+                    "score": score,
+                    "maturity": state.anomaly_engine.maturity,
+                    "trigger_kind": ev.kind,
+                }),
+            );
+            state.correlation_engine.observe(corr_event);
         }
     }
 

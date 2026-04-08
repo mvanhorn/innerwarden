@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::process::Command;
 
 /// Entry in the managed blocklist.
@@ -38,7 +39,7 @@ impl XdpManager {
         self
     }
 
-    /// Add an IP to the XDP blocklist.
+    /// Add an IP (v4 or v6) to the XDP blocklist.
     pub fn add_to_blocklist(&mut self, ip: &str, reason: &str) -> Result<()> {
         // Skip if already present.
         if self.blocklist.iter().any(|e| e.ip == ip) {
@@ -46,13 +47,13 @@ impl XdpManager {
         }
 
         if !self.dry_run {
-            let key_hex = ip_to_bpf_key(ip);
+            let (map_name, key_hex) = ip_to_bpf_map_and_key(ip)?;
             let output = Command::new("bpftool")
                 .args([
                     "map",
                     "update",
                     "pinned",
-                    &format!("{}/blocklist", self.bpf_path),
+                    &format!("{}/{}", self.bpf_path, map_name),
                     "key",
                     &key_hex,
                     "value",
@@ -80,7 +81,7 @@ impl XdpManager {
         Ok(())
     }
 
-    /// Remove an IP from the XDP blocklist.
+    /// Remove an IP (v4 or v6) from the XDP blocklist.
     pub fn remove_from_blocklist(&mut self, ip: &str) -> Result<()> {
         let idx = self.blocklist.iter().position(|e| e.ip == ip);
         if idx.is_none() {
@@ -88,22 +89,23 @@ impl XdpManager {
         }
 
         if !self.dry_run {
-            let key_hex = ip_to_bpf_key(ip);
-            let output = Command::new("bpftool")
-                .args([
-                    "map",
-                    "delete",
-                    "pinned",
-                    &format!("{}/blocklist", self.bpf_path),
-                    "key",
-                    &key_hex,
-                ])
-                .output()
-                .context("Failed to execute bpftool map delete")?;
+            if let Ok((map_name, key_hex)) = ip_to_bpf_map_and_key(ip) {
+                let output = Command::new("bpftool")
+                    .args([
+                        "map",
+                        "delete",
+                        "pinned",
+                        &format!("{}/{}", self.bpf_path, map_name),
+                        "key",
+                        &key_hex,
+                    ])
+                    .output()
+                    .context("Failed to execute bpftool map delete")?;
 
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                tracing::warn!(ip, error = %stderr, "bpftool map delete failed");
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    tracing::warn!(ip, error = %stderr, "bpftool map delete failed");
+                }
             }
         }
 
@@ -113,6 +115,11 @@ impl XdpManager {
 
         tracing::info!(ip, "Removed IP from XDP blocklist");
         Ok(())
+    }
+
+    /// Check if an IP is in the blocklist.
+    pub fn is_blocked(&self, ip: &str) -> bool {
+        self.blocklist.iter().any(|e| e.ip == ip)
     }
 
     /// Get all currently blocked IPs.
@@ -159,20 +166,25 @@ impl XdpManager {
     }
 }
 
-/// Convert a dotted IPv4 address to a bpftool hex key.
-fn ip_to_bpf_key(ip: &str) -> String {
-    let parts: Vec<&str> = ip.split('.').collect();
-    if parts.len() == 4 {
-        let octets: Vec<u8> = parts.iter().filter_map(|p| p.parse::<u8>().ok()).collect();
-        if octets.len() == 4 {
-            return format!(
+/// Convert an IP address to (map_name, bpftool hex key).
+/// IPv4 → ("blocklist", "0xc0 0xa8 ..."), IPv6 → ("blocklist_v6", "0x20 0x01 ...").
+fn ip_to_bpf_map_and_key(ip: &str) -> Result<(&'static str, String)> {
+    if let Ok(v4) = ip.parse::<Ipv4Addr>() {
+        let b = v4.octets();
+        Ok((
+            "blocklist",
+            format!(
                 "0x{:02x} 0x{:02x} 0x{:02x} 0x{:02x}",
-                octets[0], octets[1], octets[2], octets[3]
-            );
-        }
+                b[0], b[1], b[2], b[3]
+            ),
+        ))
+    } else if let Ok(v6) = ip.parse::<Ipv6Addr>() {
+        let b = v6.octets();
+        let hex: Vec<String> = b.iter().map(|x| format!("0x{:02x}", x)).collect();
+        Ok(("blocklist_v6", hex.join(" ")))
+    } else {
+        anyhow::bail!("invalid IP address: {}", ip)
     }
-    // Fallback: pass the string as-is (e.g. for IPv6 or pre-formatted).
-    ip.to_string()
 }
 
 // ===========================================================================
@@ -216,9 +228,22 @@ mod tests {
     }
 
     #[test]
-    fn ip_to_bpf_key_correct() {
-        let key = ip_to_bpf_key("192.168.1.100");
+    fn ipv4_key_correct() {
+        let (map, key) = ip_to_bpf_map_and_key("192.168.1.100").unwrap();
+        assert_eq!(map, "blocklist");
         assert_eq!(key, "0xc0 0xa8 0x01 0x64");
+    }
+
+    #[test]
+    fn ipv6_key_correct() {
+        let (map, key) = ip_to_bpf_map_and_key("2001:db8::1").unwrap();
+        assert_eq!(map, "blocklist_v6");
+        assert!(key.starts_with("0x20 0x01 0x0d 0xb8"));
+    }
+
+    #[test]
+    fn invalid_ip_returns_error() {
+        assert!(ip_to_bpf_map_and_key("not-an-ip").is_err());
     }
 
     #[test]
