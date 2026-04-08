@@ -777,6 +777,19 @@ static INODE_SIZE: HashMap<u32, u64> = HashMap::with_max_entries(1, 0);
 
 const OVERLAYFS_SUPER_MAGIC: u64 = 0x794c_7630;
 
+/// Neural model weights in Q16.16 fixed-point for in-kernel inference.
+/// Key: chunk index (0-based). Value: array of 512 i32 values.
+/// Total: 1880 params × 4 bytes = 7520 bytes → 15 chunks of 512 bytes.
+/// Loaded by `innerwarden-config-sign convert-model` via bpftool.
+/// When empty, neural inference is skipped (graceful degradation).
+#[map]
+static NEURAL_WEIGHTS: HashMap<u32, [i32; 128]> = HashMap::with_max_entries(16, 0);
+
+/// Neural baseline MSE and std in Q16.16 for anomaly scoring.
+/// Key 0 = baseline_mse, Key 1 = baseline_std.
+#[map]
+static NEURAL_BASELINE: HashMap<u32, i32> = HashMap::with_max_entries(4, 0);
+
 /// Per-cgroup capability bitmask. Key: cgroup_id. Value: bitmask of allowed capabilities.
 /// Populated by the agent from config. When guard mode is on and a cgroup has a capability
 /// bit set, that action is ALLOWED for processes in that cgroup.
