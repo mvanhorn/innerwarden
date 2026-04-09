@@ -221,6 +221,8 @@ struct DashboardState {
     agent_alert_tx: tokio::sync::mpsc::Sender<AgentGuardAlert>,
     /// Deep security snapshot: firmware, hypervisor, killchain, DNA status.
     deep_security: Arc<RwLock<DeepSecuritySnapshot>>,
+    /// Shared knowledge graph for live queries (not snapshot file).
+    knowledge_graph: Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
 }
 
 /// Aggregated status from integrated security modules.
@@ -795,6 +797,7 @@ pub async fn serve(
     rule_engine: Arc<innerwarden_agent_guard::rules::RuleEngine>,
     agent_alert_tx: tokio::sync::mpsc::Sender<AgentGuardAlert>,
     deep_security: Arc<RwLock<DeepSecuritySnapshot>>,
+    knowledge_graph: Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
 ) -> Result<()> {
     if auth.is_none() {
         warn!(
@@ -873,6 +876,7 @@ pub async fn serve(
         rule_engine,
         agent_alert_tx,
         deep_security,
+        knowledge_graph,
     };
     let auth_layer = middleware::from_fn_with_state(
         (
@@ -2356,64 +2360,39 @@ async fn api_correlation_chains(State(state): State<DashboardState>) -> Json<ser
     }))
 }
 
-/// `GET /api/graph/stats` - knowledge graph metrics (node/edge counts, memory, types).
+/// `GET /api/graph/stats` - knowledge graph metrics (live from shared graph).
 async fn api_graph_stats(State(state): State<DashboardState>) -> Json<serde_json::Value> {
-    let stats: serde_json::Value = safe_read_data_file(&state.data_dir, "graph-stats.json")
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or(serde_json::json!({
-            "node_count": 0,
-            "edge_count": 0,
-            "memory_bytes": 0,
-            "nodes_by_type": {},
-            "avg_degree": 0.0,
-            "threat_intel_nodes": 0,
-            "incident_nodes": 0
-        }));
-    Json(stats)
+    let graph = state.knowledge_graph.read().unwrap();
+    let metrics = graph.metrics();
+    Json(serde_json::to_value(&metrics).unwrap_or_default())
 }
 
-/// `GET /api/graph/view` - graph snapshot as Cytoscape.js elements (capped at 500 nodes).
+/// `GET /api/graph/view` - live graph as Cytoscape.js elements (capped at 500 nodes).
 async fn api_graph_view(State(state): State<DashboardState>) -> Json<serde_json::Value> {
     use crate::knowledge_graph::types::*;
-    use std::collections::HashMap;
 
-    let data = match std::fs::read(state.data_dir.join("graph-snapshot.json")) {
-        Ok(d) => d,
-        Err(_) => {
-            return Json(serde_json::json!({"nodes": [], "edges": []}));
-        }
-    };
+    let graph = state.knowledge_graph.read().unwrap();
 
-    #[derive(serde::Deserialize)]
-    struct Snap {
-        nodes: HashMap<u64, Node>,
-        edges: Vec<Edge>,
+    if graph.node_count() == 0 {
+        return Json(serde_json::json!({"nodes": [], "edges": []}));
     }
 
-    let snap: Snap = match serde_json::from_slice(&data) {
-        Ok(s) => s,
-        Err(_) => {
-            return Json(serde_json::json!({"nodes": [], "edges": []}));
-        }
-    };
-
-    // Cap at 500 nodes (most recent by edges, prioritize incidents/threats)
-    let mut node_ids: Vec<u64> = snap.nodes.keys().copied().collect();
+    // Cap at 500 nodes (prioritize incidents/threats)
+    let mut node_ids: Vec<NodeId> = graph.nodes().keys().copied().collect();
     if node_ids.len() > 500 {
-        // Keep threat intel, incidents, and recently-connected nodes
         node_ids.sort_by(|a, b| {
-            let pri_a = node_priority(snap.nodes.get(a));
-            let pri_b = node_priority(snap.nodes.get(b));
+            let pri_a = node_priority(graph.get_node(*a));
+            let pri_b = node_priority(graph.get_node(*b));
             pri_b.cmp(&pri_a)
         });
         node_ids.truncate(500);
     }
-    let keep: std::collections::HashSet<u64> = node_ids.iter().copied().collect();
+    let keep: std::collections::HashSet<NodeId> = node_ids.iter().copied().collect();
 
     let cy_nodes: Vec<serde_json::Value> = node_ids
         .iter()
-        .filter_map(|id| {
-            snap.nodes.get(id).map(|n| {
+        .filter_map(|&id| {
+            graph.get_node(id).map(|n| {
                 serde_json::json!({
                     "data": {
                         "id": format!("n{}", id),
@@ -2426,8 +2405,8 @@ async fn api_graph_view(State(state): State<DashboardState>) -> Json<serde_json:
         })
         .collect();
 
-    let cy_edges: Vec<serde_json::Value> = snap
-        .edges
+    let cy_edges: Vec<serde_json::Value> = graph
+        .edges_slice()
         .iter()
         .enumerate()
         .filter(|(_, e)| keep.contains(&e.from) && keep.contains(&e.to) && !e.is_snapshot())
@@ -2455,7 +2434,7 @@ async fn api_graph_neighborhood(
     State(state): State<DashboardState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
-    use crate::knowledge_graph::{graph::KnowledgeGraph, types::*};
+    use crate::knowledge_graph::types::*;
 
     let subject_type = params.get("type").map(|s| s.as_str()).unwrap_or("ip");
     let subject_value = match params.get("value") {
@@ -2468,8 +2447,7 @@ async fn api_graph_neighborhood(
         .unwrap_or(2)
         .min(4);
 
-    // Load graph from snapshot
-    let graph = KnowledgeGraph::load_snapshot(&state.data_dir.join("graph-snapshot.json"));
+    let graph = state.knowledge_graph.read().unwrap();
     if graph.node_count() == 0 {
         return Json(serde_json::json!({"nodes": [], "edges": []}));
     }

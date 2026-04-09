@@ -474,8 +474,8 @@ struct AgentState {
     latest_anomaly_score: Option<f32>,
     /// Two-factor authentication state (pending actions, brute force protection).
     two_factor_state: two_factor::TwoFactorState,
-    /// Knowledge graph — in-memory directed graph for attack context.
-    knowledge_graph: knowledge_graph::KnowledgeGraph,
+    /// Knowledge graph — in-memory directed graph for attack context (shared with dashboard).
+    knowledge_graph: std::sync::Arc<std::sync::RwLock<knowledge_graph::KnowledgeGraph>>,
     /// Graph-based detector state (cooldowns).
     graph_detector_state: knowledge_graph::detectors::GraphDetectorState,
     /// Timestamp of last knowledge graph snapshot save.
@@ -594,6 +594,13 @@ async fn main() -> Result<()> {
         dashboard::DeepSecuritySnapshot::default(),
     ));
 
+    // Shared knowledge graph: loaded from snapshot, shared between agent loop and dashboard.
+    let shared_graph = std::sync::Arc::new(std::sync::RwLock::new(
+        knowledge_graph::KnowledgeGraph::load_snapshot(
+            &cli.data_dir.join("graph-snapshot.json"),
+        ),
+    ));
+
     // Advisory cache: shared between dashboard (writes advisory denials) and
     // the incident processing loop (checks for advisory violations).
     let advisory_cache: Arc<RwLock<VecDeque<AdvisoryEntry>>> =
@@ -663,6 +670,7 @@ async fn main() -> Result<()> {
 
         let agent_alert_tx = agent_alert_tx.clone();
         let deep_security = deep_security_snapshot.clone();
+        let dashboard_graph = shared_graph.clone();
         tokio::spawn(async move {
             if let Err(e) = dashboard::serve(
                 dashboard_data_dir,
@@ -677,6 +685,7 @@ async fn main() -> Result<()> {
                 rule_engine,
                 agent_alert_tx,
                 deep_security,
+                dashboard_graph,
             )
             .await
             {
@@ -1103,9 +1112,7 @@ async fn main() -> Result<()> {
         last_autoencoder_anomaly_ts: None,
         latest_anomaly_score: None,
         two_factor_state: two_factor::TwoFactorState::new(),
-        knowledge_graph: knowledge_graph::KnowledgeGraph::load_snapshot(
-            &cli.data_dir.join("graph-snapshot.json"),
-        ),
+        knowledge_graph: shared_graph.clone(),
         graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
         last_graph_snapshot: std::time::Instant::now(),
         #[cfg(feature = "redis-reader")]
@@ -2141,8 +2148,11 @@ async fn process_incidents(
         new_incidents.entries.iter().chain(neural.iter()).collect();
 
     // Feed incidents into knowledge graph
-    for incident in &all_incidents {
-        state.knowledge_graph.ingest_incident(incident);
+    {
+        let mut graph = state.knowledge_graph.write().unwrap();
+        for incident in &all_incidents {
+            graph.ingest_incident(incident);
+        }
     }
 
     // Feed incidents into DNA attack chain tracker (MITRE ATT&CK progression).
@@ -2313,7 +2323,7 @@ async fn process_incidents(
 
         // Build graph context: attack narrative from knowledge graph neighborhood
         let graph_context = {
-            let graph = &state.knowledge_graph;
+            let graph = state.knowledge_graph.read().unwrap();
             // Find the best center node from incident entities
             let center_node = incident.entities.iter().find_map(|e| match e.r#type {
                 innerwarden_core::entities::EntityType::Ip => graph.find_by_ip(&e.value),
@@ -2963,48 +2973,59 @@ async fn process_narrative_tick(
     state.narrative_acc.ingest_events(&events_entries);
 
     // Feed events into knowledge graph (in-memory attack context)
-    for ev in &events_entries {
-        state.knowledge_graph.ingest(ev);
+    {
+        let mut graph = state.knowledge_graph.write().unwrap();
+        for ev in &events_entries {
+            graph.ingest(ev);
+        }
     }
 
     // Periodic graph maintenance (cleanup expired + snapshot every 5 min)
     if state.last_graph_snapshot.elapsed().as_secs() >= 300 {
-        state.knowledge_graph.cleanup_expired(chrono::Utc::now());
-        state.knowledge_graph.compact_edges();
-        state.knowledge_graph.enforce_memory_limit();
-        if let Err(e) = state
-            .knowledge_graph
-            .save_snapshot(&data_dir.join("graph-snapshot.json"))
         {
-            warn!("knowledge graph snapshot failed: {e:#}");
-        }
-        // Write lightweight stats for dashboard API
-        let metrics = state.knowledge_graph.metrics();
-        if let Ok(json) = serde_json::to_vec(&metrics) {
-            let _ = std::fs::write(data_dir.join("graph-stats.json"), json);
+            let mut graph = state.knowledge_graph.write().unwrap();
+            graph.cleanup_expired(chrono::Utc::now());
+            graph.compact_edges();
+            graph.enforce_memory_limit();
+            if let Err(e) = graph.save_snapshot(&data_dir.join("graph-snapshot.json")) {
+                warn!("knowledge graph snapshot failed: {e:#}");
+            }
+            let metrics = graph.metrics();
+            if let Ok(json) = serde_json::to_vec(&metrics) {
+                let _ = std::fs::write(data_dir.join("graph-stats.json"), json);
+            }
         }
         state.last_graph_snapshot = std::time::Instant::now();
     }
 
     // Update neural autoencoder with graph structural features
     {
-        let gf = state.knowledge_graph.extract_neural_features();
+        let graph = state.knowledge_graph.read().unwrap();
+        let gf = graph.extract_neural_features();
         state.anomaly_engine.set_graph_features(gf);
     }
 
     // Run graph-based detectors (parallel to sensor detectors)
     {
-        let graph_incidents = knowledge_graph::detectors::run_all(
-            &state.knowledge_graph,
-            &mut state.graph_detector_state,
-            &state.knowledge_graph.system_node()
-                .and_then(|id| state.knowledge_graph.get_node(id))
+        let (graph_incidents, host_label) = {
+            let graph = state.knowledge_graph.read().unwrap();
+            let host = graph.system_node()
+                .and_then(|id| graph.get_node(id))
                 .map(|n| n.label())
-                .unwrap_or_else(|| "unknown".to_string()),
-            chrono::Utc::now(),
-        );
-        for inc in &graph_incidents {
-            state.knowledge_graph.ingest_incident(inc);
+                .unwrap_or_else(|| "unknown".to_string());
+            let incidents = knowledge_graph::detectors::run_all(
+                &graph,
+                &mut state.graph_detector_state,
+                &host,
+                chrono::Utc::now(),
+            );
+            (incidents, host)
+        };
+        {
+            let mut graph = state.knowledge_graph.write().unwrap();
+            for inc in &graph_incidents {
+                graph.ingest_incident(inc);
+            }
         }
         if !graph_incidents.is_empty() {
             // Write graph detector incidents to JSONL (spawn_blocking for sync I/O)
@@ -3341,7 +3362,7 @@ mod tests {
             last_autoencoder_anomaly_ts: None,
             latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
-            knowledge_graph: knowledge_graph::KnowledgeGraph::new(),
+            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(knowledge_graph::KnowledgeGraph::new())),
             graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
             last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]
@@ -3625,7 +3646,7 @@ mod tests {
             last_autoencoder_anomaly_ts: None,
             latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
-            knowledge_graph: knowledge_graph::KnowledgeGraph::new(),
+            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(knowledge_graph::KnowledgeGraph::new())),
             graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
             last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]
@@ -3804,7 +3825,7 @@ mod tests {
             last_autoencoder_anomaly_ts: None,
             latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
-            knowledge_graph: knowledge_graph::KnowledgeGraph::new(),
+            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(knowledge_graph::KnowledgeGraph::new())),
             graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
             last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]
@@ -3958,7 +3979,7 @@ mod tests {
             last_autoencoder_anomaly_ts: None,
             latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
-            knowledge_graph: knowledge_graph::KnowledgeGraph::new(),
+            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(knowledge_graph::KnowledgeGraph::new())),
             graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
             last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]
@@ -4124,7 +4145,7 @@ mod tests {
             last_autoencoder_anomaly_ts: None,
             latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
-            knowledge_graph: knowledge_graph::KnowledgeGraph::new(),
+            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(knowledge_graph::KnowledgeGraph::new())),
             graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
             last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]
@@ -4267,7 +4288,7 @@ mod tests {
             last_autoencoder_anomaly_ts: None,
             latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
-            knowledge_graph: knowledge_graph::KnowledgeGraph::new(),
+            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(knowledge_graph::KnowledgeGraph::new())),
             graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
             last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]
@@ -4422,7 +4443,7 @@ mod tests {
             last_autoencoder_anomaly_ts: None,
             latest_anomaly_score: None,
             two_factor_state: two_factor::TwoFactorState::new(),
-            knowledge_graph: knowledge_graph::KnowledgeGraph::new(),
+            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(knowledge_graph::KnowledgeGraph::new())),
             graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
             last_graph_snapshot: std::time::Instant::now(),
             #[cfg(feature = "redis-reader")]
