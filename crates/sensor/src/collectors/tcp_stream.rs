@@ -550,9 +550,16 @@ pub async fn run(
 
         if let Some((key, flags, seq, payload)) = parse_tcp_packet(raw) {
             if let Some(flow_event) = table.process_packet(key, flags, seq, payload, now) {
-                // Emit event based on detected protocol
+                // Emit protocol event
                 let event = flow_event_to_event(&flow_event, &host_id);
                 let _ = tx.send(event).await;
+
+                // Try file extraction from HTTP flows
+                let filestore = std::path::Path::new("/var/lib/innerwarden/filestore");
+                if let Some(extracted) = super::file_extract::extract_from_flow(&flow_event, filestore) {
+                    let file_event = super::file_extract::to_event(&extracted, &host_id);
+                    let _ = tx.send(file_event).await;
+                }
             }
         }
 
@@ -563,6 +570,12 @@ pub async fn run(
             for flow_event in stale_events {
                 let event = flow_event_to_event(&flow_event, &host_id);
                 let _ = tx.send(event).await;
+
+                let filestore = std::path::Path::new("/var/lib/innerwarden/filestore");
+                if let Some(extracted) = super::file_extract::extract_from_flow(&flow_event, filestore) {
+                    let file_event = super::file_extract::to_event(&extracted, &host_id);
+                    let _ = tx.send(file_event).await;
+                }
             }
         }
     }
