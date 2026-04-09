@@ -383,12 +383,18 @@ fn build_prompt(ctx: &DecisionContext<'_>) -> String {
         )
     };
 
+    let graph_section = ctx
+        .graph_context
+        .as_ref()
+        .map(|gc| format!("\n{gc}\n"))
+        .unwrap_or_default();
+
     format!(
         r#"Analyze this security incident and decide on a response.
 
 INCIDENT:
 {incident_json}
-
+{graph_section}
 RECENT EVENTS FROM THE SAME ENTITY (last {count}):
 {events_json}
 
@@ -403,6 +409,7 @@ AVAILABLE RESPONSE SKILLS (select skill_id from this list):
 
 Select the best skill and return a JSON decision."#,
         incident_json = incident_json,
+        graph_section = graph_section,
         events_json = events_json,
         count = ctx.recent_events.len(),
         related_json = related_json,

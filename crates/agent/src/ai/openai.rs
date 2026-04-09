@@ -309,13 +309,19 @@ fn build_prompt(ctx: &DecisionContext<'_>) -> String {
         .map(|g| format!("\nIP GEOLOCATION:\n{}", g.as_context_line()))
         .unwrap_or_default();
 
+    let graph_section = ctx
+        .graph_context
+        .as_ref()
+        .map(|gc| format!("\n{gc}\n"))
+        .unwrap_or_default();
+
     format!(
         r#"Analyze this security incident and decide on a response.
 
 INCIDENT:
 {incident_json}
 {reputation_line}{geo_line}
-RECENT EVENTS FROM THE SAME ENTITY (last {count}):
+{graph_section}RECENT EVENTS FROM THE SAME ENTITY (last {count}):
 {events_json}
 
 TEMPORALLY CORRELATED INCIDENTS (last {related_count}, grouped by pivot ip/user/detector):
@@ -331,6 +337,7 @@ Select the best skill and return a JSON decision."#,
         incident_json = incident_json,
         reputation_line = reputation_line,
         geo_line = geo_line,
+        graph_section = graph_section,
         events_json = events_json,
         count = ctx.recent_events.len(),
         related_incidents_json = related_incidents_json,

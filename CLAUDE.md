@@ -7,7 +7,7 @@ Sensor (eBPF) + Agent (AI triage) + CTL (CLI). Open source (Apache-2.0).
 ```
 crates/
   sensor/       49 detectors, 40 eBPF hooks, 22 collectors
-  agent/        AI pipeline, dashboard, skills, correlation, notifications
+  agent/        AI pipeline, dashboard, skills, correlation, notifications, knowledge graph
   ctl/          CLI: setup, configure, scan, harden, upgrade
   agent-guard/  AI agent protection (ATR rules, MCP inspection)
   smm/          Ring -2 firmware/UEFI/SMM security audit (migrated from standalone repo)
@@ -36,7 +36,8 @@ make replay-qa    # validacao E2E
 
 ## Estado (2026-04-04)
 
-- 49 detectors, 40 eBPF hooks, 65 MITRE IDs, 43 correlation rules (CL-001 to CL-043, includes 5 AlphaZero V4 discoveries + 3 hypervisor rules)
+- 49 sensor detectors + 8 graph detectors, 40 eBPF hooks, 65 MITRE IDs, 43 correlation rules (CL-001 to CL-043)
+- Knowledge graph: in-memory directed graph (11 node types, 50 relation types, 60 event kinds mapped). Dashboard tab + AI triage integration + 58-feature autoencoder (10 graph structural features)
 - Server producao: ver config local (nao expor no repo publico)
 - Branches: main = stable, develop = bleeding edge
 - CI: `make check` + `make test` + `make spec-check`

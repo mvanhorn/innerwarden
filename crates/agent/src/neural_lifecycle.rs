@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 // Feature extraction (mirrored from innerwarden-gym/src/realdata.rs)
 // ---------------------------------------------------------------------------
 
-const NUM_FEATURES: usize = 48;
+const NUM_FEATURES: usize = 58;
 const WINDOW_SIZE: usize = 20;
 
 /// Map event kind to feature index (0-23).
@@ -198,7 +198,67 @@ fn window_features(kinds: &[Option<usize>]) -> Vec<f32> {
     // 47: window size normalized
     f[47] = (n / 50.0).min(1.0);
 
+    // Features 48-57 are graph structural features (filled by enrich_with_graph)
+    // Initialized to 0.0 by default — safe for inference without graph data.
+
     f
+}
+
+/// Graph structural features extracted from the knowledge graph.
+/// Used to enrich the autoencoder feature vector (slots 48-57).
+#[derive(Debug, Clone, Default)]
+pub struct GraphFeatures {
+    /// Average degree of active process nodes (fan-out).
+    pub avg_process_degree: f32,
+    /// Maximum depth of any process tree.
+    pub max_process_tree_depth: u32,
+    /// Number of IP nodes with threat intel dataset matches.
+    pub threat_intel_ip_count: u32,
+    /// Number of Wrote edges targeting /etc or /tmp.
+    pub writes_to_sensitive: u32,
+    /// Number of connected components (isolated clusters).
+    pub connected_components: u32,
+    /// Ratio of process nodes to IP nodes (normal ~5:1, attack ~1:1).
+    pub process_ip_ratio: f32,
+    /// Number of nodes with >10 edges (high-connectivity hubs).
+    pub high_degree_nodes: u32,
+    /// Number of Incident nodes in the graph.
+    pub incident_count: u32,
+    /// Total edge count (activity level).
+    pub total_edges: u32,
+    /// Number of active sessions (User→LoggedInFrom edges in last 5min).
+    pub active_sessions: u32,
+}
+
+/// Enrich a feature vector (slots 48-57) with graph structural features.
+fn enrich_features_with_graph(f: &mut [f32], gf: &GraphFeatures) {
+    if f.len() < NUM_FEATURES {
+        return;
+    }
+    // 48: average process degree normalized (0 = idle, 1 = 20+ avg connections)
+    f[48] = (gf.avg_process_degree / 20.0).min(1.0);
+    // 49: max process tree depth (deeper = more suspicious)
+    f[49] = (gf.max_process_tree_depth as f32 / 10.0).min(1.0);
+    // 50: threat intel IP count
+    f[50] = (gf.threat_intel_ip_count as f32 / 10.0).min(1.0);
+    // 51: writes to sensitive paths
+    f[51] = (gf.writes_to_sensitive as f32 / 20.0).min(1.0);
+    // 52: connected components (more = more isolated activity)
+    f[52] = (gf.connected_components as f32 / 20.0).min(1.0);
+    // 53: process/IP ratio anomaly (deviate from normal ~5:1)
+    f[53] = if gf.process_ip_ratio > 0.0 {
+        (1.0 - (gf.process_ip_ratio / 5.0).min(1.0)).abs()
+    } else {
+        0.0
+    };
+    // 54: high-degree hub count
+    f[54] = (gf.high_degree_nodes as f32 / 5.0).min(1.0);
+    // 55: incident count
+    f[55] = (gf.incident_count as f32 / 20.0).min(1.0);
+    // 56: total edge activity level
+    f[56] = (gf.total_edges as f32 / 10000.0).min(1.0);
+    // 57: active sessions
+    f[57] = (gf.active_sessions as f32 / 10.0).min(1.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -419,6 +479,8 @@ pub struct AnomalyEngine {
     /// Last computed anomaly score (0.0-1.0), updated by observe().
     /// Used by the agent to push to the BPF NEURAL_SCORE map for kernel enforcement.
     last_score: f32,
+    /// Cached graph structural features (updated by the agent every slow tick).
+    graph_features: Option<GraphFeatures>,
 }
 
 impl AnomalyEngine {
@@ -473,7 +535,14 @@ impl AnomalyEngine {
             config,
             cooldowns: std::collections::HashMap::new(),
             last_score: 0.0,
+            graph_features: None,
         }
+    }
+
+    /// Update the cached graph structural features.
+    /// Called by the agent every slow-loop tick with metrics from the knowledge graph.
+    pub fn set_graph_features(&mut self, gf: GraphFeatures) {
+        self.graph_features = Some(gf);
     }
 
     /// Feed an event and return anomaly score if above threshold.
@@ -501,7 +570,11 @@ impl AnomalyEngine {
         }
 
         let kinds: Vec<Option<usize>> = self.window.iter().copied().collect();
-        let features = window_features(&kinds);
+        let mut features = window_features(&kinds);
+        // Enrich with graph features if available
+        if let Some(ref gf) = self.graph_features {
+            enrich_features_with_graph(&mut features, gf);
+        }
         let mse = net.reconstruction_error(&features);
 
         // Normalize to 0-1 via z-score + sigmoid
