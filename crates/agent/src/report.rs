@@ -221,9 +221,208 @@ struct Counters {
     files_not_growing: Vec<String>,
 }
 
+/// Populate counters from the knowledge graph instead of JSONL files.
+fn populate_counters_from_graph(
+    graph: &crate::knowledge_graph::KnowledgeGraph,
+    counters: &mut Counters,
+) {
+    use crate::knowledge_graph::types::*;
+
+    // Events: count non-snapshot edges
+    counters.total_events = graph.edges_slice().iter().filter(|e| !e.is_snapshot()).count() as u64;
+
+    // Incidents
+    for id in graph.nodes_of_type(NodeType::Incident) {
+        if let Some(Node::Incident {
+            incident_id, detector, decision, confidence, auto_executed, ..
+        }) = graph.get_node(id)
+        {
+            counters.total_incidents += 1;
+            *counters.incidents_by_type.entry(detector.clone()).or_insert(0) += 1;
+
+            // Collect IPs from TriggeredBy edges
+            let has_entity = graph.outgoing_edges(id).iter().any(|e| {
+                e.relation == Relation::TriggeredBy
+            });
+            if !has_entity {
+                counters.incidents_without_entities += 1;
+            }
+            for edge in graph.outgoing_edges(id) {
+                if edge.relation == Relation::TriggeredBy {
+                    if let Some(Node::Ip { addr, .. }) = graph.get_node(edge.to) {
+                        *counters.ip_counts.entry(addr.clone()).or_insert(0) += 1;
+                        *counters.entity_counts.entry(format!("ip:{}", addr)).or_insert(0) += 1;
+                    }
+                    if let Some(Node::User { name, .. }) = graph.get_node(edge.to) {
+                        *counters.entity_counts.entry(format!("user:{}", name)).or_insert(0) += 1;
+                    }
+                }
+            }
+
+            // Decisions
+            if let Some(action) = decision {
+                counters.total_decisions += 1;
+                *counters.decisions_by_action.entry(action.clone()).or_insert(0) += 1;
+                counters.confidence_sum += confidence.unwrap_or(0.0) as f64;
+                match action.as_str() {
+                    "ignore" => counters.ignore_count += 1,
+                    "block_ip" => counters.block_ip_count += 1,
+                    _ => {}
+                }
+                if !*auto_executed {
+                    counters.dry_run_count += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Compute a `TrialReport` from the knowledge graph (live, no JSONL).
+/// File health checks still use the filesystem.
+pub fn compute_for_date_from_graph(
+    data_dir: &Path,
+    date: Option<&str>,
+    graph: &crate::knowledge_graph::KnowledgeGraph,
+) -> TrialReport {
+    let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
+    let analyzed_date = match date {
+        Some(d) => d.to_string(),
+        None => today.clone(),
+    };
+    let analyzed_is_today = analyzed_date == today;
+
+    // File health checks (still filesystem-based — that's their purpose)
+    let events_path = safe_dated_file(data_dir, "events", &analyzed_date, "jsonl");
+    let incidents_path = safe_dated_file(data_dir, "incidents", &analyzed_date, "jsonl");
+    let decisions_path = safe_dated_file(data_dir, "decisions", &analyzed_date, "jsonl");
+    let summary_path = safe_dated_file(data_dir, "summary", &analyzed_date, "md");
+    let state = data_dir.join("state.json");
+    let agent_state = data_dir.join("agent-state.json");
+
+    let mut files = Vec::new();
+    let mut counters = Counters::default();
+
+    // Quick file health (existence + size, no parsing)
+    for (name, path) in [
+        ("events", &events_path),
+        ("incidents", &incidents_path),
+        ("decisions", &decisions_path),
+    ] {
+        let exists = path.exists();
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if exists && size == 0 {
+            counters.empty_files.push(name.to_string());
+        }
+        if exists && !analyzed_is_today && size == 0 {
+            counters.files_not_growing.push(name.to_string());
+        }
+        let modified_secs_ago = std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| SystemTime::now().duration_since(t).ok())
+            .map(|d| d.as_secs());
+        files.push(FileHealth {
+            file: name.to_string(),
+            exists,
+            readable: exists,
+            size_bytes: size,
+            modified_secs_ago,
+            jsonl_valid: if exists { Some(true) } else { None },
+            lines: None,
+            malformed_lines: None,
+        });
+    }
+
+    let summary_info = parse_plain_file(&summary_path);
+    files.push(file_health_plain("summary", &summary_info));
+    let state_info = parse_state_file(&state);
+    files.push(file_health_plain("state", &state_info));
+    let agent_state_info = parse_state_file(&agent_state);
+    files.push(file_health_plain("agent-state", &agent_state_info));
+
+    // Populate counters from graph
+    populate_counters_from_graph(graph, &mut counters);
+
+    let expected_files_present = files.iter().all(|f| f.exists);
+    let state_json_readable = state_info.exists && state_info.readable;
+    let agent_state_json_readable = agent_state_info.exists && agent_state_info.readable;
+    let operational_telemetry = build_operational_telemetry(data_dir, &analyzed_date);
+
+    let detection_summary = DetectionSummary {
+        total_events: counters.total_events,
+        total_incidents: counters.total_incidents,
+        incidents_by_type: to_btreemap(counters.incidents_by_type.clone()),
+        top_ips: top_n(&counters.ip_counts, 10),
+        top_entities: top_n(&counters.entity_counts, 10),
+    };
+
+    let avg_conf = if counters.total_decisions > 0 {
+        counters.confidence_sum / counters.total_decisions as f64
+    } else {
+        0.0
+    };
+    let agent_ai_summary = AgentAiSummary {
+        total_decisions: counters.total_decisions,
+        decisions_by_action: to_btreemap(counters.decisions_by_action.clone()),
+        average_confidence: avg_conf,
+        ignore_count: counters.ignore_count,
+        block_ip_count: counters.block_ip_count,
+        dry_run_count: counters.dry_run_count,
+        skills_used: to_btreemap(counters.skills_used.clone()),
+    };
+
+    let data_quality = DataQuality {
+        empty_files: counters.empty_files.clone(),
+        malformed_jsonl: counters.malformed_jsonl.clone(),
+        incidents_without_entities: counters.incidents_without_entities,
+        decisions_without_action: counters.decisions_without_action,
+        files_not_growing: counters.files_not_growing.clone(),
+    };
+
+    // Trends: use previous day's JSONL counters as comparison (graph only has current state)
+    let previous_date = detect_previous_date(data_dir, &analyzed_date);
+    let previous_counters = previous_date
+        .as_ref()
+        .map(|d| compute_day_counters(data_dir, d));
+    let trend_summary = build_trend_summary(&counters, previous_counters.as_ref(), previous_date);
+    let anomaly_hints = build_anomaly_hints(
+        &detection_summary,
+        &agent_ai_summary,
+        &data_quality,
+        &trend_summary,
+        previous_counters.as_ref(),
+    );
+
+    let operational_health = OperationalHealth {
+        expected_files_present,
+        state_json_readable,
+        agent_state_json_readable,
+        files,
+    };
+
+    let recent_window = compute_recent_window(data_dir, &analyzed_date);
+
+    let mut report = TrialReport {
+        generated_at: Utc::now(),
+        analyzed_date,
+        data_dir: data_dir.display().to_string(),
+        operational_health,
+        operational_telemetry,
+        detection_summary,
+        agent_ai_summary,
+        recent_window,
+        trend_summary,
+        anomaly_hints,
+        data_quality,
+        suggested_improvements: vec![],
+    };
+    report.suggested_improvements = build_suggestions(&report);
+    report
+}
+
 /// Compute a `TrialReport` for the given date (or the latest available date if
 /// `date` is `None`) without writing any files to disk.
-/// Used by the dashboard `/api/report` endpoint.
+/// Used by the dashboard `/api/report` endpoint (JSONL fallback).
 pub fn compute_for_date(data_dir: &Path, date: Option<&str>) -> TrialReport {
     let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
     let analyzed_date = match date {

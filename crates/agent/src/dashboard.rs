@@ -3219,13 +3219,12 @@ async fn api_report(
     State(state): State<DashboardState>,
     Query(query): Query<ReportQuery>,
 ) -> Response {
-    let data_dir = state.data_dir.clone();
-    let date_str = query.date.clone();
-    let report: TrialReport = tokio::task::spawn_blocking(move || {
-        report_mod::compute_for_date(&data_dir, date_str.as_deref())
-    })
-    .await
-    .unwrap_or_else(|_| report_mod::compute_for_date(&state.data_dir, query.date.as_deref()));
+    let graph = state.knowledge_graph.read().unwrap();
+    let report: TrialReport = report_mod::compute_for_date_from_graph(
+        &state.data_dir,
+        query.date.as_deref(),
+        &graph,
+    );
 
     match serde_json::to_string_pretty(&report) {
         Ok(body) => (
