@@ -569,70 +569,147 @@ pub async fn run(
 }
 
 /// Convert a FlowEvent into an InnerWarden Event for the detector pipeline.
+/// Uses deep protocol parsers for HTTP, SSH, and SMB when available.
 fn flow_event_to_event(
     fe: &FlowEvent,
     host_id: &str,
 ) -> innerwarden_core::event::Event {
     use innerwarden_core::event::{Event, Severity};
+    use super::proto_http;
+    use super::proto_ssh;
+    use super::proto_smb;
 
     let src_ip = fe.key.src_ip_str();
     let dst_ip = fe.key.dst_ip_str();
 
-    // Extract HTTP details if applicable
-    let (kind, summary, details) = match fe.app_proto {
+    let (kind, severity, summary, details) = match fe.app_proto {
         AppProtocol::Http => {
-            let first_line = fe
-                .client_data
-                .iter()
-                .take(200)
-                .copied()
-                .take_while(|&b| b != b'\r' && b != b'\n')
-                .collect::<Vec<u8>>();
-            let request_line = String::from_utf8_lossy(&first_line);
+            // Deep HTTP parsing
+            let req = proto_http::parse_request(&fe.client_data);
+            let resp = proto_http::parse_response(&fe.server_data);
+            let signals = req
+                .as_ref()
+                .map(|r| proto_http::extract_signals(r, resp.as_ref()))
+                .unwrap_or_default();
+
+            let method = req.as_ref().map(|r| r.method.as_str()).unwrap_or("?");
+            let uri = req.as_ref().map(|r| r.uri.as_str()).unwrap_or("?");
+            let host = req.as_ref().map(|r| r.host.as_str()).unwrap_or("?");
+            let user_agent = req.as_ref().map(|r| r.user_agent.as_str()).unwrap_or("?");
+            let status = resp.as_ref().map(|r| r.status_code).unwrap_or(0);
+
+            let sev = if signals.iter().any(|s| {
+                s.contains("LATERAL") || s.contains("injection") || s.contains("webshell")
+            }) {
+                Severity::High
+            } else if !signals.is_empty() {
+                Severity::Medium
+            } else {
+                Severity::Info
+            };
+
             (
                 "tcp_stream.http",
-                format!("HTTP stream: {request_line} ({src_ip} -> {dst_ip}:{}", fe.key.dst_port),
+                sev,
+                format!("{method} {uri} -> {status} ({src_ip} -> {host})"),
                 serde_json::json!({
                     "app_proto": "http",
+                    "method": method,
+                    "uri": uri,
+                    "host": host,
+                    "user_agent": user_agent,
+                    "status_code": status,
+                    "content_type": resp.as_ref().map(|r| r.content_type.as_str()).unwrap_or(""),
                     "src_ip": src_ip,
                     "dst_ip": dst_ip,
-                    "src_port": fe.key.src_port,
                     "dst_port": fe.key.dst_port,
-                    "request_line": request_line,
                     "client_bytes": fe.client_data.len(),
                     "server_bytes": fe.server_data.len(),
                     "duration_ms": fe.duration_ms,
+                    "signals": signals,
                 }),
             )
         }
-        AppProtocol::Ssh => (
-            "tcp_stream.ssh",
-            format!("SSH stream: {src_ip} -> {dst_ip}:{}", fe.key.dst_port),
-            serde_json::json!({
-                "app_proto": "ssh",
-                "src_ip": src_ip,
-                "dst_ip": dst_ip,
-                "dst_port": fe.key.dst_port,
-                "client_bytes": fe.client_data.len(),
-                "server_bytes": fe.server_data.len(),
-                "duration_ms": fe.duration_ms,
-            }),
-        ),
-        AppProtocol::Smb => (
-            "tcp_stream.smb",
-            format!("SMB stream: {src_ip} -> {dst_ip}:{} (lateral movement indicator)", fe.key.dst_port),
-            serde_json::json!({
-                "app_proto": "smb",
-                "src_ip": src_ip,
-                "dst_ip": dst_ip,
-                "dst_port": fe.key.dst_port,
-                "client_bytes": fe.client_data.len(),
-                "server_bytes": fe.server_data.len(),
-                "duration_ms": fe.duration_ms,
-            }),
-        ),
+        AppProtocol::Ssh => {
+            // Deep SSH parsing
+            let session = proto_ssh::parse_session(&fe.client_data, &fe.server_data);
+            let client_ver = session.as_ref().map(|s| s.client_version.as_str()).unwrap_or("?");
+            let server_ver = session.as_ref().map(|s| s.server_version.as_str()).unwrap_or("?");
+            let signals: Vec<String> = session.as_ref().map(|s| s.signals.clone()).unwrap_or_default();
+            let has_tunnel = session.as_ref().map(|s| s.has_tunnel_request).unwrap_or(false);
+
+            let sev = if has_tunnel || signals.iter().any(|s| s.contains("bruteforce")) {
+                Severity::High
+            } else if !signals.is_empty() {
+                Severity::Medium
+            } else {
+                Severity::Info
+            };
+
+            let mut summary_extra = String::new();
+            if fe.key.dst_port != 22 {
+                summary_extra = format!(" (non-standard port {})", fe.key.dst_port);
+            }
+            if has_tunnel {
+                summary_extra.push_str(" [TUNNEL]");
+            }
+
+            (
+                "tcp_stream.ssh",
+                sev,
+                format!("SSH {client_ver} -> {server_ver} ({src_ip} -> {dst_ip}){summary_extra}"),
+                serde_json::json!({
+                    "app_proto": "ssh",
+                    "client_version": client_ver,
+                    "server_version": server_ver,
+                    "has_tunnel": has_tunnel,
+                    "src_ip": src_ip,
+                    "dst_ip": dst_ip,
+                    "dst_port": fe.key.dst_port,
+                    "non_standard_port": fe.key.dst_port != 22,
+                    "client_bytes": fe.client_data.len(),
+                    "server_bytes": fe.server_data.len(),
+                    "duration_ms": fe.duration_ms,
+                    "signals": signals,
+                }),
+            )
+        }
+        AppProtocol::Smb => {
+            // Deep SMB parsing
+            let session = proto_smb::parse_session(&fe.client_data);
+            let signals: Vec<String> = session.as_ref().map(|s| s.signals.clone()).unwrap_or_default();
+            let pipes: Vec<String> = session.as_ref().map(|s| s.named_pipes.clone()).unwrap_or_default();
+            let version = session.as_ref().map(|s| format!("{:?}", s.version)).unwrap_or("?".into());
+
+            let sev = if signals.iter().any(|s| s.contains("LATERAL") || s.contains("CREDENTIAL")) {
+                Severity::Critical
+            } else if signals.iter().any(|s| s.contains("admin_share") || s.contains("remote_")) {
+                Severity::High
+            } else {
+                Severity::Medium // SMB itself is notable
+            };
+
+            (
+                "tcp_stream.smb",
+                sev,
+                format!("SMB {version} ({src_ip} -> {dst_ip}:{}) pipes:{}", fe.key.dst_port, pipes.join(",")),
+                serde_json::json!({
+                    "app_proto": "smb",
+                    "smb_version": version,
+                    "named_pipes": pipes,
+                    "src_ip": src_ip,
+                    "dst_ip": dst_ip,
+                    "dst_port": fe.key.dst_port,
+                    "client_bytes": fe.client_data.len(),
+                    "server_bytes": fe.server_data.len(),
+                    "duration_ms": fe.duration_ms,
+                    "signals": signals,
+                }),
+            )
+        }
         _ => (
             "tcp_stream.flow",
+            Severity::Info,
             format!("TCP flow: {src_ip}:{} -> {dst_ip}:{} ({:?})",
                 fe.key.src_port, fe.key.dst_port, fe.app_proto),
             serde_json::json!({
@@ -653,8 +730,8 @@ fn flow_event_to_event(
         host: host_id.to_string(),
         source: "tcp_stream".into(),
         kind: kind.into(),
-        severity: Severity::Info,
-        summary: summary,
+        severity,
+        summary,
         details,
         tags: vec!["network".into(), format!("{:?}", fe.app_proto).to_lowercase()],
         entities: vec![

@@ -17,6 +17,9 @@ pub mod osquery_log;
 pub mod proc_maps;
 pub mod suricata_eve;
 pub mod syslog_firewall;
+pub mod proto_http;
+pub mod proto_smb;
+pub mod proto_ssh;
 pub mod tcp_stream;
 #[cfg(feature = "ebpf")]
 pub mod tls_fingerprint;
