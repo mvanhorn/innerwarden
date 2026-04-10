@@ -103,6 +103,14 @@ pub(super) async fn api_sensors_inner(state: &DashboardState) -> serde_json::Val
     let mut detectors: Vec<_> = detector_counts.into_iter().collect();
     detectors.sort_by(|a, b| b.1.cmp(&a.1));
 
+    // event_timeline may be empty after restart (cursor/snapshot race).
+    // Use detector_timeline as fallback — it's rebuilt from persisted Incident nodes.
+    let event_tl = if graph.event_timeline.is_empty() {
+        &detector_timeline
+    } else {
+        &graph.event_timeline
+    };
+
     serde_json::json!({
         "date": today,
         "total_events": total_events_val,
@@ -110,7 +118,7 @@ pub(super) async fn api_sensors_inner(state: &DashboardState) -> serde_json::Val
         "sources": sources.iter().map(|(s, c)| serde_json::json!({"name": s, "count": c})).collect::<Vec<_>>(),
         "top_kinds": kinds.iter().map(|(k, c)| serde_json::json!({"name": k, "count": c})).collect::<Vec<_>>(),
         "detectors": detectors.iter().map(|(d, c)| serde_json::json!({"name": d, "count": c})).collect::<Vec<_>>(),
-        "event_timeline": graph.event_timeline,
+        "event_timeline": event_tl,
         "detector_timeline": detector_timeline,
     })
 }
