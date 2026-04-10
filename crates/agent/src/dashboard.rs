@@ -2424,16 +2424,29 @@ async fn api_graph_view(State(state): State<DashboardState>) -> Json<serde_json:
         return Json(serde_json::json!({"nodes": [], "edges": []}));
     }
 
-    // Cap at 500 nodes (prioritize incidents/threats)
-    let mut node_ids: Vec<NodeId> = graph.nodes().keys().copied().collect();
-    if node_ids.len() > 500 {
-        node_ids.sort_by(|a, b| {
-            let pri_a = node_priority(graph.get_node(*a));
-            let pri_b = node_priority(graph.get_node(*b));
-            pri_b.cmp(&pri_a)
-        });
-        node_ids.truncate(500);
-    }
+    // Cap at 300 non-Incident nodes + 50 top Incidents (prevent grid-of-dots)
+    let mut topo_ids: Vec<NodeId> = graph.nodes().iter()
+        .filter(|(_, n)| n.node_type() != NodeType::Incident)
+        .map(|(&id, _)| id)
+        .collect();
+    topo_ids.sort_by(|a, b| {
+        let pri_a = node_priority(graph.get_node(*a));
+        let pri_b = node_priority(graph.get_node(*b));
+        pri_b.cmp(&pri_a)
+    });
+    topo_ids.truncate(300);
+
+    let mut inc_ids: Vec<NodeId> = graph.nodes_of_type(NodeType::Incident);
+    inc_ids.sort_by(|a, b| {
+        // Most recent first
+        let ts_a = match graph.get_node(*a) { Some(Node::Incident { ts, .. }) => *ts, _ => chrono::DateTime::<Utc>::MIN_UTC };
+        let ts_b = match graph.get_node(*b) { Some(Node::Incident { ts, .. }) => *ts, _ => chrono::DateTime::<Utc>::MIN_UTC };
+        ts_b.cmp(&ts_a)
+    });
+    inc_ids.truncate(50);
+
+    let mut node_ids: Vec<NodeId> = topo_ids;
+    node_ids.extend(inc_ids);
     let keep: std::collections::HashSet<NodeId> = node_ids.iter().copied().collect();
 
     let cy_nodes: Vec<serde_json::Value> = node_ids
@@ -8753,11 +8766,12 @@ const INDEX_HTML: &str = r##"<!doctype html>
     <div class="report-toolbar">
       <button type="button" class="report-refresh-btn" onclick="loadGraph()">↻ Refresh</button>
       <select id="graphFilter" onchange="filterGraph()" style="background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px 8px;margin-left:8px;">
+        <option value="topology">Topology (no incidents)</option>
         <option value="all">All nodes</option>
         <option value="Process">Processes</option>
         <option value="Ip">IPs</option>
         <option value="File">Files</option>
-        <option value="Incident">Incidents</option>
+        <option value="Incident">Incidents only</option>
         <option value="threat">Threat Intel only</option>
       </select>
       <span id="graphViewStatus" class="report-status"></span>
@@ -11648,6 +11662,9 @@ const INDEX_HTML: &str = r##"<!doctype html>
       });
 
       if (statusEl) statusEl.textContent = `${view.nodes.length} nodes, ${view.edges.length} edges`;
+
+      // Apply default filter (topology = hide incidents)
+      filterGraph();
     } catch (e) {
       if (statusEl) statusEl.textContent = 'Error: ' + e.message;
     }
@@ -11658,18 +11675,24 @@ const INDEX_HTML: &str = r##"<!doctype html>
     const filter = document.getElementById('graphFilter').value;
     graphCy.nodes().forEach(n => {
       if (filter === 'all') { n.style('display', 'element'); return; }
+      if (filter === 'topology') {
+        // Hide Incident nodes — show attack topology only
+        n.style('display', n.data('type') === 'Incident' ? 'none' : 'element');
+        return;
+      }
       if (filter === 'threat') {
-        // Show threat intel IPs + their connections
         const isIp = n.data('type') === 'Ip';
         const connected = n.connectedEdges().some(e => {
           const other = e.source().id() === n.id() ? e.target() : e.source();
           return other.data('type') === 'Ip';
         });
-        n.style('display', (isIp || n.data('type') === 'Incident' || connected) ? 'element' : 'none');
+        n.style('display', (isIp || connected) ? 'element' : 'none');
       } else {
         n.style('display', n.data('type') === filter ? 'element' : 'none');
       }
     });
+    // Re-layout after filter change
+    graphCy.layout({ name: 'cose', animate: true, animationDuration: 300, nodeRepulsion: 8000, idealEdgeLength: 80, padding: 30 }).run();
   }
 
   showView('sensors'); // Sensors is the default home page
