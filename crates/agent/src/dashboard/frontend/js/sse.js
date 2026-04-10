@@ -184,8 +184,13 @@ refreshLeft(false).then(() => {
                 lastEvent = line.slice(7).trim();
               } else if (line.startsWith('data: ')) {
                 if (lastEvent === 'refresh') {
-                  refreshLeftLive();
-                  if (document.getElementById('viewHome').style.display !== 'none') loadHome();
+                  // Throttle: at most 1 refresh per 5 seconds to avoid 429s
+                  var now = Date.now();
+                  if (!window._lastSSERefresh || now - window._lastSSERefresh > 5000) {
+                    window._lastSSERefresh = now;
+                    refreshLeftLive();
+                    if (document.getElementById('viewHome').style.display !== 'none') loadHome();
+                  }
                 } else if (lastEvent === 'alert') {
                   try {
                     const outer = JSON.parse(line.slice(6).trim());

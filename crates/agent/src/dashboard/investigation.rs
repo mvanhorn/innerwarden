@@ -371,14 +371,14 @@ pub(super) fn build_pivots_from_graph(
                     .to_string();
                 PivotItem {
                     group_by: "detector".to_string(),
-                    value: det,
+                    value: det.clone(),
                     first_seen: first.unwrap_or_else(chrono::Utc::now),
                     last_seen: last.unwrap_or_else(chrono::Utc::now),
                     max_severity: max_sev,
                     incident_count: nodes.len(),
                     event_count: 0,
                     outcome: "active".to_string(),
-                    detectors: vec![],
+                    detectors: vec![det],
                 }
             })
             .collect();
