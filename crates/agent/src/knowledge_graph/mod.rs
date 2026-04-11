@@ -25,6 +25,7 @@
 pub mod detectors;
 pub mod graph;
 pub mod ingestion;
+pub mod migrations;
 pub mod narrative;
 pub mod persistence;
 pub mod triggers;

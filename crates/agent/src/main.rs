@@ -174,6 +174,14 @@ struct Cli {
     /// Internal: path to honeypot sandbox runner result JSON.
     #[arg(long, hide = true)]
     honeypot_sandbox_result: Option<PathBuf>,
+
+    /// Spec 015 one-shot migration: load today's dated graph snapshot,
+    /// delete `graph_user_creation` false-positive incidents and
+    /// brute-force User nodes, then save and exit. Never runs unless this
+    /// flag is passed explicitly. Creates a backup of the snapshot as
+    /// `<name>.bak-015` before writing.
+    #[arg(long)]
+    cleanup_015_graph_signal_quality: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -517,6 +525,79 @@ pub(crate) use trust_rules::{
 // Trust rules and LSM enforcement moved to trust_rules.rs
 
 // ---------------------------------------------------------------------------
+// Spec 015: one-shot cleanup of graph_user_creation false positives and
+// brute-force User node pollution. Invoked via
+// `innerwarden-agent --cleanup-015-graph-signal-quality`. Non-destructive
+// outside that flag: the function below loads today's dated snapshot,
+// writes a timestamped backup, applies the migration, and saves the result.
+// ---------------------------------------------------------------------------
+
+fn run_cleanup_015(data_dir: &std::path::Path) -> Result<()> {
+    use chrono::Local;
+    use std::fs;
+
+    let snapshot_path = knowledge_graph::KnowledgeGraph::dated_snapshot_path(data_dir);
+    if !snapshot_path.exists() {
+        anyhow::bail!(
+            "No dated snapshot found at {} — run the agent at least once first",
+            snapshot_path.display()
+        );
+    }
+
+    // Backup the raw snapshot bytes before touching anything, so the
+    // operator can always roll back if the migration does something
+    // unexpected. Name it with a timestamp so repeated runs don't clobber.
+    let stamp = Local::now().format("%Y%m%dT%H%M%S");
+    let backup_path = snapshot_path.with_extension(format!("json.bak-015-{stamp}"));
+    fs::copy(&snapshot_path, &backup_path)
+        .with_context(|| format!("failed to back up snapshot to {}", backup_path.display()))?;
+    println!(
+        "spec 015 cleanup: backed up snapshot to {}",
+        backup_path.display()
+    );
+
+    // Load, mutate, save.
+    let mut graph = knowledge_graph::KnowledgeGraph::load_snapshot(&snapshot_path);
+    let report = knowledge_graph::migrations::cleanup_015_graph_signal_quality(&mut graph);
+    graph.save_snapshot(&snapshot_path).with_context(|| {
+        format!(
+            "failed to save cleaned snapshot to {}",
+            snapshot_path.display()
+        )
+    })?;
+
+    println!("spec 015 cleanup complete:");
+    println!("  snapshot             : {}", snapshot_path.display());
+    println!("  backup               : {}", backup_path.display());
+    println!("  nodes before         : {}", report.nodes_before);
+    println!("  nodes after          : {}", report.nodes_after);
+    println!(
+        "  graph_user_creation  : {} incident node(s) removed",
+        report.graph_user_creation_incidents_removed
+    );
+    println!(
+        "  brute-force users    : {} User node(s) removed",
+        report.brute_force_user_nodes_removed
+    );
+    if !report.removed_user_names.is_empty() {
+        let sample: Vec<&str> = report
+            .removed_user_names
+            .iter()
+            .take(10)
+            .map(|s| s.as_str())
+            .collect();
+        println!("  removed sample       : {}", sample.join(", "));
+        if report.removed_user_names.len() > 10 {
+            println!(
+                "  …                    : +{} more",
+                report.removed_user_names.len() - 10
+            );
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -554,6 +635,10 @@ async fn main() -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("missing --honeypot-sandbox-result"))?;
         skills::builtin::run_honeypot_sandbox_worker(spec, result).await?;
         return Ok(());
+    }
+
+    if cli.cleanup_015_graph_signal_quality {
+        return run_cleanup_015(&cli.data_dir);
     }
 
     if cli.report {
