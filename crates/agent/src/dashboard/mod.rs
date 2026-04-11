@@ -766,9 +766,22 @@ mod tests {
 
     #[test]
     fn dashboard_auth_verifies_valid_credentials() {
+        // Generate the test password at runtime from OS entropy so the test
+        // has no hard-coded cryptographic literal. A 24-byte random password
+        // is mapped into `a..z` for readability in test output, and the
+        // "wrong" variant is derived by appending a non-alphabetic byte so it
+        // can never accidentally collide with `correct_pw`.
+        let mut pw_bytes = [0u8; 24];
+        OsRng.fill_bytes(&mut pw_bytes);
+        let correct_pw: String = pw_bytes
+            .iter()
+            .map(|b| char::from(b'a' + (b % 26)))
+            .collect();
+        let wrong_pw: String = format!("{correct_pw}!");
+
         let salt = SaltString::generate(&mut OsRng);
         let hash = Argon2::default()
-            .hash_password("correct horse battery staple".as_bytes(), &salt)
+            .hash_password(correct_pw.as_bytes(), &salt)
             .unwrap()
             .to_string();
         let auth = DashboardAuth {
@@ -776,9 +789,9 @@ mod tests {
             password_hash: PasswordHashString::new(&hash).unwrap(),
         };
 
-        assert!(auth.verify("admin", "correct horse battery staple"));
-        assert!(!auth.verify("admin", "wrong"));
-        assert!(!auth.verify("other", "correct horse battery staple"));
+        assert!(auth.verify("admin", &correct_pw));
+        assert!(!auth.verify("admin", &wrong_pw));
+        assert!(!auth.verify("other", &correct_pw));
     }
 
     // ── New D2 tests ────────────────────────────────────────────────────
