@@ -1,8 +1,17 @@
 use std::path::Path;
+use std::sync::Mutex;
+use std::time::Instant;
 
 use tracing::{info, warn};
 
 use crate::{neural_lifecycle, state_store, telegram, AgentState};
+
+/// Throttle: only run the FP allowlist scan every 5 minutes.
+/// Without this, the scan runs on every narrative tick (30s) and reads
+/// 7 days of dated graph snapshots from disk on each call — wasteful and
+/// pollutes logs with integrity-check pruning warnings.
+static AUTOFP_LAST_RUN: Mutex<Option<Instant>> = Mutex::new(None);
+const AUTOFP_INTERVAL_SECS: u64 = 300;
 
 /// Suggest permanent allowlist entries via Telegram based on repeated FP reports.
 pub(crate) async fn maybe_suggest_allowlist_from_fp_reports(
@@ -11,6 +20,20 @@ pub(crate) async fn maybe_suggest_allowlist_from_fp_reports(
 ) {
     if state.telegram_client.is_none() {
         return;
+    }
+
+    // Throttle: skip if last run was less than AUTOFP_INTERVAL_SECS ago.
+    {
+        let mut last = match AUTOFP_LAST_RUN.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if let Some(t) = *last {
+            if t.elapsed().as_secs() < AUTOFP_INTERVAL_SECS {
+                return;
+            }
+        }
+        *last = Some(Instant::now());
     }
 
     // If any (detector, entity) pair has 3+ FP reports in last 7 days,
