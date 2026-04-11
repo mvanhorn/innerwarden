@@ -29,17 +29,33 @@ fn detail_u16(event: &Event, key: &str) -> Option<u16> {
         .map(|v| v as u16)
 }
 
-/// Spec 015 follow-up: decide whether an incoming incident is self-traffic
-/// (research-only) vs a real external threat (user-facing).
+/// Spec 015 follow-up: decide whether an incoming incident is research-only
+/// (hidden from the operator dashboard, still kept for neural training).
 ///
-/// An incident is research_only when it has at least one Ip entity AND
-/// EVERY Ip entity is in the cloud/agent-service safelist. The conservative
-/// "all IPs match" rule means that if a chain has one attacker IP and one
-/// Cloudflare IP, we still show it to the operator — only pure self-traffic
-/// is hidden. Incidents with zero Ip entities are treated as "not specifically
-/// about an external IP" and keep their default operator-visible status.
+/// Two orthogonal rules:
+///
+/// 1. **Kill chain forming** (severity Medium with "Kill chain forming"
+///    title) — near-miss LSM patterns (2/3 bits set) that fire hundreds
+///    of times per hour. Valuable training signal, but the operator
+///    cannot act on them. Fully formed kill chains (severity Critical)
+///    stay user-visible.
+///
+/// 2. **Self-traffic** — the incident has ≥1 `Ip` entity AND every `Ip`
+///    entity is in the cloud/agent-service safelist. Mixed chains (one
+///    attacker IP + one Cloudflare IP) stay operator-visible.
 fn is_self_traffic_incident(incident: &Incident) -> bool {
     use innerwarden_core::entities::EntityType;
+    use innerwarden_core::event::Severity;
+
+    // Rule 1: kill chain forming
+    if matches!(incident.severity, Severity::Medium)
+        && incident.incident_id.starts_with("kill_chain")
+        && incident.title.starts_with("Kill chain forming")
+    {
+        return true;
+    }
+
+    // Rule 2: self-traffic IPs
     let ips: Vec<&str> = incident
         .entities
         .iter()

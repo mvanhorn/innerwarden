@@ -180,19 +180,41 @@ pub fn backfill_research_only_flag(graph: &mut KnowledgeGraph) -> BackfillResear
     report.incidents_scanned = incident_nodes.len();
 
     for inc_id in incident_nodes {
-        let (already_flagged, detector) = match graph.get_node(inc_id) {
+        let (already_flagged, detector, severity, title) = match graph.get_node(inc_id) {
             Some(Node::Incident {
                 research_only,
                 detector,
+                severity,
+                title,
                 ..
-            }) => (*research_only, detector.clone()),
+            }) => (
+                *research_only,
+                detector.clone(),
+                severity.clone(),
+                title.clone(),
+            ),
             _ => continue,
         };
         if already_flagged {
             continue;
         }
 
-        // Gather the Ip nodes this incident is TriggeredBy.
+        // Rule 1: kill_chain "forming" (incomplete bit pattern, severity
+        // Medium) is research/training data, never user-facing. The fully
+        // formed kill chains (severity Critical) stay visible.
+        //
+        // On the 2026-04-11 prod snapshot this alone moves 21,783 incidents
+        // out of the operator view while preserving the 31 critical ones.
+        if detector == "kill_chain"
+            && severity.eq_ignore_ascii_case("medium")
+            && title.starts_with("Kill chain forming")
+        {
+            updates.push((inc_id, detector));
+            continue;
+        }
+
+        // Rule 2: self-traffic rule — the incident is anchored on IPs and
+        // every anchor IP is a cloud provider / agent service endpoint.
         let mut ip_addrs: Vec<String> = Vec::new();
         for edge in graph.outgoing_edges(inc_id) {
             if edge.relation != super::types::Relation::TriggeredBy {
@@ -203,7 +225,7 @@ pub fn backfill_research_only_flag(graph: &mut KnowledgeGraph) -> BackfillResear
             }
         }
         if ip_addrs.is_empty() {
-            continue; // not a specifically IP-anchored incident
+            continue;
         }
         let all_self = ip_addrs
             .iter()
