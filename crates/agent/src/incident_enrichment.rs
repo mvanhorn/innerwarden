@@ -67,10 +67,15 @@ pub(crate) fn enrich_attacker_identity(
             .crowdsec
             .as_ref()
             .is_some_and(|cs| cs.is_known_threat(ip));
-        if let Some(profile) = state.attacker_profiles.get_mut(ip) {
-            if profile.geo.is_none() || profile.abuseipdb_score.is_none() {
-                attacker_intel::enrich_identity(profile, ip_geo, ip_reputation, crowdsec_listed);
-            }
+        // Ensure profile exists — enrichment may run before the main
+        // attacker_intel pipeline creates the profile. Without this,
+        // GeoIP/AbuseIPDB data was silently discarded for new IPs.
+        let profile = state
+            .attacker_profiles
+            .entry(ip.to_string())
+            .or_insert_with(|| attacker_intel::new_profile(ip, incident.ts));
+        if profile.geo.is_none() || profile.abuseipdb_score.is_none() {
+            attacker_intel::enrich_identity(profile, ip_geo, ip_reputation, crowdsec_listed);
         }
     }
 }

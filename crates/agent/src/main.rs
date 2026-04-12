@@ -2574,6 +2574,20 @@ async fn process_incidents(
 
         incident_advisory::handle_advisory_violation(incident, advisory_cache, state).await;
 
+        // 1b. Enrichment — runs for ALL incidents regardless of severity.
+        // GeoIP + AbuseIPDB + attacker profile update must happen before the
+        // AI gate filters out low-severity incidents, otherwise auto-blocked
+        // and low-severity IPs never get country/abuse_confidence data.
+        let ip_geo_early = incident_enrichment::lookup_incident_geoip(incident, state).await;
+        let ip_rep_early = incident_reputation::lookup_abuseipdb_reputation(incident, state).await;
+        incident_enrichment::enrich_attacker_identity(
+            incident,
+            state,
+            ip_geo_early.as_ref(),
+            ip_rep_early.as_ref(),
+        );
+        incident_enrichment::log_threat_feed_match(incident, state);
+
         // 2. AI analysis - only when AI is enabled and incident passes the gate.
         match incident_flow::evaluate_pre_ai_flow(
             incident,
@@ -2624,7 +2638,9 @@ async fn process_incidents(
             cfg.ai.context_events,
         );
 
-        let ip_reputation = incident_reputation::lookup_abuseipdb_reputation(incident, state).await;
+        // ── Auto-handle decisions (may `continue` to skip AI) ──────────
+        // Enrichment already ran in step 1b. Reuse the results.
+        let ip_reputation = ip_rep_early;
 
         if incident_abuseipdb::try_handle_abuseipdb_autoblock(
             incident,
@@ -2655,8 +2671,6 @@ async fn process_incidents(
             continue;
         }
 
-        incident_enrichment::log_threat_feed_match(incident, state);
-
         if incident_honeypot_router::try_handle_honeypot_routing(
             incident,
             data_dir,
@@ -2669,14 +2683,6 @@ async fn process_incidents(
             handled += 1;
             continue;
         }
-
-        let ip_geo = incident_enrichment::lookup_incident_geoip(incident, state).await;
-        incident_enrichment::enrich_attacker_identity(
-            incident,
-            state,
-            ip_geo.as_ref(),
-            ip_reputation.as_ref(),
-        );
 
         // Build graph context: attack narrative from knowledge graph neighborhood.
         // Phase 015: prefer the Incident node as center (richest context after 014-D
@@ -2710,7 +2716,7 @@ async fn process_incidents(
                 })
                 .collect(),
             ip_reputation: ip_reputation.clone(),
-            ip_geo: ip_geo.clone(),
+            ip_geo: ip_geo_early.clone(),
             graph_context,
         };
 
@@ -2821,7 +2827,7 @@ async fn process_incidents(
             cfg,
             state,
             ip_reputation.as_ref(),
-            ip_geo.as_ref(),
+            ip_geo_early.as_ref(),
         );
 
         handled += 1;
