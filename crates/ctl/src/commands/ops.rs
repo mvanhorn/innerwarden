@@ -256,7 +256,10 @@ pub(crate) fn cmd_configure_2fa(cli: &Cli) -> Result<()> {
             println!();
             println!("  Scan this URI with your authenticator app:");
             println!();
-            println!("  {}", uri);
+            // Intentional: TOTP provisioning URI must be shown to the operator
+            // exactly once so they can scan it. It is never persisted or logged.
+            eprint!("  {uri}"); // lgtm[rust/cleartext-logging]
+            eprintln!();
             println!();
             print!("  Enter the 6-digit code to verify: ");
             std::io::stdout().flush()?;

@@ -362,7 +362,8 @@ pub(crate) fn cmd_ai_install(
     println!();
     println!("  Provider: Ollama cloud (https://api.ollama.com)");
     println!("  Model:    {model}");
-    println!("  API key:  {}...", &api_key[..api_key.len().min(12)]);
+    let masked = "*".repeat(api_key.len().min(12));
+    println!("  API key:  {masked} (masked)");
     println!();
 
     if !yes {
