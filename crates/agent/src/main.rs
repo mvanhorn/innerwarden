@@ -1302,11 +1302,14 @@ async fn main() -> Result<()> {
 
     // Initialize threat feed client if VT API key or IOC feed URLs are configured
     {
-        let vt_key = threat_feeds::resolve_vt_api_key(&cfg.abuseipdb.api_key);
-        // Threat feeds are always initialized (even without VT key, for IOC feed support)
+        let vt_key = if cfg.threat_feeds.virustotal_api_key.is_empty() {
+            threat_feeds::resolve_vt_api_key("")
+        } else {
+            cfg.threat_feeds.virustotal_api_key.clone()
+        };
         let client = threat_feeds::ThreatFeedClient::new(
             vt_key,
-            Vec::new(), // IOC feed URLs would come from config
+            cfg.threat_feeds.ioc_feed_urls.clone(),
             &cli.data_dir,
         );
         let feed_state = client.state();
@@ -1940,6 +1943,8 @@ async fn main() -> Result<()> {
                             .map(|t| t.elapsed().as_secs() >= INTEL_INTERVAL_SECS)
                             .unwrap_or(true);
                         if should_consolidate && !state.attacker_profiles.is_empty() {
+                            // Backfill enrichment for profiles missing GeoIP/AbuseIPDB
+                            incident_enrichment::backfill_enrichment(&mut state).await;
                             // Scan honeypot sessions for known attacker IPs
                             scan_honeypot_for_profiles(
                                 &cli.data_dir,

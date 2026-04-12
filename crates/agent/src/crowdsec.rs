@@ -84,10 +84,11 @@ impl CrowdSecClient {
     }
 
     /// Fetch new/deleted IP ban decisions from the LAPI stream endpoint.
+    /// `startup=true` fetches the full list; `startup=false` fetches deltas only.
     /// Returns (new_ips, deleted_ips).
-    async fn fetch_stream(&self) -> Result<(Vec<String>, Vec<String>)> {
+    async fn fetch_stream(&self, startup: bool) -> Result<(Vec<String>, Vec<String>)> {
         let url = format!(
-            "{}/v1/decisions/stream?startup=false&scopes=ip",
+            "{}/v1/decisions/stream?startup={startup}&scopes=ip",
             self.base_url
         );
 
@@ -177,6 +178,8 @@ pub struct CrowdSecState {
     /// Known-bad IPs from CrowdSec community intelligence.
     threat_list: HashSet<String>,
     pub client: CrowdSecClient,
+    /// First sync uses startup=true to get the full list, then switches to delta.
+    first_sync_done: bool,
 }
 
 impl CrowdSecState {
@@ -184,6 +187,7 @@ impl CrowdSecState {
         Self {
             threat_list: HashSet::new(),
             client: CrowdSecClient::new(cfg),
+            first_sync_done: false,
         }
     }
 
@@ -206,7 +210,10 @@ pub async fn sync_threat_list(cs: &mut CrowdSecState) -> (usize, usize) {
         return (0, 0);
     }
 
-    let (new_ips, deleted_ips) = match cs.client.fetch_stream().await {
+    // First sync after agent start: fetch the full decision list (startup=true).
+    // Subsequent syncs: fetch deltas only (startup=false).
+    let startup = !cs.first_sync_done;
+    let (new_ips, deleted_ips) = match cs.client.fetch_stream(startup).await {
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "CrowdSec threat list sync failed");
@@ -243,7 +250,13 @@ pub async fn sync_threat_list(cs: &mut CrowdSecState) -> (usize, usize) {
         }
     }
 
-    if added > 0 || removed > 0 {
+    if !cs.first_sync_done {
+        info!(
+            total = cs.threat_list.len(),
+            "CrowdSec threat list initialized (full sync)"
+        );
+        cs.first_sync_done = true;
+    } else if added > 0 || removed > 0 {
         info!(
             added,
             removed,

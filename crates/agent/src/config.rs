@@ -37,6 +37,8 @@ pub struct AgentConfig {
     #[serde(default)]
     pub geoip: GeoIpConfig,
     #[serde(default)]
+    pub threat_feeds: ThreatFeedsConfig,
+    #[serde(default)]
     pub slack: SlackConfig,
     #[serde(default)]
     pub cloudflare: CloudflareConfig,
@@ -2033,6 +2035,47 @@ pub struct GeoIpConfig {
     /// No API key required. Free tier: 45 requests/minute.
     #[serde(default)]
     pub enabled: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Threat Feeds
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ThreatFeedsConfig {
+    /// External IOC feed URLs (plaintext IP/domain lists). Polled periodically.
+    /// Free public feeds:
+    /// - https://feodotracker.abuse.ch/downloads/ipblocklist.txt
+    /// - https://urlhaus.abuse.ch/downloads/text/
+    /// - https://threatfox.abuse.ch/downloads/iocs/text/
+    #[serde(default)]
+    pub ioc_feed_urls: Vec<String>,
+
+    /// VirusTotal API key for binary hash checking (optional).
+    /// Can also be set via VT_API_KEY or VIRUSTOTAL_API_KEY env var.
+    #[serde(default)]
+    pub virustotal_api_key: String,
+
+    /// Poll interval in seconds (default: 3600 = 1 hour).
+    /// Currently feeds are polled on every slow tick; this field is reserved
+    /// for rate-limiting the poll frequency in a future version.
+    #[serde(default = "default_threat_feeds_poll_secs")]
+    #[allow(dead_code)]
+    pub poll_secs: u64,
+}
+
+fn default_threat_feeds_poll_secs() -> u64 {
+    3600
+}
+
+impl Default for ThreatFeedsConfig {
+    fn default() -> Self {
+        Self {
+            ioc_feed_urls: Vec::new(),
+            virustotal_api_key: String::new(),
+            poll_secs: default_threat_feeds_poll_secs(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

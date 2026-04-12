@@ -239,6 +239,12 @@ pub fn is_below_severity_threshold(
     }
 }
 
+/// Check if an IP is private (RFC1918, link-local, etc.).
+/// Exported for use by enrichment backfill to skip non-routable IPs.
+pub fn is_private_ip(addr: IpAddr) -> bool {
+    is_private_or_loopback(addr)
+}
+
 fn is_private_or_loopback(addr: IpAddr) -> bool {
     match addr {
         IpAddr::V4(v4) => {
