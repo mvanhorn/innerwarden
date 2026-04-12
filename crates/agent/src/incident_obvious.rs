@@ -106,6 +106,21 @@ pub(crate) async fn try_handle_obvious_incident(
         }
     }
 
+    // Write decision to knowledge graph so the dashboard shows "blocked".
+    {
+        let auto_executed = !execution_result.starts_with("skipped");
+        let mut graph = state.knowledge_graph.write().unwrap();
+        graph.ingest_decision(
+            &incident.incident_id,
+            "block_ip",
+            Some(ip),
+            auto_decision.confidence,
+            &auto_decision.reason,
+            auto_executed,
+            chrono::Utc::now(),
+        );
+    }
+
     // Update IP reputation
     let rep = state
         .ip_reputations

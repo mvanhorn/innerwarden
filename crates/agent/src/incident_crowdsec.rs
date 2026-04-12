@@ -84,6 +84,21 @@ pub(crate) async fn try_handle_crowdsec_autoblock(
         ("skipped: responder disabled".to_string(), false)
     };
 
+    // Write decision to knowledge graph so the dashboard shows "blocked".
+    {
+        let auto_executed = !execution_result.starts_with("skipped");
+        let mut graph = state.knowledge_graph.write().unwrap();
+        graph.ingest_decision(
+            &incident.incident_id,
+            "block_ip",
+            Some(&ip),
+            auto_decision.confidence,
+            &auto_decision.reason,
+            auto_executed,
+            chrono::Utc::now(),
+        );
+    }
+
     if let Some(writer) = &mut state.decision_writer {
         let entry = decisions::build_entry(
             &incident.incident_id,
