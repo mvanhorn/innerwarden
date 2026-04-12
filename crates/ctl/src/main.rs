@@ -1635,6 +1635,38 @@ enum SystemCommand {
         #[arg(short, long)]
         output: Option<String>,
     },
+
+    /// Audit Ring -2 firmware security (SMM, MSR, UEFI, TPM, ACPI, SPI).
+    ///
+    /// Examples:
+    ///   innerwarden system smm
+    ///   innerwarden system smm --json
+    ///   innerwarden system smm --baseline
+    ///   innerwarden system smm --drift
+    Smm {
+        /// Output as JSON instead of human-readable format.
+        #[arg(long)]
+        json: bool,
+
+        /// Capture firmware baseline for drift detection.
+        #[arg(long)]
+        baseline: bool,
+
+        /// Show what changed since the last baseline.
+        #[arg(long)]
+        drift: bool,
+    },
+
+    /// Audit Ring -1 hypervisor integrity (VM detection, KVM monitoring).
+    ///
+    /// Examples:
+    ///   innerwarden system hypervisor
+    ///   innerwarden system hypervisor --json
+    Hypervisor {
+        /// Output as JSON instead of human-readable format.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -2017,6 +2049,20 @@ fn main() -> Result<()> {
             SystemCommand::Navigator { ref output } => {
                 commands::status::cmd_navigator(output.as_deref())
             }
+            SystemCommand::Smm {
+                json,
+                baseline,
+                drift,
+            } => {
+                if *baseline {
+                    commands::firmware::cmd_smm_baseline()
+                } else if *drift {
+                    commands::firmware::cmd_smm_drift()
+                } else {
+                    commands::firmware::cmd_smm(*json)
+                }
+            }
+            SystemCommand::Hypervisor { json } => commands::firmware::cmd_hypervisor(*json),
         },
 
         // ===================================================================
