@@ -2068,12 +2068,36 @@ fn default_threat_feeds_poll_secs() -> u64 {
     3600
 }
 
+/// Default IOC feeds — mirrors sensor's datasets::FEEDS so both sensor and
+/// agent share the same curated threat intelligence sources out of the box.
+pub const DEFAULT_IOC_FEEDS: &[&str] = &[
+    "https://feodotracker.abuse.ch/downloads/ipblocklist_recommended.txt",
+    "https://lists.blocklist.de/lists/all.txt",
+    "https://www.spamhaus.org/drop/drop.txt",
+    "https://check.torproject.org/torbulkexitlist",
+    "https://sslbl.abuse.ch/blacklist/sslipblacklist.txt",
+    "https://www.dshield.org/block.txt",
+    "https://urlhaus.abuse.ch/downloads/text_online/",
+    "https://threatfox.abuse.ch/downloads/hostfile/",
+];
+
 impl Default for ThreatFeedsConfig {
     fn default() -> Self {
         Self {
             ioc_feed_urls: Vec::new(),
             virustotal_api_key: String::new(),
             poll_secs: default_threat_feeds_poll_secs(),
+        }
+    }
+}
+
+impl ThreatFeedsConfig {
+    /// Effective feed URLs: user-configured if any, otherwise the curated defaults.
+    pub fn effective_urls(&self) -> Vec<String> {
+        if self.ioc_feed_urls.is_empty() {
+            DEFAULT_IOC_FEEDS.iter().map(|u| u.to_string()).collect()
+        } else {
+            self.ioc_feed_urls.clone()
         }
     }
 }

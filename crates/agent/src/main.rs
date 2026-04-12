@@ -1307,9 +1307,17 @@ async fn main() -> Result<()> {
         } else {
             cfg.threat_feeds.virustotal_api_key.clone()
         };
+        let feed_urls = cfg.threat_feeds.effective_urls();
+        if !feed_urls.is_empty() {
+            info!(
+                feeds = feed_urls.len(),
+                "threat feeds: {} URLs configured",
+                feed_urls.len()
+            );
+        }
         let client = threat_feeds::ThreatFeedClient::new(
             vt_key,
-            cfg.threat_feeds.ioc_feed_urls.clone(),
+            feed_urls,
             &cli.data_dir,
         );
         let feed_state = client.state();
