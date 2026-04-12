@@ -125,6 +125,20 @@ impl DiscoveryBurstDetector {
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
 
+        // Skip events without process context (pid=0, comm="").
+        // These come from kernel-level activity where eBPF couldn't
+        // attribute the syscall to a userspace process — MOTD scripts,
+        // update-notifier health checks, kernel threads, early-boot
+        // init. Observed 2026-04-12: uid=0 pid=0 comm="" firing once
+        // per 30min with `uname -r` and
+        // `find /var/lib/update-notifier/updates-available ...` as the
+        // last command. An attacker with root runs in a real shell
+        // session with pid>0 and comm set — pid=0 is not exploitable
+        // for recon evasion.
+        if pid == 0 && comm.is_empty() {
+            return None;
+        }
+
         // Skip allowed processes (centralized allowlist)
         if allowlists::is_innerwarden_process(uid, comm)
             || allowlists::comm_in_allowlist(comm, allowlists::DISCOVERY_ALLOWED)

@@ -13,7 +13,7 @@ const fmtDateTime = (ts) => {
   return isNaN(d) ? String(ts) : d.toLocaleString();
 };
 
-const outcomeLabel = (o) => ({blocked:'CONTAINED', active:'ACTIVE', monitoring:'MONITORING', honeypot:'HONEYPOT', unknown:'UNKNOWN'}[o] || o.toUpperCase());
+const outcomeLabel = (o) => ({blocked:'CONTAINED', active:'OBSERVING', monitoring:'OBSERVING', honeypot:'HONEYPOT', needs_attention:'NEEDS ATTENTION', dismissed:'DISMISSED', unknown:'UNKNOWN'}[o] || o.toUpperCase());
 const outcomeCls   = (o) => 'bo bo-' + (o || 'unknown');
 
 const sevCls = (s) => ({'critical':'sc-critical','high':'sc-high','medium':'sc-medium','low':'sc-low','info':'sc-info'}[s] || '');

@@ -109,20 +109,25 @@ async function loadTopAction() {
       return;
     }
 
-    // There are threats — show the most urgent one
+    // There are incidents the AI is handling. With Guard ON, present
+    // as informational (blue), not alarming (red). The AI is autonomous.
     const topThreat = threats.length > 0 ? threats[0] : null;
-    const colors = { critical: '#f43f5e', high: '#fb923c', medium: '#facc15' };
-    const color = colors[level] || colors.medium;
+    const isGuard = (window._agentMode || 'guard') === 'guard';
+    const color = isGuard ? '#78e5ff' : (level === 'critical' ? '#f43f5e' : '#fb923c');
 
     el.style.display = 'block';
-    el.style.borderColor = color.replace(')', ',0.4)').replace('#', 'rgba(') || 'rgba(244,63,94,0.3)';
-    el.style.background = 'linear-gradient(135deg, rgba(244,63,94,0.06), transparent)';
+    el.style.borderColor = isGuard ? 'rgba(120,229,255,0.3)' : 'rgba(244,63,94,0.3)';
+    el.style.background = isGuard ? 'rgba(120,229,255,0.04)' : 'linear-gradient(135deg, rgba(244,63,94,0.06), transparent)';
+
+    const statusLabel = isGuard
+      ? hc + ' incident' + (hc > 1 ? 's' : '') + ' being handled by AI'
+      : hc + ' unresolved ' + (level === 'critical' ? 'CRITICAL' : 'high-severity') + ' incident' + (hc > 1 ? 's' : '');
 
     let actionHtml = '<div style="display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap">' +
       '<div style="display:flex;align-items:center;gap:10px">' +
-      '<span style="font-size:1.3rem">' + (level === 'critical' ? '&#128680;' : '&#9888;&#65039;') + '</span>' +
+      '<span style="font-size:1.3rem">' + (isGuard ? '&#128737;' : (level === 'critical' ? '&#128680;' : '&#9888;&#65039;')) + '</span>' +
       '<div>' +
-      '<div style="font-size:0.85rem;font-weight:700;color:' + color + '">' + hc + ' unresolved ' + (level === 'critical' ? 'CRITICAL' : 'high-severity') + ' incident' + (hc > 1 ? 's' : '') + '</div>' +
+      '<div style="font-size:0.85rem;font-weight:700;color:' + color + '">' + statusLabel + '</div>' +
       '<div style="font-size:0.7rem;color:var(--muted)">';
 
     if (topThreat) {

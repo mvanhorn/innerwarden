@@ -101,6 +101,28 @@ impl SandboxEvasionDetector {
             return None;
         }
 
+        // Skip InnerWarden's own processes: the hypervisor audit, SMM audit,
+        // and firmware integrity modules legitimately read
+        // /sys/class/dmi/id/*, /proc/cpuinfo, and run dmidecode/lspci as
+        // part of the own-host security posture check. Without this filter,
+        // `tokio-rt-worker` self-triggers sandbox_evasion every few seconds
+        // (observed on 2026-04-11: 832+ `Sandbox/VM evasion detected:
+        // tokio-rt-worker` High incidents per day, 100% self-detection).
+        let ev_uid = event
+            .details
+            .get("uid")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(u64::MAX);
+        let ev_comm = event
+            .details
+            .get("comm")
+            .or(event.details.get("process"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if super::allowlists::is_innerwarden_process(ev_uid, ev_comm) {
+            return None;
+        }
+
         let check_type = self.classify_event(event)?;
 
         // Track

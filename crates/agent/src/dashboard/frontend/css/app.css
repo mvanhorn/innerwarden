@@ -20,6 +20,43 @@
       --surface: #091121;
       --bg: #040814;
     }
+    /* ── Severity-scaled alert classes (spec 017 Phase 1, 00-shared) ── */
+    /* Container-level tone classes. Text color is NOT set here so
+       existing typography keeps working. Used by hero banners, feed
+       rows, and callouts across pages. */
+    .alert-critical {
+      border: 1px solid rgba(244, 63, 94, 0.55);
+      border-left: 3px solid var(--danger);
+      background: rgba(244, 63, 94, 0.08);
+    }
+    .alert-high {
+      border: 1px solid rgba(255, 154, 85, 0.55);
+      border-left: 3px solid var(--orange);
+      background: rgba(255, 154, 85, 0.08);
+    }
+    .alert-medium {
+      border: 1px solid rgba(255, 197, 102, 0.50);
+      border-left: 3px solid var(--warn);
+      background: rgba(255, 197, 102, 0.07);
+    }
+    .alert-low {
+      border: 1px solid rgba(120, 229, 255, 0.40);
+      border-left: 3px solid var(--accent);
+      background: rgba(120, 229, 255, 0.05);
+    }
+    .alert-info {
+      border: 1px solid rgba(74, 222, 128, 0.35);
+      border-left: 3px solid var(--ok);
+      background: rgba(74, 222, 128, 0.05);
+    }
+    /* Responsive table wrapper utility. Provides horizontal scroll
+       as a safety net on narrow viewports. Page specs (e.g. Intel)
+       may extend this with stacked-card media queries. */
+    .table-wrap {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      width: 100%;
+    }
     /* Ambient cyber grid - matches site's cyber-shell */
     body::before {
       content: "";
@@ -1146,6 +1183,15 @@
     .threat-group .attacker-card:last-child { border-bottom:none; }
     .threat-group-needs-action { border-color:rgba(244,63,94,0.25); }
     .threat-group-needs-action .threat-group-header { background:rgba(244,63,94,0.04); }
+
+    /* Outcome-group accent borders (02-threats AI audit trail) */
+    .outcome-attention { border-color:rgba(244,63,94,0.3); }
+    .outcome-attention .threat-group-header { background:rgba(244,63,94,0.06); }
+    .outcome-blocked .threat-group-header { background:rgba(74,222,128,0.04); }
+    .outcome-honeypot .threat-group-header { background:rgba(255,165,0,0.04); }
+    .outcome-observing .threat-group-header { background:rgba(120,229,255,0.04); }
+    .outcome-dismissed { opacity:0.7; }
+
     /* Incident humanization */
     .entry-contained .evidence-card { opacity:0.7; border-left:2px solid var(--ok); }
     .entry-open .evidence-card { border-left:2px solid var(--danger); }
@@ -1466,3 +1512,157 @@
     }
     .hud-panel-title::after { content:''; display:block; width:2.2em; height:1px; margin-top:0.6em;
       background:linear-gradient(90deg, rgba(120,229,255,0.7), rgba(120,229,255,0.1)); }
+
+    /* ── Home tab — spec 017 Phase 1 (01-home) ───────────────────── */
+    /* Hero status-meta strip (MODE, telemetry, links) */
+    .home-status-meta {
+      display:flex; flex-wrap:wrap; gap:14px; align-items:center;
+      margin-top:10px; font-size:0.66rem; color:var(--muted);
+      letter-spacing:0.04em;
+    }
+    .home-meta-item {
+      display:inline-flex; align-items:center; gap:4px;
+      color:var(--muted);
+    }
+    .home-meta-links {
+      margin-left:auto; display:flex; gap:14px; flex-wrap:wrap;
+    }
+    .home-link {
+      color:var(--accent); text-decoration:none;
+      font-size:0.66rem; font-weight:500; letter-spacing:0.02em;
+      border-bottom:1px dashed rgba(120,229,255,0.35);
+      padding-bottom:1px; cursor:pointer;
+      transition:color 0.15s, border-color 0.15s;
+    }
+    .home-link:hover {
+      color:var(--text); border-color:rgba(120,229,255,0.8);
+    }
+    .home-stale-soft {
+      color:var(--warn); font-weight:500;
+    }
+    .home-stale-strong {
+      color:var(--danger); font-weight:600;
+    }
+
+    /* "Now" section — 2 observational lines */
+    .home-now {
+      padding:16px 20px;
+    }
+    .home-now .home-section-title {
+      font-size:0.62rem; letter-spacing:0.22em;
+      text-transform:uppercase; color:var(--muted);
+      margin-bottom:10px;
+    }
+    .home-now-list {
+      list-style:none; padding:0; margin:0;
+      display:flex; flex-direction:column; gap:6px;
+    }
+    .home-now-list li {
+      font-size:0.82rem; line-height:1.55; color:var(--text);
+    }
+
+    /* KPI temporal sub-label */
+    .kpi-window {
+      font-size:0.62rem; color:var(--muted);
+      text-transform:none; letter-spacing:0.02em;
+      margin-top:3px; white-space:nowrap;
+    }
+
+    /* Recent Activity feed rows — severity × outcome hierarchy */
+    .feed-row {
+      display:flex; align-items:center; gap:12px;
+      padding:10px 14px; margin:6px 0;
+      border-radius:8px;
+      border-left:3px solid transparent;
+      background:rgba(9,17,33,0.4);
+      cursor:pointer;
+      transition:background 0.15s;
+    }
+    .feed-row:hover {
+      background:rgba(15,26,49,0.7);
+    }
+    .feed-row .activity-icon {
+      font-size:1rem; flex-shrink:0;
+    }
+    .feed-row .activity-time {
+      font-size:0.66rem; color:var(--dim);
+      white-space:nowrap; flex-shrink:0;
+      font-family:'JetBrains Mono',monospace;
+    }
+    /* Handled outcomes — subtle green border, muted content */
+    .feed-handled {
+      border-left-color:var(--ok);
+      opacity:0.82;
+      background:rgba(74,222,128,0.04);
+    }
+    .feed-muted {
+      border-left-color:rgba(138,157,179,0.3);
+      opacity:0.72;
+    }
+    .feed-noise {
+      border-left-color:transparent;
+      opacity:0.48;
+    }
+    .feed-monitor {
+      border-left-color:var(--accent);
+      background:rgba(120,229,255,0.04);
+      opacity:0.85;
+    }
+    .feed-honeypot {
+      border-left-color:var(--orange);
+      background:rgba(255,154,85,0.05);
+      opacity:0.9;
+    }
+
+    /* Feed empty state */
+    .home-feed-empty {
+      padding:34px 20px; text-align:center;
+    }
+    .home-feed-empty-icon {
+      font-size:1.4rem; margin-bottom:8px;
+    }
+    .home-feed-empty-title {
+      color:var(--ok); font-size:0.84rem; font-weight:600;
+    }
+    .home-feed-empty-sub {
+      color:var(--dim); font-size:0.72rem; margin-top:4px;
+    }
+
+    /* Data Collection — summary + collapsible details */
+    .collector-summary-line {
+      display:flex; align-items:center; gap:12px;
+      padding:10px 14px; border-radius:8px;
+      font-size:0.82rem; color:var(--text);
+    }
+    .collector-details-toggle {
+      margin-left:auto;
+      background:transparent; border:1px solid var(--line);
+      color:var(--muted); font-size:0.66rem;
+      padding:4px 10px; border-radius:6px; cursor:pointer;
+      transition:color 0.15s, border-color 0.15s;
+    }
+    .collector-details-toggle:hover {
+      color:var(--accent); border-color:var(--accent);
+    }
+    .collector-details {
+      margin-top:8px; padding:8px 0;
+      border-top:1px solid var(--line);
+    }
+    .collector-idle-note {
+      font-size:0.66rem; color:var(--dim); margin-top:6px;
+    }
+
+    /* AI Briefing empty-state */
+    .briefing-empty {
+      color:var(--muted); font-size:0.78rem; line-height:1.55;
+      padding:6px 0;
+    }
+
+    /* Mobile polish */
+    @media (max-width: 600px) {
+      .home-status-meta { gap:8px; font-size:0.62rem; }
+      .home-meta-links { margin-left:0; width:100%; }
+      .home-now-list li { font-size:0.78rem; }
+      .collector-summary-line { flex-wrap:wrap; }
+      .collector-details-toggle { margin-left:0; }
+    }

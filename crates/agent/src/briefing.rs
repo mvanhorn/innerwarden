@@ -44,9 +44,16 @@ pub fn build_briefing_context(kg: &Arc<RwLock<KnowledgeGraph>>) -> String {
             decision,
             decision_target,
             auto_executed,
+            research_only,
             ..
         }) = graph.get_node(id)
         {
+            // Skip research-only incidents — these are self-traffic (agent
+            // notifications, cloud metadata, CrowdSec polling) that pollute
+            // the briefing with false "threats" like Telegram API IPs.
+            if *research_only {
+                continue;
+            }
             *by_detector.entry(detector.clone()).or_default() += 1;
             *by_severity.entry(severity.to_lowercase()).or_default() += 1;
 
@@ -82,19 +89,38 @@ pub fn build_briefing_context(kg: &Arc<RwLock<KnowledgeGraph>>) -> String {
                     contained += 1;
                 }
                 None => {
-                    unresolved += 1;
-                    let sev = severity.to_lowercase();
-                    if sev == "high" || sev == "critical" {
-                        unresolved_high_crit += 1;
-                        let entity = graph
-                            .outgoing_edges(id)
+                    // Check if this "unresolved" incident only involves
+                    // self-traffic IPs — if so, it's a pre-fix FP that
+                    // wasn't marked research_only. Don't count it as
+                    // needing attention.
+                    let entities: Vec<String> = graph
+                        .outgoing_edges(id)
+                        .iter()
+                        .filter(|e| e.relation == Relation::TriggeredBy)
+                        .filter_map(|e| graph.get_node(e.to))
+                        .filter_map(|n| {
+                            if let Node::Ip { addr, .. } = n {
+                                Some(addr.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    let all_self = !entities.is_empty()
+                        && entities
                             .iter()
-                            .find(|e| e.relation == Relation::TriggeredBy)
-                            .and_then(|e| graph.get_node(e.to))
-                            .map(|n| n.label())
-                            .unwrap_or_default();
-                        if unresolved_list.len() < 10 {
-                            unresolved_list.push((sev, title.clone(), entity));
+                            .all(|ip| crate::cloud_safelist::is_self_traffic_ip(ip));
+                    if all_self {
+                        ignored += 1; // Treat as noise for briefing purposes
+                    } else {
+                        unresolved += 1;
+                        let sev = severity.to_lowercase();
+                        if sev == "high" || sev == "critical" {
+                            unresolved_high_crit += 1;
+                            let entity = entities.first().cloned().unwrap_or_default();
+                            if unresolved_list.len() < 10 {
+                                unresolved_list.push((sev, title.clone(), entity));
+                            }
                         }
                     }
                 }
@@ -110,9 +136,13 @@ pub fn build_briefing_context(kg: &Arc<RwLock<KnowledgeGraph>>) -> String {
             detector,
             decision,
             decision_target,
+            research_only,
             ..
         }) = graph.get_node(inc_id)
         {
+            if *research_only {
+                continue;
+            }
             for edge in graph.outgoing_edges(inc_id) {
                 if edge.relation != Relation::TriggeredBy {
                     continue;
@@ -123,7 +153,12 @@ pub fn build_briefing_context(kg: &Arc<RwLock<KnowledgeGraph>>) -> String {
                 {
                     if *is_internal {
                         continue;
-                    } // Skip server's own IPs
+                    }
+                    // Skip self-traffic IPs (cloud providers, agent services,
+                    // local interfaces) — same filter as investigation.rs
+                    if crate::cloud_safelist::is_self_traffic_ip(addr) {
+                        continue;
+                    }
                     let entry = ip_data
                         .entry(addr.clone())
                         .or_insert((0, Vec::new(), false));
@@ -160,27 +195,43 @@ pub fn build_briefing_context(kg: &Arc<RwLock<KnowledgeGraph>>) -> String {
         "LOW"
     };
 
+    // Count unique blocked IPs (not decisions — matches dashboard KPI)
+    let blocked_ips: std::collections::HashSet<&str> = actions_taken
+        .iter()
+        .filter_map(|a| {
+            if a.starts_with("Blocked IP ") {
+                a.split_whitespace().nth(2)
+            } else {
+                None
+            }
+        })
+        .collect();
+
     // Build context
-    let total = incident_nodes.len();
+    let operator_incidents = contained + unresolved; // excludes research_only
     let mut ctx = format!(
         "SECURITY INTELLIGENCE CONTEXT — {}\n\n\
          SITUATION STATUS:\n\
-         - Total incidents today: {}\n\
-         - CONTAINED (AI blocked/monitored/responded): {} — these are RESOLVED, not active threats\n\
-         - IGNORED by AI (noise/false positives): {} — confirmed non-threats\n\
-         - UNRESOLVED (no AI decision yet): {} — of which {} are high/critical severity\n\
-         - The system is in GUARD mode: AI auto-blocks high-confidence threats\n\n\
-         IMPORTANT: {} of {} incidents are already handled. The system is actively defending.\n\
-         Only {} incident{} need{} human attention.\n\n",
+         - Operator-relevant incidents today: {}\n\
+         - BLOCKED: {} unique IP{} auto-blocked by AI\n\
+         - OBSERVING: {} incidents being monitored (AI is handling, no human action needed)\n\
+         - IGNORED: {} confirmed non-threats\n\
+         - The server uses SSH key-only authentication — password brute-force cannot succeed\n\
+         - Most external activity is routine internet scanning that fails at protocol level\n\n\
+         IMPORTANT: The AI is handling everything. {} of {} incidents are already resolved or being monitored.\n\
+         Human attention needed: {}.\n\n",
         Utc::now().format("%Y-%m-%d"),
-        total,
-        contained,
+        operator_incidents,
+        blocked_ips.len(),
+        if blocked_ips.len() == 1 { "" } else { "s" },
+        unresolved,
         ignored,
-        unresolved, unresolved_high_crit,
-        contained + ignored, total,
-        unresolved_high_crit,
-        if unresolved_high_crit == 1 { "" } else { "s" },
-        if unresolved_high_crit == 1 { "s" } else { "" },
+        contained + unresolved, operator_incidents,
+        if unresolved_high_crit == 0 {
+            "NONE — everything is handled".to_string()
+        } else {
+            format!("{} high/critical items to review", unresolved_high_crit)
+        },
     );
 
     if !actions_taken.is_empty() {
@@ -241,24 +292,28 @@ pub fn build_briefing_context(kg: &Arc<RwLock<KnowledgeGraph>>) -> String {
 /// The LLM prompt for generating the briefing.
 pub fn briefing_prompt(context: &str) -> String {
     format!(
-        "You are a senior security analyst writing a daily briefing for a server operator.\n\
+        "You are the AI security agent writing a daily briefing for a non-technical server operator.\n\
+         \n\
+         This server is protected by InnerWarden — an autonomous AI security agent that blocks \
+         threats automatically. The operator does NOT need to take action on most items. \
+         SSH uses key-only authentication (password login disabled). Most activity from \
+         external IPs is routine internet scanning that fails at the protocol level.\n\
          \n\
          CRITICAL RULES:\n\
-         - Incidents marked CONTAINED are RESOLVED — do NOT treat them as active threats\n\
-         - Incidents marked IGNORED are confirmed noise — do NOT recommend action on them\n\
-         - Only UNRESOLVED incidents need attention\n\
-         - IPs marked [ALREADY BLOCKED] are handled — do NOT recommend blocking them again\n\
-         - Internal IPs (10.x, 192.168.x, 127.x) are the server itself — NOT attackers\n\
-         - The system AUTO-BLOCKS threats. Most detections are already handled.\n\
+         - CONTAINED/BLOCKED items are RESOLVED — present them as success, not active threats\n\
+         - IGNORED items are confirmed noise — do not mention them\n\
+         - UNRESOLVED items are being OBSERVED by the AI — only flag if genuinely dangerous\n\
+         - Routine scanners (SSH malformed strings, port probes) are NOT dangerous and NOT urgent\n\
+         - Do NOT recommend 'updating passwords' or generic security advice\n\
+         - Be reassuring when the server is safe. Be direct only when something is genuinely dangerous.\n\
+         - Write for someone who is NOT a security professional\n\
          \n\
-         Write a concise briefing with these sections:\n\
-         1. **THREAT LEVEL** — one word + one sentence. Base it on UNRESOLVED count, not total.\n\
-         2. **EXECUTIVE SUMMARY** — 2-3 sentences. Be accurate about what's resolved vs active.\n\
-         3. **WHAT WAS HANDLED** — bullet list of AI actions taken (blocks, kills, monitors)\n\
-         4. **NEEDS ATTENTION** — only UNRESOLVED high/critical threats with specific actions\n\
-         5. **RECOMMENDATIONS** — 2-3 actionable steps for TODAY\n\
+         Write a SHORT briefing (under 150 words) with:\n\
+         1. **STATUS** — one sentence: is the server safe right now?\n\
+         2. **WHAT THE AI DID** — 2-3 bullets of actions taken (blocks, monitoring)\n\
+         3. **NEEDS ATTENTION** — only if something genuinely requires human decision (rare)\n\
          \n\
-         Be accurate. Do not exaggerate. If most threats are contained, say so.\n\
+         Tone: calm, confident, specific. Like a trusted security guard giving a morning report.\n\
          \n\
          ---\n\
          \n\

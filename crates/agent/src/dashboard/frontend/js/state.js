@@ -13,6 +13,10 @@ const state = {
   knownItemValues: new Set(),  // D7: tracks rendered entity values for diff
   hideAllowlisted: true,
   filterOutcome: null,
+  // spec 017 01-home Change 8: consume-once handoff from Home's
+  // viewActivity() to Threats. 02-threats.md's responsibility to
+  // read-and-clear this flag after selecting the first matching item.
+  autoSelectOnThreatsOpen: null,
 };
 
 const pivotTitle = (pivot) => ({

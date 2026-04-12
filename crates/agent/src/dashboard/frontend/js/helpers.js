@@ -1,3 +1,16 @@
+// ── Canonical UI glossary (spec 017 shared foundation) ────────────────
+// Single source of truth for user-facing UI term definitions. Consumed
+// by page specs for title= tooltips and copy review.
+var GLOSSARY = {
+  threat:     'A detected security event that may pose risk.',
+  incident:   'A threat recorded by the backend (same concept, internal name).',
+  unresolved: 'A threat that has not been handled automatically and awaits your review.',
+  contained:  'A threat that has been blocked, killed, monitored, or suspended automatically.',
+  open:       'A threat with no containment action taken yet.',
+  resolved:   'A threat that has been closed — either contained or dismissed.',
+  noise:      'A low-signal detection the system chose not to act on.'
+};
+
 // ── Confidence system helpers ─────────────────────────────────────────
 function getUnresolved() {
   var ov = window._lastOverview || {};
@@ -5,6 +18,41 @@ function getUnresolved() {
   var responded = ov.ai_responded || 0;
   var unresolved = ov.unresolved_count != null ? ov.unresolved_count : Math.max(confirmed - responded, 0);
   return { total: confirmed, unresolved: unresolved, handled: responded };
+}
+
+// Human-readable labels for sensor collectors (spec 017 Change 6).
+// Home's Data Collection section renders these instead of raw slugs
+// so the primary operator sees "Network traffic" rather than
+// "tcp_stream". Unknown slugs fall back to humanLabel().
+var COLLECTOR_LABELS = {
+  tcp_stream:         'Network traffic',
+  http_capture:       'Web requests',
+  dns_capture:        'DNS lookups',
+  tls_fingerprint:    'TLS fingerprints',
+  auth_log:           'Login attempts',
+  auditd:             'System audit log',
+  journald:           'System journal',
+  docker:             'Docker events',
+  proc_maps:          'Process memory',
+  fanotify_watch:     'File changes',
+  kernel_integrity:   'Kernel integrity',
+  cgroup_abuse:       'Resource usage',
+  ebpf_syscall:       'Kernel system calls',
+  firmware_integrity: 'Firmware integrity',
+  nginx_access:       'Web server access',
+  nginx_error:        'Web server errors',
+  syslog_firewall:    'Firewall log',
+  falco_log:          'Falco events',
+  suricata_eve:       'Suricata alerts',
+  wazuh_alerts:       'Wazuh alerts',
+  osquery_log:        'osquery events',
+  macos_log:          'macOS log',
+  cloudtrail:         'AWS CloudTrail',
+  integrity:          'File integrity'
+};
+
+function collectorLabel(slug) {
+  return COLLECTOR_LABELS[slug] || humanLabel(slug);
 }
 
 var DETECTOR_LABELS = {
@@ -24,6 +72,50 @@ var DETECTOR_LABELS = {
   suspicious_archive: 'Suspicious archive creation', logging_config_change: 'Logging config changed',
   timing_anomaly: 'Timing anomaly'
 };
+
+// ── Severity helpers (spec 017 shared foundation) ─────────────────────
+// Map severity strings to CSS classes, human labels, and numeric ranks.
+// Used by every page spec that renders severity-scaled tone.
+function severityClass(sev) {
+  var s = (sev || '').toString().toLowerCase();
+  if (s === 'critical') return 'alert-critical';
+  if (s === 'high')     return 'alert-high';
+  if (s === 'medium')   return 'alert-medium';
+  if (s === 'low')      return 'alert-low';
+  return 'alert-info';
+}
+
+function severityLabel(sev) {
+  var s = (sev || '').toString().toLowerCase();
+  if (s === 'critical') return 'Critical';
+  if (s === 'high')     return 'High';
+  if (s === 'medium')   return 'Medium';
+  if (s === 'low')      return 'Low';
+  return 'Info';
+}
+
+function severityRank(sev) {
+  var s = (sev || '').toString().toLowerCase();
+  if (s === 'critical') return 4;
+  if (s === 'high')     return 3;
+  if (s === 'medium')   return 2;
+  if (s === 'low')      return 1;
+  if (s === 'info')     return 0;
+  return -1;
+}
+
+// Return the highest severity string found in a list of objects
+// with .severity or .effective_severity. Prefers effective_severity.
+function maxSeverity(list) {
+  var best = -1;
+  var bestName = 'info';
+  (list || []).forEach(function(item) {
+    var sev = item && (item.effective_severity || item.severity);
+    var rank = severityRank(sev);
+    if (rank > best) { best = rank; bestName = (sev || '').toString().toLowerCase() || 'info'; }
+  });
+  return best >= 0 ? bestName : 'info';
+}
 
 function humanLabel(slug) {
   return DETECTOR_LABELS[slug] || slug.replace(/_/g, ' ').replace(/\b\w/g, function(c) { return c.toUpperCase(); });
@@ -53,11 +145,12 @@ function aggregateIncidents(incidents) {
 
 function outcomeBadgeHtml(outcome) {
   if (outcome === 'blocked' || outcome === 'killed' || outcome === 'contained' || outcome === 'suspended')
-    return '<span class="badge-contained">CONTAINED</span>';
-  if (outcome === 'ignored') return '<span class="badge-noise">NOISE</span>';
-  if (outcome === 'open') return '<span class="badge-unresolved">OPEN</span>';
-  if (outcome === 'monitored') return '<span class="badge-monitor" style="font-size:0.62rem;padding:2px 7px;border-radius:4px">MONITORING</span>';
+    return '<span class="badge-contained">BLOCKED</span>';
+  if (outcome === 'ignored' || outcome === 'dismissed') return '<span class="badge-noise">DISMISSED</span>';
+  if (outcome === 'monitoring' || outcome === 'monitored' || outcome === 'open' || outcome === 'active')
+    return '<span class="badge-monitor" style="font-size:0.62rem;padding:2px 7px;border-radius:4px">OBSERVING</span>';
   if (outcome === 'honeypot') return '<span style="font-size:0.62rem;padding:2px 7px;border-radius:4px;background:rgba(255,140,66,0.12);color:var(--orange);font-weight:600">HONEYPOT</span>';
+  if (outcome === 'needs_attention') return '<span class="badge-unresolved">NEEDS ATTENTION</span>';
   return '';
 }
 
@@ -99,7 +192,11 @@ function entryOutcomeClass(entry) {
 }
 
 function toggleDetail(btn) {
-  var body = btn.parentElement.nextElementSibling;
+  // Find .detail-body within the same evidence-card, not by sibling
+  // position (the header/title/context divs sit between the button
+  // and the detail body, breaking nextElementSibling).
+  var card = btn.closest('.evidence-card');
+  var body = card ? card.querySelector('.detail-body') : null;
   if (!body) return;
   body.classList.toggle('open');
   btn.textContent = body.classList.contains('open') ? 'Hide details' : 'Show details';
@@ -112,24 +209,46 @@ function isPrivateIp(ip) {
     /^172\.(1[6-9]|2\d|3[01])\./.test(ip);
 }
 
+// Unified incident-trust check (spec 017 Change 6).
+// Returns true when the incident should be hidden while
+// state.hideAllowlisted is on; false when it should be shown.
+//
+// Rule 1 (severity gate): critical/high are NEVER filtered by trust —
+//   they must always reach the operator regardless of entity shape.
+//
+// Rule 2 (entity walk, for medium/low/info): inspect entities. If any
+//   external non-trusted IP is present, show. If any non-trusted user
+//   is present, show. Otherwise hide (handles allowlisted-only and
+//   no-entity noise like host_drift sudo or kill_chain forming).
 function isIncidentTrusted(inc) {
-  var entities = inc.entities || [];
-  var hasExternalIp = false;
+  var sev = ((inc && (inc.effective_severity || inc.severity)) || '').toString().toLowerCase();
+  if (sev === 'critical' || sev === 'high') return false;
+
+  var entities = (inc && inc.entities) || [];
+  var sawExternalIp = false;
+  var allIpsTrusted = true;
+  var sawUntrustedUser = false;
+
   for (var i = 0; i < entities.length; i++) {
     var e = entities[i];
     var eType = (typeof e === 'string') ? (e.split(':')[0] || '') : (e.type || '');
-    var eVal = (typeof e === 'string') ? (e.split(':').slice(1).join(':') || '') : (e.value || '');
-    if (eType.toLowerCase() === 'ip') {
-      if (isIpTrusted(eVal) || isPrivateIp(eVal)) return true;
-      hasExternalIp = true;
+    var eVal  = (typeof e === 'string') ? (e.split(':').slice(1).join(':') || '') : (e.value || '');
+    eType = eType.toLowerCase();
+
+    if (eType === 'ip') {
+      sawExternalIp = true;
+      if (!isIpTrusted(eVal) && !isPrivateIp(eVal)) {
+        allIpsTrusted = false;
+      }
     }
-    if (eType.toLowerCase() === 'user') {
-      if (_trustedUsers.indexOf(eVal) >= 0) return true;
+    if (eType === 'user') {
+      if (_trustedUsers.indexOf(eVal) < 0) sawUntrustedUser = true;
     }
   }
-  // No IP at all = internal/local activity = trusted
-  if (!hasExternalIp) return true;
-  return false;
+
+  if (sawExternalIp && !allIpsTrusted) return false;
+  if (sawUntrustedUser) return false;
+  return true;
 }
 
 
@@ -169,6 +288,21 @@ function timeAgo(ts) {
   if (diff < 3600) return Math.floor(diff/60) + 'm ago';
   if (diff < 86400) return Math.floor(diff/3600) + 'h ago';
   return Math.floor(diff/86400) + 'd ago';
+}
+
+// Temporal window label helper (spec 017 shared foundation).
+// Returns a canonical English label for a KPI time window.
+// Unknown kinds return '' so callers can omit the label gracefully.
+function formatWindow(kind) {
+  switch ((kind || '').toString()) {
+    case 'live':        return 'Live';
+    case 'today':       return 'Today';
+    case 'last_24h':    return 'Last 24h';
+    case 'last_6h':     return 'Last 6h';
+    case 'last_hour':   return 'Last hour';
+    case 'since_start': return 'Since startup';
+    default:            return '';
+  }
 }
 
 function handleCardClickByValue(type, value) {

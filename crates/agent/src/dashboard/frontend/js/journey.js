@@ -286,6 +286,31 @@ function renderEvidenceCard(entry, idx) {
     </div>`;
 }
 
+function toggleTimeline() {
+  var el = document.getElementById('timelineSection');
+  if (!el) return;
+  var isOpen = el.style.display !== 'none';
+  el.style.display = isOpen ? 'none' : 'block';
+}
+
+async function askAiExplain(subjectType, subjectValue) {
+  var resultEl = document.getElementById('aiExplainResult');
+  if (!resultEl) return;
+  resultEl.style.display = 'block';
+  resultEl.innerHTML = '<div style="font-size:0.75rem;color:var(--muted)">Asking AI to explain...</div>';
+  try {
+    var resp = await fetch('/api/ai-explain?type=' + encodeURIComponent(subjectType) + '&value=' + encodeURIComponent(subjectValue), { cache: 'no-store' });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    var data = await resp.json();
+    resultEl.innerHTML =
+      '<div style="font-size:0.68rem;font-weight:700;color:var(--accent);letter-spacing:0.05em;text-transform:uppercase;margin-bottom:6px">\uD83E\uDD16 AI Explanation</div>' +
+      '<div style="font-size:0.8rem;color:var(--text);line-height:1.6">' + esc(data.explanation || 'No explanation available.') + '</div>';
+  } catch (e) {
+    resultEl.innerHTML =
+      '<div style="font-size:0.75rem;color:var(--warn)">AI explanation not available yet. This feature requires the AI provider to be configured and reachable.</div>';
+  }
+}
+
 function toggleRaw(idx) {
   const el = document.getElementById('raw-' + idx);
   if (!el) return;
@@ -413,7 +438,7 @@ async function loadJourney(subjectType, subjectValue) {
       </div>
       <div class="journey-header">
         <span class="journey-ip">${esc(j.subject || subjectValue)}</span>
-        <span class="${outcomeCls(j.outcome)}">${outcomeLabel(j.outcome)}</span>
+        <span class="${outcomeCls(typeof outcomeOf === 'function' ? outcomeOf({outcome: j.outcome}) : j.outcome)}">${outcomeLabel(typeof outcomeOf === 'function' ? outcomeOf({outcome: j.outcome}) : j.outcome)}</span>
         <span class="journey-time">${esc(first)} → ${esc(last)}</span>
       </div>
       <div class="journey-subtitle">${esc((j.subject_type || subjectType).toUpperCase())} journey · ${j.entries.length} timeline entries · click any row to expand</div>
@@ -422,41 +447,95 @@ async function loadJourney(subjectType, subjectValue) {
         <button type="button" class="journey-btn" onclick="downloadSnapshot('md')">Export Markdown</button>
         ${actionBtns}
       </div>
-      ${renderVerdictCard(j)}
+      <!-- verdict card removed: narrative "What happened" + Intelligence section cover this -->
       ${(function() {
-        // TL;DR — auto-generated narrative from key entries
+        // TL;DR — human-readable narrative, mode-aware.
         const incidents = j.entries.filter(e => e.kind === 'incident');
         const decisions = j.entries.filter(e => e.kind === 'decision');
         const blocks = decisions.filter(e => (e.action||'').includes('block'));
         if (incidents.length === 0 && decisions.length === 0) return '';
 
         const topIncident = incidents.length > 0 ? incidents[0] : null;
-        const topDetector = topIncident ? (topIncident.detector || 'unknown') : '';
+        const topData = topIncident ? (topIncident.data || {}) : {};
+        const topDetector = topData.detector || (topData.incident_id || '').split(':')[0] || '';
+        const topTitle = topData.title || '';
         const wasBlocked = blocks.length > 0;
+        const isGuard = (window._agentMode || 'guard') === 'guard';
+        const isResolved = j.outcome === 'blocked' || j.outcome === 'honeypot';
+
+        // Collect all unique detectors across incidents for multi-detector signal
+        const allDetectors = new Set();
+        incidents.forEach(function(inc) {
+          var d = (inc.data || {}).detector || ((inc.data || {}).incident_id || '').split(':')[0] || '';
+          if (d) allDetectors.add(d);
+        });
+        const detLabels = Array.from(allDetectors).map(function(d) { return humanLabel(d); });
 
         let narrative = '';
         if (topIncident) {
-          narrative += '<strong>' + esc(topDetector.replace(/_/g, ' ')) + '</strong> detected';
+          // Use the incident title for specific context, detector label as category
+          if (topTitle && topTitle !== 'unknown') {
+            narrative += '<strong>' + esc(topTitle) + '</strong>';
+          } else {
+            narrative += '<strong>' + esc(detLabels[0] || 'Threat') + '</strong> detected';
+          }
           if (incidents.length > 1) narrative += ' (' + incidents.length + ' incidents total)';
+          if (detLabels.length > 1) {
+            narrative += '. Triggered <strong>' + detLabels.length + ' detectors</strong>: ' + esc(detLabels.join(', '));
+          }
           narrative += '. ';
         }
         if (wasBlocked) {
-          narrative += 'AI decided to <strong style="color:var(--ok)">block</strong>';
+          narrative += 'The AI <strong style="color:var(--ok)">blocked</strong> this threat';
           if (blocks.length > 1) narrative += ' (' + blocks.length + ' actions)';
           narrative += '. ';
         } else if (decisions.length > 0) {
           const action = decisions[0].action || 'monitor';
-          narrative += 'AI decided to <strong>' + esc(action) + '</strong>. ';
+          narrative += 'The AI decided to <strong>' + esc(action.replace(/_/g, ' ')) + '</strong>. ';
         }
-        if (j.outcome === 'blocked') {
-          narrative += 'Threat <strong style="color:var(--ok)">contained</strong>.';
-        } else if (j.outcome === 'active') {
-          narrative += 'Threat is <strong style="color:var(--danger)">still active</strong>.';
+        if (isResolved) {
+          narrative += 'Threat <strong style="color:var(--ok)">contained</strong>. No action needed.';
+        } else if (isGuard) {
+          narrative += 'The AI is <strong>still observing</strong> this activity.';
         }
 
-        return '<div style="padding:12px 16px;margin-bottom:12px;border-radius:10px;background:rgba(120,229,255,0.04);border:1px solid rgba(120,229,255,0.12)">' +
-          '<div style="font-size:0.68rem;font-weight:700;color:var(--accent);letter-spacing:0.05em;text-transform:uppercase;margin-bottom:4px">TL;DR</div>' +
+        let html = '<div style="padding:12px 16px;margin-bottom:12px;border-radius:10px;background:rgba(120,229,255,0.04);border:1px solid rgba(120,229,255,0.12)">' +
+          '<div style="font-size:0.68rem;font-weight:700;color:var(--accent);letter-spacing:0.05em;text-transform:uppercase;margin-bottom:4px">What happened</div>' +
           '<div style="font-size:0.8rem;color:var(--text);line-height:1.5">' + narrative + '</div></div>';
+
+        // When guard is OFF and the threat is NOT resolved, show a prominent
+        // decision block with AI recommendation + action buttons. This is
+        // the operator's moment to decide.
+        if (!isGuard && !isResolved && subjectType === 'ip') {
+          const topSev = topData.severity || '';
+          const sevHigh = topSev === 'critical' || topSev === 'high';
+          const hasThreatIntel = allDetectors.has('threat_intel') || allDetectors.has('graph_threat_intel');
+          const multiDetector = allDetectors.size > 1;
+
+          let recText = '';
+          if (hasThreatIntel && sevHigh) {
+            recText = 'This IP is in a <strong style="color:var(--danger)">known malicious threat feed</strong> and triggered ' + allDetectors.size + ' detectors. <strong>Blocking is strongly recommended.</strong>';
+          } else if (hasThreatIntel) {
+            recText = 'This IP is in a <strong>known malicious threat feed</strong>. The AI recommends blocking.';
+          } else if (sevHigh && multiDetector) {
+            recText = 'This is a <strong style="color:var(--danger)">' + esc(topSev) + ' severity</strong> threat that triggered ' + allDetectors.size + ' detectors. The AI recommends <strong>blocking this IP</strong>.';
+          } else if (sevHigh) {
+            recText = 'This is a <strong style="color:var(--danger)">' + esc(topSev) + ' severity</strong> threat. The AI recommends <strong>blocking this IP</strong>.';
+          } else {
+            recText = 'The AI detected suspicious activity from this IP. You can block it or continue observing.';
+          }
+
+          html += '<div style="padding:16px;margin-bottom:12px;border-radius:10px;background:rgba(244,63,94,0.06);border:1px solid rgba(244,63,94,0.2)">' +
+            '<div style="font-size:0.68rem;font-weight:700;color:var(--danger);letter-spacing:0.05em;text-transform:uppercase;margin-bottom:6px">\u26A0 Your decision needed</div>' +
+            '<div style="font-size:0.8rem;color:var(--text);line-height:1.5;margin-bottom:12px">' + recText + '</div>' +
+            '<div style="display:flex;gap:8px;flex-wrap:wrap">' +
+              '<button type="button" style="padding:8px 20px;font-size:0.8rem;font-weight:700;border-radius:8px;border:1px solid var(--danger);background:var(--danger);color:#fff;cursor:pointer" onclick="showActionModal(\'block_ip\',\'' + esc(subjectValue) + '\',null)">\u26D4 Block this IP</button>' +
+              '<button type="button" style="padding:8px 20px;font-size:0.8rem;border-radius:8px;border:1px solid var(--line);background:transparent;color:var(--muted);cursor:pointer" onclick="showToast(\'Continuing to observe\',\'ok\')">Keep observing</button>' +
+            '</div>' +
+          '</div>';
+        }
+
+        return html;
       })()}
       <!-- Attack graph available in Graph tab -->
       <div id="journeyGraphContainer" style="display:none"></div>
@@ -467,7 +546,7 @@ async function loadJourney(subjectType, subjectValue) {
           ${shortcutsHtml}
         </section>
         <section class="guided-card">
-          <div class="guided-title">Narrative Hints</div>
+          <div class="guided-title">Intelligence</div>
           ${hintsHtml}
         </section>
       </div>`;
@@ -501,10 +580,38 @@ async function loadJourney(subjectType, subjectValue) {
         </section>`;
     }
 
+    // ── AI Decision Reasoning (surfaced from decision entries) ─────────
+    // Show the AI's own reasoning prominently, before any technical data.
+    // This is the "why" that the operator needs to trust the AI's action.
+    const aiDecisions = j.entries.filter(e => e.kind === 'decision' && (e.data || {}).reason);
+    if (aiDecisions.length > 0) {
+      const dec = aiDecisions[0].data;
+      const conf = ((dec.confidence || 0) * 100).toFixed(0);
+      const wasExecuted = dec.auto_executed && !dec.dry_run;
+      const actionLabel = (dec.action_type || '').replace(/_/g, ' ');
+      html += '<div style="padding:14px 16px;margin-bottom:12px;border-radius:10px;background:rgba(74,222,128,0.04);border:1px solid rgba(74,222,128,0.15)">' +
+        '<div style="font-size:0.68rem;font-weight:700;color:var(--ok);letter-spacing:0.05em;text-transform:uppercase;margin-bottom:6px">' +
+        (wasExecuted ? '\uD83E\uDD16 AI Decision — ' + esc(actionLabel) + ' (' + conf + '% confidence)' : '\uD83E\uDD16 AI Analysis') +
+        '</div>' +
+        '<div style="font-size:0.78rem;color:var(--text);line-height:1.6">' + esc(dec.reason || '') + '</div>' +
+      '</div>';
+    }
+
+    // ── Ask AI button ─────────────────────────────────────────────────
+    html += '<div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap">' +
+      '<button type="button" class="journey-btn" style="background:rgba(120,229,255,0.08);border-color:var(--accent);color:var(--accent)" ' +
+        'onclick="askAiExplain(\'' + esc(subjectType) + '\',\'' + esc(subjectValue) + '\')">' +
+        '\uD83E\uDD16 Ask AI to explain</button>' +
+      '<button type="button" class="journey-btn" onclick="toggleTimeline()">' +
+        '\uD83D\uDCCB Show ' + j.entries.length + ' technical entries</button>' +
+    '</div>';
+    html += '<div id="aiExplainResult" style="display:none;padding:14px 16px;margin-bottom:12px;border-radius:10px;background:rgba(120,229,255,0.04);border:1px solid rgba(120,229,255,0.12)"></div>';
+
+    // ── Chapter rail (collapsed with timeline) ─────────────────────────
+    html += '<div id="timelineSection" style="display:none">';
     html += renderChapterRail(j);
 
-    html += `
-      <div class="timeline">`;
+    html += '<div class="timeline">';
 
     if (j.entries.length === 0) {
       html += '<div class="empty">No entries found for this selection on the chosen filters.</div>';
@@ -512,7 +619,7 @@ async function loadJourney(subjectType, subjectValue) {
       j.entries.forEach((e, i) => { html += renderEntry(e, i); });
     }
 
-    html += '</div>';
+    html += '</div></div>';
     document.getElementById('journeyContent').innerHTML = html;
 
     // Load mini-graph for this subject

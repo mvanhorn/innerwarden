@@ -62,11 +62,40 @@ fn is_self_traffic_incident(incident: &Incident) -> bool {
         .filter(|e| e.r#type == EntityType::Ip)
         .map(|e| e.value.as_str())
         .collect();
-    if ips.is_empty() {
-        return false;
+    if !ips.is_empty()
+        && ips
+            .iter()
+            .all(|ip| crate::cloud_safelist::is_self_traffic_ip(ip))
+    {
+        return true;
     }
-    ips.iter()
-        .all(|ip| crate::cloud_safelist::is_self_traffic_ip(ip))
+
+    // Rule 3: cross-layer chains whose title references known self-traffic
+    // patterns. CrowdSec CAPI uses rotating AWS ELB IPs that are impossible
+    // to safelist by CIDR. Instead, detect the pattern: "Data Exfiltration
+    // (eBPF Sequence)" chains where the only service entity is a known
+    // agent/infrastructure process (crowdsec, gomon, innerwarden). These
+    // are outbound connections from OUR processes, not attacker exfil.
+    if incident.incident_id.starts_with("cross_layer_chain") {
+        let service_entities: Vec<&str> = incident
+            .entities
+            .iter()
+            .filter(|e| e.r#type == EntityType::Service)
+            .map(|e| e.value.as_str())
+            .collect();
+        let has_self_service = service_entities.iter().any(|s| {
+            crate::cloud_safelist::is_agent_process(s)
+                || s.contains("crowdsec")
+                || s.contains("gomon")
+                || s.contains("snap")
+                || s.contains("oracle-cloud")
+        });
+        if has_self_service {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn detail_u64(event: &Event, key: &str) -> Option<u64> {

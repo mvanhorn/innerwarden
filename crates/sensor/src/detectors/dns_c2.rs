@@ -49,6 +49,23 @@ const ALLOWED_DOMAINS: &[&str] = &[
     "local",
     "localhost",
     "innerwarden.com",
+    // Cloud providers — OCI instances resolve metadata, API endpoints,
+    // storage, and internal services via these domains. Observed
+    // 2026-04-12: 7 "Possible DNS C2 channel: oraclecloud.com" Medium
+    // FPs per hour from normal OCI metadata/API resolution.
+    "oraclecloud.com",
+    "oracle.com",
+    "oraclecloud.net",
+    "oci.oraclecloud.com",
+    // AWS (EC2 metadata, S3, SSM, etc.)
+    "aws.amazon.com",
+    "awsstatic.com",
+    // GCP
+    "google.internal",
+    "googleusercontent.com",
+    // Hetzner
+    "hetzner.com",
+    "hetzner.cloud",
 ];
 
 pub struct DnsC2Detector {

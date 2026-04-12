@@ -94,6 +94,12 @@ pub(crate) struct JourneyQuery {
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct AiExplainQuery {
+    pub(super) r#type: Option<String>,
+    pub(super) value: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 #[allow(dead_code)] // severity_min/detector accepted for API forward-compat; graph filters land in spec 016
 pub(crate) struct ClusterQuery {
     pub(super) limit: Option<usize>,

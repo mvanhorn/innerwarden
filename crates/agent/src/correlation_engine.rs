@@ -863,6 +863,14 @@ fn builtin_rules() -> Vec<CorrelationRule> {
             severity: Severity::Critical,
         },
         // CL-014: Cryptominer deployment
+        //
+        // Requires entity match on BOTH stages so that the CPU abuse
+        // comes from the SAME process/container that made the outbound
+        // connection. Without this, any unrelated CPU spike (cargo
+        // build, snap refresh) + any outbound connect (CrowdSec polling,
+        // Telegram notification) would fire "Cryptominer Deployment
+        // Chain". Observed 2026-04-12: 21 false Cryptominer chains per
+        // day from CrowdSec CAPI polling + cargo build CPU spike.
         CorrelationRule {
             id: "CL-014".into(),
             name: "Cryptominer Deployment Chain".into(),
@@ -878,7 +886,7 @@ fn builtin_rules() -> Vec<CorrelationRule> {
                 RuleStage {
                     layer: None,
                     kind_patterns: vec!["crypto_miner".into(), "cgroup.cpu_abuse".into()],
-                    entity_must_match: false,
+                    entity_must_match: true,
                 },
             ],
             window_secs: 600,

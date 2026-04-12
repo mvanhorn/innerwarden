@@ -391,6 +391,18 @@ pub(super) fn build_pivots_from_graph(
         std::collections::HashMap::new();
 
     for inc_id in graph.nodes_of_type(NodeType::Incident) {
+        // Skip research_only incidents — same filter as api_incidents
+        // and api_overview. Without this, self-traffic IPs like
+        // 149.154.166.110 (Telegram Bot API) appear in the Threats tab
+        // entity list with 198 incidents, even though every one of them
+        // is research_only. The operator sees a "threat" that is actually
+        // the agent's own notification traffic and is one click away from
+        // blocking their own Telegram integration.
+        if let Some(Node::Incident { research_only, .. }) = graph.get_node(inc_id) {
+            if *research_only {
+                continue;
+            }
+        }
         for edge in graph.outgoing_edges(inc_id) {
             if edge.relation != Relation::TriggeredBy {
                 continue;
@@ -400,6 +412,14 @@ pub(super) fn build_pivots_from_graph(
                     let label = node.label();
                     // Skip internal IPs — they're the server, not the attacker
                     if node_type == NodeType::Ip && internal_ips.contains(&label) {
+                        continue;
+                    }
+                    // Skip self-traffic IPs (cloud providers, agent
+                    // service endpoints, local interfaces) — these are
+                    // infrastructure, not attackers.
+                    if node_type == NodeType::Ip
+                        && crate::cloud_safelist::is_self_traffic_ip(&label)
+                    {
                         continue;
                     }
                     pivot_data
@@ -994,7 +1014,7 @@ pub(super) fn build_journey_from_graph(
         .unwrap_or(if has_incident { "active" } else { "unknown" })
         .to_string();
 
-    let summary = build_journey_summary(
+    let mut summary = build_journey_summary(
         &entries,
         &outcome,
         subject_type,
@@ -1003,6 +1023,128 @@ pub(super) fn build_journey_from_graph(
         &related_users,
         &related_detectors,
     );
+
+    // ── Intelligence enrichment from knowledge graph ────────────────
+    // Replace generic hints with context from real data: connection
+    // count, severity distribution, GeoIP, threat feeds, risk
+    // assessment. This is what makes the operator understand what
+    // happened without technical knowledge.
+    if subject_type == PivotKind::Ip {
+        summary.hints.clear();
+
+        // Connection count
+        let conn_count = graph
+            .all_edges(center_id)
+            .iter()
+            .filter(|e| matches!(e.relation, Relation::ConnectedTo | Relation::AcceptedFrom))
+            .count();
+
+        // Incident severity distribution
+        let mut sev_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut blocked = false;
+        let mut has_threat_intel = false;
+        for edge in graph.incoming_edges(center_id) {
+            if edge.relation != Relation::TriggeredBy {
+                continue;
+            }
+            if let Some(Node::Incident {
+                severity,
+                detector,
+                decision,
+                research_only,
+                ..
+            }) = graph.get_node(edge.from)
+            {
+                if *research_only {
+                    continue;
+                }
+                *sev_counts.entry(severity.to_lowercase()).or_insert(0) += 1;
+                if detector == "threat_intel" || detector == "graph_threat_intel" {
+                    has_threat_intel = true;
+                }
+                if decision.as_deref() == Some("block_ip") {
+                    blocked = true;
+                }
+            }
+        }
+
+        // GeoIP from edge properties (if available)
+        let geo = graph
+            .all_edges(center_id)
+            .iter()
+            .find_map(|e| {
+                e.properties
+                    .get("country")
+                    .and_then(|v| v.as_str())
+                    .map(|c| c.to_string())
+            });
+
+        // Build human-readable intelligence hints
+        let total_incidents: usize = sev_counts.values().sum();
+        let critical = sev_counts.get("critical").copied().unwrap_or(0);
+        let high = sev_counts.get("high").copied().unwrap_or(0);
+
+        // Origin
+        if let Some(country) = &geo {
+            summary.hints.push(format!("Origin: {country}."));
+        }
+
+        // Threat intelligence
+        if has_threat_intel {
+            summary
+                .hints
+                .push("This IP is in a known malicious threat intelligence feed.".to_string());
+        }
+
+        // Activity summary
+        if conn_count > 0 {
+            summary.hints.push(format!(
+                "{} connection attempt{} observed today.",
+                conn_count,
+                if conn_count > 1 { "s" } else { "" }
+            ));
+        }
+
+        // Severity assessment
+        if critical > 0 {
+            summary.hints.push(format!(
+                "{} critical and {} high severity incident{}. Investigate immediately.",
+                critical,
+                high,
+                if total_incidents > 1 { "s" } else { "" }
+            ));
+        } else if high > 0 && has_threat_intel {
+            summary.hints.push(format!(
+                "Known malicious IP with {} incident{}. AI should handle automatically.",
+                total_incidents,
+                if total_incidents > 1 { "s" } else { "" }
+            ));
+        } else if total_incidents <= 2 && !has_threat_intel {
+            summary.hints.push(
+                "Low activity — likely a routine internet scanner. Not dangerous.".to_string(),
+            );
+        }
+
+        // Outcome
+        if blocked {
+            summary
+                .hints
+                .push("AI has blocked this IP. No further action needed.".to_string());
+        } else if outcome == "active" || outcome == "monitoring" {
+            if total_incidents <= 2 && critical == 0 && high == 0 {
+                summary.hints.push(
+                    "Routine scanner activity. The AI is monitoring but no action is needed."
+                        .to_string(),
+                );
+            } else {
+                summary.hints.push(
+                    "The AI is still evaluating this activity.".to_string(),
+                );
+            }
+        }
+    }
+
     let verdict = derive_verdict(&entries, &outcome);
     let chapters = derive_chapters(&entries);
 

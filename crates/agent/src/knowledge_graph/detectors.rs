@@ -911,6 +911,19 @@ fn detect_network_sniffing(
             continue;
         }
 
+        // Fallback: if the ancestor walk couldn't find the parent (eBPF
+        // event arrived with pid=0 or ppid not ingested), check the Process
+        // node's own uid. The agent runs as uid 998 (innerwarden); tcpdump
+        // spawned by pcap_capture inherits this uid. Observed 2026-04-12:
+        // the ancestor walk returns empty when the graph doesn't have the
+        // parent Process node, so the uid check is the safety net.
+        if let Some(Node::Process { uid, .. }) = graph.get_node(pid_id) {
+            if *uid == 998 {
+                // innerwarden UID — this sniffer is our own pcap_capture
+                continue;
+            }
+        }
+
         let key = format!("graph_sniff:{}:{}", comm, pid_id);
         if !state.check_and_set(&key, now, 600) {
             continue;

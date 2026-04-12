@@ -62,6 +62,7 @@ pub(super) async fn api_overview(
         if let Some(Node::Incident {
             detector,
             decision,
+            decision_target,
             severity,
             is_allowlisted,
             research_only,
@@ -89,13 +90,20 @@ pub(super) async fn api_overview(
                         safely_resolved += 1;
                     }
                     "request_confirmation" => {
-                        // awaiting human approval → unresolved
                         ai_confirmed += 1;
                         unresolved_count += 1;
                     }
                     _ => {
                         ai_confirmed += 1;
-                        ai_responded += 1;
+                        // Only count as "responded" if the target looks like
+                        // an IP. Pre-fix FPs like sandbox_evasion blocked a
+                        // PID (numeric string) which is not a real response.
+                        let target_is_ip = decision_target
+                            .as_ref()
+                            .is_some_and(|t| t.contains('.'));
+                        if target_is_ip {
+                            ai_responded += 1;
+                        }
                         safely_resolved += 1;
                     }
                 }
@@ -389,6 +397,147 @@ pub(super) async fn api_briefing_generate(
 }
 
 // ---------------------------------------------------------------------------
+// AI Explain — ask the AI to explain a threat in plain language
+// ---------------------------------------------------------------------------
+
+pub(super) async fn api_ai_explain(
+    State(state): State<DashboardState>,
+    Query(query): Query<AiExplainQuery>,
+) -> Json<serde_json::Value> {
+    let subject_type = query.r#type.as_deref().unwrap_or("ip");
+    let subject_value = match query.value.as_deref() {
+        Some(v) if !v.is_empty() => v,
+        _ => {
+            return Json(serde_json::json!({
+                "error": "Missing 'value' parameter"
+            }))
+        }
+    };
+
+    let Some(ref ai) = state.ai_provider else {
+        return Json(serde_json::json!({
+            "error": "AI provider not configured. Enable AI in agent.toml."
+        }));
+    };
+
+    // Build context from the knowledge graph: incidents, decisions,
+    // events linked to this entity. Keep it compact for the LLM.
+    let context = {
+        use crate::knowledge_graph::types::*;
+        let graph = state.knowledge_graph.read().unwrap();
+
+        // Find the entity node
+        let target_node = match subject_type {
+            "ip" => graph
+                .nodes_of_type(NodeType::Ip)
+                .iter()
+                .find(|&&id| {
+                    matches!(graph.get_node(id), Some(Node::Ip { addr, .. }) if addr == subject_value)
+                })
+                .copied(),
+            _ => None,
+        };
+
+        let Some(node_id) = target_node else {
+            return Json(serde_json::json!({
+                "explanation": format!("No data found for {} '{}'.", subject_type, subject_value)
+            }));
+        };
+
+        // Collect incidents linked to this entity
+        let mut incident_lines: Vec<String> = Vec::new();
+        let mut decision_lines: Vec<String> = Vec::new();
+
+        for edge in graph.incoming_edges(node_id) {
+            if edge.relation != Relation::TriggeredBy {
+                continue;
+            }
+            if let Some(Node::Incident {
+                detector,
+                severity,
+                title,
+                summary,
+                decision,
+                decision_reason,
+                research_only,
+                auto_executed,
+                ts,
+                ..
+            }) = graph.get_node(edge.from)
+            {
+                if *research_only {
+                    continue;
+                }
+                incident_lines.push(format!(
+                    "- [{}] {}: {} (detector: {}, ts: {})",
+                    severity.to_uppercase(),
+                    title,
+                    summary,
+                    detector,
+                    ts.format("%H:%M:%S")
+                ));
+                if let Some(dec) = decision {
+                    let reason = decision_reason
+                        .as_deref()
+                        .unwrap_or("no reason recorded");
+                    let executed = if *auto_executed { "executed" } else { "recommended" };
+                    decision_lines.push(format!(
+                        "- AI {} {}: {}",
+                        executed, dec, reason
+                    ));
+                }
+            }
+        }
+
+        // Count events
+        let event_count = graph
+            .all_edges(node_id)
+            .iter()
+            .filter(|e| e.relation == Relation::ConnectedTo || e.relation == Relation::AcceptedFrom)
+            .count();
+
+        format!(
+            "Entity: {} {}\nEvent count: {}\n\nIncidents ({}):\n{}\n\nAI Decisions ({}):\n{}",
+            subject_type,
+            subject_value,
+            event_count,
+            incident_lines.len(),
+            if incident_lines.is_empty() {
+                "None".to_string()
+            } else {
+                incident_lines.join("\n")
+            },
+            decision_lines.len(),
+            if decision_lines.is_empty() {
+                "None".to_string()
+            } else {
+                decision_lines.join("\n")
+            },
+        )
+    };
+
+    let system = "You are a security assistant explaining threats to a non-technical person. \
+        This server is protected by InnerWarden (an AI security agent) and uses SSH key-only authentication (password login is disabled). \
+        Explain in plain English: what happened, whether it's actually dangerous, and whether any action is needed. \
+        Base your answer strictly on the incident data provided — the title and summary tell you exactly what happened. \
+        Most activity you'll see is routine internet noise (bots scanning every IP on the internet). Failed connection attempts from scanners are NOT dangerous. \
+        Only say it's dangerous if the attacker actually got past the initial connection (authentication success, shell access, data exfiltration). \
+        Keep your explanation to 2-3 sentences. No jargon. No generic security advice like 'update passwords'. Be specific to what happened.";
+
+    let user_msg = format!(
+        "Explain this activity to me in simple terms. Should I be worried?\n\n{}",
+        context
+    );
+
+    match ai.chat(system, &user_msg).await {
+        Ok(explanation) => Json(serde_json::json!({ "explanation": explanation })),
+        Err(e) => Json(serde_json::json!({
+            "error": format!("AI call failed: {}", e)
+        })),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Business logic - overview (graph-based, Phase 6A)
 // ---------------------------------------------------------------------------
 
@@ -418,6 +567,7 @@ pub(super) fn compute_overview_from_graph(
         if let Some(Node::Incident {
             detector,
             decision,
+            decision_target,
             severity,
             is_allowlisted,
             research_only,
@@ -450,7 +600,12 @@ pub(super) fn compute_overview_from_graph(
                     }
                     _ => {
                         ai_confirmed += 1;
-                        ai_responded += 1;
+                        let target_is_ip = decision_target
+                            .as_ref()
+                            .is_some_and(|t| t.contains('.'));
+                        if target_is_ip {
+                            ai_responded += 1;
+                        }
                         safely_resolved += 1;
                     }
                 }

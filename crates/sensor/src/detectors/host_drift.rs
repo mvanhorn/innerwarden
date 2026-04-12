@@ -166,6 +166,20 @@ impl HostDriftDetector {
         }
         let filename = filename.as_str();
 
+        // Non-absolute path → the sensor couldn't resolve the binary location
+        // for this event. "pgrep" vs "/usr/bin/pgrep" are semantically
+        // different: the latter is a real location we can compare against
+        // TRUSTED_PATHS, the former is a name without context. Firing a
+        // "Host drift: executed from non-standard path" alert for a bare
+        // name is wrong by construction — we don't know WHERE it executed
+        // from. Observed 2026-04-11 as 23,673 Medium "host_drift pgrep pid=0
+        // uid=0 comm=unknown" incidents per day, all from unresolved events.
+        // Real drift (binary in /tmp, /dev/shm, /home/…) has an absolute
+        // path and is unaffected by this guard.
+        if !filename.starts_with('/') {
+            return None;
+        }
+
         let comm = event
             .details
             .get("comm")

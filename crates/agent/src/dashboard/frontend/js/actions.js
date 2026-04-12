@@ -1,12 +1,18 @@
 // ── D3 - action state ─────────────────────────────────────────────────
 let actionCfg = null;
 let pendingAction = null; // { type: 'block_ip'|'suspend_user', ip, user }
+// Sentinel set to true only after /api/action/config has been loaded
+// at boot. Diagnostic for spec 017 — distinguishes "allowlist loaded
+// and genuinely empty" from "allowlist never loaded" (both show
+// length === 0 but mean very different things).
+var _allowlistLoaded = false;
 
 async function loadActionConfig() {
   try {
     actionCfg = await loadJson('/api/action/config');
     _trustedIps = actionCfg.trusted_ips || [];
     _trustedUsers = actionCfg.trusted_users || [];
+    _allowlistLoaded = true;
     const badge = document.getElementById('modeBadge');
     const aiBadge = document.getElementById('aiBadge');
     // Mode badge

@@ -9,68 +9,108 @@ var DETECTOR_PRIORITY = {
   logging_config_change: 3, suspicious_archive: 2
 };
 
+// Outcome display order and labels for the AI-first audit trail.
+// Threats is NOT a triage queue — the AI decides and acts. The operator
+// reads outcomes, not work items. Grouping by outcome answers "what did
+// the AI do?" instead of "what detector fired?".
+var OUTCOME_ORDER = ['needs_attention', 'blocked', 'honeypot', 'monitoring', 'dismissed'];
+var OUTCOME_META = {
+  blocked:         { icon: '\uD83D\uDEE1\uFE0F', label: 'Blocked',          cls: 'outcome-blocked' },
+  honeypot:        { icon: '\uD83C\uDF6F',       label: 'Honeypot',          cls: 'outcome-honeypot' },
+  monitoring:      { icon: '\uD83D\uDC41\uFE0F', label: 'Observing',         cls: 'outcome-observing' },
+  needs_attention: { icon: '\u26A0\uFE0F',       label: 'Needs your attention', cls: 'outcome-attention' },
+  dismissed:       { icon: '\u2713',              label: 'Dismissed',         cls: 'outcome-dismissed' },
+};
+
+function outcomeOf(item) {
+  var o = (item.outcome || '').toLowerCase();
+  if (o === 'blocked') return 'blocked';
+  if (o === 'honeypot') return 'honeypot';
+  if (o === 'monitoring') return 'monitoring';
+  if (o === 'ignored' || o === 'noise' || o === 'dismissed') return 'dismissed';
+  // 'active', 'open', '' → depends on operational mode:
+  //   Guard ON:  AI is processing autonomously → 'monitoring' (observing)
+  //   Guard OFF: AI detected but CANNOT act    → 'needs_attention' (operator must decide)
+  var mode = (window._agentMode || 'guard');
+  if (mode === 'guard') return 'monitoring';
+  return 'needs_attention';
+}
+
 function buildGroupedList(items) {
   // Filter out trusted/private IPs if toggle is on
   if (state.hideAllowlisted) {
     items = items.filter(function(item) { return !isIpTrusted(item.value) && !isPrivateIp(item.value); });
   }
-  // Filter by outcome if set (e.g. from Home KPI click)
+  // Filter by outcome if set (e.g. from Home CTA click)
   var titleEl = document.getElementById('entityTitle');
   if (state.filterOutcome === 'contained') {
-    items = items.filter(function(item) { return ['blocked','monitoring','honeypot'].includes(item.outcome || ''); });
-    if (titleEl) titleEl.innerHTML = 'Contained Threats <span style="font-size:0.6rem;color:var(--muted);cursor:pointer;margin-left:6px" onclick="state.filterOutcome=null;refreshLeft(false)">\u2715 clear filter</span>';
+    items = items.filter(function(item) {
+      var o = (item.outcome || '').toLowerCase();
+      return o === 'blocked' || o === 'honeypot';
+    });
+    if (titleEl) titleEl.innerHTML = 'Blocked threats <span style="font-size:0.6rem;color:var(--muted);cursor:pointer;margin-left:6px" onclick="state.filterOutcome=null;refreshLeft(false)">\u2715 show all</span>';
   } else {
-    if (titleEl) titleEl.textContent = 'Defense Activity';
+    if (titleEl) titleEl.textContent = 'AI Defense Log';
   }
-  // Each IP goes to the group of its highest-priority detector. No duplicates.
+
+  // Group by outcome (what the AI did), not by detector (what was found).
   var seen = {};
   var groups = {};
+  OUTCOME_ORDER.forEach(function(o) {
+    groups[o] = { outcome: o, items: [] };
+  });
+
   items.forEach(function(item) {
-    if (seen[item.value]) return; // skip duplicate IPs
+    if (seen[item.value]) return;
     seen[item.value] = true;
-    var dets = item.detectors || [];
-    var primary = 'unknown';
-    var bestPrio = -1;
-    dets.forEach(function(d) {
-      // Strip graph_ prefix for priority lookup (graph detectors use graph_threat_intel, etc.)
-      var base = d.replace(/^graph_/, '');
-      var p = DETECTOR_PRIORITY[base] || DETECTOR_PRIORITY[d] || 0;
-      if (p > bestPrio) { bestPrio = p; primary = base; }
+    var o = outcomeOf(item);
+    if (!groups[o]) groups[o] = { outcome: o, items: [] };
+    groups[o].items.push(item);
+  });
+
+  // Sort items within each group: highest severity first, then most recent
+  var sevRank = { critical: 4, high: 3, medium: 2, low: 1, info: 0 };
+  Object.values(groups).forEach(function(g) {
+    g.items.sort(function(a, b) {
+      var sa = sevRank[(a.max_severity || '').toLowerCase()] || 0;
+      var sb = sevRank[(b.max_severity || '').toLowerCase()] || 0;
+      if (sb !== sa) return sb - sa;
+      return (b.last_seen || '') > (a.last_seen || '') ? 1 : -1;
     });
-    if (bestPrio < 0 && dets.length > 0) primary = dets[0];
-    if (!groups[primary]) groups[primary] = { detector: primary, items: [], hasOpen: false };
-    groups[primary].items.push(item);
-    if (!['blocked','monitoring','honeypot'].includes(item.outcome || '')) groups[primary].hasOpen = true;
   });
-  // Sort: groups with open items first, then by item count descending
-  var sorted = Object.values(groups).sort(function(a, b) {
-    if (a.hasOpen && !b.hasOpen) return -1;
-    if (!a.hasOpen && b.hasOpen) return 1;
-    return b.items.length - a.items.length;
-  });
+
   var html = '';
-  sorted.forEach(function(g, idx) {
-    var label = humanLabel(g.detector);
+  OUTCOME_ORDER.forEach(function(o, idx) {
+    var g = groups[o];
+    if (!g) return;
+    var meta = OUTCOME_META[o] || { icon: '', label: o, cls: '' };
     var count = g.items.length;
-    var contained = g.items.filter(function(i) { return ['blocked','monitoring','honeypot'].includes(i.outcome || ''); }).length;
-    var open = count - contained;
-    var statusHtml = '';
-    if (open > 0) {
-      statusHtml = '<span class="badge-unresolved">' + open + ' open</span>';
-    } else {
-      statusHtml = '<span class="badge-contained">\u2705 All contained</span>';
-    }
-    var groupClass = open > 0 ? 'threat-group threat-group-needs-action' : 'threat-group';
-    var startOpen = open > 0 || idx === 0;
-    html += '<div class="' + groupClass + '">' +
+
+    // Always show "Needs your attention" group (even at 0 — reassuring).
+    // Hide empty groups for other outcomes.
+    if (count === 0 && o !== 'needs_attention') return;
+
+    var startOpen = count > 0 && (o === 'needs_attention' || o === 'blocked' || idx === 0);
+    var countLabel = o === 'needs_attention' && count === 0
+      ? '<span style="color:var(--ok);font-weight:700">0</span>'
+      : count + '';
+
+    html += '<div class="threat-group ' + meta.cls + '">' +
       '<div class="threat-group-header" onclick="toggleThreatGroup(this)">' +
       '<span class="threat-group-chevron' + (startOpen ? ' open' : '') + '">\u25B8</span>' +
-      '<span class="threat-group-label">' + label + '</span>' +
-      '<span class="threat-group-meta">' + count + ' IP' + (count > 1 ? 's' : '') + '</span>' +
-      statusHtml +
+      '<span class="threat-group-label">' + meta.icon + ' ' + meta.label + '</span>' +
+      '<span class="threat-group-meta">' + countLabel + '</span>' +
       '</div>' +
       '<div class="threat-group-body' + (startOpen ? ' open' : '') + '">' +
-      g.items.map(function(item) { return renderCard(item); }).join('') +
+      (count === 0
+        ? '<div class="empty" style="padding:12px 16px;color:var(--ok);font-size:0.75rem">' +
+          (o === 'needs_attention'
+            ? ((window._agentMode || 'guard') === 'guard'
+                ? 'Nothing here. The AI is handling everything.'
+                : 'Enable Guard mode for automatic threat response.')
+            : 'None today.') +
+          '</div>'
+        : g.items.map(function(item) { return renderCard(item); }).join('')) +
       '</div></div>';
   });
   return html;
@@ -100,10 +140,8 @@ function showContained() {
 
 function toggleAllowlistFilter() {
   state.hideAllowlisted = document.getElementById('hideAllowlisted')?.checked || false;
-  if (state.hideAllowlisted && _trustedIps.length === 0 && actionCfg) {
-    _trustedIps = actionCfg.trusted_ips || [];
-    _trustedUsers = actionCfg.trusted_users || [];
-  }
+  // _trustedIps / _trustedUsers are loaded at boot by loadActionConfig()
+  // in actions.js (called from sse.js module load). No lazy-load needed.
   refreshLeft(false);
   // Also refresh Home if visible
   if (document.getElementById('viewHome').style.display !== 'none') loadHome();
@@ -124,11 +162,17 @@ function renderCard(item) {
   const outcome = item.outcome || 'unknown';
   const dets = (item.detectors || []).map(function(d) { return humanLabel(d); }).join(', ') || '-';
 
-  // Build badges
+  // Build badges — outcome-first, no "OPEN" status exists in the AI-first model.
   let badges = '';
-  const outMap = { blocked:'badge-blocked', active:'badge-active', monitoring:'badge-monitor', honeypot:'badge-honeypot' };
-  const outBadge = outMap[outcome] || '';
-  if (outBadge) badges += `<span class="card-badge ${outBadge}">${outcomeLabel(outcome)}</span>`;
+  const mappedOutcome = outcomeOf(item);
+  const outBadgeMap = {
+    blocked: 'badge-blocked', honeypot: 'badge-honeypot',
+    monitoring: 'badge-monitor', dismissed: 'badge-noise',
+    needs_attention: 'badge-unresolved'
+  };
+  const outBadgeCls = outBadgeMap[mappedOutcome] || 'badge-monitor';
+  const outBadgeLabel = (OUTCOME_META[mappedOutcome] || {}).label || 'Observing';
+  badges += `<span class="card-badge ${outBadgeCls}">${outBadgeLabel}</span>`;
 
   const ago = (ts) => {
     if (!ts) return '';
@@ -230,29 +274,48 @@ function updateStatusHero(incidents, decisions) {
   const sub = document.getElementById('heroSub');
   if (!hero || !icon || !title || !sub) return;
 
-  // Use AI-confirmed threats, not raw incident count.
   const ov = window._lastOverview || {};
-  const confirmedThreats = ov.ai_confirmed || 0;
-  const responded = ov.ai_responded || 0;
+  const blocked = ov.ai_responded || 0;
   const noise = ov.ai_ignored || 0;
-  const rawTotal = (incidents || []).length;
-  const blockedCount = (decisions || []).filter(d => ['block_ip','suspend_user_sudo','kill_process','block_container'].includes(d.action_type)).length;
 
-  if (confirmedThreats > 5) {
+  // Count items by outcome from the current entity list
+  var items = (window._lastEntityItems || []);
+  var needsAttention = 0, observing = 0, totalBlocked = 0, totalHoneypot = 0;
+  items.forEach(function(item) {
+    var o = outcomeOf(item);
+    if (o === 'needs_attention') needsAttention++;
+    else if (o === 'monitoring') observing++;
+    else if (o === 'blocked') totalBlocked++;
+    else if (o === 'honeypot') totalHoneypot++;
+  });
+
+  var isGuard = (window._agentMode || 'guard') === 'guard';
+
+  if (!isGuard) {
+    // Detection-only mode (watch / read_only): AI sees threats but cannot act.
+    // Everything unresolved is the operator's responsibility.
+    var detected = needsAttention + observing;
+    hero.className = detected > 0 ? 'status-hero danger' : 'status-hero safe';
+    icon.textContent = '\uD83D\uDC41\uFE0F';
+    title.textContent = 'Detection Mode';
+    sub.textContent = detected > 0
+      ? detected + ' threat' + (detected > 1 ? 's' : '') + ' detected. AI is monitoring only \u2014 enable Guard mode for automatic response.'
+      : 'No threats detected. AI is monitoring only.';
+  } else if (needsAttention > 0) {
     hero.className = 'status-hero danger';
-    icon.textContent = '🛡️';
-    title.textContent = 'Active Defense — ' + confirmedThreats + ' threats';
-    sub.textContent = responded + ' contained · ' + blockedCount + ' IPs blocked · ' + noise + ' noise filtered';
-  } else if (confirmedThreats > 0) {
+    icon.textContent = '\u26A0\uFE0F';
+    title.textContent = needsAttention + ' item' + (needsAttention > 1 ? 's need' : ' needs') + ' your attention';
+    sub.textContent = 'The AI could not resolve ' + (needsAttention > 1 ? 'these' : 'this') + ' automatically. Review below.';
+  } else if (observing > 0) {
     hero.className = 'status-hero safe';
-    icon.textContent = '🛡️';
-    title.textContent = 'Server Protected';
-    sub.textContent = confirmedThreats + ' threats detected · ' + responded + ' contained · ' + noise + ' noise filtered';
+    icon.textContent = '\uD83D\uDEE1\uFE0F';
+    title.textContent = 'AI Protection Active';
+    sub.textContent = totalBlocked + ' blocked \u00B7 ' + totalHoneypot + ' honeypot \u00B7 ' + observing + ' observing \u00B7 ' + noise + ' dismissed';
   } else {
     hero.className = 'status-hero safe';
-    icon.textContent = '✅';
-    title.textContent = 'All Clear';
-    sub.textContent = 'No confirmed threats · ' + rawTotal + ' events analyzed · defense active';
+    icon.textContent = '\u2705';
+    title.textContent = 'All Handled';
+    sub.textContent = totalBlocked + ' blocked \u00B7 ' + totalHoneypot + ' honeypot \u00B7 ' + noise + ' dismissed. Nothing requires attention.';
   }
 }
 
@@ -357,17 +420,23 @@ async function refreshLeftLive() {
 
     const items = entityData.items || [];
 
-    window._lastOverview = ov; // Store for threat level gauge
+    window._lastOverview = ov;
+    window._lastEntityItems = items;
+
+    // Outcome-first KPIs (same logic as refreshLeft)
+    var kpiBlocked = 0, kpiObserving = 0, kpiAttention = 0;
+    items.forEach(function(item) {
+      var o = outcomeOf(item);
+      if (o === 'blocked' || o === 'honeypot') kpiBlocked++;
+      else if (o === 'needs_attention') kpiAttention++;
+      else if (o === 'monitoring') kpiObserving++;
+    });
+    updateKpi('kpi-confirmed', kpiBlocked);
+    updateKpi('kpi-responded', kpiObserving);
+    updateKpi('kpi-noise',     kpiAttention);
     updateKpi('kpi-events',    ov.events_count);
-    updateKpi('kpi-confirmed', ov.ai_confirmed || 0);
-    updateKpi('kpi-responded', ov.ai_responded || 0);
-    updateKpi('kpi-noise',     ov.ai_ignored || 0);
     updateKpi('kpi-incidents', ov.incidents_count);
     updateKpi('kpi-attackers', items.length);
-    // Contextual KPI colors (confidence system)
-    var u = getUnresolved();
-    var confEl = document.getElementById('kpi-confirmed');
-    if (confEl) confEl.style.color = u.unresolved > 0 ? 'var(--danger)' : u.total > 0 ? 'var(--ok)' : 'var(--accent)';
 
     const list = document.getElementById('attackerList');
     const newItems = items.filter(it => !state.knownItemValues.has(it.value));
@@ -411,7 +480,7 @@ async function refreshLeft(forceRefreshJourney = false) {
       window_seconds: state.filters.window_seconds,
     });
 
-    const [ov, entityData, clusterData] = await Promise.all([
+    const [ov, entityData, clusterData, statusData] = await Promise.all([
       loadJson('/api/overview' + (overviewQs ? '?' + overviewQs : '')),
       state.pivot === 'ip'
         ? loadJson('/api/entities?' + entityQs).then((r) => ({
@@ -423,16 +492,31 @@ async function refreshLeft(forceRefreshJourney = false) {
           }))
         : loadJson('/api/pivots?' + entityQs),
       loadJson('/api/clusters?' + clusterQs),
+      loadJson('/api/status').catch(() => ({ mode: 'guard' })),
     ]);
+
+    // Store agent mode globally so outcomeOf() can adapt.
+    // guard = AI blocks autonomously, watch/read_only = AI detects only.
+    window._agentMode = statusData.mode || 'guard';
 
     const items = entityData.items || [];
     state.clusters = clusterData.items || [];
 
     window._lastOverview = ov;
+    window._lastEntityItems = items;
+
+    // Outcome-first KPIs: Blocked / Observing / Needs attention
+    var kpiBlocked = 0, kpiObserving = 0, kpiAttention = 0;
+    items.forEach(function(item) {
+      var o = outcomeOf(item);
+      if (o === 'blocked' || o === 'honeypot') kpiBlocked++;
+      else if (o === 'needs_attention') kpiAttention++;
+      else if (o === 'monitoring') kpiObserving++;
+    });
+    document.getElementById('kpi-confirmed').textContent = kpiBlocked;
+    document.getElementById('kpi-responded').textContent = kpiObserving;
+    document.getElementById('kpi-noise').textContent     = kpiAttention;
     document.getElementById('kpi-events').textContent    = ov.events_count;
-    document.getElementById('kpi-confirmed').textContent = ov.ai_confirmed || 0;
-    document.getElementById('kpi-responded').textContent = ov.ai_responded || 0;
-    document.getElementById('kpi-noise').textContent     = ov.ai_ignored || 0;
     document.getElementById('kpi-incidents').textContent = ov.incidents_count;
     const kpiAtt = document.getElementById('kpi-attackers');
     if (kpiAtt) kpiAtt.textContent = items.length;

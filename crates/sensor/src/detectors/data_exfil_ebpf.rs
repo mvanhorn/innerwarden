@@ -83,6 +83,12 @@ impl DataExfilEbpfDetector {
 
         // Skip processes that legitimately read /etc/passwd for NSS uid→name
         // resolution and then make outbound connections (CrowdSec, web servers).
+        //
+        // This list is for DAEMONS that read /etc/passwd as part of normal
+        // operation (uid lookup for every request, session setup, etc.) and
+        // are always making outbound calls as part of their job. These
+        // cannot meaningfully be distinguished from the exfil pattern, so
+        // they are always allowed.
         const PASSWD_READERS: &[&str] = &[
             "http",
             "https",
@@ -151,6 +157,19 @@ impl DataExfilEbpfDetector {
             let cutoff = now - self.window;
             self.pending_reads.retain(|_, r| r.ts > cutoff);
 
+            // Peek dst_port BEFORE consuming the pending read: port 0 means
+            // eBPF never observed a real TCP handshake (connect error, NSS
+            // probe, AF_UNIX upgrade). Drop the event and keep the pending
+            // read in the map so a later real connect can still correlate.
+            let dst_port = event
+                .details
+                .get("dst_port")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u16;
+            if dst_port == 0 {
+                return None;
+            }
+
             if let Some(read) = self.pending_reads.remove(&pid) {
                 // Same PID read a sensitive file then made outbound connection
                 let dst_ip = event
@@ -158,11 +177,6 @@ impl DataExfilEbpfDetector {
                     .get("dst_ip")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
-                let dst_port = event
-                    .details
-                    .get("dst_port")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u16;
                 let comm = event
                     .details
                     .get("comm")
@@ -171,6 +185,55 @@ impl DataExfilEbpfDetector {
 
                 // Skip internal IPs
                 if super::is_internal_ip(dst_ip) {
+                    return None;
+                }
+
+                // Targeted NSS-init suppression.
+                //
+                // Every dynamically linked C program calls `getpwuid_r` /
+                // `getpwnam_r` at startup, which opens `/etc/passwd`. CLI
+                // tools like wget, curl, git, apt that ALSO make outbound
+                // connections trivially trip "read sensitive file →
+                // connect" in the first milliseconds of startup. Observed
+                // 2026-04-11: Critical FP on `wget read /etc/passwd then
+                // connected to 34.244.58.147:0` — 6ms between read and
+                // connect, port 0 (never established) — pure NSS init.
+                //
+                // The suppression is INTENTIONALLY NARROW:
+                //   - file must be exactly "/etc/passwd" (NSS file), AND
+                //   - comm must be a known CLI network tool whose NSS
+                //     lookup is legitimate.
+                //
+                // Reads of `/etc/shadow`, `~/.ssh/*`, `id_rsa`, `.env`,
+                // `/credentials`, `.kube/config` by wget/curl/git/etc. are
+                // NOT NSS init and STILL fire Critical alerts. A real
+                // exfil of shadow hashes or SSH keys by a renamed-to-wget
+                // attacker is caught unchanged.
+                const NSS_INIT_CLI_TOOLS: &[&str] = &[
+                    "wget",
+                    "curl",
+                    "git",
+                    "git-remote",
+                    "apt",
+                    "apt-get",
+                    "apt-check",
+                    "dpkg",
+                    "snap",
+                    "snapd",
+                    "pip",
+                    "pip3",
+                    "npm",
+                    "yarn",
+                    "cargo",
+                    "rustup",
+                    "gem",
+                    "composer",
+                    "mvn",
+                    "gradle",
+                ];
+                let is_nss_init = read.filename == "/etc/passwd"
+                    && NSS_INIT_CLI_TOOLS.iter().any(|p| read.comm.starts_with(p));
+                if is_nss_init {
                     return None;
                 }
 

@@ -42,9 +42,9 @@
       <span class="status-badge status-badge-read" id="modeBadge">READ-ONLY</span>
       <span class="status-badge status-badge-ai-off" id="aiBadge">AI: off</span>
       <span class="status-badge" id="versionBadge" style="background:rgba(120,229,255,0.08);color:var(--accent);font-size:0.58rem"></span>
-      <label style="display:flex;align-items:center;gap:3px;font-size:0.58rem;color:var(--muted);cursor:pointer;user-select:none;margin-left:4px" title="Hide events from allowlisted IPs and users">
-        <input type="checkbox" id="hideAllowlisted" checked onchange="toggleAllowlistFilter()" style="margin:0;cursor:pointer;width:12px;height:12px"> Hide trusted
-      </label>
+      <!-- Toggle removed: research_only server-side filter handles self-traffic.
+           The checkbox element is kept hidden so JS references don't break. -->
+      <input type="checkbox" id="hideAllowlisted" checked style="display:none">
     </div>
     <span id="refreshStatus"></span>
     <div class="main-nav">
@@ -72,24 +72,34 @@
 
   <!-- ── Home view ── -->
   <div class="report-view" id="viewHome" style="display:none">
-    <div class="status-hero safe" id="homeHero">
-      <div class="status-hero-icon" id="homeHeroIcon">✅</div>
+    <div class="status-hero alert-info" id="homeHero">
+      <div class="status-hero-icon" id="homeHeroIcon">🛡</div>
       <div class="status-hero-title" id="homeHeroTitle">Loading…</div>
       <div class="status-hero-sub" id="homeHeroSub"></div>
       <div class="home-status-meta" id="homeStatusMeta"></div>
     </div>
+    <section id="homeNow" class="home-section home-now">
+      <div class="home-section-title">Now</div>
+      <ul class="home-now-list">
+        <li id="homeNowWhat">Loading…</li>
+        <li id="homeNowDid"></li>
+      </ul>
+    </section>
     <div class="home-kpi-row">
-      <div class="home-kpi-big" onclick="showView('investigate')">
-        <div class="kpi-value" id="homeKpiThreats" style="color:var(--accent)">0</div>
-        <div class="kpi-label">Threats Detected</div>
-      </div>
       <div class="home-kpi-big" onclick="showContained()">
-        <div class="kpi-value" id="homeKpiResponded" style="color:#27ae60">0</div>
-        <div class="kpi-label">Contained</div>
+        <div class="kpi-value" id="homeKpiThreats" style="color:var(--ok)">0</div>
+        <div class="kpi-label">Blocked</div>
+        <div class="kpi-window" id="homeKpiThreatsWindow">Today</div>
+      </div>
+      <div class="home-kpi-big" onclick="viewActivity()">
+        <div class="kpi-value" id="homeKpiResponded" style="color:var(--accent)">0</div>
+        <div class="kpi-label">Incidents</div>
+        <div class="kpi-window" id="homeKpiRespondedWindow">Today</div>
       </div>
       <div class="home-kpi-big" onclick="showView('sensors')">
         <div class="kpi-value" id="homeKpiEvents" style="color:var(--accent)">0</div>
-        <div class="kpi-label">Events Today</div>
+        <div class="kpi-label">Events Scanned</div>
+        <div class="kpi-window" id="homeKpiEventsWindow">Today</div>
       </div>
     </div>
     <div class="home-section" id="briefingSection" style="display:none">
@@ -141,11 +151,11 @@
   <div class="app-body" id="viewInvestigate" style="display:none">
     <aside class="left-panel">
       <div class="kpi-grid" style="grid-template-columns: repeat(3,1fr)">
-        <div class="kpi-card"><div class="kpi-label">Threats</div><div class="kpi-value" id="kpi-confirmed" style="color:var(--accent)">0</div></div>
-        <div class="kpi-card"><div class="kpi-label">Contained</div><div class="kpi-value" id="kpi-responded" style="color:#27ae60">0</div></div>
-        <div class="kpi-card"><div class="kpi-label">Events</div><div class="kpi-value" id="kpi-events">0</div></div>
+        <div class="kpi-card"><div class="kpi-value" id="kpi-confirmed" style="color:var(--ok)">0</div><div class="kpi-label">Blocked</div><div class="kpi-window">Today</div></div>
+        <div class="kpi-card"><div class="kpi-value" id="kpi-responded" style="color:var(--accent)">0</div><div class="kpi-label">Observing</div><div class="kpi-window">Now</div></div>
+        <div class="kpi-card"><div class="kpi-value" id="kpi-noise" style="color:var(--muted)">0</div><div class="kpi-label">Needs attention</div><div class="kpi-window">Today</div></div>
       </div>
-      <div style="display:none"><span id="kpi-noise">0</span><span id="kpi-incidents">0</span><span id="kpi-attackers">0</span></div>
+      <div style="display:none"><span id="kpi-incidents">0</span><span id="kpi-attackers">0</span><span id="kpi-events">0</span></div>
       <div class="filters" style="grid-template-columns:1fr auto;margin-bottom:6px">
         <input id="flt-date" type="date" class="full" style="grid-column:1/-1" />
         <button id="flt-adv-toggle" type="button" class="full" style="background:transparent;border:none;color:var(--muted);font-size:0.68rem;cursor:pointer;text-align:left;padding:2px 0" onclick="toggleAdvFilters()">▸ Advanced filters</button>
@@ -181,7 +191,7 @@
       <div class="search-wrap">
         <input id="entitySearch" type="search" placeholder="search threats…" autocomplete="off" spellcheck="false" />
       </div>
-      <div class="section-title" id="entityTitle">Defense Activity</div>
+      <div class="section-title" id="entityTitle">AI Defense Log</div>
       <div id="attackerList"><div class="empty">Loading…</div></div>
     </aside>
     <main class="right-panel" id="rightPanel">

@@ -121,6 +121,27 @@ pub(crate) async fn try_handle_abuseipdb_autoblock(
         );
     }
 
+    // Write decision to knowledge graph so the dashboard shows "Blocked".
+    // Previously this was missing — the IP was blocked at the firewall
+    // but the graph incident had decision=null, so the Threats tab showed
+    // "Observing" instead of "Blocked". Observed 2026-04-12: 3 auto-blocked
+    // IPs (149.56.102.185, 196.196.253.20, 103.189.235.30) appeared as
+    // "Observing" despite being blocked.
+    {
+        let auto_executed = !execution_result.starts_with("skipped")
+            && !execution_result.starts_with("rate-limited");
+        let mut graph = state.knowledge_graph.write().unwrap();
+        graph.ingest_decision(
+            &incident.incident_id,
+            "block_ip",
+            Some(&ip),
+            auto_decision.confidence,
+            &auto_decision.reason,
+            auto_executed,
+            chrono::Utc::now(),
+        );
+    }
+
     if let Some(writer) = &mut state.decision_writer {
         let entry = decisions::build_entry(
             &incident.incident_id,

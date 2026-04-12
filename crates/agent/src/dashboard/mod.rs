@@ -386,6 +386,8 @@ pub async fn serve(
         // AI Intelligence Briefing
         .route("/api/briefing", get(api_briefing))
         .route("/api/briefing/generate", post(api_briefing_generate))
+        // AI Explain — plain-language threat explanation for non-technical operators
+        .route("/api/ai-explain", get(api_ai_explain))
         // Sensors activity
         .route("/api/sensors", get(api_sensors))
         // E6 - system status

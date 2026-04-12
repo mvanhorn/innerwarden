@@ -923,6 +923,19 @@ impl MitreHuntDetector {
         }
 
         // Skip if spawned by InnerWarden itself (pcap_capture spawns tcpdump).
+        //
+        // Three-layer check because eBPF events sometimes arrive with
+        // incomplete process context (pid=0, parent_comm="", uid=0):
+        //   1. parent_comm starts with "innerwarden"
+        //   2. /proc/{ppid}/comm starts with "innerwarden" (best-effort)
+        //   3. uid == INNERWARDEN_UID (998) — the tcpdump processes spawned
+        //      by pcap_capture.rs inherit the agent's uid. This is the most
+        //      reliable check when eBPF couldn't resolve parent context.
+        //      Observed 2026-04-12: 9 Medium "Network sniffing tool:
+        //      tcpdump (pid=0, user=unknown)" per day, all self-spawned.
+        if super::allowlists::is_innerwarden_process(uid as u64, "") {
+            return None;
+        }
         let ppid = event
             .details
             .get("ppid")
@@ -936,7 +949,6 @@ impl MitreHuntDetector {
         if parent_comm.starts_with("innerwarden") {
             return None;
         }
-        // Also check if parent is the sensor by reading /proc/ppid/comm (best-effort).
         if ppid > 0 {
             if let Ok(pcomm) = std::fs::read_to_string(format!("/proc/{ppid}/comm")) {
                 if pcomm.trim().starts_with("innerwarden") {

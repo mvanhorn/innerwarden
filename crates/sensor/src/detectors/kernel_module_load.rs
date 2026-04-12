@@ -116,9 +116,45 @@ impl KernelModuleLoadDetector {
     }
 
     /// Check if the command is a kernel module operation.
+    ///
+    /// Requires the FIRST whitespace token to be (a path ending in)
+    /// `insmod`, `modprobe`, or `rmmod`. A substring check was previously
+    /// used, which fired on anything that *mentioned* those words in
+    /// arguments — `grep modprobe /var/log/*`, `man insmod`, `bash
+    /// /etc/systemd/modules-load.d/modprobe.conf`, etc. Observed
+    /// 2026-04-11: 73 "Kernel module load detected: unknown" High
+    /// incidents per day, driven entirely by substring matches where
+    /// `extract_module_name` returned None and the detector fell back to
+    /// "unknown". A real insmod/modprobe/rmmod invocation has the tool
+    /// name as the program being executed (after optional shell wrapper
+    /// like `sudo` / `bash -c`), which the first-token heuristic catches
+    /// via the nested shell check.
     fn is_module_command(command: &str) -> bool {
         let lower = command.to_lowercase();
-        lower.contains("insmod") || lower.contains("modprobe") || lower.contains("rmmod")
+        let mut tokens = lower.split_whitespace();
+        let Some(first) = tokens.next() else {
+            return false;
+        };
+        // Strip path prefix: /usr/sbin/modprobe → modprobe
+        let first_base = first.rsplit('/').next().unwrap_or(first);
+        if first_base == "insmod" || first_base == "modprobe" || first_base == "rmmod" {
+            return true;
+        }
+        // Nested shell wrappers: sudo modprobe foo, bash -c 'modprobe foo',
+        // env VAR=x insmod bar, nice -n 10 rmmod baz. Walk one more token
+        // under a known shell/env wrapper so we still catch real usage.
+        const WRAPPERS: &[&str] =
+            &["sudo", "doas", "bash", "sh", "zsh", "dash", "env", "nice", "nohup", "timeout"];
+        if WRAPPERS.contains(&first_base) {
+            for tok in tokens {
+                if tok.starts_with('-') || tok.contains('=') {
+                    continue;
+                }
+                let base = tok.rsplit('/').next().unwrap_or(tok);
+                return base == "insmod" || base == "modprobe" || base == "rmmod";
+            }
+        }
+        false
     }
 
     pub fn process(&mut self, event: &Event) -> Option<Incident> {
@@ -131,7 +167,15 @@ impl KernelModuleLoadDetector {
             return None;
         }
 
-        let module_name = Self::extract_module_name(command).unwrap_or("unknown");
+        // If we can't extract the module name, we don't have enough signal
+        // to fire a High/Critical incident. Previous behavior was to emit
+        // `Kernel module load detected: unknown`, which gives the operator
+        // nothing actionable and is the signature of a substring-match FP
+        // from the old `is_module_command`.
+        let module_name = match Self::extract_module_name(command) {
+            Some(name) => name,
+            None => return None,
+        };
 
         // Skip allowlisted modules
         if Self::is_allowed_module(module_name) {
