@@ -14,10 +14,13 @@ pub(super) async fn api_attacker_profiles(
     let min_risk = query.min_risk.unwrap_or(0);
     let sort = query.sort.as_deref().unwrap_or("risk_score");
 
-    let profiles: Vec<serde_json::Value> =
-        safe_read_data_file(&state.data_dir, "attacker-profiles.json")
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+    let profiles: Vec<serde_json::Value> = state
+        .sqlite_store
+        .as_ref()
+        .and_then(|sq| sq.get_blob("attacker_profiles").ok().flatten())
+        .or_else(|| safe_read_data_file(&state.data_dir, "attacker-profiles.json"))
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
 
     let mut filtered: Vec<serde_json::Value> = profiles
         .into_iter()
@@ -60,10 +63,13 @@ pub(super) async fn api_attacker_profile_detail(
     State(state): State<DashboardState>,
     axum::extract::Path(ip): axum::extract::Path<String>,
 ) -> Json<serde_json::Value> {
-    let profiles: Vec<serde_json::Value> =
-        safe_read_data_file(&state.data_dir, "attacker-profiles.json")
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+    let profiles: Vec<serde_json::Value> = state
+        .sqlite_store
+        .as_ref()
+        .and_then(|sq| sq.get_blob("attacker_profiles").ok().flatten())
+        .or_else(|| safe_read_data_file(&state.data_dir, "attacker-profiles.json"))
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
 
     let profile = profiles.into_iter().find(|p| p["ip"].as_str() == Some(&ip));
     match profile {
@@ -102,10 +108,14 @@ pub(super) async fn api_threat_report(
     // Report doesn't exist - generate on demand
     let data_dir = state.data_dir.clone();
     let month_clone = month.clone();
+    let sq_store = state.sqlite_store.clone();
     match tokio::task::spawn_blocking(move || {
-        // Load profiles from snapshot for generation
+        // Load profiles from snapshot for generation (blob first, file fallback)
         let profiles: std::collections::HashMap<String, crate::attacker_intel::AttackerProfile> =
-            safe_read_data_file(&data_dir, "attacker-profiles.json")
+            sq_store
+                .as_ref()
+                .and_then(|sq| sq.get_blob("attacker_profiles").ok().flatten())
+                .or_else(|| safe_read_data_file(&data_dir, "attacker-profiles.json"))
                 .and_then(|s| {
                     serde_json::from_str::<Vec<crate::attacker_intel::AttackerProfile>>(&s).ok()
                 })
@@ -315,7 +325,11 @@ pub(super) async fn api_graph_neighborhood(
 pub(super) async fn api_baseline_status(
     State(state): State<DashboardState>,
 ) -> Json<serde_json::Value> {
-    let baseline: serde_json::Value = safe_read_data_file(&state.data_dir, "baseline.json")
+    let baseline: serde_json::Value = state
+        .sqlite_store
+        .as_ref()
+        .and_then(|sq| sq.get_blob("baseline").ok().flatten())
+        .or_else(|| safe_read_data_file(&state.data_dir, "baseline.json"))
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or(serde_json::json!({"mature": false, "training_days": 0}));
     Json(baseline)
@@ -325,7 +339,11 @@ pub(super) async fn api_baseline_status(
 pub(super) async fn api_playbook_log(
     State(state): State<DashboardState>,
 ) -> Json<serde_json::Value> {
-    let log: Vec<serde_json::Value> = safe_read_data_file(&state.data_dir, "playbook-log.json")
+    let log: Vec<serde_json::Value> = state
+        .sqlite_store
+        .as_ref()
+        .and_then(|sq| sq.get_blob("playbook_log").ok().flatten())
+        .or_else(|| safe_read_data_file(&state.data_dir, "playbook-log.json"))
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
     Json(serde_json::json!({
@@ -343,7 +361,11 @@ pub(super) async fn api_deep_security(
 
 /// `GET /api/campaigns` - detected campaign clusters (DNA + IOC correlation).
 pub(super) async fn api_campaigns(State(state): State<DashboardState>) -> Json<serde_json::Value> {
-    let campaigns: Vec<serde_json::Value> = safe_read_data_file(&state.data_dir, "campaigns.json")
+    let campaigns: Vec<serde_json::Value> = state
+        .sqlite_store
+        .as_ref()
+        .and_then(|sq| sq.get_blob("campaigns").ok().flatten())
+        .or_else(|| safe_read_data_file(&state.data_dir, "campaigns.json"))
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
     Json(serde_json::json!({

@@ -183,6 +183,8 @@ pub(crate) struct DashboardState {
     /// Briefing schedule (hour, minute).
     pub(super) briefing_hour: u8,
     pub(super) briefing_minute: u8,
+    /// SQLite store for blob reads (Phase 6: try blob before JSON file).
+    pub(super) sqlite_store: Option<Arc<innerwarden_store::Store>>,
 }
 
 /// Aggregated status from integrated security modules.

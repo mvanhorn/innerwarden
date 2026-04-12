@@ -428,9 +428,13 @@ pub(super) async fn api_prometheus_metrics(
         ));
     }
 
-    // Response lifecycle metrics (from responses.json snapshot).
-    let responses_path = state.data_dir.join("responses.json");
-    if let Ok(data) = std::fs::read_to_string(&responses_path) {
+    // Response lifecycle metrics (from responses blob/file snapshot).
+    let responses_data = state
+        .sqlite_store
+        .as_ref()
+        .and_then(|sq| sq.get_blob("responses").ok().flatten())
+        .or_else(|| std::fs::read_to_string(state.data_dir.join("responses.json")).ok());
+    if let Some(data) = responses_data {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) {
             out.push_str("# HELP innerwarden_responses_active Currently active response actions\n");
             out.push_str("# TYPE innerwarden_responses_active gauge\n");
@@ -466,14 +470,19 @@ pub(super) async fn api_prometheus_metrics(
 
 /// GET /api/responses — active and historical response actions with TTL.
 pub(super) async fn api_responses(State(state): State<DashboardState>) -> axum::response::Response {
-    let responses_path = state.data_dir.join("responses.json");
-    match std::fs::read_to_string(&responses_path) {
-        Ok(data) => axum::response::Response::builder()
+    // Try SQLite blob first, fall back to JSON file
+    let data = state
+        .sqlite_store
+        .as_ref()
+        .and_then(|sq| sq.get_blob("responses").ok().flatten())
+        .or_else(|| std::fs::read_to_string(state.data_dir.join("responses.json")).ok());
+    match data {
+        Some(data) => axum::response::Response::builder()
             .header("content-type", "application/json")
             .body(Body::from(data))
             .unwrap()
             .into_response(),
-        Err(_) => {
+        None => {
             let empty = serde_json::json!({"active": [], "active_count": 0, "history": [], "totals": {"registered": 0, "expired": 0, "reverted": 0}});
             axum::response::Response::builder()
                 .header("content-type", "application/json")

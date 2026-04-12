@@ -427,7 +427,7 @@ struct AgentState {
     /// Persistent state store (redb) - cooldowns, block_counts, ip_reputations,
     /// xdp_block_times, trust_rules. Primary source of truth for reads.
     store: state_store::StateStore,
-    sqlite_store: Option<innerwarden_store::Store>,
+    sqlite_store: Option<Arc<innerwarden_store::Store>>,
     /// Attacker intelligence profiles: IP → unified profile.
     attacker_profiles: HashMap<String, attacker_intel::AttackerProfile>,
     /// Last attacker intel consolidation timestamp (5-minute interval).
@@ -735,14 +735,15 @@ async fn main() -> Result<()> {
     ));
 
     // Open SQLite store early so the graph can try loading from it.
-    let sqlite_store = match innerwarden_store::Store::open(&cli.data_dir) {
-        Ok(s) => { info!(path = %cli.data_dir.join("innerwarden.db").display(), "sqlite store opened"); Some(s) }
+    // Wrapped in Arc so it can be shared with the dashboard task.
+    let sqlite_store: Option<Arc<innerwarden_store::Store>> = match innerwarden_store::Store::open(&cli.data_dir) {
+        Ok(s) => { info!(path = %cli.data_dir.join("innerwarden.db").display(), "sqlite store opened"); Some(Arc::new(s)) }
         Err(e) => { warn!("sqlite store unavailable: {e:#}"); None }
     };
 
     // Shared knowledge graph: try SQLite store first, fall back to file-based dated snapshot.
     let shared_graph = std::sync::Arc::new(std::sync::RwLock::new({
-        let from_store = sqlite_store.as_ref()
+        let from_store = sqlite_store.as_deref()
             .and_then(knowledge_graph::KnowledgeGraph::load_from_store);
         if let Some(g) = from_store {
             g
@@ -837,6 +838,7 @@ async fn main() -> Result<()> {
         let dashboard_briefing = Arc::new(tokio::sync::Mutex::new(None::<briefing::Briefing>));
         let briefing_hour = cfg.briefing.hour;
         let briefing_minute = cfg.briefing.minute;
+        let dashboard_store = sqlite_store.clone();
         tokio::spawn(async move {
             if let Err(e) = dashboard::serve(
                 dashboard_data_dir,
@@ -856,6 +858,7 @@ async fn main() -> Result<()> {
                 dashboard_briefing,
                 briefing_hour,
                 briefing_minute,
+                dashboard_store,
             )
             .await
             {
@@ -1229,17 +1232,17 @@ async fn main() -> Result<()> {
         },
         recent_blocks: std::collections::VecDeque::new(),
         xdp_block_times: HashMap::new(),
-        response_lifecycle: response_lifecycle::ResponseLifecycle::load_snapshot(&cli.data_dir),
+        response_lifecycle: response_lifecycle::ResponseLifecycle::load_snapshot(&cli.data_dir, sqlite_store.as_deref()),
         abuseipdb_report_queue: Vec::new(),
         narrative_acc: NarrativeAccumulator::default(),
         narrative_incidents_offset: 0,
         forensics: forensics::ForensicsCapture::new(&cli.data_dir),
         store,
-        sqlite_store,
+        baseline: baseline::BaselineStore::load(&cli.data_dir, sqlite_store.as_deref()),
+        sqlite_store: sqlite_store.clone(),
         attacker_profiles: HashMap::new(), // loaded from redb below
         last_intel_consolidation_at: None,
         correlation_engine: correlation_engine::CorrelationEngine::new(),
-        baseline: baseline::BaselineStore::load(&cli.data_dir),
         playbook_engine: playbook::PlaybookEngine::new(&cli.data_dir),
         defender_brain: defender_brain::DefenderBrain::load(
             &cli.data_dir.join("defender-brain.json").to_string_lossy(),
@@ -1320,7 +1323,7 @@ async fn main() -> Result<()> {
                 feed_urls.len()
             );
         }
-        let client = threat_feeds::ThreatFeedClient::new(vt_key, feed_urls, &cli.data_dir);
+        let client = threat_feeds::ThreatFeedClient::new(vt_key, feed_urls, &cli.data_dir, sqlite_store.as_deref());
         let feed_state = client.state();
         if feed_state.total_iocs > 0 {
             info!(
@@ -1831,6 +1834,12 @@ async fn main() -> Result<()> {
                         let json = state.response_lifecycle.to_json();
                         let path = cli.data_dir.join("responses.json");
                         if let Ok(data) = serde_json::to_string(&json) {
+                            // Dual-write: SQLite blob + JSON file
+                            if let Some(ref sq) = state.sqlite_store {
+                                if let Err(e) = sq.set_blob("responses", &data) {
+                                    warn!("failed to write responses blob: {e}");
+                                }
+                            }
                             let _ = tokio::fs::write(&path, data).await;
                         }
                     }
@@ -1930,7 +1939,7 @@ async fn main() -> Result<()> {
                         // ── Threat feed poll + save ──
                         if let Some(ref mut tf) = state.threat_feed {
                             tf.poll_feeds().await;
-                            tf.save(&cli.data_dir);
+                            tf.save(&cli.data_dir, state.sqlite_store.as_deref());
                         }
 
                         // ── Pcap capture cooldown cleanup ──
@@ -1950,7 +1959,7 @@ async fn main() -> Result<()> {
                                     anomaly.description
                                 );
                             }
-                            state.baseline.save(&cli.data_dir);
+                            state.baseline.save(&cli.data_dir, state.sqlite_store.as_deref());
                         }
 
                         // ── Attacker intelligence consolidation (every 5 min) ──
@@ -1972,6 +1981,7 @@ async fn main() -> Result<()> {
                                 &mut state.attacker_profiles,
                                 &state.store,
                                 &cli.data_dir,
+                                state.sqlite_store.as_deref(),
                             );
                             state.last_intel_consolidation_at = Some(Instant::now());
                         }

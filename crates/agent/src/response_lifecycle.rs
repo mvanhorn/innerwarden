@@ -284,11 +284,32 @@ impl ResponseLifecycle {
     /// Restore active responses from a previous `responses.json` snapshot.
     /// Called once on agent startup to survive restarts. Expired entries are
     /// moved to history automatically via the next `tick_cleanup` call.
-    pub fn load_snapshot(data_dir: &std::path::Path) -> Self {
-        let path = data_dir.join("responses.json");
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => return Self::new(),
+    /// Tries SQLite blob first, falls back to JSON file.
+    pub fn load_snapshot(
+        data_dir: &std::path::Path,
+        store: Option<&innerwarden_store::Store>,
+    ) -> Self {
+        // Try SQLite blob first, fall back to JSON file
+        let content = if let Some(sq) = store {
+            match sq.get_blob("responses") {
+                Ok(Some(json)) => {
+                    tracing::info!("loaded response lifecycle from sqlite blob");
+                    json
+                }
+                _ => {
+                    let path = data_dir.join("responses.json");
+                    match std::fs::read_to_string(&path) {
+                        Ok(c) => c,
+                        Err(_) => return Self::new(),
+                    }
+                }
+            }
+        } else {
+            let path = data_dir.join("responses.json");
+            match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => return Self::new(),
+            }
         };
         let json: serde_json::Value = match serde_json::from_str(&content) {
             Ok(v) => v,
@@ -1374,7 +1395,7 @@ mod tests {
             serde_json::to_string(&snapshot).unwrap(),
         )
         .unwrap();
-        let reloaded = ResponseLifecycle::load_snapshot(&tmp);
+        let reloaded = ResponseLifecycle::load_snapshot(&tmp, None);
         assert_eq!(reloaded.list_active().len(), 1);
         match &reloaded.list_active()[0].state {
             LifecycleState::RevertFailed { attempts, .. } => {
@@ -1415,7 +1436,7 @@ mod tests {
             serde_json::to_string(&legacy).unwrap(),
         )
         .unwrap();
-        let reloaded = ResponseLifecycle::load_snapshot(&tmp);
+        let reloaded = ResponseLifecycle::load_snapshot(&tmp, None);
         assert_eq!(reloaded.list_active().len(), 1);
         assert!(matches!(
             reloaded.list_active()[0].state,

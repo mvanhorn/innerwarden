@@ -199,6 +199,7 @@ pub async fn serve(
     briefing_state: Arc<tokio::sync::Mutex<Option<crate::briefing::Briefing>>>,
     briefing_hour: u8,
     briefing_minute: u8,
+    sqlite_store: Option<Arc<innerwarden_store::Store>>,
 ) -> Result<()> {
     if auth.is_none() {
         warn!(
@@ -282,6 +283,7 @@ pub async fn serve(
         latest_briefing: briefing_state,
         briefing_hour,
         briefing_minute,
+        sqlite_store,
     };
     let auth_layer = middleware::from_fn_with_state(
         (

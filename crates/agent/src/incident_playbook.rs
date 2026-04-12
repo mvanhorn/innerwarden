@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::AgentState;
 
@@ -32,6 +32,13 @@ pub(crate) fn maybe_evaluate_and_persist_playbook(
         if log.len() > 100 {
             log = log.split_off(log.len() - 100);
         }
-        let _ = std::fs::write(&log_path, serde_json::to_string(&log).unwrap_or_default());
+        let json_str = serde_json::to_string(&log).unwrap_or_default();
+        // Dual-write: SQLite blob + JSON file
+        if let Some(ref sq) = state.sqlite_store {
+            if let Err(e) = sq.set_blob("playbook_log", &json_str) {
+                warn!("failed to write playbook_log blob: {e}");
+            }
+        }
+        let _ = std::fs::write(&log_path, json_str);
     }
 }

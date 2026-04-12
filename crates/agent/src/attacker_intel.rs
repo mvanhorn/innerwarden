@@ -488,6 +488,7 @@ pub fn consolidation_tick(
     profiles: &mut HashMap<String, AttackerProfile>,
     store: &StateStore,
     data_dir: &Path,
+    sqlite_store: Option<&innerwarden_store::Store>,
 ) {
     // Recompute DNA and risk scores
     for profile in profiles.values_mut() {
@@ -504,21 +505,31 @@ pub fn consolidation_tick(
     }
 
     // Write JSON snapshot for dashboard
-    persist_snapshot(data_dir, profiles);
+    persist_snapshot(data_dir, profiles, sqlite_store);
 
     // Detect campaigns and persist
     let campaigns = detect_campaigns(profiles);
-    persist_campaigns(data_dir, &campaigns);
+    persist_campaigns(data_dir, &campaigns, sqlite_store);
 }
 
 /// Write profiles as a sorted JSON array to `attacker-profiles.json`.
-pub fn persist_snapshot(data_dir: &Path, profiles: &HashMap<String, AttackerProfile>) {
+pub fn persist_snapshot(
+    data_dir: &Path,
+    profiles: &HashMap<String, AttackerProfile>,
+    store: Option<&innerwarden_store::Store>,
+) {
     let mut sorted: Vec<&AttackerProfile> = profiles.values().collect();
     sorted.sort_by(|a, b| b.risk_score.cmp(&a.risk_score));
 
     let path = data_dir.join("attacker-profiles.json");
     match serde_json::to_string(&sorted) {
         Ok(json) => {
+            // Dual-write: SQLite blob + JSON file
+            if let Some(sq) = store {
+                if let Err(e) = sq.set_blob("attacker_profiles", &json) {
+                    warn!("failed to write attacker_profiles blob: {e}");
+                }
+            }
             if let Err(e) = std::fs::write(&path, json) {
                 warn!("failed to write attacker-profiles.json: {e}");
             }
@@ -912,10 +923,20 @@ pub fn detect_campaigns(profiles: &HashMap<String, AttackerProfile>) -> Vec<Camp
 }
 
 /// Persist campaign clusters to `campaigns.json` for dashboard.
-pub fn persist_campaigns(data_dir: &Path, campaigns: &[CampaignCluster]) {
+pub fn persist_campaigns(
+    data_dir: &Path,
+    campaigns: &[CampaignCluster],
+    store: Option<&innerwarden_store::Store>,
+) {
     let path = data_dir.join("campaigns.json");
     match serde_json::to_string(campaigns) {
         Ok(json) => {
+            // Dual-write: SQLite blob + JSON file
+            if let Some(sq) = store {
+                if let Err(e) = sq.set_blob("campaigns", &json) {
+                    warn!("failed to write campaigns blob: {e}");
+                }
+            }
             if let Err(e) = std::fs::write(&path, json) {
                 warn!("failed to write campaigns.json: {e}");
             }

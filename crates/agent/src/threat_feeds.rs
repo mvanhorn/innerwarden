@@ -64,8 +64,13 @@ pub struct ThreatFeedClient {
 }
 
 impl ThreatFeedClient {
-    pub fn new(vt_api_key: String, ioc_feed_urls: Vec<String>, data_dir: &Path) -> Self {
-        let state = load_state(data_dir);
+    pub fn new(
+        vt_api_key: String,
+        ioc_feed_urls: Vec<String>,
+        data_dir: &Path,
+        store: Option<&innerwarden_store::Store>,
+    ) -> Self {
+        let state = load_state(data_dir, store);
         info!(
             ips = state.malicious_ips.len(),
             domains = state.malicious_domains.len(),
@@ -184,11 +189,17 @@ impl ThreatFeedClient {
         Ok(())
     }
 
-    /// Persist state to disk.
-    pub fn save(&self, data_dir: &Path) {
+    /// Persist state to disk (and SQLite blob if available).
+    pub fn save(&self, data_dir: &Path, store: Option<&innerwarden_store::Store>) {
         let path = data_dir.join("threat-feeds.json");
         match serde_json::to_string(&self.state) {
             Ok(json) => {
+                // Dual-write: SQLite blob + JSON file
+                if let Some(sq) = store {
+                    if let Err(e) = sq.set_blob("threat_feeds", &json) {
+                        warn!("failed to write threat_feeds blob: {e}");
+                    }
+                }
                 if let Err(e) = std::fs::write(&path, json) {
                     warn!("failed to write threat-feeds.json: {e}");
                 }
@@ -219,7 +230,20 @@ fn is_domain_like(s: &str) -> bool {
     s.contains('.') && !s.contains(' ') && !s.starts_with("http") && !is_ip_like(s)
 }
 
-fn load_state(data_dir: &Path) -> ThreatFeedState {
+fn load_state(data_dir: &Path, store: Option<&innerwarden_store::Store>) -> ThreatFeedState {
+    // Try SQLite blob first
+    if let Some(sq) = store {
+        if let Ok(Some(json)) = sq.get_blob("threat_feeds") {
+            match serde_json::from_str(&json) {
+                Ok(s) => {
+                    info!("loaded threat feeds from sqlite blob");
+                    return s;
+                }
+                Err(e) => warn!("failed to deserialize threat_feeds blob: {e}"),
+            }
+        }
+    }
+    // Fall back to JSON file
     let path = data_dir.join("threat-feeds.json");
     let Ok(content) = std::fs::read_to_string(&path) else {
         return ThreatFeedState::default();
@@ -272,7 +296,7 @@ mod tests {
         let path = dir.path().join("threat-feeds.json");
         std::fs::write(&path, serde_json::to_string(&state).unwrap()).unwrap();
 
-        let loaded = load_state(dir.path());
+        let loaded = load_state(dir.path(), None);
         assert!(loaded.malicious_ips.contains("1.2.3.4"));
         assert!(loaded.malicious_domains.contains("evil.com"));
     }
@@ -280,7 +304,7 @@ mod tests {
     #[test]
     fn empty_state_for_missing_file() {
         let dir = tempfile::TempDir::new().unwrap();
-        let state = load_state(dir.path());
+        let state = load_state(dir.path(), None);
         assert!(state.malicious_ips.is_empty());
     }
 }

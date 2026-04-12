@@ -362,11 +362,17 @@ impl BaselineStore {
         anomalies
     }
 
-    /// Persist the baseline to a JSON file.
-    pub fn save(&self, data_dir: &Path) {
+    /// Persist the baseline to a JSON file (and SQLite blob if available).
+    pub fn save(&self, data_dir: &Path, store: Option<&innerwarden_store::Store>) {
         let path = data_dir.join("baseline.json");
         match serde_json::to_string(self) {
             Ok(json) => {
+                // Dual-write: SQLite blob + JSON file
+                if let Some(sq) = store {
+                    if let Err(e) = sq.set_blob("baseline", &json) {
+                        warn!("failed to write baseline blob: {e}");
+                    }
+                }
                 if let Err(e) = std::fs::write(&path, json) {
                     warn!("failed to write baseline.json: {e}");
                 }
@@ -375,8 +381,21 @@ impl BaselineStore {
         }
     }
 
-    /// Load a baseline from a JSON file.
-    pub fn load(data_dir: &Path) -> Self {
+    /// Load a baseline — try SQLite blob first, fall back to JSON file.
+    pub fn load(data_dir: &Path, store: Option<&innerwarden_store::Store>) -> Self {
+        // Try SQLite blob first
+        if let Some(sq) = store {
+            if let Ok(Some(json)) = sq.get_blob("baseline") {
+                match serde_json::from_str(&json) {
+                    Ok(b) => {
+                        info!("loaded baseline from sqlite blob");
+                        return b;
+                    }
+                    Err(e) => warn!("failed to deserialize baseline blob: {e}"),
+                }
+            }
+        }
+        // Fall back to JSON file
         let path = data_dir.join("baseline.json");
         let Ok(content) = std::fs::read_to_string(&path) else {
             return Self::new();
@@ -622,9 +641,9 @@ mod tests {
         let mut store = BaselineStore::new();
         store.process_lineages.insert("nginx→worker".into());
         store.training_days = 5;
-        store.save(dir.path());
+        store.save(dir.path(), None);
 
-        let loaded = BaselineStore::load(dir.path());
+        let loaded = BaselineStore::load(dir.path(), None);
         assert_eq!(loaded.training_days, 5);
         assert!(loaded.process_lineages.contains("nginx→worker"));
     }
