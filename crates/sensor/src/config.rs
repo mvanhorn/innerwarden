@@ -11,6 +11,7 @@ pub struct Config {
     #[serde(default)]
     pub detectors: DetectorsConfig,
     #[serde(default)]
+    #[allow(dead_code)] // Fields read at runtime when calibration is wired to detectors
     pub calibration: CalibrationConfig,
 }
 
@@ -216,20 +217,12 @@ pub struct DetectorsConfig {
     pub suspicious_login: SuspiciousLoginConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct SuspiciousLoginConfig {
     /// Enable time-of-day anomaly detection based on a 7-day user login baseline.
     /// When true, logins outside a user's normal hours fire a Medium-severity incident.
     #[serde(default)]
     pub anomaly_hours_enabled: bool,
-}
-
-impl Default for SuspiciousLoginConfig {
-    fn default() -> Self {
-        Self {
-            anomaly_hours_enabled: false,
-        }
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1180,6 +1173,7 @@ fn default_log_tampering_cooldown_seconds() -> u64 {
 /// expected_outbound = ["api.telegram.org", "api.openai.com", "abuseipdb.com"]
 /// ```
 #[derive(Debug, Deserialize, Default, Clone)]
+#[allow(dead_code)] // Fields reserved for detector wiring in next phase
 pub struct CalibrationConfig {
     /// Services the operator expects to be running. Process names (comm).
     /// Detectors use this to suppress FPs from known infrastructure.
