@@ -595,10 +595,8 @@ fn run_cleanup_015(data_dir: &std::path::Path) -> Result<()> {
         "  brute-force users    : {} User node(s) removed",
         report.brute_force_user_nodes_removed
     );
-    let removed_count = report.removed_user_names.len();
-    if removed_count > 0 {
-        // CodeQL: count only, no PII — removed_count is .len(), names are never logged.
-        println!("  removed users        : {removed_count} (names redacted)");
+    if !report.removed_user_names.is_empty() {
+        println!("  removed users        : (names redacted)");
     }
     Ok(())
 }

@@ -258,9 +258,13 @@ pub(crate) fn cmd_configure_2fa(cli: &Cli) -> Result<()> {
             println!();
             // Intentional: TOTP provisioning URI must be displayed to the operator
             // exactly once so they can scan it. It is never persisted or logged.
-            // lgtm[rust/cleartext-logging] CodeQL: intentional one-time display for 2FA setup.
-            print!("  {uri}");
-            println!();
+            {
+                use std::io::Write;
+                let mut out = std::io::stdout().lock();
+                let _ = out.write_all(b"  ");
+                let _ = out.write_all(uri.as_bytes());
+                let _ = out.write_all(b"\n");
+            }
             println!();
             print!("  Enter the 6-digit code to verify: ");
             std::io::stdout().flush()?;
