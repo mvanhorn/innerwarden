@@ -90,9 +90,7 @@ impl SuspiciousLoginDetector {
             .entry(user.to_string())
             .or_default()
             .insert(date_str);
-        self.user_login_hours
-            .entry(user.to_string())
-            .or_default()[hour as usize] = true;
+        self.user_login_hours.entry(user.to_string()).or_default()[hour as usize] = true;
 
         // Track login hours for this IP (for off-hours detection).
         self.ip_login_hours
