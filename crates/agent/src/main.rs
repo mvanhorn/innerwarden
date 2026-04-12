@@ -3727,6 +3727,52 @@ fn backfill_graph_decisions(data_dir: &std::path::Path, state: &mut AgentState) 
             scanned, "backfill: reconciled JSONL decisions with knowledge graph"
         );
     }
+
+    // Phase 2: dismiss visible incidents that never received any decision.
+    // These are historical incidents from before the noise-gate was deployed.
+    // Without this, they show as "OBSERVING" forever in the dashboard.
+    {
+        use crate::knowledge_graph::types::{Node, NodeType};
+        let mut graph = state.knowledge_graph.write().unwrap();
+        let orphan_ids: Vec<_> = graph
+            .nodes_of_type(NodeType::Incident)
+            .iter()
+            .filter_map(|&id| {
+                if let Some(Node::Incident {
+                    incident_id,
+                    decision,
+                    research_only,
+                    ..
+                }) = graph.get_node(id)
+                {
+                    if decision.is_none() && !research_only {
+                        return Some((id, incident_id.clone()));
+                    }
+                }
+                None
+            })
+            .collect();
+
+        let dismissed = orphan_ids.len();
+        for (_nid, iid) in &orphan_ids {
+            graph.ingest_decision(
+                iid,
+                "dismiss",
+                None,
+                1.0,
+                "Retroactive dismiss: historical incident with no decision",
+                true,
+                chrono::Utc::now(),
+            );
+        }
+
+        if dismissed > 0 {
+            info!(
+                dismissed,
+                "backfill: dismissed orphan incidents with no decision"
+            );
+        }
+    }
 }
 
 /// Quick validation at agent startup that the host inventory (own IPs,
