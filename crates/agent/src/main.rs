@@ -734,10 +734,22 @@ async fn main() -> Result<()> {
         dashboard::DeepSecuritySnapshot::default(),
     ));
 
-    // Shared knowledge graph: loaded from today's dated snapshot (Phase 7: daily snapshots).
-    let shared_graph = std::sync::Arc::new(std::sync::RwLock::new(
-        knowledge_graph::KnowledgeGraph::load_today_snapshot(&cli.data_dir),
-    ));
+    // Open SQLite store early so the graph can try loading from it.
+    let sqlite_store = match innerwarden_store::Store::open(&cli.data_dir) {
+        Ok(s) => { info!(path = %cli.data_dir.join("innerwarden.db").display(), "sqlite store opened"); Some(s) }
+        Err(e) => { warn!("sqlite store unavailable: {e:#}"); None }
+    };
+
+    // Shared knowledge graph: try SQLite store first, fall back to file-based dated snapshot.
+    let shared_graph = std::sync::Arc::new(std::sync::RwLock::new({
+        let from_store = sqlite_store.as_ref()
+            .and_then(knowledge_graph::KnowledgeGraph::load_from_store);
+        if let Some(g) = from_store {
+            g
+        } else {
+            knowledge_graph::KnowledgeGraph::load_today_snapshot(&cli.data_dir)
+        }
+    }));
 
     // Advisory cache: shared between dashboard (writes advisory denials) and
     // the incident processing loop (checks for advisory violations).
@@ -979,11 +991,6 @@ async fn main() -> Result<()> {
         tracing::warn!(error = %e, "state store open failed - using fresh store");
         state_store::StateStore::open(&std::env::temp_dir()).expect("fallback store")
     });
-
-    let sqlite_store = match innerwarden_store::Store::open(&cli.data_dir) {
-        Ok(s) => { info!(path = %cli.data_dir.join("innerwarden.db").display(), "sqlite store opened"); Some(s) }
-        Err(e) => { warn!("sqlite store unavailable: {e:#}"); None }
-    };
 
     // Seed the persistent store with decision cooldowns loaded from recent JSONL files.
     // This ensures restart continuity: IPs already decided on won't be re-evaluated.
@@ -3479,12 +3486,22 @@ async fn process_narrative_tick(
             if let Err(e) = graph.save_dated_snapshot(data_dir) {
                 warn!("knowledge graph snapshot failed: {e:#}");
             }
+            // Spec 016: also save to SQLite store
+            if let Some(ref sq) = state.sqlite_store {
+                if let Err(e) = graph.save_to_store(sq) {
+                    warn!("knowledge graph SQLite snapshot failed: {e:#}");
+                }
+            }
             let metrics = graph.metrics();
             if let Ok(json) = serde_json::to_vec(&metrics) {
                 let _ = std::fs::write(data_dir.join("graph-stats.json"), json);
             }
             // Phase 7: cleanup old snapshots (keep 7 days)
             knowledge_graph::KnowledgeGraph::cleanup_old_snapshots(data_dir, 7);
+            // Spec 016: also cleanup SQLite snapshots
+            if let Some(ref sq) = state.sqlite_store {
+                knowledge_graph::KnowledgeGraph::cleanup_store_snapshots(sq, 7);
+            }
         }
         state.last_graph_snapshot = std::time::Instant::now();
     }
