@@ -44,6 +44,7 @@ mod incident_action_report;
 mod incident_advisory;
 mod incident_ai_context;
 mod incident_ai_failure;
+mod incident_autodismiss;
 mod incident_attacker_profile;
 mod incident_audit_write;
 mod incident_crowdsec;
@@ -2603,6 +2604,15 @@ async fn process_incidents(
                 let mut graph = state.knowledge_graph.write().unwrap();
                 graph.set_allowlisted(&incident.incident_id, true);
                 drop(graph);
+                handled += 1;
+                continue;
+            }
+            incident_flow::PreAiFlowDecision::SkipBelowSeverity => {
+                // Low-severity noise: write auto-dismiss decision so the
+                // dashboard shows a clear outcome instead of "needs attention".
+                if incident_autodismiss::try_autodismiss_noise(incident, cfg, state) {
+                    state.grouping_engine.mark_auto_resolved(incident);
+                }
                 handled += 1;
                 continue;
             }

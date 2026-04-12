@@ -148,13 +148,15 @@ pub(super) fn determine_outcome_for_ips(
 ) -> String {
     let mut has_monitoring = false;
     let mut has_honeypot = false;
-    let mut has_active = has_incident;
+    let mut has_dismissed = false;
+    let mut has_active = false;
 
     for ip in ips {
         match determine_outcome(decisions, ip, has_incident).as_str() {
             "blocked" => return "blocked".to_string(),
             "honeypot" => has_honeypot = true,
             "monitoring" => has_monitoring = true,
+            "dismissed" => has_dismissed = true,
             "active" => has_active = true,
             _ => {}
         }
@@ -167,6 +169,12 @@ pub(super) fn determine_outcome_for_ips(
         return "monitoring".to_string();
     }
     if has_active {
+        return "active".to_string();
+    }
+    if has_dismissed {
+        return "dismissed".to_string();
+    }
+    if has_incident {
         return "active".to_string();
     }
     "unknown".to_string()
@@ -201,6 +209,11 @@ pub(super) fn determine_outcome(
     for d in &ip_decisions {
         if d.action_type == "honeypot" && d.auto_executed && !d.dry_run {
             return "honeypot".to_string();
+        }
+    }
+    for d in &ip_decisions {
+        if (d.action_type == "dismiss" || d.action_type == "ignore") && d.auto_executed {
+            return "dismissed".to_string();
         }
     }
     if has_incident {

@@ -10,6 +10,9 @@ pub(crate) enum PreAiFlowDecision {
     /// Entity is in allowlist — skip AI but mark in graph.
     SkipAllowlisted,
     PipelineTestHandled,
+    /// Incident severity is below the configured AI min_severity threshold.
+    /// Eligible for rule-based auto-dismiss (noise gate) when Guard mode is ON.
+    SkipBelowSeverity,
 }
 
 /// Evaluate all pre-AI gates for one incident.
@@ -103,10 +106,24 @@ pub(crate) fn evaluate_pre_ai_flow(
     }
 
     if !ai::should_invoke_ai(incident, blocked_set, &cfg.ai.parsed_min_severity()) {
+        // Distinguish "below severity threshold" from other skip reasons so
+        // the caller can route low-severity noise to the auto-dismiss gate.
+        let dominated_by_min = ai::is_below_severity_threshold(
+            &incident.severity,
+            &cfg.ai.parsed_min_severity(),
+        );
+        if dominated_by_min {
+            info!(
+                incident_id = %incident.incident_id,
+                severity = ?incident.severity,
+                "AI gate: skipping (below min_severity threshold)"
+            );
+            return PreAiFlowDecision::SkipBelowSeverity;
+        }
         info!(
             incident_id = %incident.incident_id,
             severity = ?incident.severity,
-            "AI gate: skipping (low severity / private IP / already blocked)"
+            "AI gate: skipping (private IP / already blocked)"
         );
         return PreAiFlowDecision::SkipHandled;
     }

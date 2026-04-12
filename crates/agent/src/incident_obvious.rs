@@ -20,7 +20,11 @@ pub(crate) async fn try_handle_obvious_incident(
     let detector = incident_detector(&incident.incident_id);
     let is_obvious_detector = matches!(
         detector,
-        "ssh_bruteforce" | "credential_stuffing" | "packet_flood" | "port_scan"
+        "ssh_bruteforce"
+            | "credential_stuffing"
+            | "packet_flood"
+            | "port_scan"
+            | "threat_intel"
     );
     let is_high_or_critical = matches!(
         incident.severity,

@@ -223,6 +223,22 @@ pub fn should_invoke_ai(
     true
 }
 
+/// Check if incident severity is strictly below the configured min_severity threshold.
+/// Extracted so `incident_flow` can distinguish "below severity" from other skip reasons.
+pub fn is_below_severity_threshold(
+    severity: &innerwarden_core::event::Severity,
+    min_severity: &innerwarden_core::event::Severity,
+) -> bool {
+    use innerwarden_core::event::Severity;
+    match min_severity {
+        Severity::Low => matches!(severity, Severity::Debug | Severity::Info),
+        Severity::Medium => matches!(severity, Severity::Debug | Severity::Info | Severity::Low),
+        Severity::High => !matches!(severity, Severity::High | Severity::Critical),
+        Severity::Critical => !matches!(severity, Severity::Critical),
+        _ => true,
+    }
+}
+
 fn is_private_or_loopback(addr: IpAddr) -> bool {
     match addr {
         IpAddr::V4(v4) => {
