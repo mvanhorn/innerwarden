@@ -204,62 +204,93 @@ fn check_firewall() -> CheckResult {
     let mut findings = Vec::new();
     let cat = "Firewall";
 
-    // Check UFW (try sudo first, fall back to non-sudo; use verbose for default policy)
-    let ufw = Command::new("sudo")
-        .args(["ufw", "status", "verbose"])
-        .output()
-        .or_else(|_| Command::new("ufw").args(["status", "verbose"]).output());
-    match ufw {
-        Ok(out) => {
-            let status = String::from_utf8_lossy(&out.stdout);
-            if status.contains("Status: active") {
-                passed.push("UFW firewall is active".into());
+    // Check firewalld first (RHEL/Rocky/CentOS/Fedora), then UFW (Debian/Ubuntu),
+    // then iptables as fallback.
+    let firewalld = Command::new("firewall-cmd").args(["--state"]).output();
+    let firewalld_active = firewalld
+        .as_ref()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "running")
+        .unwrap_or(false);
 
-                // Check default policy
-                if status.contains("Default: deny (incoming)") {
-                    passed.push("Default incoming policy: deny".into());
-                } else {
-                    findings.push(Finding {
-                        category: cat,
-                        severity: Severity::High,
-                        title: "Default incoming policy is not 'deny'".into(),
-                        fix: "Run: sudo ufw default deny incoming".into(),
-                    });
-                }
+    if firewalld_active {
+        passed.push("firewalld is active".into());
+        // Check default zone policy
+        if let Ok(out) = Command::new("firewall-cmd")
+            .args(["--get-default-zone"])
+            .output()
+        {
+            let zone = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if zone == "drop" || zone == "block" || zone == "public" {
+                passed.push(format!("Default zone: {zone}"));
             } else {
                 findings.push(Finding {
                     category: cat,
-                    severity: Severity::Critical,
-                    title: "Firewall (UFW) is not active".into(),
-                    fix: "Run: sudo ufw enable".into(),
+                    severity: Severity::Medium,
+                    title: format!(
+                        "Default firewalld zone is '{}' — consider 'public' or 'drop'",
+                        zone
+                    ),
+                    fix: "Run: sudo firewall-cmd --set-default-zone=public".into(),
                 });
             }
         }
-        Err(_) => {
-            // Check iptables as fallback
-            let ipt = Command::new("iptables").args(["-L", "-n"]).output();
-            match ipt {
-                Ok(out) => {
-                    let rules = String::from_utf8_lossy(&out.stdout);
-                    if rules.lines().count() > 5 {
-                        passed.push("iptables rules configured".into());
+    } else {
+        // Check UFW (try sudo first, fall back to non-sudo; use verbose for default policy)
+        let ufw = Command::new("sudo")
+            .args(["ufw", "status", "verbose"])
+            .output()
+            .or_else(|_| Command::new("ufw").args(["status", "verbose"]).output());
+        match ufw {
+            Ok(out) => {
+                let status = String::from_utf8_lossy(&out.stdout);
+                if status.contains("Status: active") {
+                    passed.push("UFW firewall is active".into());
+
+                    // Check default policy
+                    if status.contains("Default: deny (incoming)") {
+                        passed.push("Default incoming policy: deny".into());
                     } else {
                         findings.push(Finding {
                             category: cat,
                             severity: Severity::High,
-                            title: "No firewall rules detected".into(),
-                            fix:
-                                "Install and configure UFW: sudo apt install ufw && sudo ufw enable"
-                                    .into(),
+                            title: "Default incoming policy is not 'deny'".into(),
+                            fix: "Run: sudo ufw default deny incoming".into(),
                         });
                     }
+                } else {
+                    findings.push(Finding {
+                        category: cat,
+                        severity: Severity::Critical,
+                        title: "Firewall (UFW) is not active".into(),
+                        fix: "Run: sudo ufw enable".into(),
+                    });
                 }
-                Err(_) => findings.push(Finding {
-                    category: cat,
-                    severity: Severity::High,
-                    title: "No firewall detected".into(),
-                    fix: "Install UFW: sudo apt install ufw && sudo ufw enable".into(),
-                }),
+            }
+            Err(_) => {
+                // Check iptables/nftables as fallback
+                let ipt = Command::new("iptables").args(["-L", "-n"]).output();
+                match ipt {
+                    Ok(out) => {
+                        let rules = String::from_utf8_lossy(&out.stdout);
+                        if rules.lines().count() > 5 {
+                            passed.push("iptables rules configured".into());
+                        } else {
+                            findings.push(Finding {
+                                category: cat,
+                                severity: Severity::High,
+                                title: "No firewall rules detected".into(),
+                                fix: "Install and configure a firewall: ufw (Debian/Ubuntu) or firewalld (RHEL/Rocky)".into(),
+                            });
+                        }
+                    }
+                    Err(_) => findings.push(Finding {
+                        category: cat,
+                        severity: Severity::High,
+                        title: "No firewall detected".into(),
+                        fix: "Install a firewall: ufw (Debian/Ubuntu) or firewalld (RHEL/Rocky)"
+                            .into(),
+                    }),
+                }
             }
         }
     }
