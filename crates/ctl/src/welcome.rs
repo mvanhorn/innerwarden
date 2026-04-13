@@ -6,11 +6,11 @@ use std::process::Command;
 
 /// Wide ASCII logo for larger terminals.
 const LOGO_WIDE: &[&str] = &[
-    "  _____ _   _ _   _ _____ ____  __        ___    ____  ____  _____ _   _ ",
-    " |_   _| \\ | | \\ | | ____|  _ \\ \\ \\      / / \\  |  _ \\|  _ \\| ____| \\ | |",
-    "   | | |  \\| |  \\| |  _| | |_) | \\ \\ /\\ / / _ \\ | |_) | | | |  _| |  \\| |",
-    "   | | | |\\  | |\\  | |___|  _ <   \\ V  V / ___ \\|  _ <| |_| | |___| |\\  |",
-    "   |_| |_| \\_|_| \\_|_____|_| \\_\\   \\_/\\_/_/   \\_\\_| \\_\\____/|_____|_| \\_|",
+    "  III  N   N N   N EEEEE RRRR   W   W  A   RRRR  DDDD  EEEEE N   N",
+    "   I   NN  N NN  N E     R   R  W   W A A  R   R D   D E     NN  N",
+    "   I   N N N N N N EEEE  RRRR   W W W AAA  RRRR  D   D EEEE  N N N",
+    "   I   N  NN N  NN E     R  R   WW WW A A  R  R  D   D E     N  NN",
+    "  III  N   N N   N EEEEE R   R   W W  A A  R   R DDDD  EEEEE N   N",
 ];
 
 fn parse_env_size(key: &str) -> Option<usize> {
