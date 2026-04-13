@@ -254,31 +254,12 @@ pub(crate) fn cmd_configure_2fa(cli: &Cli) -> Result<()> {
             );
 
             println!();
-            // Write TOTP URI to a temp file with strict permissions (0600)
-            // so the operator can read it once. This avoids writing secrets
-            // to stdout/stderr which CodeQL flags as cleartext logging.
-            {
-                use std::io::Write;
-                let totp_path = std::env::temp_dir().join("innerwarden-totp-setup.txt");
-                let mut f = std::fs::File::create(&totp_path)?;
-                f.write_all(uri.as_bytes())?;
-                f.write_all(b"\n")?;
-                drop(f);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(
-                        &totp_path,
-                        std::fs::Permissions::from_mode(0o600),
-                    );
-                }
-                println!(
-                    "  TOTP provisioning URI written to: {}",
-                    totp_path.display()
-                );
-                println!("  Open that file, scan the URI with your authenticator app,");
-                println!("  then DELETE the file immediately.");
-            }
+            println!("  Scan this QR code with your authenticator app:");
+            println!();
+            // Render QR code as ASCII art in the terminal. The TOTP secret
+            // never touches disk or log files — displayed only as visual
+            // pixels that the operator scans with their phone camera.
+            render_qr_to_terminal(&uri);
             println!();
             print!("  Enter the 6-digit code to verify: ");
             std::io::stdout().flush()?;
@@ -336,6 +317,41 @@ pub(crate) fn cmd_configure_2fa(cli: &Cli) -> Result<()> {
             println!("  Unknown option. Run: innerwarden configure 2fa");
             Ok(())
         }
+    }
+}
+
+/// Render a QR code as Unicode block characters in the terminal.
+/// Uses two rows per line (upper/lower half blocks) for compact display.
+fn render_qr_to_terminal(data: &str) {
+    use qrcode::QrCode;
+    let code = match QrCode::new(data.as_bytes()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  (QR code generation failed: {e})");
+            return;
+        }
+    };
+    let matrix = code.to_colors();
+    let width = code.width();
+    // Each character represents 2 vertical pixels using half-block chars
+    let rows = width.div_ceil(2);
+    for row in 0..rows {
+        print!("    "); // indent
+        for col in 0..width {
+            let top = matrix[row * 2 * width + col] == qrcode::Color::Dark;
+            let bot = if row * 2 + 1 < width {
+                matrix[(row * 2 + 1) * width + col] == qrcode::Color::Dark
+            } else {
+                false
+            };
+            match (top, bot) {
+                (true, true) => print!("\u{2588}"),  // █ full block
+                (true, false) => print!("\u{2580}"), // ▀ upper half
+                (false, true) => print!("\u{2584}"), // ▄ lower half
+                (false, false) => print!(" "),       //   space
+            }
+        }
+        println!();
     }
 }
 
