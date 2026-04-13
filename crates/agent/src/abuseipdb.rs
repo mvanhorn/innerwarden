@@ -47,7 +47,7 @@ pub struct AbuseIpDbData {
 }
 
 /// Lightweight reputation summary attached to `DecisionContext`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpReputation {
     pub confidence_score: u8,
     pub total_reports: u32,

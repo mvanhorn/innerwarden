@@ -2,6 +2,15 @@ use tracing::{debug, info};
 
 use crate::{abuseipdb, attacker_intel, geoip, AgentState};
 
+/// Namespace for cached AbuseIPDB reputation results.
+const ABUSEIPDB_CACHE_NS: &str = "abuseipdb_cache";
+/// Namespace for daily API call counters.
+const ABUSEIPDB_LIMITS_NS: &str = "abuseipdb_limits";
+/// Max API calls per day (free tier = 1000; reserve 200 for ad-hoc checks).
+const ABUSEIPDB_DAILY_LIMIT: u32 = 800;
+/// Cache TTL: 24 hours.
+const CACHE_TTL_HOURS: i64 = 24;
+
 pub(crate) fn log_threat_feed_match(
     incident: &innerwarden_core::incident::Incident,
     state: &AgentState,
@@ -84,29 +93,76 @@ pub(crate) fn enrich_attacker_identity(
 /// profiles that are still missing data.  Called from the slow tick (every 5 min).
 ///
 /// Processes a small batch per call to stay well within rate limits:
-/// - ip-api.com free tier: 45 req/min  → 5 per call is safe
-/// - AbuseIPDB free tier: 1000/day     → 5 per call is safe
+/// - ip-api.com free tier: 45 req/min  → 3 per call is safe
+/// - AbuseIPDB free tier: 1000/day     → 3 per call × 288 ticks = 864 max
+///
+/// Additionally uses a SQLite cache (24h TTL) and a daily counter (max 800)
+/// to avoid exhausting the AbuseIPDB free-tier quota across restarts.
 pub(crate) async fn backfill_enrichment(state: &mut AgentState) {
-    const BATCH_SIZE: usize = 5;
+    const BATCH_SIZE: usize = 3;
 
     if state.geoip_client.is_none() && state.abuseipdb.is_none() {
         return;
     }
 
+    // --- Global daily rate limiter (AbuseIPDB) ---
+    let today = chrono::Local::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    let daily_key = format!("abuseipdb_daily_{today}");
+    let mut daily_count: u32 = state
+        .sqlite_store
+        .as_ref()
+        .and_then(|sq| {
+            sq.kv_get_str(ABUSEIPDB_LIMITS_NS, &daily_key)
+                .ok()
+                .flatten()
+        })
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0);
+    let abuse_budget_exhausted = daily_count >= ABUSEIPDB_DAILY_LIMIT;
+
+    if abuse_budget_exhausted && state.geoip_client.is_none() {
+        // Nothing useful to do — both sources exhausted/disabled.
+        debug!(
+            daily_count,
+            "enrichment backfill: AbuseIPDB daily limit reached, skipping"
+        );
+        return;
+    }
+
     // Collect IPs that need enrichment (missing geo OR abuseipdb).
     // Skip private/loopback — they'll never resolve externally.
+    // Skip IPs already cached in SQLite (survives restarts).
     let candidates: Vec<(String, bool, bool)> = state
         .attacker_profiles
         .iter()
         .filter(|(ip, p)| {
-            let missing = p.geo.is_none() || p.abuseipdb_score.is_none();
-            if !missing {
+            let needs_geo = p.geo.is_none();
+            let needs_abuse = p.abuseipdb_score.is_none();
+            if !needs_geo && !needs_abuse {
                 return false;
             }
             match ip.parse::<std::net::IpAddr>() {
                 Ok(addr) => !addr.is_loopback() && !crate::ai::is_private_ip(addr),
                 Err(_) => false,
             }
+        })
+        .filter(|(ip, _p)| {
+            // If abuse score is missing, check SQLite cache — the score may
+            // already be cached from a previous agent lifetime.
+            if _p.abuseipdb_score.is_none() {
+                let cached = state
+                    .sqlite_store
+                    .as_ref()
+                    .and_then(|sq| sq.kv_get(ABUSEIPDB_CACHE_NS, ip).ok().flatten());
+                if cached.is_some() {
+                    // Will be applied below in the "restore from cache" pass.
+                    return true;
+                }
+            }
+            true
         })
         .map(|(ip, p)| (ip.clone(), p.geo.is_none(), p.abuseipdb_score.is_none()))
         .take(BATCH_SIZE)
@@ -135,8 +191,51 @@ pub(crate) async fn backfill_enrichment(state: &mut AgentState) {
         };
 
         let abuse = if *needs_abuse {
-            if let Some(client) = &state.abuseipdb {
-                client.check(ip).await
+            // Try SQLite cache first (survives restarts).
+            let cached_abuse = state
+                .sqlite_store
+                .as_ref()
+                .and_then(|sq| sq.kv_get_str(ABUSEIPDB_CACHE_NS, ip).ok().flatten())
+                .and_then(|json| serde_json::from_str::<abuseipdb::IpReputation>(&json).ok());
+
+            if let Some(reputation) = cached_abuse {
+                debug!(ip, "abuseipdb: using cached reputation");
+                Some(reputation)
+            } else if !abuse_budget_exhausted {
+                // Cache miss — call API.
+                let result = if let Some(client) = &state.abuseipdb {
+                    client.check(ip).await
+                } else {
+                    None
+                };
+
+                // Cache successful result in SQLite with 24h TTL.
+                if let Some(ref reputation) = result {
+                    if let Some(ref sq) = state.sqlite_store {
+                        let expiry = (chrono::Utc::now()
+                            + chrono::Duration::hours(CACHE_TTL_HOURS))
+                        .to_rfc3339();
+                        if let Ok(json) = serde_json::to_string(reputation) {
+                            let _ = sq.kv_set_with_expiry(
+                                ABUSEIPDB_CACHE_NS,
+                                ip,
+                                json.as_bytes(),
+                                Some(&expiry),
+                            );
+                        }
+                    }
+                    // Increment daily counter.
+                    daily_count += 1;
+                    if let Some(ref sq) = state.sqlite_store {
+                        let _ = sq.kv_set(
+                            ABUSEIPDB_LIMITS_NS,
+                            &daily_key,
+                            daily_count.to_string().as_bytes(),
+                        );
+                    }
+                }
+
+                result
             } else {
                 None
             }
@@ -173,6 +272,7 @@ pub(crate) async fn backfill_enrichment(state: &mut AgentState) {
     info!(
         enriched,
         candidates = candidates.len(),
+        daily_abuseipdb_calls = daily_count,
         "enrichment backfill: updated profiles with missing data"
     );
 }
