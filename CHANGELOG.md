@@ -11,6 +11,32 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.11.1] - 2026-04-14
+
+### Added
+- **Auto-calibration** — cloud VM detection via DMI (22 signatures), operator UID auto-detection, graph detector CalibrationContext. Eliminates ~1500 FPs/day on fresh installs.
+- **Centralized notification gate** — single policy for ALL channels (Telegram, Slack, Webhook, Web Push). Only uncontained active intrusions notify immediately.
+- **Burst summary** — 50+ auto-blocked threats/hour sends single "all handled" message instead of 50 alerts.
+- **AbuseIPDB cache** — SQLite KV with 24h TTL + 800/day cap. Stops exhausting free tier.
+- **GeoIP cache** — SQLite KV with 7-day TTL. Survives restarts.
+- **notification_gate.rs** — 27 unit tests for notification policy rules.
+
+### Changed
+- **Event retention** — 8 days to 2 days for raw events.
+- **Telegram rate limit** — MAX_ALERTS_PER_HOUR 30 → 10.
+- **Dashboard toasts** — only uncontained CRITICAL/HIGH. Close button added. Click navigates to Threats tab.
+- **Dashboard KPIs** — Home and Threats now use same data source for consistent numbers.
+
+### Fixed
+- **SQLite DB growth** — 1.8GB/day → ~80MB/day. High-volume events (tcp_stream.flow, process.exit, etc.) filtered from persistence.
+- **AbuseIPDB daily exhaustion** — was using 1440 checks/day on free tier (limit 1000).
+- **Honeypot notification spam** — probe-only sessions (0 commands, ≤2s) no longer notify.
+- **Kill chain false positives** — allowlist for ruby, node, python, nginx, postgres (legitimate socket+dup).
+- **Timing anomaly FPs on cloud** — z-score threshold 20 on VMs (was 4), eliminates I/O jitter noise.
+- **Discovery burst FPs for operators** — trusted UIDs get 3x threshold.
+
+---
+
 ## [0.11.0] - 2026-04-13
 
 ### Added
