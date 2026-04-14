@@ -48,9 +48,11 @@ impl Store {
         }
         let db_path = data_dir.join("innerwarden.db");
 
-        // Pre-create the DB file with group-writable permissions (0664) so that
+        // Pre-create the DB file with group-writable permissions (0660) so that
         // both sensor (root:innerwarden) and agent (innerwarden:innerwarden) can
-        // write. SQLite's internal open() uses 0644, ignoring the process UMask.
+        // write. NOT world-readable — contains security-sensitive data (incidents,
+        // decisions, attacker profiles). SQLite's internal open() uses 0644,
+        // ignoring the process UMask.
         if !db_path.exists() {
             if let Ok(f) = std::fs::File::create(&db_path) {
                 drop(f);
@@ -58,7 +60,7 @@ impl Store {
                 {
                     use std::os::unix::fs::PermissionsExt;
                     let _ =
-                        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o664));
+                        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o660));
                 }
             }
         }

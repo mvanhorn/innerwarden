@@ -216,8 +216,11 @@ impl MaintenanceScheduler {
     }
 
     /// Called every slow-loop tick (~30s). Runs time-gated maintenance tasks.
-    pub fn tick(&mut self, store: &Store) {
+    /// Returns a list of security alerts (integrity violations) that the caller
+    /// should forward to Telegram/notifications.
+    pub fn tick(&mut self, store: &Store) -> Vec<String> {
         let now = std::time::Instant::now();
+        let mut alerts = Vec::new();
 
         // 5-minute tasks
         if now.duration_since(self.last_5min).as_secs() >= 300 {
@@ -228,7 +231,7 @@ impl MaintenanceScheduler {
         // Hourly tasks
         if now.duration_since(self.last_hourly).as_secs() >= 3600 {
             self.last_hourly = now;
-            self.tick_hourly(store);
+            alerts.extend(self.tick_hourly(store));
         }
 
         // Daily tasks (first tick of a new calendar day)
@@ -237,6 +240,8 @@ impl MaintenanceScheduler {
             self.last_daily = Some(today);
             self.tick_daily(store);
         }
+
+        alerts
     }
 
     // ── 5-minute bucket ───────────────────────────────────────────────
@@ -280,7 +285,9 @@ impl MaintenanceScheduler {
 
     // ── Hourly bucket ─────────────────────────────────────────────────
 
-    fn tick_hourly(&self, store: &Store) {
+    fn tick_hourly(&self, store: &Store) -> Vec<String> {
+        let mut alerts = Vec::new();
+
         // Incremental vacuum (1000 pages)
         if let Err(e) = store.incremental_vacuum(1000) {
             warn!("maintenance: incremental_vacuum(1000) failed: {e:#}");
@@ -298,6 +305,59 @@ impl MaintenanceScheduler {
             Err(e) => warn!("maintenance: kv_trim attacker_profiles failed: {e:#}"),
             _ => {}
         }
+
+        // ── Security: database integrity checks (every hour) ─────────
+        // Detects corruption from disk errors, external tampering, or bugs.
+
+        // SQLite PRAGMA integrity_check
+        match store.integrity_check() {
+            Ok(ref s) if s == "ok" => {}
+            Ok(ref s) => {
+                let msg = format!("DATABASE INTEGRITY VIOLATION: {s}");
+                warn!("{msg}");
+                alerts.push(msg);
+            }
+            Err(e) => warn!("maintenance: integrity_check failed: {e:#}"),
+        }
+
+        // Decision hash chain verification
+        match store.verify_hash_chain() {
+            Ok(result) => {
+                if result.intact {
+                    info!(verified = result.verified, "maintenance: hash chain intact");
+                } else {
+                    let msg = format!(
+                        "HASH CHAIN BROKEN — audit trail tampered. {} verified, broken at: {:?}",
+                        result.verified,
+                        result.broken_at,
+                    );
+                    warn!("{msg}");
+                    alerts.push(msg);
+                }
+            }
+            Err(e) => warn!("maintenance: verify_hash_chain failed: {e:#}"),
+        }
+
+        // DB file permissions check (should be 0660, not world-readable)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let db_path = store.data_dir.join("innerwarden.db");
+            if let Ok(meta) = std::fs::metadata(&db_path) {
+                let mode = meta.permissions().mode() & 0o777;
+                if mode & 0o004 != 0 {
+                    let msg = format!(
+                        "DATABASE WORLD-READABLE (mode {:o}). Run: chmod 660 {}",
+                        mode,
+                        db_path.display()
+                    );
+                    warn!("{msg}");
+                    alerts.push(msg);
+                }
+            }
+        }
+
+        alerts
     }
 
     // ── Daily bucket ──────────────────────────────────────────────────
@@ -323,28 +383,8 @@ impl MaintenanceScheduler {
             Err(e) => warn!("maintenance: run_retention failed: {e:#}"),
         }
 
-        // Hash chain verification
-        match store.verify_hash_chain() {
-            Ok(result) => {
-                if result.intact {
-                    info!(verified = result.verified, "maintenance: hash chain intact");
-                } else {
-                    warn!(
-                        verified = result.verified,
-                        broken_at = ?result.broken_at,
-                        "maintenance: hash chain BROKEN"
-                    );
-                }
-            }
-            Err(e) => warn!("maintenance: verify_hash_chain failed: {e:#}"),
-        }
-
-        // Integrity check
-        match store.integrity_check() {
-            Ok(ref s) if s == "ok" => {}
-            Ok(ref s) => warn!(result = %s, "maintenance: integrity check NOT ok"),
-            Err(e) => warn!("maintenance: integrity_check failed: {e:#}"),
-        }
+        // Hash chain + integrity checks moved to hourly bucket for faster
+        // tamper detection. Daily still runs vacuum and retention.
 
         // Conditional vacuum if DB > 500 MB
         match store.db_size_bytes() {

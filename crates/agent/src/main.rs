@@ -1917,7 +1917,27 @@ async fn main() -> Result<()> {
                     if let (Some(ref mut sched), Some(ref sq)) =
                         (&mut state.maintenance_scheduler, &state.sqlite_store)
                     {
-                        sched.tick(sq);
+                        let integrity_alerts = sched.tick(sq);
+                        if !integrity_alerts.is_empty() {
+                            for alert in &integrity_alerts {
+                                warn!(alert = %alert, "DATABASE SECURITY ALERT");
+                            }
+                            if let Some(tg) = &state.telegram_client {
+                                let msg = format!(
+                                    "\u{1f6a8} <b>Database Security Alert</b>\n\n{}\n\n\
+                                     <i>Possible tampering or corruption detected. \
+                                     Investigate immediately.</i>",
+                                    integrity_alerts
+                                        .iter()
+                                        .map(|a| format!("\u{2022} {a}"))
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                );
+                                if let Err(e) = tg.send_text_message(&msg).await {
+                                    warn!("failed to send integrity alert: {e:#}");
+                                }
+                            }
+                        }
                     }
 
                     // ── Memory housekeeping: cap unbounded HashMaps ──
