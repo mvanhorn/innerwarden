@@ -142,3 +142,61 @@ impl CapabilityRegistry {
         self.caps.iter().map(|c| c.as_ref())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- PreflightError --
+
+    #[test]
+    fn preflight_error_without_hint() {
+        let err = PreflightError::new("binary not found");
+        assert_eq!(err.message, "binary not found");
+        assert!(err.fix_hint.is_none());
+    }
+
+    #[test]
+    fn preflight_error_with_hint() {
+        let err =
+            PreflightError::new("binary not found").with_hint("install with: apt install foo");
+        assert_eq!(err.message, "binary not found");
+        assert_eq!(err.fix_hint.unwrap(), "install with: apt install foo");
+    }
+
+    // -- CapabilityEffect --
+
+    #[test]
+    fn capability_effect_from_string() {
+        let effect = CapabilityEffect::new("enable responder");
+        assert_eq!(effect.description, "enable responder");
+    }
+
+    // -- CapabilityRegistry --
+
+    #[test]
+    fn registry_contains_all_capabilities() {
+        let reg = CapabilityRegistry::default_all();
+        let ids: Vec<&str> = reg.all().map(|c| c.id()).collect();
+        assert!(ids.contains(&"ai"));
+        assert!(ids.contains(&"block-ip"));
+        assert!(ids.contains(&"sudo-protection"));
+        assert!(ids.contains(&"shell-audit"));
+        assert!(ids.contains(&"search-protection"));
+    }
+
+    #[test]
+    fn registry_get_by_id() {
+        let reg = CapabilityRegistry::default_all();
+        assert!(reg.get("block-ip").is_some());
+        assert!(reg.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn registry_capability_has_metadata() {
+        let reg = CapabilityRegistry::default_all();
+        let cap = reg.get("block-ip").unwrap();
+        assert!(!cap.name().is_empty());
+        assert!(!cap.description().is_empty());
+    }
+}

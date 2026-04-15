@@ -187,3 +187,119 @@ pub(crate) fn resolve_data_dir(cli: &Cli, data_dir: &Path) -> PathBuf {
         data_dir.to_path_buf()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- mask_secret --
+
+    #[test]
+    fn mask_secret_short_string() {
+        assert_eq!(mask_secret("abc"), "***");
+        assert_eq!(mask_secret(""), "***");
+        assert_eq!(mask_secret("123456"), "***");
+    }
+
+    #[test]
+    fn mask_secret_long_string() {
+        assert_eq!(mask_secret("1234567890:AAAA"), "123***AAA");
+    }
+
+    #[test]
+    fn mask_secret_exactly_7_chars() {
+        assert_eq!(mask_secret("abcdefg"), "abc***efg");
+    }
+
+    // -- looks_like_ip --
+
+    #[test]
+    fn looks_like_ip_valid_ipv4() {
+        assert!(looks_like_ip("192.168.1.1"));
+        assert!(looks_like_ip("10.0.0.1"));
+        assert!(looks_like_ip("255.255.255.255"));
+    }
+
+    #[test]
+    fn looks_like_ip_valid_ipv4_cidr() {
+        assert!(looks_like_ip("10.0.0.0/8"));
+        assert!(looks_like_ip("192.168.1.0/24"));
+    }
+
+    #[test]
+    fn looks_like_ip_valid_ipv6() {
+        assert!(looks_like_ip("2001:db8::1"));
+        assert!(looks_like_ip("::1"));
+    }
+
+    #[test]
+    fn looks_like_ip_rejects_hostnames() {
+        assert!(!looks_like_ip("example.com"));
+        assert!(!looks_like_ip("localhost"));
+        assert!(!looks_like_ip(""));
+    }
+
+    #[test]
+    fn looks_like_ip_rejects_partial() {
+        assert!(!looks_like_ip("192.168.1"));
+        assert!(!looks_like_ip("999.999.999.999"));
+    }
+
+    // -- load_env_file --
+
+    #[test]
+    fn load_env_file_parses_key_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.env");
+        std::fs::write(
+            &path,
+            "KEY1=value1\nKEY2=value2\n# comment\n\nKEY3=\"quoted\"\n",
+        )
+        .unwrap();
+        let map = load_env_file(&path);
+        assert_eq!(map.get("KEY1").unwrap(), "value1");
+        assert_eq!(map.get("KEY2").unwrap(), "value2");
+        assert_eq!(map.get("KEY3").unwrap(), "quoted");
+        assert!(!map.contains_key("# comment"));
+    }
+
+    #[test]
+    fn load_env_file_missing_returns_empty() {
+        let map = load_env_file(Path::new("/nonexistent/path.env"));
+        assert!(map.is_empty());
+    }
+
+    // -- write_env_key --
+
+    #[test]
+    fn write_env_key_creates_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.env");
+        write_env_key(&path, "MY_KEY", "my_value").unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("MY_KEY=my_value"));
+    }
+
+    #[test]
+    fn write_env_key_replaces_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.env");
+        std::fs::write(&path, "MY_KEY=old\nOTHER=keep\n").unwrap();
+        write_env_key(&path, "MY_KEY", "new").unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("MY_KEY=new"));
+        assert!(content.contains("OTHER=keep"));
+        assert!(!content.contains("MY_KEY=old"));
+    }
+
+    #[test]
+    fn write_env_key_replaces_commented_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("commented.env");
+        std::fs::write(&path, "#MY_KEY=old_commented\nOTHER=keep\n").unwrap();
+        write_env_key(&path, "MY_KEY", "active").unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("MY_KEY=active"));
+        assert!(!content.contains("old_commented"));
+    }
+}

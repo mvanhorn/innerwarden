@@ -150,3 +150,57 @@ pub fn run_welcome(ebpf_hooks: u32) {
     let _ = writeln!(out);
     let _ = out.flush();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn centered_line_centers_text() {
+        let result = centered_line("hello", 20);
+        // "hello" has 5 chars, padding = (20-5)/2 = 7
+        assert!(result.starts_with("       hello"));
+    }
+
+    #[test]
+    fn centered_line_no_overflow() {
+        // Line wider than cols should get 0 padding
+        let result = centered_line("long text here", 5);
+        assert_eq!(result, "long text here");
+    }
+
+    #[test]
+    fn box_lines_wraps_content() {
+        let lines = vec!["hello".to_string(), "world".to_string()];
+        let boxed = box_lines(lines, 80);
+        // Should have border lines (top + bottom) + 2 content lines
+        assert!(boxed.len() >= 4);
+        // Borders contain + and -
+        assert!(boxed.first().unwrap().contains('+'));
+        assert!(boxed.last().unwrap().contains('+'));
+    }
+
+    #[test]
+    fn box_lines_skips_if_too_narrow() {
+        let lines = vec!["a very long line that exceeds the terminal width".to_string()];
+        let boxed = box_lines(lines.clone(), 10);
+        // Should return original lines when boxed_width > cols
+        assert_eq!(boxed.len(), 1);
+    }
+
+    #[test]
+    fn build_screen_has_content() {
+        let screen = build_screen(80, 5);
+        assert!(!screen.is_empty());
+        let joined = screen.join("\n");
+        assert!(joined.contains("Kernel hooks active: 5"));
+    }
+
+    #[test]
+    fn build_screen_narrow_terminal() {
+        let screen = build_screen(20, 0);
+        let joined = screen.join("\n");
+        // Should use compact header
+        assert!(joined.contains("INNERWARDEN"));
+    }
+}
