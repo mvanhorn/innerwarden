@@ -1020,6 +1020,11 @@ if [[ "${CANARY}" -eq 1 ]] && [[ "${IW_VERSION}" != "canary" ]]; then
   fi
 fi
 
+# Anonymous install ping (no personal data, just version + OS + arch)
+# Helps us understand how many people install InnerWarden.
+# View the source: this sends nothing beyond what's shown here.
+curl -s "https://innerwarden.com/api/ping?v=${IW_VERSION}&os=${OS_TYPE}&arch=${ARCH}" >/dev/null 2>&1 &
+
 # Show welcome, then auto-run setup
 if ! innerwarden welcome 2>/dev/null; then
   echo "  ✓ Downloaded ${IW_VERSION}"
