@@ -936,3 +936,106 @@ pub(crate) fn write_telegram_triage_audit(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- parse_telegram_triage_action ---
+
+    #[test]
+    fn parse_allow_proc_action() {
+        let action = parse_telegram_triage_action("__allow_proc__:sshd");
+        assert_eq!(action, Some(TelegramTriageAction::AllowProc("sshd")));
+    }
+
+    #[test]
+    fn parse_allow_ip_action() {
+        let action = parse_telegram_triage_action("__allow_ip__:1.2.3.4");
+        assert_eq!(action, Some(TelegramTriageAction::AllowIp("1.2.3.4")));
+    }
+
+    #[test]
+    fn parse_fp_action() {
+        let action = parse_telegram_triage_action("__fp__:ssh_bruteforce:1.2.3.4:abc");
+        assert_eq!(
+            action,
+            Some(TelegramTriageAction::ReportFp("ssh_bruteforce:1.2.3.4:abc"))
+        );
+    }
+
+    #[test]
+    fn parse_unknown_returns_none() {
+        assert_eq!(parse_telegram_triage_action("some:normal:incident"), None);
+        assert_eq!(parse_telegram_triage_action(""), None);
+        assert_eq!(parse_telegram_triage_action("__unknown__:xyz"), None);
+    }
+
+    // --- sanitize_allowlist_process_name ---
+
+    #[test]
+    fn sanitize_normal_name() {
+        assert_eq!(
+            sanitize_allowlist_process_name("sshd"),
+            Some("sshd".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_quotes_and_trims() {
+        assert_eq!(
+            sanitize_allowlist_process_name("  \"my_proc\"  "),
+            Some("my_proc".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_replaces_newlines() {
+        assert_eq!(
+            sanitize_allowlist_process_name("proc\nwith\nnewlines"),
+            Some("proc with newlines".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_empty_returns_none() {
+        assert_eq!(sanitize_allowlist_process_name(""), None);
+        assert_eq!(sanitize_allowlist_process_name("  "), None);
+        assert_eq!(sanitize_allowlist_process_name("\"\""), None);
+    }
+
+    // --- is_2fa_enabled ---
+
+    #[test]
+    fn is_2fa_disabled_when_no_security_section() {
+        let cfg = config::AgentConfig {
+            security: None,
+            ..Default::default()
+        };
+        assert!(!is_2fa_enabled(&cfg));
+    }
+
+    #[test]
+    fn is_2fa_enabled_when_totp() {
+        let cfg = config::AgentConfig {
+            security: Some(config::SecurityConfig {
+                two_factor_method: "totp".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(is_2fa_enabled(&cfg));
+    }
+
+    #[test]
+    fn is_2fa_disabled_when_method_is_none() {
+        let cfg = config::AgentConfig {
+            security: Some(config::SecurityConfig {
+                two_factor_method: "none".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!is_2fa_enabled(&cfg));
+    }
+}
