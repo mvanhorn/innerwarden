@@ -1380,9 +1380,24 @@ mod tests {
     #[test]
     fn test_count_failed_setup_checks() {
         let checks = vec![
-            SetupCheck { label: "1".into(), detail: "".into(), ok: true, critical: true },
-            SetupCheck { label: "2".into(), detail: "".into(), ok: false, critical: true },
-            SetupCheck { label: "3".into(), detail: "".into(), ok: false, critical: false },
+            SetupCheck {
+                label: "1".into(),
+                detail: "".into(),
+                ok: true,
+                critical: true,
+            },
+            SetupCheck {
+                label: "2".into(),
+                detail: "".into(),
+                ok: false,
+                critical: true,
+            },
+            SetupCheck {
+                label: "3".into(),
+                detail: "".into(),
+                ok: false,
+                critical: false,
+            },
         ];
         assert_eq!(count_failed_setup_checks(&checks), 1);
     }
@@ -1402,13 +1417,13 @@ mod tests {
         assert_eq!(setup_remediation_command(&checks, false), None);
 
         // 1 critical: Agent service
-        checks.push(SetupCheck { 
-            label: "Agent service".into(), 
-            detail: "".into(), 
-            ok: false, 
-            critical: true 
+        checks.push(SetupCheck {
+            label: "Agent service".into(),
+            detail: "".into(),
+            ok: false,
+            critical: true,
         });
-        
+
         let linux_cmd = setup_remediation_command(&checks, false).unwrap();
         assert!(linux_cmd.contains("systemctl restart"));
 
@@ -1416,13 +1431,13 @@ mod tests {
         assert!(macos_cmd.contains("launchctl kickstart"));
 
         // More than 1 critical
-        checks.push(SetupCheck { 
-            label: "AI".into(), 
-            detail: "".into(), 
-            ok: false, 
-            critical: true 
+        checks.push(SetupCheck {
+            label: "AI".into(),
+            detail: "".into(),
+            ok: false,
+            critical: true,
         });
-        
+
         let complex_cmd = setup_remediation_command(&checks, false).unwrap();
         assert_eq!(complex_cmd, "innerwarden setup --mode advanced");
     }

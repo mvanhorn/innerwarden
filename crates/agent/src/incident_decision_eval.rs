@@ -329,7 +329,8 @@ fn build_brain_features(
 pub(crate) fn is_brain_agreeing_with_ai(brain_action: &str, ai_action_str: &str) -> bool {
     (brain_action == "block_ip" && ai_action_str.contains("BlockIp"))
         || (brain_action == "kill_process" && ai_action_str.contains("KillProcess"))
-        || (brain_action == "observe" && (ai_action_str.contains("Ignore") || ai_action_str.contains("Monitor")))
+        || (brain_action == "observe"
+            && (ai_action_str.contains("Ignore") || ai_action_str.contains("Monitor")))
         || (brain_action == "alert" && ai_action_str.contains("Monitor"))
         || (brain_action == "escalate" && ai_action_str.contains("Escalate"))
 }
@@ -342,14 +343,17 @@ mod tests {
     fn test_is_brain_agreeing_with_ai() {
         assert!(is_brain_agreeing_with_ai("block_ip", "BlockIp(10.0.0.1)"));
         assert!(!is_brain_agreeing_with_ai("block_ip", "Monitor"));
-        
+
         assert!(is_brain_agreeing_with_ai("observe", "Ignore"));
         assert!(is_brain_agreeing_with_ai("observe", "Monitor"));
-        
+
         assert!(is_brain_agreeing_with_ai("alert", "Monitor"));
         assert!(!is_brain_agreeing_with_ai("alert", "Ignore"));
-        
+
         assert!(is_brain_agreeing_with_ai("kill_process", "KillProcess"));
-        assert!(!is_brain_agreeing_with_ai("kill_process", "SuspendUserSudo"));
+        assert!(!is_brain_agreeing_with_ai(
+            "kill_process",
+            "SuspendUserSudo"
+        ));
     }
 }

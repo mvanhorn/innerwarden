@@ -105,10 +105,10 @@ pub(crate) fn build_autofp_message_and_keyboard(
     let section = if is_ip { "ip" } else { "proc" };
     let yes_cb = format!("autofp:yes:{section}:{entity}");
     let no_cb = format!("autofp:no:{entity}");
-    
+
     let yes_cb = telegram::truncate_callback_pub(&yes_cb);
     let no_cb = telegram::truncate_callback_pub(&no_cb);
-    
+
     let keyboard = serde_json::json!([
         [
             { "text": "\u{2705} Yes, allowlist", "callback_data": yes_cb },
@@ -125,12 +125,12 @@ mod tests {
     #[test]
     fn test_build_autofp_message_and_keyboard_for_ip() {
         let (text, keyboard) = build_autofp_message_and_keyboard("8.8.8.8", "ssh_bruteforce", 3);
-        
+
         // Assert text mentions both
         assert!(text.contains("8.8.8.8"));
         assert!(text.contains("ssh_bruteforce"));
         assert!(text.contains("3 times"));
-        
+
         // IP entity means section is "ip"
         let yes_cb = keyboard[0][0]["callback_data"].as_str().unwrap();
         assert_eq!(yes_cb, "autofp:yes:ip:8.8.8.8");
@@ -139,12 +139,12 @@ mod tests {
     #[test]
     fn test_build_autofp_message_and_keyboard_for_proc() {
         let (text, keyboard) = build_autofp_message_and_keyboard("/bin/bash", "suspicious_exec", 5);
-        
+
         // Assert text mentions both
         assert!(text.contains("/bin/bash"));
         assert!(text.contains("suspicious_exec"));
         assert!(text.contains("5 times"));
-        
+
         // Non-IP entity means section is "proc"
         let yes_cb = keyboard[0][0]["callback_data"].as_str().unwrap();
         assert_eq!(yes_cb, "autofp:yes:proc:/bin/bash");

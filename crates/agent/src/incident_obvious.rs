@@ -33,7 +33,12 @@ pub(crate) async fn try_handle_obvious_incident(
                 .is_some_and(|r| r.total_incidents > 1)
     });
 
-    if !is_obvious_attack(detector, &incident.severity, ip_seen_before, cfg.responder.enabled) {
+    if !is_obvious_attack(
+        detector,
+        &incident.severity,
+        ip_seen_before,
+        cfg.responder.enabled,
+    ) {
         return false;
     }
 
@@ -184,18 +189,43 @@ mod tests {
     #[test]
     fn test_is_obvious_attack() {
         // 1. Obvious condition
-        assert!(is_obvious_attack("ssh_bruteforce", &Severity::High, true, true));
+        assert!(is_obvious_attack(
+            "ssh_bruteforce",
+            &Severity::High,
+            true,
+            true
+        ));
 
         // 2. Not an obvious detector
-        assert!(!is_obvious_attack("strange_logs", &Severity::High, true, true));
+        assert!(!is_obvious_attack(
+            "strange_logs",
+            &Severity::High,
+            true,
+            true
+        ));
 
         // 3. Not high severity
-        assert!(!is_obvious_attack("ssh_bruteforce", &Severity::Medium, true, true));
+        assert!(!is_obvious_attack(
+            "ssh_bruteforce",
+            &Severity::Medium,
+            true,
+            true
+        ));
 
         // 4. IP not seen before
-        assert!(!is_obvious_attack("ssh_bruteforce", &Severity::High, false, true));
+        assert!(!is_obvious_attack(
+            "ssh_bruteforce",
+            &Severity::High,
+            false,
+            true
+        ));
 
         // 5. Responder disabled
-        assert!(!is_obvious_attack("ssh_bruteforce", &Severity::High, true, false));
+        assert!(!is_obvious_attack(
+            "ssh_bruteforce",
+            &Severity::High,
+            true,
+            false
+        ));
     }
 }

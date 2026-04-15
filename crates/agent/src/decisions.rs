@@ -319,14 +319,7 @@ mod tests {
             alternatives: vec![],
         };
 
-        let entry = build_entry(
-            "inc-123",
-            "host-1",
-            "openai",
-            &decision,
-            false,
-            "success",
-        );
+        let entry = build_entry("inc-123", "host-1", "openai", &decision, false, "success");
 
         assert_eq!(entry.incident_id, "inc-123");
         assert_eq!(entry.action_type, "block_ip");
@@ -349,14 +342,7 @@ mod tests {
             alternatives: vec![],
         };
 
-        let entry = build_entry(
-            "inc-456",
-            "host-2",
-            "anthropic",
-            &decision,
-            true,
-            "dry ran",
-        );
+        let entry = build_entry("inc-456", "host-2", "anthropic", &decision, true, "dry ran");
 
         assert_eq!(entry.action_type, "suspend_user_sudo");
         assert_eq!(entry.target_user, Some("alice".to_string()));

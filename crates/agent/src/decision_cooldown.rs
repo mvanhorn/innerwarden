@@ -295,11 +295,11 @@ pub(crate) fn html_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::{AiAction, AiDecision};
+    use crate::decisions::DecisionEntry;
     use innerwarden_core::entities::EntityRef;
     use innerwarden_core::event::Severity;
     use innerwarden_core::incident::Incident;
-    use crate::ai::{AiDecision, AiAction};
-    use crate::decisions::DecisionEntry;
 
     fn mock_incident(incident_id: &str, entities: Vec<EntityRef>) -> Incident {
         Incident {
@@ -336,10 +336,7 @@ mod tests {
     fn test_decision_cooldown_candidates() {
         let inc = mock_incident(
             "pam:sudo_fail:456",
-            vec![
-                EntityRef::ip("5.6.7.8"),
-                EntityRef::user("admin"),
-            ],
+            vec![EntityRef::ip("5.6.7.8"), EntityRef::user("admin")],
         );
         let keys = decision_cooldown_candidates(&inc);
         assert_eq!(keys.len(), 4);
@@ -353,7 +350,10 @@ mod tests {
     fn test_decision_cooldown_key_for_decision() {
         let inc = mock_incident("kernel:oops:789", vec![]);
         let decision_block = AiDecision {
-            action: AiAction::BlockIp { ip: "9.9.9.9".to_string(), skill_id: "block-ip-xdp".to_string() },
+            action: AiAction::BlockIp {
+                ip: "9.9.9.9".to_string(),
+                skill_id: "block-ip-xdp".to_string(),
+            },
             confidence: 0.9,
             reason: "test".to_string(),
             auto_execute: true,
@@ -364,7 +364,9 @@ mod tests {
         assert_eq!(key, Some("block_ip:kernel:ip:9.9.9.9".to_string()));
 
         let decision_monitor = AiDecision {
-            action: AiAction::Monitor { ip: "9.9.9.9".to_string() },
+            action: AiAction::Monitor {
+                ip: "9.9.9.9".to_string(),
+            },
             confidence: 0.5,
             reason: "test".to_string(),
             auto_execute: true,
@@ -375,14 +377,19 @@ mod tests {
         assert_eq!(key2, Some("monitor:kernel:ip:9.9.9.9".to_string()));
 
         let decision_ignore = AiDecision {
-            action: AiAction::Ignore { reason: "benign".to_string() },
+            action: AiAction::Ignore {
+                reason: "benign".to_string(),
+            },
             confidence: 1.0,
             reason: "test".to_string(),
             auto_execute: false,
             estimated_threat: "low".to_string(),
             alternatives: vec![],
         };
-        assert_eq!(decision_cooldown_key_for_decision(&inc, &decision_ignore), None);
+        assert_eq!(
+            decision_cooldown_key_for_decision(&inc, &decision_ignore),
+            None
+        );
     }
 
     #[test]

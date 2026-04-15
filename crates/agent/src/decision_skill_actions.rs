@@ -171,11 +171,8 @@ mod tests {
     #[test]
     fn test_check_skill_allowed() {
         let allowed = vec!["suspend-user-sudo".to_string(), "block-ip".to_string()];
-        
-        assert_eq!(
-            check_skill_allowed("suspend-user-sudo", &allowed),
-            Ok(())
-        );
+
+        assert_eq!(check_skill_allowed("suspend-user-sudo", &allowed), Ok(()));
 
         assert_eq!(
             check_skill_allowed("kill-process", &allowed),

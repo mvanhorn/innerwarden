@@ -20,7 +20,9 @@ pub(crate) async fn execute_block_ip_decision(
 ) -> (String, bool) {
     // Purge stale entries BEFORE eligibility check so rate limit uses accurate count.
     let now_utc = chrono::Utc::now();
-    state.recent_blocks.retain(|ts| *ts > now_utc - chrono::Duration::seconds(60));
+    state
+        .recent_blocks
+        .retain(|ts| *ts > now_utc - chrono::Duration::seconds(60));
 
     // Safeguard: pure eligibility checks (empty IP, operator session, rate limit).
     if let Err(reason) = check_block_eligibility(
@@ -241,7 +243,9 @@ pub(crate) fn check_block_eligibility(
         return Err(format!("skipped: {ip} is an active operator session"));
     }
     if recent_blocks_len >= max_blocks_per_min {
-        return Err(format!("rate-limited: {ip} (>{max_blocks_per_min} blocks/min)"));
+        return Err(format!(
+            "rate-limited: {ip} (>{max_blocks_per_min} blocks/min)"
+        ));
     }
     Ok(())
 }
