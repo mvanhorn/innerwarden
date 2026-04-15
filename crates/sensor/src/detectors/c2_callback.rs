@@ -36,10 +36,24 @@ const DOH_RESOLVER_IPS: &[&str] = &[
 
 /// Processes that legitimately use DoH (browsers, VPN clients, system resolvers).
 const DOH_ALLOWED_COMMS: &[&str] = &[
-    "firefox", "chrome", "chromium", "brave", "safari", "edge",
-    "openvpn", "wireguard", "nordvpn", "expressvpn", "protonvpn",
-    "systemd-resolve", "dnsmasq", "unbound", "named", "coredns",
-    "dnscrypt-proxy", "stubby",
+    "firefox",
+    "chrome",
+    "chromium",
+    "brave",
+    "safari",
+    "edge",
+    "openvpn",
+    "wireguard",
+    "nordvpn",
+    "expressvpn",
+    "protonvpn",
+    "systemd-resolve",
+    "dnsmasq",
+    "unbound",
+    "named",
+    "coredns",
+    "dnscrypt-proxy",
+    "stubby",
 ];
 
 /// Detects Command & Control (C2) callback patterns from outbound connections.
