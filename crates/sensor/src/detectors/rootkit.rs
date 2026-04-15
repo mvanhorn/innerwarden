@@ -491,19 +491,47 @@ impl RootkitDetector {
         }
     }
 
+    /// Processes that commonly exit/restart and should not trigger hidden PID alerts.
+    const BENIGN_COMMS: &'static [&'static str] = &[
+        "tokio-rt-worker",
+        "openclaw-gatewa",
+        "cargo",
+        "rustc",
+        "cc1",
+        "ld",
+        "sh",
+        "bash",
+        "git",
+        "node",
+        "npm",
+        "apt",
+        "dpkg",
+        "pip",
+        "python3",
+        "innerwarden-age",
+        "innerwarden-sen",
+    ];
+
     /// Check if any tracked PIDs are hidden from /proc.
     fn check_hidden_processes(&mut self, now: DateTime<Utc>) -> Option<Incident> {
         let check_fn = self.pid_exists_fn;
-        let _short_lived_cutoff = now - Duration::seconds(2);
+
+        // Garbage collect: remove PIDs not seen in 60s (normal process exit)
+        let gc_cutoff = now - chrono::Duration::seconds(60);
+        self.pids.retain(|_pid, info| info.last_seen > gc_cutoff);
 
         for (&pid, info) in &self.pids {
-            // Skip short-lived processes (< 5s since last seen) - normal exits
-            let five_sec_cutoff = now - chrono::Duration::seconds(5);
-            if info.last_seen > five_sec_cutoff {
+            // Skip short-lived processes (< 10s since last seen) - normal exits
+            let recent_cutoff = now - chrono::Duration::seconds(10);
+            if info.last_seen > recent_cutoff {
                 continue;
             }
             // Only flag if seen many times (persistent process, not one-shot commands)
-            if info.seen_count < 5 {
+            if info.seen_count < 10 {
+                continue;
+            }
+            // Skip known benign processes that commonly exit/restart
+            if Self::BENIGN_COMMS.iter().any(|c| info.comm.starts_with(c)) {
                 continue;
             }
             // Check if PID exists in /proc
@@ -1687,15 +1715,15 @@ mod tests {
         let mut det = RootkitDetector::new("test", 10, 600).with_pid_exists_fn(never_exists);
         let now = Utc::now();
 
-        // Add a PID that was just seen (< 2s ago) - should be excluded
+        // Add a PID that was just seen (< 10s ago) - should be excluded
         det.pids.insert(
             1234,
             PidInfo {
                 comm: "malware".to_string(),
                 binary_path: "/tmp/malware".to_string(),
-                last_seen: now - Duration::seconds(1), // 1s ago - still short-lived
+                last_seen: now - Duration::seconds(3), // 3s ago - still short-lived
                 uid: 0,
-                seen_count: 5,
+                seen_count: 10,
             },
         );
 
@@ -1703,8 +1731,8 @@ mod tests {
         let inc = det.check_hidden_processes(now);
         assert!(inc.is_none(), "Short-lived process should be excluded");
 
-        // Now make the PID old enough (> 2s)
-        det.pids.get_mut(&1234).unwrap().last_seen = now - Duration::seconds(5);
+        // Now make the PID old enough (> 10s)
+        det.pids.get_mut(&1234).unwrap().last_seen = now - Duration::seconds(15);
         let inc2 = det.check_hidden_processes(now);
         assert!(inc2.is_some(), "Old enough PID should be flagged");
         assert_eq!(inc2.unwrap().severity, Severity::Critical);
@@ -1820,12 +1848,12 @@ mod tests {
             "PID seen only once should not be flagged"
         );
 
-        // Now bump seen_count to 5 (persistent process threshold)
-        det.pids.get_mut(&5555).unwrap().seen_count = 5;
-        det.pids.get_mut(&5555).unwrap().last_seen = now - Duration::seconds(10);
+        // Now bump seen_count to 10 (persistent process threshold)
+        det.pids.get_mut(&5555).unwrap().seen_count = 10;
+        det.pids.get_mut(&5555).unwrap().last_seen = now - Duration::seconds(15);
         assert!(
             det.check_hidden_processes(now).is_some(),
-            "PID seen 5+ times should be flagged"
+            "PID seen 10+ times should be flagged"
         );
     }
 
