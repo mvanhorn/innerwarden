@@ -16,9 +16,7 @@ use tracing::{info, warn};
 
 use crate::agent_context::incident_detector;
 use crate::config::ChannelFilterLevel;
-use crate::{
-    ai, allowlist, config, decisions, execute_decision, AgentState, LocalIpReputation,
-};
+use crate::{ai, allowlist, config, decisions, execute_decision, AgentState, LocalIpReputation};
 
 /// A built-in auto-response rule definition.
 struct AutoRule {
@@ -97,11 +95,7 @@ pub(crate) async fn try_handle_auto_rule(
     if allowlist::is_ip_allowlisted(ip, &cfg.allowlist.trusted_ips)
         || allowlist::is_ip_allowlisted(ip, &state.dynamic_trusted_ips)
     {
-        info!(
-            ip,
-            detector,
-            "auto-rule: skipping — IP is allowlisted"
-        );
+        info!(ip, detector, "auto-rule: skipping — IP is allowlisted");
         return false;
     }
 
@@ -109,8 +103,7 @@ pub(crate) async fn try_handle_auto_rule(
     if state.operator_ips.contains_key(ip) {
         info!(
             ip,
-            detector,
-            "auto-rule: skipping — active operator session"
+            detector, "auto-rule: skipping — active operator session"
         );
         return false;
     }
