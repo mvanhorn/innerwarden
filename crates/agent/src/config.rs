@@ -1045,6 +1045,41 @@ pub struct ResponderConfig {
     /// Respects dry_run and allowlist.
     #[serde(default = "default_true")]
     pub auto_rules_enabled: bool,
+
+    /// Process names (comm) excluded from correlation-engine data exfil detection.
+    /// Events from these processes are still logged but do not feed into attack
+    /// chain correlation. Prevents false positives from agent's own API calls,
+    /// monitoring tools, and package managers.
+    ///
+    /// Default includes InnerWarden's own processes. Add system daemons and
+    /// monitoring tools that make legitimate outbound connections.
+    #[serde(default = "default_trusted_processes")]
+    pub trusted_processes: Vec<String>,
+}
+
+fn default_trusted_processes() -> Vec<String> {
+    vec![
+        // InnerWarden ecosystem
+        "innerwarden-age".into(),
+        "innerwarden-sen".into(),
+        "innerwarden-wat".into(),
+        "openclaw-gatewa".into(),
+        // System services
+        "crowdsec".into(),
+        "apt".into(),
+        "dpkg".into(),
+        "dnf".into(),
+        "yum".into(),
+        "snap".into(),
+        "snapd".into(),
+        "certbot".into(),
+        "unattended-upgr".into(),
+        // Monitoring
+        "prometheus".into(),
+        "grafana".into(),
+        "node_exporter".into(),
+        "telegraf".into(),
+    ]
 }
 
 impl Default for ResponderConfig {
@@ -1055,6 +1090,7 @@ impl Default for ResponderConfig {
             block_backend: default_block_backend(),
             allowed_skills: default_allowed_skills(),
             auto_rules_enabled: true,
+            trusted_processes: default_trusted_processes(),
         }
     }
 }

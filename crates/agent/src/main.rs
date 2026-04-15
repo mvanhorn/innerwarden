@@ -3587,8 +3587,26 @@ async fn process_narrative_tick(
         }
     }
 
-    // Feed events into cross-layer correlation engine and baseline learning
+    // Feed events into cross-layer correlation engine and baseline learning.
+    // Events from trusted processes are excluded — they make legitimate
+    // outbound connections that would false-positive on data-exfil chains.
+    let trusted_procs = &cfg.responder.trusted_processes;
     for ev in &events_entries {
+        // Skip trusted processes from correlation + kill chain detection.
+        let ev_comm = ev
+            .details
+            .get("comm")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !ev_comm.is_empty()
+            && trusted_procs
+                .iter()
+                .any(|tp| ev_comm.starts_with(tp.as_str()))
+        {
+            // Still feed to baseline (we want to learn their normal patterns)
+            let _ = state.baseline.observe_event(ev);
+            continue;
+        }
         let corr_event = correlation_engine::CorrelationEngine::classify_event(ev);
         let ev_entities = corr_event.entities.clone();
         state.correlation_engine.observe(corr_event);
@@ -3626,10 +3644,23 @@ async fn process_narrative_tick(
     }
 
     // Feed eBPF events through kill chain tracker (inline pattern detection).
+    // Filter out trusted processes to prevent false kill chain matches.
     if cfg.killchain.enabled {
+        let kc_events: Vec<_> = events_entries
+            .iter()
+            .filter(|ev| {
+                let comm = ev
+                    .details
+                    .get("comm")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                comm.is_empty() || !trusted_procs.iter().any(|tp| comm.starts_with(tp.as_str()))
+            })
+            .cloned()
+            .collect();
         let kc_incidents = killchain_inline::process_events(
             &mut state.killchain_tracker,
-            &events_entries,
+            &kc_events,
             &mut state.correlation_engine,
         );
         killchain_inline::write_incidents(data_dir, &kc_incidents);
@@ -4327,6 +4358,7 @@ mod tests {
                 block_backend: "ufw".to_string(),
                 allowed_skills: vec!["block-ip-ufw".to_string()],
                 auto_rules_enabled: false,
+                ..config::ResponderConfig::default()
             },
             ..config::AgentConfig::default()
         };
@@ -4507,6 +4539,7 @@ mod tests {
                 // Only ufw is allowed; AI picks iptables - should fall back silently
                 allowed_skills: vec!["block-ip-ufw".to_string()],
                 auto_rules_enabled: false,
+                ..config::ResponderConfig::default()
             },
             ..config::AgentConfig::default()
         };
@@ -4667,6 +4700,7 @@ mod tests {
                 block_backend: "ufw".to_string(),
                 allowed_skills: vec!["block-ip-ufw".to_string()],
                 auto_rules_enabled: false,
+                ..config::ResponderConfig::default()
             },
             ..config::AgentConfig::default()
         };
@@ -4980,6 +5014,7 @@ mod tests {
                 block_backend: "ufw".to_string(),
                 allowed_skills: vec!["honeypot".to_string()],
                 auto_rules_enabled: false,
+                ..config::ResponderConfig::default()
             },
             ..config::AgentConfig::default()
         };
@@ -5134,6 +5169,7 @@ mod tests {
                 block_backend: "ufw".to_string(),
                 allowed_skills: vec!["block-ip-ufw".to_string()],
                 auto_rules_enabled: false,
+                ..config::ResponderConfig::default()
             },
             ..config::AgentConfig::default()
         };
