@@ -1040,3 +1040,66 @@ fn tg_reply(state: &AgentState, text: impl Into<String>) {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_strip_ansi() {
+        let clean = "hello world";
+        assert_eq!(strip_ansi(clean), "hello world");
+
+        let colored = "\x1b[31mred text\x1b[0m and normal";
+        assert_eq!(strip_ansi(colored), "red text and normal");
+
+        let multiple = "\x1b[1;31m bold red \x1b[0m \x1b[32m green \x1b[0m";
+        assert_eq!(strip_ansi(multiple), " bold red   green ");
+    }
+
+    #[test]
+    fn format_capabilities_evaluates_enabled_flags() {
+        // Disabled everything
+        let mut cfg = config::AgentConfig::default();
+        cfg.ai.enabled = false;
+        cfg.responder.enabled = false;
+
+        let out = format_capabilities(&cfg);
+        assert!(out.contains("🔴 <b>AI Analysis</b>  disabled"));
+        assert!(out.contains("🔴 <b>Block IP</b>  disabled"));
+
+        // Enable AI
+        cfg.ai.enabled = true;
+        cfg.ai.provider = "openai".to_string();
+        cfg.ai.model = "gpt-4".to_string();
+        let out = format_capabilities(&cfg);
+        assert!(out.contains("🟢 <b>AI Analysis</b>  <code>openai / gpt-4</code>"));
+    }
+
+    #[test]
+    fn capabilities_keyboard_creates_enable_buttons() {
+        // All disabled should create multiple buttons
+        let mut cfg = config::AgentConfig::default();
+        cfg.ai.enabled = false;
+        cfg.responder.enabled = false;
+
+        let kb = capabilities_keyboard(&cfg);
+        let s = serde_json::to_string(&kb).unwrap();
+        assert!(s.contains("enable:ai"));
+        assert!(s.contains("enable:block-ip"));
+
+        // All enabled should yield single status button
+        cfg.ai.enabled = true;
+        cfg.responder.enabled = true;
+        cfg.responder.allowed_skills = vec!["suspend-user".to_string()];
+        cfg.abuseipdb.enabled = true;
+        cfg.geoip.enabled = true;
+        cfg.fail2ban.enabled = true;
+        cfg.honeypot.mode = "listener".to_string();
+
+        let kb = capabilities_keyboard(&cfg);
+        let s = serde_json::to_string(&kb).unwrap();
+        assert!(s.contains("menu:status"));
+        assert!(!s.contains("enable:ai"));
+    }
+}

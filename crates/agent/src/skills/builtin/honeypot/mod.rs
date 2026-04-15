@@ -3154,4 +3154,53 @@ mod tests {
             result.message
         );
     }
+
+    #[test]
+    fn test_is_bwrap_runner() {
+        assert!(is_bwrap_runner("bwrap"));
+        assert!(is_bwrap_runner("/usr/bin/bwrap"));
+        assert!(is_bwrap_runner("bubblewrap"));
+        assert!(!is_bwrap_runner("other"));
+    }
+
+    #[tokio::test]
+    async fn test_is_lock_stale_detection() {
+        let dir = tempdir().unwrap();
+        let lock_path = dir.path().join("session.lock");
+
+        // Zero stale_secs means never stale
+        assert!(!is_lock_stale(&lock_path, 0).await);
+
+        // Write a lock file with old timestamp
+        let lock_body = serde_json::json!({
+            "ts": "2020-01-01T00:00:00Z",
+            "session_id": "test_stale",
+        });
+        tokio::fs::write(&lock_path, format!("{lock_body}\n"))
+            .await
+            .unwrap();
+
+        // 10 seconds stale should trigger since it's from 2020
+        assert!(is_lock_stale(&lock_path, 10).await);
+
+        // Update it to now
+        let lock_body_now = serde_json::json!({
+            "ts": Utc::now().to_rfc3339(),
+            "session_id": "test_fresh",
+        });
+        tokio::fs::write(&lock_path, format!("{lock_body_now}\n"))
+            .await
+            .unwrap();
+
+        // Now it shouldn't be stale
+        assert!(!is_lock_stale(&lock_path, 10).await);
+    }
+
+    #[test]
+    fn test_append_unique_args() {
+        let mut target = vec!["--foo".to_string(), "--bar".to_string()];
+        let extras = vec!["--bar".to_string(), "--baz".to_string()];
+        append_unique_args(&mut target, &extras);
+        assert_eq!(target, vec!["--foo", "--bar", "--baz"]);
+    }
 }

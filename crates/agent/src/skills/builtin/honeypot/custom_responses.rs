@@ -189,4 +189,20 @@ http_routes:
         assert_eq!(ct, "application/json");
         assert!(body.contains("ok"));
     }
+
+    #[test]
+    fn test_shell_prefix_match() {
+        let yaml = r#"
+shell_commands:
+  "cat /etc/passwd":
+    output: "root:x:0:0:root:/root:/bin/bash"
+"#;
+        let custom: CustomResponses = serde_yaml::from_str(yaml).unwrap();
+        // Exact match
+        assert!(custom.try_shell("cat /etc/passwd").is_some());
+        // Prefix match with trailing spaces/args
+        assert!(custom.try_shell("cat /etc/passwd > /tmp/out").is_some());
+        // No match
+        assert!(custom.try_shell("cat /etc/shadow").is_none());
+    }
 }
