@@ -524,8 +524,8 @@ fn build_shell_system_prompt(user: &str, hostname: &str, history: &[(String, Str
 
 /// Build an ephemeral russh server config with an Ed25519 key.
 pub(crate) fn build_ssh_config(max_auth_attempts: usize) -> Arc<Config> {
-    // ssh_key::PrivateKey::random requires a CSPRNG.
-    let key = PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519)
+    // ssh_key::PrivateKey::random requires CryptoRng from rand_core 0.10 (via russh 0.60).
+    let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)
         .expect("Ed25519 key generation should not fail");
     Arc::new(Config {
         keys: vec![key],

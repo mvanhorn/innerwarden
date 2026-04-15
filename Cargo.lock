@@ -1883,6 +1883,7 @@ dependencies = [
  "innerwarden-store",
  "innerwarden_core",
  "p256 0.13.2",
+ "rand 0.10.1",
  "rand_core 0.6.4",
  "redis 1.2.0",
  "regex",
