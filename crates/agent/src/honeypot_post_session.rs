@@ -29,20 +29,28 @@ async fn read_shell_commands_from_evidence(path: &Path) -> Vec<String> {
     let mut commands = Vec::new();
     while let Ok(Some(line)) = lines.next_line().await {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-            if val.get("type").and_then(|t| t.as_str()) == Some("ssh_connection") {
-                if let Some(attempts) = val.get("shell_commands").and_then(|a| a.as_array()) {
-                    for a in attempts {
-                        if let Some(cmd) = a.get("command").and_then(|c| c.as_str()) {
-                            if !cmd.is_empty() {
-                                commands.push(cmd.to_string());
-                            }
-                        }
+            if let Some(mut extracted) = extract_commands_from_json(&val) {
+                commands.append(&mut extracted);
+            }
+        }
+    }
+    commands
+}
+
+pub(crate) fn extract_commands_from_json(val: &serde_json::Value) -> Option<Vec<String>> {
+    let mut commands = Vec::new();
+    if val.get("type").and_then(|t| t.as_str()) == Some("ssh_connection") {
+        if let Some(attempts) = val.get("shell_commands").and_then(|a| a.as_array()) {
+            for a in attempts {
+                if let Some(cmd) = a.get("command").and_then(|c| c.as_str()) {
+                    if !cmd.is_empty() {
+                        commands.push(cmd.to_string());
                     }
                 }
             }
         }
     }
-    commands
+    if commands.is_empty() { None } else { Some(commands) }
 }
 
 async fn read_credentials_from_evidence(path: &Path) -> Vec<(String, Option<String>)> {
@@ -54,27 +62,35 @@ async fn read_credentials_from_evidence(path: &Path) -> Vec<(String, Option<Stri
     let mut creds = Vec::new();
     while let Ok(Some(line)) = lines.next_line().await {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
-            if val.get("type").and_then(|t| t.as_str()) == Some("ssh_connection") {
-                if let Some(attempts) = val.get("auth_attempts").and_then(|a| a.as_array()) {
-                    for a in attempts {
-                        let user = a
-                            .get("username")
-                            .and_then(|u| u.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let pass = a
-                            .get("password")
-                            .and_then(|p| p.as_str())
-                            .map(|p| p.to_string());
-                        if !user.is_empty() {
-                            creds.push((user, pass));
-                        }
-                    }
-                }
+            if let Some(mut extracted) = extract_credentials_from_json(&val) {
+                creds.append(&mut extracted);
             }
         }
     }
     creds
+}
+
+pub(crate) fn extract_credentials_from_json(val: &serde_json::Value) -> Option<Vec<(String, Option<String>)>> {
+    let mut creds = Vec::new();
+    if val.get("type").and_then(|t| t.as_str()) == Some("ssh_connection") {
+        if let Some(attempts) = val.get("auth_attempts").and_then(|a| a.as_array()) {
+            for a in attempts {
+                let user = a
+                    .get("username")
+                    .and_then(|u| u.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let pass = a
+                    .get("password")
+                    .and_then(|p| p.as_str())
+                    .map(|p| p.to_string());
+                if !user.is_empty() {
+                    creds.push((user, pass));
+                }
+            }
+        }
+    }
+    if creds.is_empty() { None } else { Some(creds) }
 }
 
 /// Spawned in the background after a honeypot session starts.
@@ -276,5 +292,58 @@ pub(crate) async fn spawn_post_session_tasks(
                 tracing::debug!(ip, session_id, "honeypot: probe-only session dropped");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_extract_session_id_from_message() {
+        let msg1 = "Honeypot listeners started (session xyz123, port 2222)";
+        assert_eq!(extract_session_id_from_message(msg1), Some("xyz123".to_string()));
+
+        let msg2 = "Honeypot session abc)";
+        assert_eq!(extract_session_id_from_message(msg2), Some("abc".to_string()));
+
+        let msg3 = "No connected instances here";
+        assert_eq!(extract_session_id_from_message(msg3), None);
+    }
+
+    #[test]
+    fn test_extract_commands_from_json() {
+        let val = json!({
+            "type": "ssh_connection",
+            "shell_commands": [
+                { "command": "uname -a" },
+                { "command": "" },
+                { "command": "whoami" }
+            ]
+        });
+
+        let cmds = extract_commands_from_json(&val).unwrap();
+        assert_eq!(cmds, vec!["uname -a".to_string(), "whoami".to_string()]);
+
+        let empty_val = json!({ "type": "ssh_connection" });
+        assert_eq!(extract_commands_from_json(&empty_val), None);
+    }
+
+    #[test]
+    fn test_extract_credentials_from_json() {
+        let val = json!({
+            "type": "ssh_connection",
+            "auth_attempts": [
+                { "username": "root", "password": "123" },
+                { "username": "admin" }, // no password
+                { "password": "only" }   // no username should be skipped
+            ]
+        });
+
+        let creds = extract_credentials_from_json(&val).unwrap();
+        assert_eq!(creds.len(), 2);
+        assert_eq!(creds[0], ("root".to_string(), Some("123".to_string())));
+        assert_eq!(creds[1], ("admin".to_string(), None));
     }
 }

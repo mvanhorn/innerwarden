@@ -23,9 +23,6 @@ pub(crate) async fn try_handle_abuseipdb_autoblock(
     };
 
     let threshold = cfg.abuseipdb.auto_block_threshold;
-    if threshold == 0 || rep.confidence_score < threshold {
-        return false;
-    }
 
     let primary_ip = incident
         .entities
@@ -36,36 +33,46 @@ pub(crate) async fn try_handle_abuseipdb_autoblock(
         return false;
     };
 
-    // Protected IP check: skip auto-block for protected ranges.
-    if allowlist::is_ip_allowlisted(&ip, &cfg.ai.protected_ips) {
-        warn!(
-            ip = %ip,
-            incident_id = %incident.incident_id,
-            "AbuseIPDB auto-block tried to block protected IP {ip} - skipped"
-        );
-        return false;
-    }
-
-    // Never auto-block active operator sessions (publickey SSH from trusted_users).
-    if state.operator_ips.contains_key(&ip) {
-        info!(
-            ip = %ip,
-            incident_id = %incident.incident_id,
-            "AbuseIPDB auto-block skipped: active operator session"
-        );
-        return false;
-    }
-
-    if cloud_safelist::is_cloud_provider_ip(&ip) {
-        let provider = cloud_safelist::identify_provider(&ip).unwrap_or("Unknown Cloud");
-        warn!(
-            ip = %ip,
-            provider,
-            score = rep.confidence_score,
-            incident_id = %incident.incident_id,
-            "AbuseIPDB auto-block skipped: {ip} belongs to {provider}. \
-             Sending to AI for evaluation instead."
-        );
+    if let Some(reason) = is_eligible_for_abuseipdb_autoblock(
+        &ip,
+        rep.confidence_score,
+        threshold,
+        &cfg.ai.protected_ips,
+        &state.operator_ips,
+    ) {
+        match reason {
+            AbuseIpDbBlockResult::Eligible => {}
+            AbuseIpDbBlockResult::BelowScoreThreshold => return false,
+            AbuseIpDbBlockResult::SkipProtectedIp => {
+                warn!(
+                    ip = %ip,
+                    incident_id = %incident.incident_id,
+                    "AbuseIPDB auto-block tried to block protected IP {ip} - skipped"
+                );
+                return false;
+            }
+            AbuseIpDbBlockResult::SkipOperator => {
+                info!(
+                    ip = %ip,
+                    incident_id = %incident.incident_id,
+                    "AbuseIPDB auto-block skipped: active operator session"
+                );
+                return false;
+            }
+            AbuseIpDbBlockResult::SkipCloudSafelist => {
+                let provider = cloud_safelist::identify_provider(&ip).unwrap_or("Unknown Cloud");
+                warn!(
+                    ip = %ip,
+                    provider,
+                    score = rep.confidence_score,
+                    incident_id = %incident.incident_id,
+                    "AbuseIPDB auto-block skipped: {ip} belongs to {provider}. \
+                     Sending to AI for evaluation instead."
+                );
+                return false;
+            }
+        }
+    } else {
         return false;
     }
 
@@ -216,4 +223,87 @@ pub(crate) async fn try_handle_abuseipdb_autoblock(
     }
 
     true
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AbuseIpDbBlockResult {
+    Eligible,
+    BelowScoreThreshold,
+    SkipProtectedIp,
+    SkipOperator,
+    SkipCloudSafelist,
+}
+
+pub(crate) fn is_eligible_for_abuseipdb_autoblock(
+    ip: &str,
+    score: u8,
+    threshold: u8,
+    protected_ips: &[String],
+    operator_ips: &std::collections::HashMap<String, std::time::Instant>,
+) -> Option<AbuseIpDbBlockResult> {
+    if threshold == 0 || score < threshold {
+        return Some(AbuseIpDbBlockResult::BelowScoreThreshold);
+    }
+    
+    // Protected IP check: skip auto-block for protected ranges.
+    if allowlist::is_ip_allowlisted(ip, protected_ips) {
+        return Some(AbuseIpDbBlockResult::SkipProtectedIp);
+    }
+    
+    // Never auto-block active operator sessions.
+    if operator_ips.contains_key(ip) {
+        return Some(AbuseIpDbBlockResult::SkipOperator);
+    }
+    
+    if cloud_safelist::is_cloud_provider_ip(ip) {
+        return Some(AbuseIpDbBlockResult::SkipCloudSafelist);
+    }
+
+    Some(AbuseIpDbBlockResult::Eligible)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_is_eligible_for_abuseipdb_autoblock() {
+        let operators = HashMap::new();
+        let protected: Vec<String> = vec![];
+
+        // Valid block scenario
+        assert_eq!(
+            is_eligible_for_abuseipdb_autoblock("8.8.8.8", 100, 90, &protected, &operators),
+            Some(AbuseIpDbBlockResult::Eligible)
+        );
+
+        // Below threshold scenario
+        assert_eq!(
+            is_eligible_for_abuseipdb_autoblock("8.8.8.8", 50, 90, &protected, &operators),
+            Some(AbuseIpDbBlockResult::BelowScoreThreshold)
+        );
+
+        // 0 threshold disables auto-blocking
+        assert_eq!(
+            is_eligible_for_abuseipdb_autoblock("8.8.8.8", 100, 0, &protected, &operators),
+            Some(AbuseIpDbBlockResult::BelowScoreThreshold)
+        );
+
+        // Operator IP
+        let mut op_map = HashMap::new();
+        op_map.insert("10.0.0.1".to_string(), std::time::Instant::now());
+        assert_eq!(
+            is_eligible_for_abuseipdb_autoblock("10.0.0.1", 100, 90, &protected, &op_map),
+            Some(AbuseIpDbBlockResult::SkipOperator)
+        );
+
+        // Cloud safelist (assuming 169.254.x.x or AWS ranges, e.g. AWS ranges handled by cloud_safelist)
+        // using mock known cloud API IP or we can test protected_ips instead.
+        let protected2 = vec!["1.2.3.4".to_string()];
+        assert_eq!(
+            is_eligible_for_abuseipdb_autoblock("1.2.3.4", 100, 90, &protected2, &HashMap::new()),
+            Some(AbuseIpDbBlockResult::SkipProtectedIp)
+        );
+    }
 }

@@ -146,10 +146,10 @@ pub(crate) async fn backfill_enrichment(state: &mut AgentState) {
             if !needs_geo && !needs_abuse {
                 return false;
             }
-            match ip.parse::<std::net::IpAddr>() {
-                Ok(addr) => !addr.is_loopback() && !crate::ai::is_private_ip(addr),
-                Err(_) => false,
+            if !is_ip_eligible_for_external_enrichment(ip) {
+                return false;
             }
+            true
         })
         .filter(|(ip, _p)| {
             // If abuse score is missing, check SQLite cache — the score may
@@ -302,4 +302,39 @@ pub(crate) async fn backfill_enrichment(state: &mut AgentState) {
         daily_abuseipdb_calls = daily_count,
         "enrichment backfill: updated profiles with missing data"
     );
+}
+
+// Extracted pure logic for testing
+pub(crate) fn is_ip_eligible_for_external_enrichment(ip: &str) -> bool {
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(addr) => !addr.is_loopback() && !crate::ai::is_private_ip(addr),
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_ip_eligible_for_external_enrichment() {
+        // Valid external IPs
+        assert!(is_ip_eligible_for_external_enrichment("8.8.8.8"));
+        assert!(is_ip_eligible_for_external_enrichment("104.21.5.1"));
+        assert!(is_ip_eligible_for_external_enrichment("2001:4860:4860::8888")); // External IPv6
+
+        // Loopback
+        assert!(!is_ip_eligible_for_external_enrichment("127.0.0.1"));
+        assert!(!is_ip_eligible_for_external_enrichment("::1"));
+
+        // Private IPs (assuming crate::ai::is_private_ip covers RFC1918)
+        assert!(!is_ip_eligible_for_external_enrichment("10.0.5.5"));
+        assert!(!is_ip_eligible_for_external_enrichment("172.16.0.1"));
+        assert!(!is_ip_eligible_for_external_enrichment("192.168.1.100"));
+
+        // Invalid format
+        assert!(!is_ip_eligible_for_external_enrichment("not_an_ip"));
+        assert!(!is_ip_eligible_for_external_enrichment(""));
+        assert!(!is_ip_eligible_for_external_enrichment("256.256.256.256"));
+    }
 }

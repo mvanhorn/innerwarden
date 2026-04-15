@@ -204,11 +204,41 @@ pub(crate) async fn dispatch_incident_notifications(
         }
     }
 
-    // Mark notification cooldown for all entities in this incident.
     let now = chrono::Utc::now();
     for k in &notify_keys {
         state
             .store
             .set_cooldown(state_store::CooldownTable::Notification, k, now);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use innerwarden_core::event::Severity;
+
+    #[test]
+    fn test_passes_channel_filter() {
+        // ChannelFilterLevel::All passes everything
+        assert!(passes_channel_filter(ChannelFilterLevel::All, &Severity::Low));
+        assert!(passes_channel_filter(ChannelFilterLevel::All, &Severity::Medium));
+        assert!(passes_channel_filter(ChannelFilterLevel::All, &Severity::High));
+        assert!(passes_channel_filter(ChannelFilterLevel::All, &Severity::Critical));
+
+        // ChannelFilterLevel::Actionable passes everything
+        assert!(passes_channel_filter(ChannelFilterLevel::Actionable, &Severity::Low));
+        assert!(passes_channel_filter(ChannelFilterLevel::Actionable, &Severity::Critical));
+
+        // ChannelFilterLevel::None passes nothing
+        assert!(!passes_channel_filter(ChannelFilterLevel::None, &Severity::Low));
+        assert!(!passes_channel_filter(ChannelFilterLevel::None, &Severity::Medium));
+        assert!(!passes_channel_filter(ChannelFilterLevel::None, &Severity::High));
+        assert!(!passes_channel_filter(ChannelFilterLevel::None, &Severity::Critical));
+
+        // ChannelFilterLevel::Critical passes only High and Critical
+        assert!(!passes_channel_filter(ChannelFilterLevel::Critical, &Severity::Low));
+        assert!(!passes_channel_filter(ChannelFilterLevel::Critical, &Severity::Medium));
+        assert!(passes_channel_filter(ChannelFilterLevel::Critical, &Severity::High));
+        assert!(passes_channel_filter(ChannelFilterLevel::Critical, &Severity::Critical));
     }
 }
