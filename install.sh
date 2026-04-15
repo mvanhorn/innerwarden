@@ -61,7 +61,7 @@ fi
 # ── Sudo handling ────────────────────────────────────────────────────────
 # Instead of re-execing the entire script with sudo (which kills stdin/tty),
 # we validate sudo once and prefix privileged commands with $SUDO.
-# This keeps the terminal attached so innerwarden setup can prompt the user.
+# This keeps the terminal attached so interactive flows can prompt the user.
 if [[ "${SIMULATE}" -eq 1 ]]; then
   SUDO=""
 else
@@ -246,31 +246,31 @@ print_install_banner() {
   echo ""
 }
 
+run_with_tty_if_available() {
+  if [[ -t 0 ]]; then
+    "$@"
+  elif [[ -e /dev/tty ]] && { : < /dev/tty; } 2>/dev/null; then
+    "$@" < /dev/tty
+  else
+    "$@"
+  fi
+}
+
 run_simulated_setup_flow() {
   echo "  [SIMULATION] No files will be written. No services will be changed."
   echo "  [SIMULATION] Running setup flow in dry-run mode (${SIMULATE_MODE})."
   echo ""
 
-  run_with_tty_if_available() {
-    if [[ -t 0 ]]; then
-      "$@"
-    elif [[ -e /dev/tty ]] && { : < /dev/tty; } 2>/dev/null; then
-      "$@" < /dev/tty
-    else
-      "$@"
-    fi
-  }
-
   local wizard_path="${SCRIPT_DIR}/scripts/setup-wizard.sh"
 
   if [[ -x "${wizard_path}" ]]; then
     echo "  [SIMULATION] Launching interactive wizard (no root required)..."
-    if run_with_tty_if_available "${wizard_path}"; then
+    if run_with_tty_if_available env IW_WIZARD_SIMULATE=1 "${wizard_path}"; then
       return 0
     fi
     echo "  [SIMULATION] Wizard unavailable in this shell."
     echo "  [SIMULATION] Open a normal interactive terminal and run:"
-    echo "    ${wizard_path}"
+    echo "    IW_WIZARD_SIMULATE=1 ${wizard_path}"
     return 0
   fi
 
@@ -361,13 +361,8 @@ fi
 ENABLE_EXEC_AUDIT="${INNERWARDEN_ENABLE_EXEC_AUDIT:-}"
 ENABLE_EXEC_AUDIT_TTY="${INNERWARDEN_ENABLE_EXEC_AUDIT_TTY:-}"
 
-if [[ -t 0 && -z "${ENABLE_EXEC_AUDIT}" ]]; then
-  echo
-  echo "Privacy notice:"
-  echo "  Shell auditing can capture executed commands and, if enabled, terminal input."
-  echo "  This may include sensitive or personal data."
-  echo "  Enable only with explicit legal authorization from the host owner."
-  if prompt_yes_no "Enable shell command audit trail (auditd EXECVE)?" "no"; then
+if [[ -z "${ENABLE_EXEC_AUDIT}" ]]; then
+  if [[ "${OS_TYPE}" == "Linux" ]]; then
     ENABLE_EXEC_AUDIT="true"
   else
     ENABLE_EXEC_AUDIT="false"
@@ -377,13 +372,6 @@ fi
 ENABLE_EXEC_AUDIT="$(normalize_bool "${ENABLE_EXEC_AUDIT:-false}")"
 
 if [[ "${ENABLE_EXEC_AUDIT}" == "true" ]]; then
-  if [[ -t 0 && -z "${ENABLE_EXEC_AUDIT_TTY}" ]]; then
-    if prompt_yes_no "Also ingest auditd TTY input records when available? (higher privacy impact)" "no"; then
-      ENABLE_EXEC_AUDIT_TTY="true"
-    else
-      ENABLE_EXEC_AUDIT_TTY="false"
-    fi
-  fi
   ENABLE_EXEC_AUDIT_TTY="$(normalize_bool "${ENABLE_EXEC_AUDIT_TTY:-false}")"
 else
   ENABLE_EXEC_AUDIT_TTY="false"
@@ -1060,5 +1048,24 @@ if ! innerwarden welcome 2>/dev/null; then
   echo ""
 fi
 
-# Auto-run setup with terminal input via /dev/tty (curl pipe consumes stdin)
+# Auto-run interactive wizard. If unavailable, fallback to classic setup.
+WIZARD_PATH="${SCRIPT_DIR}/scripts/setup-wizard.sh"
+if [[ -x "${WIZARD_PATH}" ]] && command -v gum >/dev/null 2>&1; then
+  echo "  Launching setup wizard..."
+  if run_with_tty_if_available "${WIZARD_PATH}"; then
+    exit 0
+  fi
+
+  WIZARD_STATUS=$?
+  if [[ "${WIZARD_STATUS}" -eq 130 ]]; then
+    echo "  Setup canceled by user."
+    exit 130
+  fi
+
+  echo "  [error] Wizard failed (exit ${WIZARD_STATUS})."
+  echo "  [error] Exiting without running classic setup to avoid duplicate prompts."
+  exit "${WIZARD_STATUS}"
+fi
+
+# Classic setup fallback with terminal input via /dev/tty.
 $SUDO innerwarden setup < /dev/tty
