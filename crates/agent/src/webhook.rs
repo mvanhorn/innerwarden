@@ -297,4 +297,32 @@ mod tests {
         inc.severity = Severity::Medium;
         assert_eq!(opsgenie_payload(&inc)["priority"], "P3");
     }
+
+    // severity_rank covers all 6 levels
+    #[test]
+    fn severity_rank_covers_all_levels() {
+        assert_eq!(severity_rank(&Severity::Debug), 0);
+        assert_eq!(severity_rank(&Severity::Info), 1);
+        assert_eq!(severity_rank(&Severity::Low), 2);
+        assert_eq!(severity_rank(&Severity::Medium), 3);
+        assert_eq!(severity_rank(&Severity::High), 4);
+        assert_eq!(severity_rank(&Severity::Critical), 5);
+    }
+
+    // redact_url removes query strings (prevents leaking tokens)
+    #[test]
+    fn redact_url_strips_query_string() {
+        assert_eq!(
+            redact_url("https://hooks.slack.com/T123/B456?token=secret"),
+            "https://hooks.slack.com/T123/B456?[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn redact_url_preserves_no_query() {
+        assert_eq!(
+            redact_url("https://hooks.slack.com/T123/B456"),
+            "https://hooks.slack.com/T123/B456"
+        );
+    }
 }

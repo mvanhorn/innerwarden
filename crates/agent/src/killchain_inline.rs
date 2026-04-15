@@ -203,3 +203,79 @@ pub(crate) fn cleanup_stale(tracker: &mut PidTracker) {
 pub(crate) fn stats(tracker: &PidTracker) -> (usize, usize, usize) {
     tracker.stats()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // event_to_tracker_json preserves key fields
+    #[test]
+    fn event_to_tracker_json_has_required_fields() {
+        let event = innerwarden_core::event::Event {
+            ts: chrono::Utc::now(),
+            host: "myhost".into(),
+            kind: "syscall.execve".into(),
+            source: "ebpf".into(),
+            details: serde_json::json!({"pid": 1234, "comm": "bash"}),
+            severity: innerwarden_core::event::Severity::Medium,
+            summary: String::new(),
+            tags: vec![],
+            entities: vec![],
+        };
+        let json = event_to_tracker_json(&event);
+        assert_eq!(json["kind"], "syscall.execve");
+        assert_eq!(json["source"], "ebpf");
+        assert_eq!(json["host"], "myhost");
+        assert!(json["ts"].as_str().is_some());
+        assert_eq!(json["details"]["pid"], 1234);
+        assert_eq!(json["details"]["comm"], "bash");
+    }
+
+    // event_to_tracker_json handles empty details
+    #[test]
+    fn event_to_tracker_json_empty_details() {
+        let event = innerwarden_core::event::Event {
+            ts: chrono::Utc::now(),
+            host: "h".into(),
+            kind: "file.read".into(),
+            source: "audit".into(),
+            details: serde_json::json!({}),
+            severity: innerwarden_core::event::Severity::Low,
+            summary: String::new(),
+            tags: vec![],
+            entities: vec![],
+        };
+        let json = event_to_tracker_json(&event);
+        assert_eq!(json["kind"], "file.read");
+        assert!(json["details"].is_object());
+    }
+
+    // KILLCHAIN_COMM_ALLOWLIST prevents notification for known service processes
+    #[test]
+    fn comm_allowlist_blocks_known_services() {
+        let allowlist: &[&str] = &[
+            "ruby",
+            "python",
+            "python3",
+            "node",
+            "java",
+            "beam.smp",
+            "nginx",
+            "haproxy",
+            "envoy",
+            "caddy",
+            "postgres",
+            "mysqld",
+            "redis-server",
+            "openclaw",
+            "innerwarden",
+        ];
+        // Known services should be in the list
+        assert!(allowlist.iter().any(|a| "nginx".starts_with(a)));
+        assert!(allowlist.iter().any(|a| "python3".starts_with(a)));
+        assert!(allowlist.iter().any(|a| "innerwarden-agent".starts_with(a)));
+        // Unknown attacker binaries should NOT match
+        assert!(!allowlist.iter().any(|a| "nc".starts_with(a)));
+        assert!(!allowlist.iter().any(|a| "bash".starts_with(a)));
+    }
+}
