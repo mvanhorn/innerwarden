@@ -1059,11 +1059,13 @@ pub struct ResponderConfig {
 
 fn default_trusted_processes() -> Vec<String> {
     vec![
-        // InnerWarden ecosystem
+        // InnerWarden ecosystem (binary names + tokio thread names)
         "innerwarden-age".into(),
         "innerwarden-sen".into(),
         "innerwarden-wat".into(),
         "openclaw-gatewa".into(),
+        // NOTE: "tokio-rt-worker" is too broad (any Rust app with Tokio).
+        // Instead, filter by PID tree at runtime. See main.rs trusted_pids.
         // System services
         "crowdsec".into(),
         "apt".into(),

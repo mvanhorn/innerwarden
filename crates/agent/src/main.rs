@@ -3590,19 +3590,33 @@ async fn process_narrative_tick(
     // Feed events into cross-layer correlation engine and baseline learning.
     // Events from trusted processes are excluded — they make legitimate
     // outbound connections that would false-positive on data-exfil chains.
+    //
+    // Two filters:
+    // 1. PID-based: exclude our own process tree (agent, sensor, watchdog children).
+    //    Catches tokio-rt-worker threads that eBPF reports with the thread comm.
+    // 2. Comm-based: exclude known system services (crowdsec, apt, certbot, etc.)
     let trusted_procs = &cfg.responder.trusted_processes;
+    let own_pid = std::process::id();
     for ev in &events_entries {
-        // Skip trusted processes from correlation + kill chain detection.
         let ev_comm = ev
             .details
             .get("comm")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if !ev_comm.is_empty()
+        let ev_pid = ev.details.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+
+        // Filter 1: own process tree (agent + its threads).
+        // eBPF reports thread comm ("tokio-rt-worker") not binary name.
+        // Check if event PID belongs to us by reading /proc/PID/status PPid.
+        let is_own_tree = ev_pid > 0 && is_pid_in_own_tree(ev_pid, own_pid);
+
+        // Filter 2: trusted process comm names from config.
+        let is_trusted_comm = !ev_comm.is_empty()
             && trusted_procs
                 .iter()
-                .any(|tp| ev_comm.starts_with(tp.as_str()))
-        {
+                .any(|tp| ev_comm.starts_with(tp.as_str()));
+
+        if is_own_tree || is_trusted_comm {
             // Still feed to baseline (we want to learn their normal patterns)
             let _ = state.baseline.observe_event(ev);
             continue;
@@ -3654,7 +3668,11 @@ async fn process_narrative_tick(
                     .get("comm")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                comm.is_empty() || !trusted_procs.iter().any(|tp| comm.starts_with(tp.as_str()))
+                let pid = ev.details.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let own_tree = pid > 0 && is_pid_in_own_tree(pid, own_pid);
+                let trusted = !comm.is_empty()
+                    && trusted_procs.iter().any(|tp| comm.starts_with(tp.as_str()));
+                !own_tree && !trusted
             })
             .cloned()
             .collect();
@@ -3946,6 +3964,35 @@ fn boot_self_test() {
     }
 
     info!("boot self-test: passed");
+}
+
+// ---------------------------------------------------------------------------
+/// Check if a PID belongs to our own process tree by walking PPid up to 3 levels.
+/// Used to filter eBPF events from agent/sensor threads out of correlation detection.
+/// Reads /proc/PID/status which is cheap (procfs, no disk I/O).
+fn is_pid_in_own_tree(pid: u32, own_pid: u32) -> bool {
+    if pid == own_pid {
+        return true;
+    }
+    // Walk up the PPid chain (max 3 hops: thread → process → watchdog → init).
+    let mut current = pid;
+    for _ in 0..3 {
+        let status_path = format!("/proc/{current}/status");
+        let Ok(content) = std::fs::read_to_string(&status_path) else {
+            return false;
+        };
+        let ppid = content
+            .lines()
+            .find(|l| l.starts_with("PPid:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse::<u32>().ok());
+        match ppid {
+            Some(p) if p == own_pid => return true,
+            Some(0) | Some(1) | None => return false, // reached init
+            Some(p) => current = p,
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
