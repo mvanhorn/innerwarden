@@ -217,28 +217,110 @@ mod tests {
     use super::*;
     use innerwarden_core::event::Severity;
 
+    // Test 1: Full permutation of passes_channel_filter
     #[test]
-    fn test_passes_channel_filter() {
-        // ChannelFilterLevel::All passes everything
-        assert!(passes_channel_filter(ChannelFilterLevel::All, &Severity::Low));
-        assert!(passes_channel_filter(ChannelFilterLevel::All, &Severity::Medium));
-        assert!(passes_channel_filter(ChannelFilterLevel::All, &Severity::High));
-        assert!(passes_channel_filter(ChannelFilterLevel::All, &Severity::Critical));
+    fn test_passes_channel_filter_all_level() {
+        // ChannelFilterLevel::All passes everything including edge severities
+        assert!(passes_channel_filter(
+            ChannelFilterLevel::All,
+            &Severity::Low
+        ));
+        assert!(passes_channel_filter(
+            ChannelFilterLevel::All,
+            &Severity::Medium
+        ));
+        assert!(passes_channel_filter(
+            ChannelFilterLevel::All,
+            &Severity::High
+        ));
+        assert!(passes_channel_filter(
+            ChannelFilterLevel::All,
+            &Severity::Critical
+        ));
+    }
 
-        // ChannelFilterLevel::Actionable passes everything
-        assert!(passes_channel_filter(ChannelFilterLevel::Actionable, &Severity::Low));
-        assert!(passes_channel_filter(ChannelFilterLevel::Actionable, &Severity::Critical));
+    // Test 2: Actionable passes everything for first alerts (auto_resolved=false path)
+    #[test]
+    fn test_passes_channel_filter_actionable_level() {
+        assert!(passes_channel_filter(
+            ChannelFilterLevel::Actionable,
+            &Severity::Low
+        ));
+        assert!(passes_channel_filter(
+            ChannelFilterLevel::Actionable,
+            &Severity::Medium
+        ));
+        assert!(passes_channel_filter(
+            ChannelFilterLevel::Actionable,
+            &Severity::High
+        ));
+        assert!(passes_channel_filter(
+            ChannelFilterLevel::Actionable,
+            &Severity::Critical
+        ));
+    }
 
-        // ChannelFilterLevel::None passes nothing
-        assert!(!passes_channel_filter(ChannelFilterLevel::None, &Severity::Low));
-        assert!(!passes_channel_filter(ChannelFilterLevel::None, &Severity::Medium));
-        assert!(!passes_channel_filter(ChannelFilterLevel::None, &Severity::High));
-        assert!(!passes_channel_filter(ChannelFilterLevel::None, &Severity::Critical));
+    // Test 3: None blocks everything
+    #[test]
+    fn test_passes_channel_filter_none_level() {
+        assert!(!passes_channel_filter(
+            ChannelFilterLevel::None,
+            &Severity::Low
+        ));
+        assert!(!passes_channel_filter(
+            ChannelFilterLevel::None,
+            &Severity::Medium
+        ));
+        assert!(!passes_channel_filter(
+            ChannelFilterLevel::None,
+            &Severity::High
+        ));
+        assert!(!passes_channel_filter(
+            ChannelFilterLevel::None,
+            &Severity::Critical
+        ));
+    }
 
-        // ChannelFilterLevel::Critical passes only High and Critical
-        assert!(!passes_channel_filter(ChannelFilterLevel::Critical, &Severity::Low));
-        assert!(!passes_channel_filter(ChannelFilterLevel::Critical, &Severity::Medium));
-        assert!(passes_channel_filter(ChannelFilterLevel::Critical, &Severity::High));
-        assert!(passes_channel_filter(ChannelFilterLevel::Critical, &Severity::Critical));
+    // Test 4: Critical level only passes High and Critical
+    #[test]
+    fn test_passes_channel_filter_critical_level() {
+        assert!(!passes_channel_filter(
+            ChannelFilterLevel::Critical,
+            &Severity::Low
+        ));
+        assert!(!passes_channel_filter(
+            ChannelFilterLevel::Critical,
+            &Severity::Medium
+        ));
+        assert!(passes_channel_filter(
+            ChannelFilterLevel::Critical,
+            &Severity::High
+        ));
+        assert!(passes_channel_filter(
+            ChannelFilterLevel::Critical,
+            &Severity::Critical
+        ));
+    }
+
+    // Test 5: severity_rank produces monotonically increasing values
+    #[test]
+    fn test_severity_rank_ordering() {
+        use crate::webhook::severity_rank;
+        assert!(severity_rank(&Severity::Low) < severity_rank(&Severity::Medium));
+        assert!(severity_rank(&Severity::Medium) < severity_rank(&Severity::High));
+        assert!(severity_rank(&Severity::High) < severity_rank(&Severity::Critical));
+    }
+
+    // Test 6: severity_rank boundary — Low meets min_rank threshold vs Medium
+    #[test]
+    fn test_severity_rank_threshold_gating() {
+        use crate::webhook::severity_rank;
+        let min_rank = severity_rank(&Severity::High);
+        // High meets its own threshold
+        assert!(severity_rank(&Severity::High) >= min_rank);
+        // Critical exceeds High threshold
+        assert!(severity_rank(&Severity::Critical) >= min_rank);
+        // Medium does NOT meet High threshold
+        assert!(severity_rank(&Severity::Medium) < min_rank);
     }
 }

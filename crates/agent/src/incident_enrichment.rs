@@ -321,7 +321,9 @@ mod tests {
         // Valid external IPs
         assert!(is_ip_eligible_for_external_enrichment("8.8.8.8"));
         assert!(is_ip_eligible_for_external_enrichment("104.21.5.1"));
-        assert!(is_ip_eligible_for_external_enrichment("2001:4860:4860::8888")); // External IPv6
+        assert!(is_ip_eligible_for_external_enrichment(
+            "2001:4860:4860::8888"
+        )); // External IPv6
 
         // Loopback
         assert!(!is_ip_eligible_for_external_enrichment("127.0.0.1"));

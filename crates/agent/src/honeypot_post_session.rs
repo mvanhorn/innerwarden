@@ -50,7 +50,11 @@ pub(crate) fn extract_commands_from_json(val: &serde_json::Value) -> Option<Vec<
             }
         }
     }
-    if commands.is_empty() { None } else { Some(commands) }
+    if commands.is_empty() {
+        None
+    } else {
+        Some(commands)
+    }
 }
 
 async fn read_credentials_from_evidence(path: &Path) -> Vec<(String, Option<String>)> {
@@ -70,7 +74,9 @@ async fn read_credentials_from_evidence(path: &Path) -> Vec<(String, Option<Stri
     creds
 }
 
-pub(crate) fn extract_credentials_from_json(val: &serde_json::Value) -> Option<Vec<(String, Option<String>)>> {
+pub(crate) fn extract_credentials_from_json(
+    val: &serde_json::Value,
+) -> Option<Vec<(String, Option<String>)>> {
     let mut creds = Vec::new();
     if val.get("type").and_then(|t| t.as_str()) == Some("ssh_connection") {
         if let Some(attempts) = val.get("auth_attempts").and_then(|a| a.as_array()) {
@@ -90,7 +96,11 @@ pub(crate) fn extract_credentials_from_json(val: &serde_json::Value) -> Option<V
             }
         }
     }
-    if creds.is_empty() { None } else { Some(creds) }
+    if creds.is_empty() {
+        None
+    } else {
+        Some(creds)
+    }
 }
 
 /// Spawned in the background after a honeypot session starts.
@@ -303,10 +313,16 @@ mod tests {
     #[test]
     fn test_extract_session_id_from_message() {
         let msg1 = "Honeypot listeners started (session xyz123, port 2222)";
-        assert_eq!(extract_session_id_from_message(msg1), Some("xyz123".to_string()));
+        assert_eq!(
+            extract_session_id_from_message(msg1),
+            Some("xyz123".to_string())
+        );
 
         let msg2 = "Honeypot session abc)";
-        assert_eq!(extract_session_id_from_message(msg2), Some("abc".to_string()));
+        assert_eq!(
+            extract_session_id_from_message(msg2),
+            Some("abc".to_string())
+        );
 
         let msg3 = "No connected instances here";
         assert_eq!(extract_session_id_from_message(msg3), None);
@@ -345,5 +361,39 @@ mod tests {
         assert_eq!(creds.len(), 2);
         assert_eq!(creds[0], ("root".to_string(), Some("123".to_string())));
         assert_eq!(creds[1], ("admin".to_string(), None));
+    }
+
+    // Test 18: Wrong event type returns None for commands
+    #[test]
+    fn test_extract_commands_wrong_type() {
+        let val = json!({
+            "type": "http_connection",
+            "shell_commands": [
+                { "command": "whoami" }
+            ]
+        });
+        assert_eq!(extract_commands_from_json(&val), None);
+    }
+
+    // Test 19: Wrong event type returns None for credentials
+    #[test]
+    fn test_extract_credentials_wrong_type() {
+        let val = json!({
+            "type": "http_connection",
+            "auth_attempts": [
+                { "username": "root", "password": "pass" }
+            ]
+        });
+        assert_eq!(extract_credentials_from_json(&val), None);
+    }
+
+    // Test 20: Session ID with trailing spaces is trimmed
+    #[test]
+    fn test_extract_session_id_trims_whitespace() {
+        let msg = "Honeypot listeners started (session   abc123  , port 22)";
+        assert_eq!(
+            extract_session_id_from_message(msg),
+            Some("abc123".to_string())
+        );
     }
 }

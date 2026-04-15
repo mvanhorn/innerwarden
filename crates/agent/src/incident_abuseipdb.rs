@@ -244,17 +244,17 @@ pub(crate) fn is_eligible_for_abuseipdb_autoblock(
     if threshold == 0 || score < threshold {
         return Some(AbuseIpDbBlockResult::BelowScoreThreshold);
     }
-    
+
     // Protected IP check: skip auto-block for protected ranges.
     if allowlist::is_ip_allowlisted(ip, protected_ips) {
         return Some(AbuseIpDbBlockResult::SkipProtectedIp);
     }
-    
+
     // Never auto-block active operator sessions.
     if operator_ips.contains_key(ip) {
         return Some(AbuseIpDbBlockResult::SkipOperator);
     }
-    
+
     if cloud_safelist::is_cloud_provider_ip(ip) {
         return Some(AbuseIpDbBlockResult::SkipCloudSafelist);
     }
@@ -267,43 +267,90 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    // Test 7: Valid block scenario — score exceeds threshold
     #[test]
-    fn test_is_eligible_for_abuseipdb_autoblock() {
+    fn test_eligible_when_score_exceeds_threshold() {
         let operators = HashMap::new();
         let protected: Vec<String> = vec![];
-
-        // Valid block scenario
         assert_eq!(
             is_eligible_for_abuseipdb_autoblock("8.8.8.8", 100, 90, &protected, &operators),
             Some(AbuseIpDbBlockResult::Eligible)
         );
+    }
 
-        // Below threshold scenario
+    // Test 8: Below threshold — score is lower than threshold
+    #[test]
+    fn test_below_threshold_returns_skip() {
+        let operators = HashMap::new();
+        let protected: Vec<String> = vec![];
         assert_eq!(
             is_eligible_for_abuseipdb_autoblock("8.8.8.8", 50, 90, &protected, &operators),
             Some(AbuseIpDbBlockResult::BelowScoreThreshold)
         );
+    }
 
-        // 0 threshold disables auto-blocking
+    // Test 9: Zero threshold disables auto-blocking entirely
+    #[test]
+    fn test_zero_threshold_disables_autoblock() {
+        let operators = HashMap::new();
+        let protected: Vec<String> = vec![];
         assert_eq!(
             is_eligible_for_abuseipdb_autoblock("8.8.8.8", 100, 0, &protected, &operators),
             Some(AbuseIpDbBlockResult::BelowScoreThreshold)
         );
+    }
 
-        // Operator IP
+    // Test 10: Score exactly AT threshold is still eligible
+    #[test]
+    fn test_score_at_threshold_boundary_is_eligible() {
+        let operators = HashMap::new();
+        let protected: Vec<String> = vec![];
+        assert_eq!(
+            is_eligible_for_abuseipdb_autoblock("1.1.1.1", 90, 90, &protected, &operators),
+            Some(AbuseIpDbBlockResult::Eligible)
+        );
+    }
+
+    // Test 11: Score one below threshold is NOT eligible
+    #[test]
+    fn test_score_one_below_threshold_not_eligible() {
+        let operators = HashMap::new();
+        let protected: Vec<String> = vec![];
+        assert_eq!(
+            is_eligible_for_abuseipdb_autoblock("1.1.1.1", 89, 90, &protected, &operators),
+            Some(AbuseIpDbBlockResult::BelowScoreThreshold)
+        );
+    }
+
+    // Test 12: Operator session IP is never auto-blocked
+    #[test]
+    fn test_operator_ip_skipped() {
+        let protected: Vec<String> = vec![];
         let mut op_map = HashMap::new();
         op_map.insert("10.0.0.1".to_string(), std::time::Instant::now());
         assert_eq!(
             is_eligible_for_abuseipdb_autoblock("10.0.0.1", 100, 90, &protected, &op_map),
             Some(AbuseIpDbBlockResult::SkipOperator)
         );
+    }
 
-        // Cloud safelist (assuming 169.254.x.x or AWS ranges, e.g. AWS ranges handled by cloud_safelist)
-        // using mock known cloud API IP or we can test protected_ips instead.
-        let protected2 = vec!["1.2.3.4".to_string()];
+    // Test 13: Protected IP is skipped
+    #[test]
+    fn test_protected_ip_skipped() {
+        let protected = vec!["1.2.3.4".to_string()];
         assert_eq!(
-            is_eligible_for_abuseipdb_autoblock("1.2.3.4", 100, 90, &protected2, &HashMap::new()),
+            is_eligible_for_abuseipdb_autoblock("1.2.3.4", 100, 90, &protected, &HashMap::new()),
             Some(AbuseIpDbBlockResult::SkipProtectedIp)
+        );
+    }
+
+    // Test 14: Non-protected IP is NOT skipped
+    #[test]
+    fn test_non_protected_ip_eligible() {
+        let protected = vec!["1.2.3.4".to_string()];
+        assert_eq!(
+            is_eligible_for_abuseipdb_autoblock("5.6.7.8", 100, 90, &protected, &HashMap::new()),
+            Some(AbuseIpDbBlockResult::Eligible)
         );
     }
 }
