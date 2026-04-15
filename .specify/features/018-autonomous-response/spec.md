@@ -1,6 +1,16 @@
 # Spec 018: Autonomous Response — From Observer to Defender
 
-## Status: DRAFT
+## Status: Phases A-D DONE. Phase E (validation) in progress.
+
+### Phase completion
+
+| Phase | Description | Status | PR |
+|-------|-------------|--------|-----|
+| A | Layer 1 — deterministic auto-response rules (5 rules) | ✅ DONE | #107 |
+| B | Layer 2 — correlation-driven escalation (chains + repeat offender + multi-technique) | ✅ DONE | #113 |
+| C | Noise-gate reform + confidence threshold 0.80→0.85 | ✅ DONE | #113 |
+| D | Model learning — brain trains from all decision layers | ✅ DONE | #113 |
+| E | First-hour validation on clean server | 🔄 IN PROGRESS | — |
 
 ## Problem
 
