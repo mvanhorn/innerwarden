@@ -16,9 +16,10 @@ async function loadSensors() {
     // HUD stat cards
     let html = '';
     html += '<div class="hud-card"><div class="hud-val">' + (data.total_events||0).toLocaleString() + '</div><div class="hud-label">Events Today</div></div>';
-    var incClass = getUnresolved().unresolved > 0 ? 'danger' : 'safe';
-    var incSuffix = data.total_incidents > 0 && getUnresolved().unresolved === 0 ? ' <span style="font-size:0.5rem;opacity:0.7">(all handled)</span>' : '';
-    html += '<div class="hud-card"><div class="hud-val ' + incClass + '">' + (data.total_incidents||0) + incSuffix + '</div><div class="hud-label">Incidents</div></div>';
+    var unresolved = getUnresolved().unresolved;
+    var incClass = unresolved > 0 ? 'danger' : 'safe';
+    var incSuffix = data.total_incidents > 0 && unresolved === 0 ? '<div style="font-size:0.6rem;opacity:0.6;margin-top:2px">all handled</div>' : '';
+    html += '<div class="hud-card"><div class="hud-val ' + incClass + '">' + (data.total_incidents||0) + '</div>' + incSuffix + '<div class="hud-label">Incidents</div></div>';
     html += '<div class="hud-card"><div class="hud-val safe">' + (data.sources||[]).length + '</div><div class="hud-label">Sources Active</div></div>';
     html += '<div class="hud-card"><div class="hud-val">' + (data.detectors||[]).length + '</div><div class="hud-label">Detectors Firing</div></div>';
     cards.innerHTML = html;

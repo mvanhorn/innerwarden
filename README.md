@@ -12,6 +12,8 @@ curl -fsSL https://innerwarden.com/install | sudo bash
 
 Installs in 10 seconds. Starts in observe-only mode. Dry-run by default. You decide when to go live.
 
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/InnerWarden/innerwarden/badge)](https://scorecard.dev/viewer/?uri=github.com/InnerWarden/innerwarden)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/10870/badge)](https://www.bestpractices.dev/projects/10870)
 [![CI](https://github.com/InnerWarden/innerwarden/actions/workflows/ci.yml/badge.svg)](https://github.com/InnerWarden/innerwarden/actions/workflows/ci.yml)
 [![Security](https://github.com/InnerWarden/innerwarden/actions/workflows/security.yml/badge.svg)](https://github.com/InnerWarden/innerwarden/actions/workflows/security.yml)
 [![Release](https://img.shields.io/github/v/release/InnerWarden/innerwarden?label=release&color=blue)](https://github.com/InnerWarden/innerwarden/releases/latest)
