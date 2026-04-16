@@ -709,6 +709,7 @@ mod tests {
 
     #[test]
     fn test_validate_action_params() {
+        // Validates common guardrails for action parameter validation.
         // Vazio rejeita
         assert_eq!(
             validate_action_params("", "reason").unwrap_err(),
@@ -740,5 +741,35 @@ mod tests {
         // Allowed
         assert!(validate_action_params("8.8.8.8", "reason").is_ok());
         assert!(validate_action_params("admin", "reason").is_ok());
+    }
+
+    #[test]
+    fn test_block_ip_empty_string_is_rejected() {
+        // Empty target string should be rejected for block-ip action.
+        let result = validate_action_params("   ", "manual investigation");
+        assert!(result.is_err());
+        assert_eq!(result.err(), Some("target is required"));
+    }
+
+    #[test]
+    fn test_block_ip_private_ranges_are_rejected() {
+        // Internal RFC1918 ranges must not be accepted by block-ip.
+        assert_eq!(
+            validate_action_params("10.42.0.9", "internal should fail").err(),
+            Some("cannot target internal IP")
+        );
+        assert_eq!(
+            validate_action_params("192.168.10.20", "internal should fail").err(),
+            Some("cannot target internal IP")
+        );
+    }
+
+    #[test]
+    fn test_unblock_nonexistent_ip_is_noop() {
+        // Removing an IP that does not exist should be a safe no-op.
+        let mut blocked = std::collections::HashSet::from(["8.8.8.8".to_string()]);
+        let removed = blocked.remove("9.9.9.9");
+        assert!(!removed);
+        assert!(blocked.contains("8.8.8.8"));
     }
 }

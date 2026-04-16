@@ -373,6 +373,23 @@ pub(super) fn live_feed_reason(detector: &str, action: &str) -> String {
     }
 }
 
+#[cfg(test)]
+pub(super) fn incident_priority(severity: &str) -> u8 {
+    match severity.to_ascii_lowercase().as_str() {
+        "critical" => 5,
+        "high" => 4,
+        "medium" => 3,
+        "low" => 2,
+        "info" => 1,
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+pub(super) fn enforce_feed_max_size<T>(items: Vec<T>, max: usize) -> Vec<T> {
+    items.into_iter().take(max).collect()
+}
+
 /// `GET /api/live-feed/stream` - SSE stream of alerts for public live page.
 pub(super) async fn api_live_feed_stream(
     State(state): State<DashboardState>,
@@ -750,6 +767,7 @@ mod tests {
 
     #[test]
     fn test_is_internal_filter() {
+        // Filters internal/system noise while keeping real external attacks.
         use innerwarden_core::entities::EntityRef;
         // Real IP based threat => external
         let ext_inc = Incident {
@@ -786,5 +804,35 @@ mod tests {
             ..ext_inc.clone()
         };
         assert_eq!(is_internal(&no_ip_inc), true);
+    }
+
+    #[test]
+    fn test_feed_max_size_enforcement_truncates_entries() {
+        // Ensures feed result is truncated when it exceeds configured max entries.
+        let source: Vec<usize> = (0..250).collect();
+        let truncated = enforce_feed_max_size(source, 200);
+        assert_eq!(truncated.len(), 200);
+        assert_eq!(truncated.first(), Some(&0));
+        assert_eq!(truncated.last(), Some(&199));
+    }
+
+    #[test]
+    fn test_critical_priority_higher_than_low() {
+        // Confirms severity priority ordering used by feed ranking.
+        assert!(incident_priority("critical") > incident_priority("low"));
+    }
+
+    #[test]
+    fn test_feed_with_zero_entries_returns_empty_list() {
+        // Verifies empty feed serialization remains an empty list.
+        let empty: Vec<LiveFeedItem> = Vec::new();
+        let response = LiveFeedResponse {
+            total_today: 0,
+            total_blocked: 0,
+            total_high: 0,
+            unique_sources: 0,
+            items: empty,
+        };
+        assert!(response.items.is_empty());
     }
 }

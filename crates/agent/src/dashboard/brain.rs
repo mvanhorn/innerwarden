@@ -40,7 +40,7 @@ pub(super) fn compute_brain_stats(
     serde_json::json!({
         "loaded": model_exists,
         "total_suggestions": total,
-        "agreement_rate": if total > 0 { format!("{:.1}%", agreed as f32 / total as f32 * 100.0) } else { "N/A".to_string() },
+        "agreement_rate": if total > 0 { format!("{:.1}%", agreed as f32 / total as f32 * 100.0) } else { "0.0%".to_string() },
         "tp_count": tp,
         "fp_count": fp,
         "unreviewed": unreviewed,
@@ -119,6 +119,7 @@ mod tests {
 
     #[test]
     fn test_compute_brain_stats() {
+        // Computes core defender-brain counters and agreement percentage.
         let entries = vec![
             serde_json::json!({"incident_id": "1", "agreed": true, "feedback": true}),
             serde_json::json!({"incident_id": "2", "agreed": false, "feedback": false}),
@@ -134,5 +135,13 @@ mod tests {
         assert_eq!(stats["unreviewed"], 1);
         assert_eq!(stats["agreement_rate"], "66.7%");
         assert_eq!(stats["last_retrain_accuracy"], 0.95);
+    }
+
+    #[test]
+    fn test_compute_brain_stats_zero_total_uses_zero_percent() {
+        // Zero total entries must produce 0.0% and avoid division by zero.
+        let stats = compute_brain_stats(&[], &serde_json::json!({}));
+        assert_eq!(stats["total_suggestions"], 0);
+        assert_eq!(stats["agreement_rate"], "0.0%");
     }
 }

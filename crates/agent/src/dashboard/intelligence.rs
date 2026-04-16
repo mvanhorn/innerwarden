@@ -624,6 +624,7 @@ mod tests {
 
     #[test]
     fn test_sort_attacker_profiles_missing_fields() {
+        // Missing score fields default safely and still sort/filter deterministically.
         let profiles = vec![
             serde_json::json!({"ip": "1.1.1.1"}), // missing risk_score, defaults to 0
         ];
@@ -632,5 +633,23 @@ mod tests {
 
         let filtered = sort_attacker_profiles(profiles, 1, "risk_score");
         assert_eq!(filtered.len(), 0);
+    }
+
+    #[test]
+    fn test_min_risk_100_filters_everything() {
+        // min_risk=100 should filter all profiles below 100.
+        let profiles = vec![
+            serde_json::json!({"ip": "1.1.1.1", "risk_score": 99}),
+            serde_json::json!({"ip": "2.2.2.2", "risk_score": 10}),
+        ];
+        let filtered = sort_attacker_profiles(profiles, 100, "risk_score");
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn test_sort_empty_list_does_not_panic() {
+        // Sorting an empty profile list should be stable and panic-free.
+        let filtered = sort_attacker_profiles(Vec::new(), 0, "risk_score");
+        assert!(filtered.is_empty());
     }
 }

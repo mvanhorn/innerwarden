@@ -41,8 +41,12 @@ self.addEventListener('notificationclick', function(event) {
 pub(super) async fn api_push_vapid_key(State(state): State<DashboardState>) -> impl IntoResponse {
     Json(serde_json::json!({
         "publicKey": state.web_push_vapid_public_key,
-        "enabled": !state.web_push_vapid_public_key.is_empty(),
+        "enabled": web_push_enabled(&state.web_push_vapid_public_key),
     }))
+}
+
+pub(super) fn web_push_enabled(vapid_public_key: &str) -> bool {
+    !vapid_public_key.trim().is_empty()
 }
 
 #[derive(Deserialize)]
@@ -116,6 +120,7 @@ mod tests {
 
     #[test]
     fn test_push_subscribe_body_deserialization() {
+        // Parses web-push subscription payload sent by browser clients.
         let json = r#"{
             "endpoint": "https://push.example.com",
             "keys": {
@@ -128,5 +133,13 @@ mod tests {
         assert_eq!(body.endpoint, "https://push.example.com");
         assert_eq!(body.keys.p256dh, "dummy_p256dh");
         assert_eq!(body.keys.auth, "dummy_auth");
+    }
+
+    #[test]
+    fn test_empty_vapid_key_disables_web_push() {
+        // Empty VAPID keys should mark web push as disabled.
+        assert!(!web_push_enabled(""));
+        assert!(!web_push_enabled("   "));
+        assert!(web_push_enabled("BElongPublicKey"));
     }
 }

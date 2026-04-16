@@ -166,6 +166,7 @@ mod tests {
 
     #[test]
     fn test_extract_alert_entity() {
+        // Picks best entity representation for alert payload rendering.
         let root_inc = Incident {
             ts: Utc::now(),
             host: "test".to_string(),
@@ -211,5 +212,11 @@ mod tests {
         let (etype, eval) = extract_alert_entity(&empty_inc);
         assert_eq!(etype, "ip");
         assert_eq!(eval, "unknown");
+    }
+
+    #[test]
+    fn test_sse_connection_count_starts_at_zero() {
+        // The global SSE connection counter should be initialized to zero.
+        assert_eq!(SSE_CONNECTIONS.load(Ordering::Relaxed), 0);
     }
 }

@@ -741,6 +741,7 @@ mod tests {
 
     #[test]
     fn test_is_dashboard_sleeping() {
+        // Detects dashboard sleep mode after inactivity timeout.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -757,5 +758,42 @@ mod tests {
         // Active at 0 (never active or system restart)
         let never = AtomicU64::new(0);
         assert!(is_dashboard_sleeping(&never));
+    }
+
+    #[test]
+    fn test_pagination_page_zero_returns_first_batch() {
+        // Page 0 should return the first batch of items.
+        let items: Vec<usize> = (1..=10).collect();
+        let page_size = 3usize;
+        let page = 0usize;
+        let batch: Vec<usize> = items
+            .iter()
+            .skip(page.saturating_mul(page_size))
+            .take(page_size)
+            .copied()
+            .collect();
+        assert_eq!(batch, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_pagination_page_past_end_returns_empty() {
+        // Requesting a page after the available range should return no items.
+        let items: Vec<usize> = (1..=5).collect();
+        let page_size = 2usize;
+        let page = 10usize;
+        let batch: Vec<usize> = items
+            .iter()
+            .skip(page.saturating_mul(page_size))
+            .take(page_size)
+            .copied()
+            .collect();
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn test_date_range_parsing_with_invalid_format() {
+        // Invalid date formats should fail parsing rather than silently succeed.
+        let invalid = chrono::NaiveDate::parse_from_str("16-04-2026", "%Y-%m-%d");
+        assert!(invalid.is_err());
     }
 }

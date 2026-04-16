@@ -431,10 +431,30 @@ mod tests {
 
     #[test]
     fn test_verify_hash_chain_single() {
+        // Single-entry chain should be valid and report length one.
         let entry1 = r#"{"action":"block", "prev_hash": null}"#;
         // With 1 entry, chain is always intact since there is no missing preceding hash
         let (intact, len, _) = verify_hash_chain(entry1);
         assert!(intact);
         assert_eq!(len, 1);
+    }
+
+    #[test]
+    fn test_verify_hash_chain_single_entry_last_hash_present() {
+        // Single entry should still produce a concrete hash value.
+        let entry = r#"{"action":"monitor", "prev_hash": null}"#;
+        let (intact, len, last) = verify_hash_chain(entry);
+        assert!(intact);
+        assert_eq!(len, 1);
+        assert_ne!(last, "none");
+    }
+
+    #[test]
+    fn test_verify_hash_chain_empty_returns_none_hash() {
+        // Empty chain should return none as sentinel hash value.
+        let (intact, len, last) = verify_hash_chain("");
+        assert!(intact);
+        assert_eq!(len, 0);
+        assert_eq!(last, "none");
     }
 }
