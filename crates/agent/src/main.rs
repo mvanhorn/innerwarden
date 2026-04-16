@@ -1318,7 +1318,12 @@ async fn main() -> Result<()> {
         hypervisor_environment: None,
         killchain_tracker: innerwarden_killchain::tracker::PidTracker::new()
             .with_timeout(cfg.killchain.session_timeout_secs)
-            .with_pre_chain_threshold(cfg.killchain.pre_chain_threshold),
+            .with_pre_chain_threshold(cfg.killchain.pre_chain_threshold)
+            .with_excluded_comms(
+                killchain_inline::KILLCHAIN_SELF_EXCLUDED_COMMS
+                    .iter()
+                    .copied(),
+            ),
         last_killchain_cleanup: std::time::Instant::now(),
         dna_state: dna_inline::DnaState::new(
             &cli.data_dir.join("dna"),

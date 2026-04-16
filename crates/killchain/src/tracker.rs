@@ -4,7 +4,7 @@
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{debug, info};
 
 use crate::bridge;
@@ -21,6 +21,11 @@ pub struct PidTracker {
     /// Fraction of bits that must be set before emitting a pre-chain warning.
     /// Default: 0.67 (i.e. 2 out of 3 bits).
     pre_chain_threshold: f32,
+    /// Process names (`comm`) whose events are ignored entirely. Used to
+    /// prevent the platform from flagging its own threads (e.g. the agent's
+    /// `tokio-rt-worker` threads read credentials + call outbound APIs, which
+    /// trivially matches DATA_EXFIL even though there is no attack).
+    excluded_comms: HashSet<String>,
 }
 
 impl PidTracker {
@@ -29,6 +34,7 @@ impl PidTracker {
             pids: HashMap::new(),
             session_timeout_secs: 300, // 5 minutes
             pre_chain_threshold: 0.6,
+            excluded_comms: HashSet::new(),
         }
     }
 
@@ -40,6 +46,23 @@ impl PidTracker {
     pub fn with_pre_chain_threshold(mut self, threshold: f32) -> Self {
         self.pre_chain_threshold = threshold;
         self
+    }
+
+    /// Replace the set of `comm` names whose events are ignored. Typical
+    /// callers pass their own platform/infra thread names so they are not
+    /// treated as attackers.
+    pub fn with_excluded_comms<I, S>(mut self, comms: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.excluded_comms = comms.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Returns true if the given `comm` is in the exclusion set.
+    pub fn is_excluded_comm(&self, comm: &str) -> bool {
+        self.excluded_comms.contains(comm)
     }
 
     /// Insert a pre-built PidChainState (used in tests).
@@ -87,6 +110,14 @@ impl PidTracker {
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string();
+
+        // Skip events from processes the caller explicitly excluded (e.g. the
+        // platform's own threads). Without this, long-running daemons that
+        // legitimately mix outbound I/O with sensitive file reads trip DATA_EXFIL
+        // against themselves.
+        if self.excluded_comms.contains(&comm) {
+            return vec![];
+        }
 
         let ts_str = event.get("ts").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -795,6 +826,126 @@ mod tests {
     // ---------------------------------------------------------------
     // Stats
     // ---------------------------------------------------------------
+
+    // ---------------------------------------------------------------
+    // Self-exclusion: platform can suppress its own threads
+    // ---------------------------------------------------------------
+
+    fn make_event_with_comm(kind: &str, pid: u32, comm: &str, details_extra: Value) -> Value {
+        let mut details = json!({"pid": pid, "uid": 1000, "comm": comm});
+        if let Value::Object(map) = details_extra {
+            for (k, v) in map {
+                details[k] = v;
+            }
+        }
+        json!({
+            "kind": kind,
+            "ts": ts(),
+            "host": "production",
+            "details": details
+        })
+    }
+
+    #[test]
+    fn excluded_comm_is_skipped_entirely() {
+        let mut tracker = PidTracker::new().with_excluded_comms(["tokio-rt-worker"]);
+        assert!(tracker.is_excluded_comm("tokio-rt-worker"));
+
+        // DATA_EXFIL = outbound_connect + sensitive_read. Both arrive for the
+        // excluded comm — neither should be tracked nor emit anything.
+        let connect = make_event_with_comm(
+            "network.outbound_connect",
+            1234,
+            "tokio-rt-worker",
+            json!({"dst_ip": "1.2.3.4", "dst_port": 443}),
+        );
+        let read = make_event_with_comm(
+            "file.read_access",
+            1234,
+            "tokio-rt-worker",
+            json!({"filename": "/root/.ssh/id_rsa"}),
+        );
+
+        let incidents1 = tracker.process_event(&connect);
+        let incidents2 = tracker.process_event(&read);
+        assert!(incidents1.is_empty());
+        assert!(incidents2.is_empty());
+        assert!(
+            tracker.get_state(1234).is_none(),
+            "excluded comm must not create tracker state"
+        );
+        assert_eq!(tracker.stats(), (0, 0, 0));
+    }
+
+    #[test]
+    fn excluded_comm_does_not_affect_other_processes() {
+        let mut tracker = PidTracker::new().with_excluded_comms(["innerwarden-age"]);
+
+        // Different comm: full DATA_EXFIL chain must still fire.
+        let connect = make_event_with_comm(
+            "network.outbound_connect",
+            4444,
+            "attacker",
+            json!({"dst_ip": "185.234.1.1", "dst_port": 9999}),
+        );
+        let read = make_event_with_comm(
+            "file.read_access",
+            4444,
+            "attacker",
+            json!({"filename": "/etc/shadow"}),
+        );
+
+        tracker.process_event(&connect);
+        let incidents = tracker.process_event(&read);
+        let fulls: Vec<&Value> = incidents
+            .iter()
+            .filter(|i| i["severity"] == "critical")
+            .collect();
+        assert!(
+            !fulls.is_empty(),
+            "attacker DATA_EXFIL must still fire when a different comm is excluded"
+        );
+    }
+
+    #[test]
+    fn with_excluded_comms_replaces_previous_set() {
+        let tracker = PidTracker::new()
+            .with_excluded_comms(["a", "b"])
+            .with_excluded_comms(["c"]);
+        assert!(!tracker.is_excluded_comm("a"));
+        assert!(!tracker.is_excluded_comm("b"));
+        assert!(tracker.is_excluded_comm("c"));
+    }
+
+    #[test]
+    fn empty_exclusion_set_by_default() {
+        let tracker = PidTracker::new();
+        assert!(!tracker.is_excluded_comm("tokio-rt-worker"));
+        assert!(!tracker.is_excluded_comm(""));
+    }
+
+    #[test]
+    fn excluded_comm_blocks_pre_chain_too() {
+        // 2/3 bits would normally emit a pre-chain warning. Exclusion must
+        // short-circuit before the pre-chain check fires.
+        let mut tracker = PidTracker::new().with_excluded_comms(["infra-thread"]);
+
+        let connect = make_event_with_comm(
+            "network.outbound_connect",
+            9000,
+            "infra-thread",
+            json!({"dst_ip": "10.0.0.1", "dst_port": 443}),
+        );
+        let dup = make_event_with_comm(
+            "process.fd_redirect",
+            9000,
+            "infra-thread",
+            json!({"newfd": 0}),
+        );
+        tracker.process_event(&connect);
+        let incidents = tracker.process_event(&dup);
+        assert!(incidents.is_empty(), "excluded comm must suppress pre-chain");
+    }
 
     #[test]
     fn stats_reflect_state() {
