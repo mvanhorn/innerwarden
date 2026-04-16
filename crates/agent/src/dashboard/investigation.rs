@@ -2060,3 +2060,101 @@ pub(super) fn render_markdown_snapshot(snapshot: &InvestigationExport) -> String
 
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    #[test]
+    fn test_format_duration() {
+        assert_eq!(format_duration(45), "45s");
+        assert_eq!(format_duration(0), "0s");
+        assert_eq!(format_duration(-10), "0s"); // fallback handling
+        assert_eq!(format_duration(125), "2m 5s");
+        assert_eq!(format_duration(120), "2m");
+        assert_eq!(format_duration(3600), "1h");
+        assert_eq!(format_duration(3665), "1h 1m");
+    }
+
+    #[test]
+    fn test_derive_verdict_blocked() {
+        let ts = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
+        let entries = vec![
+            JourneyEntry {
+                ts,
+                kind: "event".to_string(),
+                data: serde_json::json!({"event_kind": "nmap_port_scan"}),
+            },
+            JourneyEntry {
+                ts,
+                kind: "incident".to_string(),
+                data: serde_json::json!({"incident_id": "port_scan:1"}),
+            },
+            JourneyEntry {
+                ts,
+                kind: "decision".to_string(),
+                data: serde_json::json!({"action_type": "block_ip"}),
+            },
+        ];
+
+        let verdict = derive_verdict(&entries, "blocked");
+        assert_eq!(verdict.entry_vector, "port_scan");
+        assert_eq!(verdict.access_status, "no_evidence_of_success");
+        assert_eq!(verdict.containment_status, "blocked");
+        assert_eq!(verdict.confidence, "high"); // has event + incident + decision
+    }
+
+    #[test]
+    fn test_derive_chapters() {
+        let ts = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
+        let entries = vec![
+            JourneyEntry {
+                ts,
+                kind: "event".to_string(),
+                data: serde_json::json!({"event_kind": "login_attempt", "details": {"user": "admin"}}),
+            },
+            JourneyEntry {
+                ts,
+                kind: "event".to_string(),
+                data: serde_json::json!({"event_kind": "login_attempt", "details": {"user": "root"}}),
+            },
+            JourneyEntry {
+                ts,
+                kind: "incident".to_string(),
+                data: serde_json::json!({"incident_id": "ssh_bruteforce:1"}),
+            },
+        ];
+
+        let chapters = derive_chapters(&entries);
+        assert_eq!(chapters.len(), 2);
+
+        let ch1 = &chapters[0];
+        assert_eq!(ch1.stage, "initial_access_attempt");
+        assert_eq!(ch1.entry_count, 2);
+        assert!(
+            ch1.evidence_highlights.contains(&"admin".to_string())
+                || ch1.evidence_highlights.contains(&"root".to_string())
+        );
+
+        let ch2 = &chapters[1];
+        assert_eq!(ch2.stage, "response");
+        assert_eq!(ch2.entry_count, 1);
+    }
+
+    #[test]
+    fn test_build_journey_summary_with_hints() {
+        // Build summary with no entries
+        let summary = build_journey_summary(
+            &[],
+            "unknown",
+            PivotKind::Ip,
+            "10.0.0.1",
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(summary.total_entries, 0);
+        assert!(summary.hints[0].contains("No timeline entries"));
+    }
+}
