@@ -105,6 +105,8 @@ mod threat_feeds;
 mod threat_report;
 mod trust_rules;
 #[allow(dead_code)]
+mod trust_scoring;
+#[allow(dead_code)]
 mod two_factor;
 mod web_push;
 mod webhook;
