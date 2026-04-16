@@ -97,8 +97,12 @@ pub struct AgentConfig {
     pub observation: crate::observation_verify::ObservationConfig,
     /// Trust scoring engine — continuous entity trust scores (spec 020 Phase C).
     #[serde(default)]
-    #[allow(dead_code)] // Phase C integration reads this
+    #[allow(dead_code)]
     pub trust_scoring: crate::trust_scoring::TrustScoringConfig,
+    /// SOC daily checks — system health checks at configurable hour (spec 020 Phase D).
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub soc_checks: crate::soc_checks::SocChecksConfig,
     /// Detectors that run graph-only (sensor version suppressed).
     /// After parallel validation, add detector names here to disable the sensor version.
     /// Example: ["threat_intel", "lateral_movement", "persistence"]
