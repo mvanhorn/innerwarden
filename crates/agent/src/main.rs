@@ -3974,21 +3974,36 @@ fn is_pid_in_own_tree(pid: u32, own_pid: u32) -> bool {
     if pid == own_pid {
         return true;
     }
-    // Walk up the PPid chain (max 3 hops: thread → process → watchdog → init).
+    // Check /proc/PID/status for Tgid (thread group leader) and PPid.
+    // Tokio threads report PPid=1 (init) but Tgid=agent_pid.
+    let status_path = format!("/proc/{pid}/status");
+    let Ok(content) = std::fs::read_to_string(&status_path) else {
+        return false;
+    };
+    // Tgid = thread group ID. For threads, this is the main process PID.
+    let tgid = content
+        .lines()
+        .find(|l| l.starts_with("Tgid:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u32>().ok());
+    if tgid == Some(own_pid) {
+        return true;
+    }
+    // Walk PPid chain (max 3 hops) for child processes (not threads).
     let mut current = pid;
     for _ in 0..3 {
-        let status_path = format!("/proc/{current}/status");
-        let Ok(content) = std::fs::read_to_string(&status_path) else {
+        let path = format!("/proc/{current}/status");
+        let Ok(c) = std::fs::read_to_string(&path) else {
             return false;
         };
-        let ppid = content
+        let ppid = c
             .lines()
             .find(|l| l.starts_with("PPid:"))
             .and_then(|l| l.split_whitespace().nth(1))
             .and_then(|s| s.parse::<u32>().ok());
         match ppid {
             Some(p) if p == own_pid => return true,
-            Some(0) | Some(1) | None => return false, // reached init
+            Some(0) | Some(1) | None => return false,
             Some(p) => current = p,
         }
     }
