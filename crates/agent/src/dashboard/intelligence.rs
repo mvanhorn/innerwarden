@@ -183,22 +183,51 @@ pub(super) async fn api_graph_view(State(state): State<DashboardState>) -> Json<
         return Json(serde_json::json!({"nodes": [], "edges": []}));
     }
 
-    // Top 50 non-Incident nodes by degree. Strict cap to prevent browser crash.
-    let mut scored: Vec<(NodeId, usize)> = graph
+    // Build a useful subgraph: incidents + their connected entities (IPs, processes, users).
+    // This shows the "attack story" rather than a blob of unrelated infrastructure.
+    let mut keep: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+
+    // 1. Add all recent incidents (max 20).
+    let mut incidents: Vec<(NodeId, chrono::DateTime<chrono::Utc>)> = graph
         .nodes()
         .iter()
-        .filter(|(_, n)| n.node_type() != NodeType::Incident)
-        .map(|(&id, _)| {
-            let out = graph.outgoing.get(&id).map(|v| v.len()).unwrap_or(0);
-            let inc = graph.incoming.get(&id).map(|v| v.len()).unwrap_or(0);
-            (id, out + inc)
+        .filter_map(|(&id, n)| match n {
+            Node::Incident { ts, .. } => Some((id, *ts)),
+            _ => None,
         })
-        .filter(|(_, degree)| *degree >= 2)
         .collect();
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
-    scored.truncate(50);
-    let node_ids: Vec<NodeId> = scored.into_iter().map(|(id, _)| id).collect();
-    let keep: std::collections::HashSet<NodeId> = node_ids.iter().copied().collect();
+    incidents.sort_by(|a, b| b.1.cmp(&a.1));
+    incidents.truncate(20);
+    for (id, _) in &incidents {
+        keep.insert(*id);
+        // Add nodes connected to each incident (IP, process, user).
+        for edge in graph.all_edges(*id) {
+            keep.insert(edge.from);
+            keep.insert(edge.to);
+        }
+    }
+
+    // 2. Fill remaining slots with high-degree infrastructure nodes (IPs, processes).
+    if keep.len() < 80 {
+        let mut scored: Vec<(NodeId, usize)> = graph
+            .nodes()
+            .iter()
+            .filter(|(id, n)| !keep.contains(id) && n.node_type() != NodeType::Incident)
+            .map(|(&id, _)| {
+                let out = graph.outgoing.get(&id).map(|v| v.len()).unwrap_or(0);
+                let inc = graph.incoming.get(&id).map(|v| v.len()).unwrap_or(0);
+                (id, out + inc)
+            })
+            .filter(|(_, degree)| *degree >= 3)
+            .collect();
+        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        for (id, _) in scored.into_iter().take(80 - keep.len()) {
+            keep.insert(id);
+        }
+    }
+
+    // Cap at 100 nodes to prevent browser crash.
+    let node_ids: Vec<NodeId> = keep.iter().copied().collect();
 
     let cy_nodes: Vec<serde_json::Value> = node_ids
         .iter()

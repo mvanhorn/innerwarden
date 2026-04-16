@@ -138,10 +138,7 @@ async function loadGraph() {
       }
     });
 
-    if (statusEl) statusEl.textContent = `${view.nodes.length} nodes, ${view.edges.length} edges`;
-
-    // Apply default filter (topology = hide incidents)
-    filterGraph();
+    if (statusEl) statusEl.textContent = `Showing ${view.nodes.length} of ${stats.node_count||'?'} nodes, ${view.edges.length} edges`;
   } catch (e) {
     if (statusEl) statusEl.textContent = 'Error: ' + e.message;
   }

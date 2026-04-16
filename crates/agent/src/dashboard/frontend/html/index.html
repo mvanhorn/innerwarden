@@ -341,13 +341,13 @@
     <div class="report-toolbar">
       <button type="button" class="report-refresh-btn" onclick="loadGraph()">↻ Refresh</button>
       <select id="graphFilter" onchange="filterGraph()" style="background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px 8px;margin-left:8px;">
-        <option value="topology">Topology (no incidents)</option>
         <option value="all">All nodes</option>
+        <option value="topology">Infrastructure only</option>
         <option value="Process">Processes</option>
         <option value="Ip">IPs</option>
         <option value="File">Files</option>
-        <option value="Incident">Incidents only</option>
-        <option value="threat">Threat Intel only</option>
+        <option value="Incident">Incidents</option>
+        <option value="threat">Threat Intel</option>
       </select>
       <input type="text" id="graphSearch" placeholder="Search IP, process, domain…" oninput="searchGraph()" style="margin-left:8px;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);width:180px;">
       <button type="button" onclick="exportGraphPng()" style="margin-left:4px;padding:4px 10px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);cursor:pointer;font-size:0.72rem;">Export PNG</button>
