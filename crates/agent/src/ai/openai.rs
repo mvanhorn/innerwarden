@@ -30,6 +30,7 @@ fn uses_new_token_param(model: &str) -> bool {
 }
 
 impl OpenAiProvider {
+    #[allow(dead_code)] // Used when provider = "openai" (matched explicitly in factory)
     pub fn new(api_key: String, model: String) -> Self {
         Self::with_base_url(api_key, model, "https://api.openai.com".to_string())
     }

@@ -371,7 +371,8 @@ fn run_module_preflight(pf: &module_manifest::ModulePreflightSpec) -> (bool, Str
                 .any(|l| l.split(':').next().is_some_and(|u| u == pf.value));
             (exists, format!("user '{}' does not exist", pf.value))
         }
-        _ => (true, String::new()), // unknown kind = pass (fail-open)
+        // SEC-009: Fail closed on unknown preflight kinds.
+        other => (false, format!("unknown preflight kind '{}'", other)),
     }
 }
 
@@ -630,7 +631,14 @@ pub(crate) fn cmd_module_install(
     use module_manifest::ModuleManifest;
     use module_package::*;
 
-    let is_url = source.starts_with("https://") || source.starts_with("http://");
+    // SEC-008: Reject insecure HTTP transport for module installation.
+    if source.starts_with("http://") {
+        anyhow::bail!(
+            "insecure HTTP transport is not allowed for module installation.\n\
+             Use https:// or a local file path instead."
+        );
+    }
+    let is_url = source.starts_with("https://");
     let is_path =
         source.starts_with('/') || source.starts_with('.') || std::path::Path::new(source).exists();
 

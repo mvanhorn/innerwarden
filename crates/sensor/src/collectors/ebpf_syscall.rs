@@ -54,8 +54,16 @@ pub fn is_ebpf_available() -> bool {
         return false;
     }
 
-    // eBPF bytecode exists
-    std::path::Path::new(EBPF_OBJ_PATH).exists() || std::path::Path::new(EBPF_OBJ_PATH_DEV).exists()
+    // eBPF bytecode exists: embedded builds always have it, otherwise check disk.
+    #[cfg(feature = "ebpf-embedded")]
+    {
+        true
+    }
+    #[cfg(not(feature = "ebpf-embedded"))]
+    {
+        std::path::Path::new(EBPF_OBJ_PATH).exists()
+            || std::path::Path::new(EBPF_OBJ_PATH_DEV).exists()
+    }
 }
 
 /// Find the eBPF bytecode file.

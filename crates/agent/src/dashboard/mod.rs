@@ -204,12 +204,24 @@ pub async fn serve(
     tls_key: Option<String>,
     insecure_no_tls: bool,
 ) -> Result<()> {
+    // SEC-005: Reject non-loopback bind without authentication.
+    let is_loopback_bind =
+        bind.starts_with("127.0.0.1") || bind.starts_with("[::1]") || bind.starts_with("localhost");
     if auth.is_none() {
-        warn!(
-            "dashboard is running WITHOUT authentication - \
-             set INNERWARDEN_DASHBOARD_USER and INNERWARDEN_DASHBOARD_PASSWORD_HASH \
-             in agent.env to require a login"
-        );
+        if is_loopback_bind {
+            warn!(
+                "dashboard is running WITHOUT authentication (loopback only) - \
+                 set INNERWARDEN_DASHBOARD_USER and INNERWARDEN_DASHBOARD_PASSWORD_HASH \
+                 in agent.env to require a login"
+            );
+        } else {
+            anyhow::bail!(
+                "dashboard bound to non-loopback address {} without authentication. \
+                 Set INNERWARDEN_DASHBOARD_USER and INNERWARDEN_DASHBOARD_PASSWORD_HASH, \
+                 or bind to 127.0.0.1 for unauthenticated local access.",
+                bind
+            );
+        }
     }
 
     // HTTPS warning: credentials sent in plaintext over non-localhost HTTP
@@ -328,9 +340,10 @@ pub async fn serve(
         }
     });
 
-    // Agent API routes - no auth required (localhost service-to-service)
-    // These are used by AI agents (OpenClaw, n8n, etc.) to query security state.
-    let agent_api = Router::new()
+    // SEC-006: Agent API routes — require auth when bound to non-loopback.
+    // On loopback, these remain unauthenticated for local service-to-service use
+    // (OpenClaw, n8n, etc.). On non-loopback, they go through the auth layer.
+    let agent_api_router = Router::new()
         .route(
             "/api/agent/security-context",
             get(api_agent_security_context),
@@ -347,8 +360,14 @@ pub async fn serve(
             "/api/agent-guard/disconnect",
             post(api_agent_guard_disconnect),
         )
-        .route("/api/agent-guard/agents", get(api_agent_guard_list))
-        .with_state(state.clone());
+        .route("/api/agent-guard/agents", get(api_agent_guard_list));
+    let agent_api = if is_loopback_bind {
+        agent_api_router.with_state(state.clone())
+    } else {
+        agent_api_router
+            .layer(auth_layer.clone())
+            .with_state(state.clone())
+    };
 
     // Auth login route - public (no auth required; this IS the auth endpoint)
     let auth_login = Router::new()
@@ -450,18 +469,25 @@ pub async fn serve(
         // Session management endpoints (auth-protected)
         .route("/api/auth/logout", post(api_auth_logout))
         .route("/api/auth/sessions", get(api_auth_sessions))
-        .layer(auth_layer)
+        .layer(auth_layer.clone())
         .with_state(state.clone());
 
-    // Public live-feed routes - CORS-enabled, no auth, read-only
-    let live_api = Router::new()
+    // SEC-007: Live-feed routes require auth on non-loopback binds.
+    // On loopback, they remain public for local integrations.
+    let live_api_router = Router::new()
         .route("/api/live-feed", get(api_live_feed))
         .route("/api/live-feed/stream", get(api_live_feed_stream))
         .route("/api/live-feed/geoip", get(api_live_feed_geoip))
         .route("/api/live-feed/honeypot", get(api_live_feed_honeypot))
-        .route("/api/live-feed/mitre", get(api_live_feed_mitre))
-        .layer(middleware::from_fn(cors_middleware))
-        .with_state(state);
+        .route("/api/live-feed/mitre", get(api_live_feed_mitre));
+    let live_api = if is_loopback_bind {
+        live_api_router
+            .layer(middleware::from_fn(cors_middleware))
+            .with_state(state)
+    } else {
+        // Non-loopback: no wildcard CORS, require auth
+        live_api_router.layer(auth_layer.clone()).with_state(state)
+    };
 
     let app = agent_api
         .merge(auth_login)
@@ -577,8 +603,13 @@ async fn build_tls_config(
             rcgen::DnType::OrganizationName,
             rcgen::DnValue::Utf8String("InnerWarden".to_string()),
         );
-        // Valid for 365 days
-        params.not_after = rcgen::date_time_ymd(2027, 4, 15);
+        // SEC-013: Valid for 365 days from now (not a hardcoded date).
+        let expiry = chrono::Utc::now() + chrono::Duration::days(365);
+        params.not_after = rcgen::date_time_ymd(
+            chrono::Datelike::year(&expiry),
+            chrono::Datelike::month(&expiry) as u8,
+            chrono::Datelike::day(&expiry) as u8,
+        );
         // Add SANs for common access patterns
         params.subject_alt_names = vec![
             rcgen::SanType::DnsName("localhost".try_into()?),

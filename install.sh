@@ -407,21 +407,25 @@ download_asset() {
     fail "Downloaded file is empty: ${asset}. The release may be corrupted."
   fi
 
-  if curl -fsSL "${base_url}/${asset}.sha256" | awk '{print $1}' > /tmp/iw-expected-sha256 2>/dev/null; then
+  local sha_tmpfile
+  sha_tmpfile="$(mktemp)" || fail "failed to create secure temporary file"
+  trap 'rm -f "${sha_tmpfile}"' RETURN
+  if curl -fsSL "${base_url}/${asset}.sha256" | awk '{print $1}' > "${sha_tmpfile}" 2>/dev/null; then
     local expected actual
-    expected="$(cat /tmp/iw-expected-sha256)"
+    expected="$(cat "${sha_tmpfile}")"
     # Use shasum on macOS, sha256sum on Linux
     if command -v sha256sum >/dev/null 2>&1; then
       actual="$(sha256sum "${dest}" | awk '{print $1}')"
     else
       actual="$(shasum -a 256 "${dest}" | awk '{print $1}')"
     fi
-    rm -f /tmp/iw-expected-sha256
+    rm -f "${sha_tmpfile}"
     if [[ "${expected}" != "${actual}" ]]; then
       fail "SHA-256 mismatch for ${asset}:\n  expected: ${expected}\n  got:      ${actual}"
     fi
     log "SHA-256 ok"
   else
+    rm -f "${sha_tmpfile}"
     log "warning: no SHA-256 sidecar for ${asset} - skipping integrity check"
   fi
 }
@@ -1020,10 +1024,11 @@ if [[ "${CANARY}" -eq 1 ]] && [[ "${IW_VERSION}" != "canary" ]]; then
   fi
 fi
 
-# Anonymous install ping (no personal data, just version + OS + arch)
-# Helps us understand how many people install InnerWarden.
-# View the source: this sends nothing beyond what's shown here.
-curl -s "https://innerwarden.com/api/ping?v=${IW_VERSION}&os=${OS_TYPE}&arch=${ARCH}" >/dev/null 2>&1 &
+# SEC-019: Install telemetry is opt-in only.
+# Set INNERWARDEN_TELEMETRY=1 to send an anonymous install ping (version + OS + arch).
+if [[ "${INNERWARDEN_TELEMETRY:-0}" == "1" ]]; then
+  curl -s "https://innerwarden.com/api/ping?v=${IW_VERSION}&os=${OS_TYPE}&arch=${ARCH}" >/dev/null 2>&1 &
+fi
 
 # Show welcome, then auto-run setup
 if ! innerwarden welcome 2>/dev/null; then

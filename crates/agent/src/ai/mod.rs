@@ -389,8 +389,9 @@ pub fn build_provider(cfg: &AiConfig) -> Result<Box<dyn AiProvider>> {
             )))
         }
         other => {
-            // Unknown provider name - if base_url is set, treat as OpenAI-compatible.
-            // This lets users connect any compatible API without code changes.
+            // SEC-017: Unknown provider name — require explicit base_url.
+            // If base_url is set, treat as OpenAI-compatible endpoint.
+            // Without base_url, fail closed to prevent accidental data egress.
             if !cfg.base_url.is_empty() {
                 validate_ai_base_url(&cfg.base_url)?;
                 tracing::info!(
@@ -404,14 +405,11 @@ pub fn build_provider(cfg: &AiConfig) -> Result<Box<dyn AiProvider>> {
                     cfg.base_url.clone(),
                 )))
             } else {
-                tracing::warn!(
-                    provider = other,
-                    "unknown AI provider and no base_url - falling back to openai"
+                anyhow::bail!(
+                    "unknown AI provider '{}'. Set provider to 'openai', 'anthropic', \
+                     or 'ollama', or provide a base_url for OpenAI-compatible endpoints.",
+                    other
                 );
-                Ok(Box::new(openai::OpenAiProvider::new(
-                    cfg.resolved_api_key(),
-                    cfg.model.clone(),
-                )))
             }
         }
     }

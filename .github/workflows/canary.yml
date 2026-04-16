@@ -87,7 +87,7 @@ jobs:
           done
 
       - name: Update canary release
-        uses: ncipollo/release-action@v1
+        uses: ncipollo/release-action@440c8c1cb0ed28b9f43f5c0920cbec5b3422c6a2 # v1
         with:
           tag: canary
           commit: ${{ github.sha }}
