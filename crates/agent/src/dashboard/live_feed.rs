@@ -435,7 +435,7 @@ pub(super) async fn api_live_feed_geoip(Query(query): Query<GeoIpQuery>) -> Json
     for ip in ips {
         let ip = ip.trim();
         let url = format!(
-            "http://ip-api.com/json/{}?fields=status,lat,lon,country",
+            "https://ip-api.com/json/{}?fields=status,lat,lon,country",
             ip
         );
         if let Ok(resp) = client.get(&url).send().await {

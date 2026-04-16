@@ -38,11 +38,14 @@ async function loadGraph() {
     }
 
     // Load Cytoscape.js from CDN if not loaded (with offline fallback)
+    // SEC-018: Pinned version with SRI integrity hash to prevent CDN tampering.
     if (typeof cytoscape === 'undefined') {
       try {
         await new Promise((resolve, reject) => {
           const s = document.createElement('script');
           s.src = 'https://unpkg.com/cytoscape@3.30.4/dist/cytoscape.min.js';
+          s.integrity = 'sha384-H3uzGzTfGHUAumB8+s4GEdfFwzAceN9wCCndN8AXubWKFIPuBSWKKtWDx7RhSf/z';
+          s.crossOrigin = 'anonymous';
           s.onload = resolve;
           s.onerror = reject;
           s.timeout = 5000;

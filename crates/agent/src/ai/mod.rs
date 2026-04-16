@@ -389,8 +389,9 @@ pub fn build_provider(cfg: &AiConfig) -> Result<Box<dyn AiProvider>> {
             )))
         }
         other => {
-            // Unknown provider name - if base_url is set, treat as OpenAI-compatible.
-            // This lets users connect any compatible API without code changes.
+            // SEC-017: Unknown provider name — require explicit base_url.
+            // If base_url is set, treat as OpenAI-compatible endpoint.
+            // Without base_url, fail closed to prevent accidental data egress.
             if !cfg.base_url.is_empty() {
                 validate_ai_base_url(&cfg.base_url)?;
                 tracing::info!(
@@ -404,14 +405,11 @@ pub fn build_provider(cfg: &AiConfig) -> Result<Box<dyn AiProvider>> {
                     cfg.base_url.clone(),
                 )))
             } else {
-                tracing::warn!(
-                    provider = other,
-                    "unknown AI provider and no base_url - falling back to openai"
+                anyhow::bail!(
+                    "unknown AI provider '{}'. Set provider to 'openai', 'anthropic', \
+                     or 'ollama', or provide a base_url for OpenAI-compatible endpoints.",
+                    other
                 );
-                Ok(Box::new(openai::OpenAiProvider::new(
-                    cfg.resolved_api_key(),
-                    cfg.model.clone(),
-                )))
             }
         }
     }
@@ -491,5 +489,54 @@ mod tests {
         let d = AiDecision::ignore("test reason");
         assert!(matches!(d.action, AiAction::Ignore { .. }));
         assert!(!d.auto_execute);
+    }
+
+    // SEC-017: Unknown provider without base_url must fail.
+    #[test]
+    fn build_provider_unknown_no_base_url_fails() {
+        let cfg = crate::config::AiConfig {
+            enabled: true,
+            provider: "nonexistent-provider".into(),
+            base_url: String::new(),
+            ..Default::default()
+        };
+        let result = build_provider(&cfg);
+        assert!(
+            result.is_err(),
+            "should fail for unknown provider without base_url"
+        );
+        let err = format!("{}", result.err().unwrap());
+        assert!(
+            err.contains("unknown AI provider"),
+            "expected 'unknown AI provider' error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_provider_unknown_with_base_url_succeeds() {
+        let cfg = crate::config::AiConfig {
+            enabled: true,
+            provider: "custom-llm".into(),
+            base_url: "https://my-llm.example.com".into(),
+            api_key: "test-key".into(),
+            model: "my-model".into(),
+            ..Default::default()
+        };
+        let result = build_provider(&cfg);
+        assert!(
+            result.is_ok(),
+            "should accept unknown provider with base_url"
+        );
+    }
+
+    #[test]
+    fn build_provider_known_provider_succeeds() {
+        let cfg = crate::config::AiConfig {
+            enabled: true,
+            provider: "ollama".into(),
+            ..Default::default()
+        };
+        let result = build_provider(&cfg);
+        assert!(result.is_ok());
     }
 }

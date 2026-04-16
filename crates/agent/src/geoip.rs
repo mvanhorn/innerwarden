@@ -84,10 +84,11 @@ impl GeoIpClient {
             return None;
         }
 
-        debug!(ip, "querying ip-api.com");
+        // SEC-016: Use HTTPS to avoid leaking queried IPs in transit.
+        debug!(ip, "querying ip-api.com (HTTPS)");
 
         let url = format!(
-            "http://ip-api.com/json/{}?fields=status,country,countryCode,city,isp,org,as",
+            "https://ip-api.com/json/{}?fields=status,country,countryCode,city,isp,org,as",
             ip
         );
 

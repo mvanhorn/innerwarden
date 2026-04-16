@@ -371,7 +371,8 @@ fn run_module_preflight(pf: &module_manifest::ModulePreflightSpec) -> (bool, Str
                 .any(|l| l.split(':').next().is_some_and(|u| u == pf.value));
             (exists, format!("user '{}' does not exist", pf.value))
         }
-        _ => (true, String::new()), // unknown kind = pass (fail-open)
+        // SEC-009: Fail closed on unknown preflight kinds.
+        other => (false, format!("unknown preflight kind '{}'", other)),
     }
 }
 
@@ -619,6 +620,17 @@ pub(crate) fn cmd_module_search(query: Option<&str>) -> Result<()> {
 // Module install / uninstall / publish
 // ---------------------------------------------------------------------------
 
+/// SEC-008: Validate module source rejects insecure HTTP transport.
+fn validate_module_source(source: &str) -> Result<()> {
+    if source.starts_with("http://") {
+        anyhow::bail!(
+            "insecure HTTP transport is not allowed for module installation.\n\
+             Use https:// or a local file path instead."
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn cmd_module_install(
     cli: &Cli,
     source: &str,
@@ -630,7 +642,9 @@ pub(crate) fn cmd_module_install(
     use module_manifest::ModuleManifest;
     use module_package::*;
 
-    let is_url = source.starts_with("https://") || source.starts_with("http://");
+    // SEC-008: Reject insecure HTTP transport for module installation.
+    validate_module_source(source)?;
+    let is_url = source.starts_with("https://");
     let is_path =
         source.starts_with('/') || source.starts_with('.') || std::path::Path::new(source).exists();
 
@@ -1107,4 +1121,79 @@ pub(crate) fn cmd_module_update_all(
         println!("({skipped} skipped - no update_url declared)");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // SEC-009: Unknown preflight kind fails closed.
+    #[test]
+    fn preflight_unknown_kind_fails() {
+        let pf = module_manifest::ModulePreflightSpec {
+            kind: "magic_check".into(),
+            value: "anything".into(),
+            reason: "test".into(),
+        };
+        let (passed, msg) = run_module_preflight(&pf);
+        assert!(!passed, "unknown preflight kind should fail");
+        assert!(msg.contains("unknown preflight kind"));
+    }
+
+    #[test]
+    fn preflight_binary_exists_known_path() {
+        let pf = module_manifest::ModulePreflightSpec {
+            kind: "binary_exists".into(),
+            value: "/usr/bin/env".into(),
+            reason: "test".into(),
+        };
+        let (passed, _) = run_module_preflight(&pf);
+        // /usr/bin/env exists on all Unix systems
+        if cfg!(unix) {
+            assert!(passed);
+        }
+    }
+
+    #[test]
+    fn preflight_binary_exists_missing() {
+        let pf = module_manifest::ModulePreflightSpec {
+            kind: "binary_exists".into(),
+            value: "/nonexistent/binary/xyz".into(),
+            reason: "test".into(),
+        };
+        let (passed, msg) = run_module_preflight(&pf);
+        assert!(!passed);
+        assert!(msg.contains("not found"));
+    }
+
+    #[test]
+    fn preflight_directory_exists_missing() {
+        let pf = module_manifest::ModulePreflightSpec {
+            kind: "directory_exists".into(),
+            value: "/nonexistent/dir/xyz".into(),
+            reason: "test".into(),
+        };
+        let (passed, _) = run_module_preflight(&pf);
+        assert!(!passed);
+    }
+
+    // SEC-008: Module source validation.
+    #[test]
+    fn validate_module_source_rejects_http() {
+        let r = validate_module_source("http://evil.com/module.tar.gz");
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("insecure HTTP"));
+    }
+
+    #[test]
+    fn validate_module_source_allows_https() {
+        assert!(validate_module_source("https://registry.innerwarden.com/mod.tar.gz").is_ok());
+    }
+
+    #[test]
+    fn validate_module_source_allows_local_path() {
+        assert!(validate_module_source("/opt/modules/my-module.tar.gz").is_ok());
+        assert!(validate_module_source("./my-module.tar.gz").is_ok());
+        assert!(validate_module_source("my-module").is_ok());
+    }
 }

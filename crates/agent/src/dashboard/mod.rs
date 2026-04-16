@@ -204,9 +204,14 @@ pub async fn serve(
     tls_key: Option<String>,
     insecure_no_tls: bool,
 ) -> Result<()> {
-    if auth.is_none() {
+    // SEC-005: Reject non-loopback bind without authentication.
+    let is_loopback_bind = is_loopback_address(&bind);
+    if let Err(e) = validate_bind_auth(&bind, auth.is_some()) {
+        anyhow::bail!("{}", e);
+    }
+    if auth.is_none() && is_loopback_bind {
         warn!(
-            "dashboard is running WITHOUT authentication - \
+            "dashboard is running WITHOUT authentication (loopback only) - \
              set INNERWARDEN_DASHBOARD_USER and INNERWARDEN_DASHBOARD_PASSWORD_HASH \
              in agent.env to require a login"
         );
@@ -328,9 +333,10 @@ pub async fn serve(
         }
     });
 
-    // Agent API routes - no auth required (localhost service-to-service)
-    // These are used by AI agents (OpenClaw, n8n, etc.) to query security state.
-    let agent_api = Router::new()
+    // SEC-006: Agent API routes — require auth when bound to non-loopback.
+    // On loopback, these remain unauthenticated for local service-to-service use
+    // (OpenClaw, n8n, etc.). On non-loopback, they go through the auth layer.
+    let agent_api_router = Router::new()
         .route(
             "/api/agent/security-context",
             get(api_agent_security_context),
@@ -347,8 +353,14 @@ pub async fn serve(
             "/api/agent-guard/disconnect",
             post(api_agent_guard_disconnect),
         )
-        .route("/api/agent-guard/agents", get(api_agent_guard_list))
-        .with_state(state.clone());
+        .route("/api/agent-guard/agents", get(api_agent_guard_list));
+    let agent_api = if should_require_api_auth(&bind) {
+        agent_api_router
+            .layer(auth_layer.clone())
+            .with_state(state.clone())
+    } else {
+        agent_api_router.with_state(state.clone())
+    };
 
     // Auth login route - public (no auth required; this IS the auth endpoint)
     let auth_login = Router::new()
@@ -450,18 +462,25 @@ pub async fn serve(
         // Session management endpoints (auth-protected)
         .route("/api/auth/logout", post(api_auth_logout))
         .route("/api/auth/sessions", get(api_auth_sessions))
-        .layer(auth_layer)
+        .layer(auth_layer.clone())
         .with_state(state.clone());
 
-    // Public live-feed routes - CORS-enabled, no auth, read-only
-    let live_api = Router::new()
+    // SEC-007: Live-feed routes require auth on non-loopback binds.
+    // On loopback, they remain public for local integrations.
+    let live_api_router = Router::new()
         .route("/api/live-feed", get(api_live_feed))
         .route("/api/live-feed/stream", get(api_live_feed_stream))
         .route("/api/live-feed/geoip", get(api_live_feed_geoip))
         .route("/api/live-feed/honeypot", get(api_live_feed_honeypot))
-        .route("/api/live-feed/mitre", get(api_live_feed_mitre))
-        .layer(middleware::from_fn(cors_middleware))
-        .with_state(state);
+        .route("/api/live-feed/mitre", get(api_live_feed_mitre));
+    let live_api = if should_require_api_auth(&bind) {
+        // Non-loopback: no wildcard CORS, require auth
+        live_api_router.layer(auth_layer.clone()).with_state(state)
+    } else {
+        live_api_router
+            .layer(middleware::from_fn(cors_middleware))
+            .with_state(state)
+    };
 
     let app = agent_api
         .merge(auth_login)
@@ -577,8 +596,9 @@ async fn build_tls_config(
             rcgen::DnType::OrganizationName,
             rcgen::DnValue::Utf8String("InnerWarden".to_string()),
         );
-        // Valid for 365 days
-        params.not_after = rcgen::date_time_ymd(2027, 4, 15);
+        // SEC-013: Valid for 365 days from now (not a hardcoded date).
+        let (y, m, d) = cert_expiry_ymd(365);
+        params.not_after = rcgen::date_time_ymd(y, m, d);
         // Add SANs for common access patterns
         params.subject_alt_names = vec![
             rcgen::SanType::DnsName("localhost".try_into()?),
@@ -697,6 +717,45 @@ const JS_SSE: &str = include_str!("frontend/js/sse.js");
 
 // ---------------------------------------------------------------------------
 // Tests
+// ---------------------------------------------------------------------------
+// SEC-005: Pure helpers for bind address validation (testable).
+// ---------------------------------------------------------------------------
+
+/// Check if a bind address is a loopback address.
+pub(crate) fn is_loopback_address(bind: &str) -> bool {
+    bind.starts_with("127.0.0.1") || bind.starts_with("[::1]") || bind.starts_with("localhost")
+}
+
+/// Validate bind address + auth combination.
+/// Returns Err if non-loopback bind has no auth configured.
+pub(crate) fn validate_bind_auth(bind: &str, has_auth: bool) -> Result<(), String> {
+    if !has_auth && !is_loopback_address(bind) {
+        return Err(format!(
+            "dashboard bound to non-loopback address {} without authentication. \
+             Set INNERWARDEN_DASHBOARD_USER and INNERWARDEN_DASHBOARD_PASSWORD_HASH, \
+             or bind to 127.0.0.1 for unauthenticated local access.",
+            bind
+        ));
+    }
+    Ok(())
+}
+
+/// SEC-013: Compute TLS certificate expiry date (year, month, day).
+pub(crate) fn cert_expiry_ymd(days_valid: i64) -> (i32, u8, u8) {
+    let expiry = chrono::Utc::now() + chrono::Duration::days(days_valid);
+    (
+        chrono::Datelike::year(&expiry),
+        chrono::Datelike::month(&expiry) as u8,
+        chrono::Datelike::day(&expiry) as u8,
+    )
+}
+
+/// SEC-006/007: Determine if agent API / live-feed should require auth.
+/// Returns true when auth should be enforced (non-loopback bind).
+pub(crate) fn should_require_api_auth(bind: &str) -> bool {
+    !is_loopback_address(bind)
+}
+
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -1630,5 +1689,85 @@ mod tests {
 
         let second: Vec<Event> = read_jsonl(&path);
         assert_eq!(second.len(), 2);
+    }
+
+    // ── SEC-005: bind address validation tests ──────────────────────────
+
+    #[test]
+    fn is_loopback_localhost() {
+        assert!(is_loopback_address("127.0.0.1:8787"));
+        assert!(is_loopback_address("[::1]:8787"));
+        assert!(is_loopback_address("localhost:8787"));
+    }
+
+    #[test]
+    fn is_not_loopback_external() {
+        assert!(!is_loopback_address("0.0.0.0:8787"));
+        assert!(!is_loopback_address("192.168.1.1:8787"));
+        assert!(!is_loopback_address("10.0.0.1:8787"));
+    }
+
+    #[test]
+    fn validate_bind_auth_loopback_no_auth_ok() {
+        assert!(validate_bind_auth("127.0.0.1:8787", false).is_ok());
+        assert!(validate_bind_auth("localhost:8787", false).is_ok());
+    }
+
+    #[test]
+    fn validate_bind_auth_external_no_auth_rejected() {
+        let result = validate_bind_auth("0.0.0.0:8787", false);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("without authentication"));
+    }
+
+    #[test]
+    fn validate_bind_auth_external_with_auth_ok() {
+        assert!(validate_bind_auth("0.0.0.0:8787", true).is_ok());
+    }
+
+    #[test]
+    fn validate_bind_auth_loopback_with_auth_ok() {
+        assert!(validate_bind_auth("127.0.0.1:8787", true).is_ok());
+    }
+
+    // SEC-013: TLS cert expiry date tests.
+    #[test]
+    fn cert_expiry_ymd_365_days() {
+        let (y, m, d) = cert_expiry_ymd(365);
+        let now = chrono::Utc::now();
+        // Year should be this year or next year
+        assert!(y >= chrono::Datelike::year(&now));
+        assert!(y <= chrono::Datelike::year(&now) + 1);
+        assert!((1..=12).contains(&m));
+        assert!((1..=31).contains(&d));
+    }
+
+    #[test]
+    fn cert_expiry_ymd_1_day() {
+        let (y, m, d) = cert_expiry_ymd(1);
+        let tomorrow = chrono::Utc::now() + chrono::Duration::days(1);
+        assert_eq!(y, chrono::Datelike::year(&tomorrow));
+        assert_eq!(m, chrono::Datelike::month(&tomorrow) as u8);
+        assert_eq!(d, chrono::Datelike::day(&tomorrow) as u8);
+    }
+
+    #[test]
+    fn cert_expiry_ymd_zero_days() {
+        let (y, _m, _d) = cert_expiry_ymd(0);
+        assert_eq!(y, chrono::Datelike::year(&chrono::Utc::now()));
+    }
+
+    // SEC-006/007: API auth requirement tests.
+    #[test]
+    fn should_require_api_auth_external() {
+        assert!(should_require_api_auth("0.0.0.0:8787"));
+        assert!(should_require_api_auth("192.168.1.1:8787"));
+    }
+
+    #[test]
+    fn should_not_require_api_auth_loopback() {
+        assert!(!should_require_api_auth("127.0.0.1:8787"));
+        assert!(!should_require_api_auth("[::1]:8787"));
+        assert!(!should_require_api_auth("localhost:8787"));
     }
 }
