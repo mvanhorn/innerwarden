@@ -97,6 +97,8 @@ mod scoring;
 mod shield_inline;
 mod skills;
 mod slack;
+#[allow(dead_code)]
+mod soc_checks;
 mod state_store;
 mod telegram;
 mod telemetry;
