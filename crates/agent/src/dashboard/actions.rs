@@ -673,3 +673,23 @@ pub(super) fn hostname() -> String {
         .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()))
         .unwrap_or_else(|_| "unknown".to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_make_synthetic_incident() {
+        let incident = make_synthetic_incident("test1", "10.0.0.5", "Manual block test");
+
+        assert_eq!(incident.incident_id, "dashboard:manual:test1");
+        assert_eq!(incident.summary, "Manual block test");
+        assert_eq!(incident.tags, vec!["dashboard", "manual"]);
+
+        let has_ip = incident
+            .entities
+            .iter()
+            .any(|e| e.value == "10.0.0.5" && format!("{:?}", e.r#type) == "Ip");
+        assert!(has_ip);
+    }
+}

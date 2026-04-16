@@ -22,22 +22,7 @@ pub(super) async fn api_attacker_profiles(
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
-    let mut filtered: Vec<serde_json::Value> = profiles
-        .into_iter()
-        .filter(|p| p["risk_score"].as_u64().unwrap_or(0) >= min_risk as u64)
-        .collect();
-
-    match sort {
-        "last_seen" => {
-            filtered.sort_by(|a, b| b["last_seen"].as_str().cmp(&a["last_seen"].as_str()))
-        }
-        "incidents" => filtered.sort_by(|a, b| {
-            b["total_incidents"]
-                .as_u64()
-                .cmp(&a["total_incidents"].as_u64())
-        }),
-        _ => filtered.sort_by(|a, b| b["risk_score"].as_u64().cmp(&a["risk_score"].as_u64())),
-    }
+    let filtered = sort_attacker_profiles(profiles, min_risk, sort);
 
     let total = filtered.len();
     let page: Vec<serde_json::Value> = filtered.into_iter().skip(offset).take(limit).collect();
@@ -56,6 +41,30 @@ pub(super) struct AttackerProfilesQuery {
     offset: Option<usize>,
     sort: Option<String>,
     min_risk: Option<u8>,
+}
+
+pub(super) fn sort_attacker_profiles(
+    profiles: Vec<serde_json::Value>,
+    min_risk: u8,
+    sort_key: &str,
+) -> Vec<serde_json::Value> {
+    let mut filtered: Vec<serde_json::Value> = profiles
+        .into_iter()
+        .filter(|p| p["risk_score"].as_u64().unwrap_or(0) >= min_risk as u64)
+        .collect();
+
+    match sort_key {
+        "last_seen" => {
+            filtered.sort_by(|a, b| b["last_seen"].as_str().cmp(&a["last_seen"].as_str()))
+        }
+        "incidents" => filtered.sort_by(|a, b| {
+            b["total_incidents"]
+                .as_u64()
+                .cmp(&a["total_incidents"].as_u64())
+        }),
+        _ => filtered.sort_by(|a, b| b["risk_score"].as_u64().cmp(&a["risk_score"].as_u64())),
+    }
+    filtered
 }
 
 /// `GET /api/attacker-profiles/:ip` - single attacker profile detail.
@@ -569,4 +578,34 @@ pub(super) async fn api_graph_threats(
         .collect();
 
     Json(serde_json::json!({ "total": items.len(), "hits": items }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sort_attacker_profiles() {
+        let profiles = vec![
+            serde_json::json!({"ip": "1.1.1.1", "risk_score": 10, "total_incidents": 5, "last_seen": "2023-01-01"}),
+            serde_json::json!({"ip": "2.2.2.2", "risk_score": 90, "total_incidents": 20, "last_seen": "2023-02-01"}),
+            serde_json::json!({"ip": "3.3.3.3", "risk_score": 50, "total_incidents": 10, "last_seen": "2023-03-01"}),
+        ];
+
+        // test minimum risk filtering
+        let filtered = sort_attacker_profiles(profiles.clone(), 50, "risk_score");
+        assert_eq!(filtered.len(), 2);
+
+        // test sort by risk score
+        assert_eq!(filtered[0]["ip"], "2.2.2.2");
+
+        // test sort by incidents
+        let by_incidents = sort_attacker_profiles(profiles.clone(), 0, "incidents");
+        assert_eq!(by_incidents[0]["ip"], "2.2.2.2");
+        assert_eq!(by_incidents[1]["ip"], "3.3.3.3");
+
+        // test sort by last_seen
+        let by_last_seen = sort_attacker_profiles(profiles, 0, "last_seen");
+        assert_eq!(by_last_seen[0]["ip"], "3.3.3.3");
+    }
 }

@@ -2,28 +2,14 @@
 
 use super::*;
 
-/// Read sensor config.toml to find detectors with `enabled = false`.
-/// Returns a set of detector names that are explicitly disabled.
-/// Falls back to empty set if config can't be read or parsed.
-fn read_disabled_detectors_from_config() -> std::collections::HashSet<&'static str> {
+// ---------------------------------------------------------------------------
+
+pub(super) fn parse_disabled_detectors(content: &str) -> std::collections::HashSet<&'static str> {
     let mut disabled = std::collections::HashSet::new();
-
-    // Try common config paths
-    let paths = [
-        "/etc/innerwarden/config.toml",
-        "/etc/innerwarden/sensor.toml",
-    ];
-
-    let content = paths
-        .iter()
-        .find_map(|p| std::fs::read_to_string(p).ok())
-        .unwrap_or_default();
-
     if content.is_empty() {
         return disabled;
     }
 
-    // Parse TOML and check [detectors.X] enabled = false
     let table: toml::Table = match content.parse() {
         Ok(t) => t,
         Err(_) => return disabled,
@@ -34,7 +20,6 @@ fn read_disabled_detectors_from_config() -> std::collections::HashSet<&'static s
         None => return disabled,
     };
 
-    // Map config names to detector names (they match 1:1)
     let all_names: &[&str] = &[
         "ssh_bruteforce",
         "credential_stuffing",
@@ -86,6 +71,23 @@ fn read_disabled_detectors_from_config() -> std::collections::HashSet<&'static s
     }
 
     disabled
+}
+
+/// Read sensor config.toml to find detectors with `enabled = false`.
+/// Returns a set of detector names that are explicitly disabled.
+/// Falls back to empty set if config can't be read or parsed.
+fn read_disabled_detectors_from_config() -> std::collections::HashSet<&'static str> {
+    let paths = [
+        "/etc/innerwarden/config.toml",
+        "/etc/innerwarden/sensor.toml",
+    ];
+
+    let content = paths
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+
+    parse_disabled_detectors(&content)
 }
 
 // ---------------------------------------------------------------------------
@@ -729,4 +731,27 @@ pub(super) async fn api_mitre_coverage(
         ))
         .unwrap()
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_disabled_detectors() {
+        let toml_data = r#"
+[detectors.crypto_miner]
+enabled = false
+[detectors.ssh_bruteforce]
+enabled = true
+[detectors.ransomware]
+enabled = false
+        "#;
+
+        let disabled = parse_disabled_detectors(toml_data);
+        assert_eq!(disabled.len(), 2);
+        assert!(disabled.contains("crypto_miner"));
+        assert!(disabled.contains("ransomware"));
+        assert!(!disabled.contains("ssh_bruteforce"));
+    }
 }
