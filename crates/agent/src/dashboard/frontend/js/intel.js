@@ -160,7 +160,7 @@ function switchIntelTab(tab) {
   const tabs = ['Profiles','Campaigns','Chains','Baseline','Playbooks','Brain','Mitre'];
   tabs.forEach(t => {
     const btn = document.getElementById('intelTab'+t);
-    if (btn) { const active = t.toLowerCase() === tab; btn.style.background = active ? 'var(--accent)' : 'var(--card-bg)'; btn.style.color = active ? '#fff' : 'var(--text)'; btn.style.borderColor = active ? 'var(--accent)' : 'var(--border)'; }
+    if (btn) { const active = t.toLowerCase() === tab; btn.style.background = active ? 'var(--accent)' : 'var(--card-bg)'; btn.style.color = active ? '#0a0f1a' : 'var(--text)'; btn.style.fontWeight = active ? '600' : '400'; btn.style.borderColor = active ? 'var(--accent)' : 'var(--border)'; }
   });
   if (tab === 'campaigns') loadCampaigns();
   else if (tab === 'chains') loadChains();
