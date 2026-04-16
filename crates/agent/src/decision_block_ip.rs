@@ -230,6 +230,31 @@ pub(crate) async fn execute_block_ip_decision(
     }
 }
 
+/// Returns true if `s` is a single IPv4/IPv6 address **or** a valid
+/// CIDR (`<ip>/<prefix>`) that ufw / iptables / nftables will accept.
+///
+/// Must be called at every boundary where external data (configs,
+/// ip-reputation cache, correlation decisions, AI output) could deliver a
+/// string to the firewall skills. A single missed boundary reintroduces the
+/// "zombie active response" bug where an invalid rule gets registered in
+/// the lifecycle but cannot be reverted.
+pub(crate) fn is_valid_block_target(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    match s.split_once('/') {
+        Some((ip_part, prefix_part)) => match (
+            ip_part.parse::<std::net::IpAddr>(),
+            prefix_part.parse::<u8>(),
+        ) {
+            (Ok(std::net::IpAddr::V4(_)), Ok(p)) => p <= 32,
+            (Ok(std::net::IpAddr::V6(_)), Ok(p)) => p <= 128,
+            _ => false,
+        },
+        None => s.parse::<std::net::IpAddr>().is_ok(),
+    }
+}
+
 pub(crate) fn check_block_eligibility(
     ip: &str,
     operator_ips: &std::collections::HashMap<String, std::time::Instant>,
@@ -239,8 +264,10 @@ pub(crate) fn check_block_eligibility(
     if ip.is_empty() {
         return Err("skipped: block decision has empty IP".to_string());
     }
-    // Reject IPs that won't parse — prevents ufw/iptables "Bad source address" errors.
-    if ip.parse::<std::net::IpAddr>().is_err() {
+    // Reject malformed targets — prevents ufw/iptables "Bad source address"
+    // errors that otherwise leak into the response lifecycle as zombie
+    // "active" entries that can never be reverted.
+    if !is_valid_block_target(ip) {
         return Err(format!("skipped: {ip} is not a valid IP address"));
     }
     if operator_ips.contains_key(ip) {
@@ -306,5 +333,112 @@ mod tests {
             check_block_eligibility("2001:db8::1", &operator_ips, 0, 20),
             Ok(())
         );
+
+        // 8. valid IPv4 CIDR — ufw accepts these and revert is symmetric
+        assert_eq!(
+            check_block_eligibility("10.0.0.0/8", &operator_ips, 0, 20),
+            Ok(())
+        );
+        assert_eq!(
+            check_block_eligibility("136.216.0.0/16", &operator_ips, 0, 20),
+            Ok(())
+        );
+        assert_eq!(
+            check_block_eligibility("192.168.1.1/32", &operator_ips, 0, 20),
+            Ok(())
+        );
+
+        // 9. valid IPv6 CIDR
+        assert_eq!(
+            check_block_eligibility("2001:db8::/48", &operator_ips, 0, 20),
+            Ok(())
+        );
+
+        // 10. CIDR with invalid IP part must fail
+        assert_eq!(
+            check_block_eligibility("129.950.5.0/24", &operator_ips, 0, 20),
+            Err("skipped: 129.950.5.0/24 is not a valid IP address".to_string())
+        );
+
+        // 11. CIDR with out-of-range prefix must fail
+        assert_eq!(
+            check_block_eligibility("10.0.0.0/33", &operator_ips, 0, 20),
+            Err("skipped: 10.0.0.0/33 is not a valid IP address".to_string())
+        );
+        assert_eq!(
+            check_block_eligibility("2001:db8::/129", &operator_ips, 0, 20),
+            Err("skipped: 2001:db8::/129 is not a valid IP address".to_string())
+        );
+
+        // 12. CIDR with malformed prefix
+        assert_eq!(
+            check_block_eligibility("10.0.0.0/abc", &operator_ips, 0, 20),
+            Err("skipped: 10.0.0.0/abc is not a valid IP address".to_string())
+        );
+    }
+
+    // Exhaustive validation of `is_valid_block_target` at the helper level so
+    // future callers don't have to synthesize HashMap<operator_ips> just to
+    // probe target parsing behaviour.
+    #[test]
+    fn is_valid_block_target_accepts_plain_ips() {
+        assert!(is_valid_block_target("1.2.3.4"));
+        assert!(is_valid_block_target("255.255.255.255"));
+        assert!(is_valid_block_target("0.0.0.0"));
+        assert!(is_valid_block_target("::1"));
+        assert!(is_valid_block_target("2001:db8::1"));
+    }
+
+    #[test]
+    fn is_valid_block_target_accepts_valid_cidrs() {
+        assert!(is_valid_block_target("10.0.0.0/8"));
+        assert!(is_valid_block_target("192.168.0.0/16"));
+        assert!(is_valid_block_target("192.168.1.1/32"));
+        assert!(is_valid_block_target("172.16.0.0/12"));
+        assert!(is_valid_block_target("::/0"));
+        assert!(is_valid_block_target("2001:db8::/32"));
+        assert!(is_valid_block_target("fe80::/10"));
+    }
+
+    #[test]
+    fn is_valid_block_target_rejects_empty_and_garbage() {
+        assert!(!is_valid_block_target(""));
+        assert!(!is_valid_block_target("not-an-ip"));
+        assert!(!is_valid_block_target("abc"));
+        assert!(!is_valid_block_target(" "));
+        assert!(!is_valid_block_target("/"));
+    }
+
+    #[test]
+    fn is_valid_block_target_rejects_out_of_range_octets() {
+        // Exact production samples that generated the orphaned-response alerts.
+        assert!(!is_valid_block_target("129.950.5.0"));
+        assert!(!is_valid_block_target("129.525.8.0"));
+        assert!(!is_valid_block_target("130.890.9.0"));
+        assert!(!is_valid_block_target("130.932.0.0"));
+        assert!(!is_valid_block_target("130.806.3.0"));
+        assert!(!is_valid_block_target("130.806.1.17"));
+        assert!(!is_valid_block_target("129.491.8.0"));
+        assert!(!is_valid_block_target("129.952.2.0"));
+        assert!(!is_valid_block_target("129.950.5.15"));
+        assert!(!is_valid_block_target("129.950.5.5"));
+    }
+
+    #[test]
+    fn is_valid_block_target_rejects_short_and_long_ipv4() {
+        assert!(!is_valid_block_target("137.274.6"));  // 3 octets
+        assert!(!is_valid_block_target("1.2.3"));
+        assert!(!is_valid_block_target("1.2.3.4.5"));
+    }
+
+    #[test]
+    fn is_valid_block_target_rejects_invalid_cidr() {
+        assert!(!is_valid_block_target("129.950.5.0/24")); // bad IP
+        assert!(!is_valid_block_target("10.0.0.0/33"));    // prefix > 32 on v4
+        assert!(!is_valid_block_target("2001:db8::/129")); // prefix > 128 on v6
+        assert!(!is_valid_block_target("10.0.0.0/"));      // empty prefix
+        assert!(!is_valid_block_target("10.0.0.0/-1"));    // negative prefix
+        assert!(!is_valid_block_target("10.0.0.0/abc"));   // non-numeric
+        assert!(!is_valid_block_target("/16"));            // empty IP
     }
 }

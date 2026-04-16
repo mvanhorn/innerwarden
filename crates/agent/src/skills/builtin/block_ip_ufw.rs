@@ -5,6 +5,8 @@ use tracing::{info, warn};
 
 use crate::skills::{ResponseSkill, SkillContext, SkillResult, SkillTier};
 
+use super::firewall_target::is_valid_firewall_target;
+
 pub struct BlockIpUfw;
 
 impl ResponseSkill for BlockIpUfw {
@@ -41,6 +43,19 @@ impl ResponseSkill for BlockIpUfw {
                     }
                 }
             };
+
+            // Defense in depth: callers *should* validate targets before
+            // reaching here, but a missed boundary must never trigger a
+            // `ufw deny` for a malformed string. ufw silently accepts some
+            // junk on add and then rejects revert, which manifests as an
+            // orphaned-response alert on the dashboard.
+            if !is_valid_firewall_target(&ip) {
+                warn!(ip, "block-ip-ufw: rejecting invalid target before invoking ufw");
+                return SkillResult {
+                    success: false,
+                    message: format!("block-ip-ufw: {ip} is not a valid IP/CIDR"),
+                };
+            }
 
             if dry_run {
                 info!(
@@ -139,5 +154,52 @@ mod tests {
         assert!(BlockIpUfw.name().contains("ufw"));
         assert_eq!(BlockIpUfw.tier(), SkillTier::Open);
         assert!(BlockIpUfw.applicable_to().contains(&"credential_stuffing"));
+    }
+
+    // Invalid targets must fail the skill with success=false *without*
+    // spawning a ufw subprocess. A dry-run passes through the validator
+    // too, so this exercises both execution modes with a single ctx.
+    #[tokio::test]
+    async fn rejects_invalid_target_before_spawn() {
+        for bad in ["129.950.5.0", "130.890.9.0", "137.274.6", "not-an-ip", ""] {
+            let ctx = make_ctx(Some(bad));
+            // dry_run=true proves the validator runs *before* the dry-run
+            // branch — otherwise bad inputs would falsely report success.
+            let result = BlockIpUfw.execute(&ctx, true).await;
+            assert!(!result.success, "'{bad}' should be rejected");
+            assert!(
+                result.message.contains("not a valid"),
+                "message for '{bad}' should explain the rejection, got: {}",
+                result.message
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_accepts_valid_cidr() {
+        let ctx = make_ctx(Some("10.0.0.0/24"));
+        let result = BlockIpUfw.execute(&ctx, true).await;
+        assert!(result.success, "CIDR /24 must be accepted: {:?}", result.message);
+    }
+
+    #[test]
+    fn is_valid_firewall_target_accepts_ips_and_cidrs() {
+        assert!(is_valid_firewall_target("1.2.3.4"));
+        assert!(is_valid_firewall_target("2001:db8::1"));
+        assert!(is_valid_firewall_target("10.0.0.0/8"));
+        assert!(is_valid_firewall_target("2001:db8::/32"));
+        assert!(is_valid_firewall_target("192.168.1.1/32"));
+    }
+
+    #[test]
+    fn is_valid_firewall_target_rejects_malformed() {
+        assert!(!is_valid_firewall_target(""));
+        assert!(!is_valid_firewall_target("129.950.5.0"));
+        assert!(!is_valid_firewall_target("130.890.9.0"));
+        assert!(!is_valid_firewall_target("137.274.6"));
+        assert!(!is_valid_firewall_target("not-an-ip"));
+        assert!(!is_valid_firewall_target("10.0.0.0/33"));
+        assert!(!is_valid_firewall_target("10.0.0.0/abc"));
+        assert!(!is_valid_firewall_target("2001:db8::/129"));
     }
 }

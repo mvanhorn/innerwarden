@@ -3,6 +3,7 @@ use std::pin::Pin;
 
 use tracing::{info, warn};
 
+use super::firewall_target::is_valid_firewall_target;
 use crate::skills::{ResponseSkill, SkillContext, SkillResult, SkillTier};
 
 pub struct BlockIpPf;
@@ -45,6 +46,14 @@ impl ResponseSkill for BlockIpPf {
                     }
                 }
             };
+
+            if !is_valid_firewall_target(&ip) {
+                warn!(ip, "block-ip-pf: rejecting invalid target before invoking pfctl");
+                return SkillResult {
+                    success: false,
+                    message: format!("block-ip-pf: {ip} is not a valid IP/CIDR"),
+                };
+            }
 
             if dry_run {
                 info!(
@@ -150,5 +159,21 @@ mod tests {
         assert!(BlockIpPf.applicable_to().contains(&"ssh_bruteforce"));
         assert!(BlockIpPf.applicable_to().contains(&"port_scan"));
         assert!(BlockIpPf.applicable_to().contains(&"credential_stuffing"));
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_target_before_spawn() {
+        for bad in ["129.950.5.0", "130.890.9.0", "not-an-ip", ""] {
+            let ctx = make_ctx(Some(bad));
+            let result = BlockIpPf.execute(&ctx, true).await;
+            assert!(!result.success, "'{bad}' should be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_accepts_valid_cidr() {
+        let ctx = make_ctx(Some("10.0.0.0/24"));
+        let result = BlockIpPf.execute(&ctx, true).await;
+        assert!(result.success);
     }
 }

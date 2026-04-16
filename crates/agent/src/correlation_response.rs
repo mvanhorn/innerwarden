@@ -282,6 +282,21 @@ async fn check_repeat_offenders(
         .collect();
 
     for (ip, total_blocks) in repeat_ips {
+        // Guard: never feed a malformed target into the block pipeline. A
+        // corrupted `ip-reputation.json` (e.g. stray octet > 255 from a
+        // broken upstream feed) would otherwise reach the firewall, fail
+        // silently on add, and register a zombie "Active" lifecycle entry
+        // that can never be reverted — producing the orphaned-response
+        // alert on the dashboard.
+        if !crate::decision_block_ip::is_valid_block_target(&ip) {
+            warn!(
+                ip = %ip,
+                "repeat-offender: skipping invalid target — removing from ip_reputations"
+            );
+            state.ip_reputations.remove(&ip);
+            continue;
+        }
+
         let cooldown_key = format!("repeat-offender:{ip}");
         // Only fire once per 24h per IP.
         let cooldown_cutoff = Utc::now() - chrono::Duration::seconds(86400);

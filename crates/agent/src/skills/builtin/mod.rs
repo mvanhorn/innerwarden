@@ -4,6 +4,7 @@ mod block_ip_nftables;
 mod block_ip_pf;
 mod block_ip_ufw;
 mod block_ip_xdp;
+mod firewall_target;
 pub(crate) mod honeypot;
 mod kill_chain_response;
 mod kill_process;

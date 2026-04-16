@@ -3,6 +3,7 @@ use std::pin::Pin;
 
 use tracing::{info, warn};
 
+use super::firewall_target::is_valid_firewall_target;
 use crate::skills::{ResponseSkill, SkillContext, SkillResult, SkillTier};
 
 pub struct BlockIpNftables;
@@ -41,6 +42,14 @@ impl ResponseSkill for BlockIpNftables {
                     }
                 }
             };
+
+            if !is_valid_firewall_target(&ip) {
+                warn!(ip, "block-ip-nftables: rejecting invalid target before invoking nft");
+                return SkillResult {
+                    success: false,
+                    message: format!("block-ip-nftables: {ip} is not a valid IP/CIDR"),
+                };
+            }
 
             if dry_run {
                 info!(
@@ -148,5 +157,21 @@ mod tests {
         assert!(BlockIpNftables.name().contains("nftables"));
         assert_eq!(BlockIpNftables.tier(), SkillTier::Open);
         assert!(BlockIpNftables.applicable_to().contains(&"ssh_bruteforce"));
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_target_before_spawn() {
+        for bad in ["129.950.5.0", "130.890.9.0", "not-an-ip", ""] {
+            let ctx = make_ctx(Some(bad));
+            let result = BlockIpNftables.execute(&ctx, true).await;
+            assert!(!result.success, "'{bad}' should be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_accepts_valid_cidr() {
+        let ctx = make_ctx(Some("10.0.0.0/24"));
+        let result = BlockIpNftables.execute(&ctx, true).await;
+        assert!(result.success);
     }
 }

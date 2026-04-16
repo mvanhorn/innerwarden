@@ -100,12 +100,44 @@ pub(crate) fn persist_ip_reputations(
 }
 
 /// Load the reputation map from `ip-reputation.json` at startup.
+/// Malformed entries (octets out of range, short forms, CIDR with invalid
+/// prefix) are dropped and the cleaned map is rewritten to disk. A
+/// corrupted entry that survives here becomes a "zombie" ufw rule: the
+/// agent tries to deny it, ufw silently fails, the lifecycle marks it
+/// Active, and 1h later a revert fails → orphaned response alert.
 pub(crate) fn load_ip_reputations(data_dir: &Path) -> HashMap<String, LocalIpReputation> {
     let path = data_dir.join("ip-reputation.json");
     let Ok(content) = std::fs::read_to_string(&path) else {
         return HashMap::new();
     };
-    serde_json::from_str(&content).unwrap_or_default()
+    let mut reputations: HashMap<String, LocalIpReputation> =
+        serde_json::from_str(&content).unwrap_or_default();
+    let removed = prune_invalid_reputation_targets(&mut reputations);
+    if removed > 0 {
+        warn!(
+            removed,
+            "pruned invalid IP/CIDR entries from ip-reputation.json at startup"
+        );
+        persist_ip_reputations(data_dir, &reputations);
+    }
+    reputations
+}
+
+/// Remove entries whose keys are not accepted by
+/// `decision_block_ip::is_valid_block_target`. Returns the number removed
+/// so the caller can surface a single summary line in the startup log.
+pub(crate) fn prune_invalid_reputation_targets(
+    reputations: &mut HashMap<String, LocalIpReputation>,
+) -> usize {
+    let to_remove: Vec<String> = reputations
+        .keys()
+        .filter(|ip| !crate::decision_block_ip::is_valid_block_target(ip))
+        .cloned()
+        .collect();
+    for ip in &to_remove {
+        reputations.remove(ip);
+    }
+    to_remove.len()
 }
 
 /// Scan honeypot session files for IPs in attacker profiles and feed session
@@ -159,5 +191,128 @@ pub(crate) fn scan_honeypot_for_profiles(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rep() -> LocalIpReputation {
+        LocalIpReputation::new()
+    }
+
+    #[test]
+    fn prune_removes_octet_out_of_range_entries() {
+        let mut map = HashMap::new();
+        map.insert("1.2.3.4".to_string(), rep());
+        map.insert("129.950.5.0".to_string(), rep());
+        map.insert("130.890.9.0".to_string(), rep());
+        let removed = prune_invalid_reputation_targets(&mut map);
+        assert_eq!(removed, 2);
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("1.2.3.4"));
+    }
+
+    #[test]
+    fn prune_keeps_valid_cidr() {
+        let mut map = HashMap::new();
+        map.insert("136.216.0.0/16".to_string(), rep());
+        map.insert("10.0.0.0/33".to_string(), rep()); // prefix too big
+        let removed = prune_invalid_reputation_targets(&mut map);
+        assert_eq!(removed, 1);
+        assert!(map.contains_key("136.216.0.0/16"));
+    }
+
+    #[test]
+    fn prune_keeps_ipv6() {
+        let mut map = HashMap::new();
+        map.insert("2001:db8::1".to_string(), rep());
+        map.insert("::1".to_string(), rep());
+        map.insert("not-an-ip".to_string(), rep());
+        let removed = prune_invalid_reputation_targets(&mut map);
+        assert_eq!(removed, 1);
+        assert!(map.contains_key("2001:db8::1"));
+        assert!(map.contains_key("::1"));
+    }
+
+    #[test]
+    fn prune_no_op_on_clean_map() {
+        let mut map = HashMap::new();
+        map.insert("1.2.3.4".to_string(), rep());
+        map.insert("10.0.0.0/8".to_string(), rep());
+        let removed = prune_invalid_reputation_targets(&mut map);
+        assert_eq!(removed, 0);
+        assert_eq!(map.len(), 2);
+    }
+
+    // Exact set of bad entries observed on the production server — must
+    // all be dropped in one pass.
+    #[test]
+    fn prune_matches_production_bad_set() {
+        let mut map = HashMap::new();
+        for good in ["1.2.3.4", "8.8.8.8", "136.216.0.0/16"] {
+            map.insert(good.to_string(), rep());
+        }
+        for bad in [
+            "129.491.8.0",
+            "129.950.5.15",
+            "129.950.5.0",
+            "129.952.2.0",
+            "130.806.3.0",
+            "129.950.5.5",
+            "137.274.6",
+            "130.932.0.0",
+            "129.525.8.0",
+            "130.890.9.0",
+            "130.806.1.17",
+        ] {
+            map.insert(bad.to_string(), rep());
+        }
+        let removed = prune_invalid_reputation_targets(&mut map);
+        assert_eq!(removed, 11);
+        assert_eq!(map.len(), 3);
+        assert!(map.contains_key("136.216.0.0/16"));
+    }
+
+    // load_ip_reputations rewrites the file when it cleans up. This end-to-end
+    // test writes a corrupted JSON file, loads it, and verifies both the
+    // returned map and the file on disk are cleaned.
+    #[test]
+    fn load_rewrites_file_after_pruning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let json = format!(
+            r#"{{
+              "1.2.3.4": {{"total_incidents":1,"total_blocks":0,"first_seen":"{now}","last_seen":"{now}","reputation_score":1.0}},
+              "129.950.5.0": {{"total_incidents":3,"total_blocks":1,"first_seen":"{now}","last_seen":"{now}","reputation_score":5.0}}
+            }}"#
+        );
+        std::fs::write(tmp.path().join("ip-reputation.json"), &json).unwrap();
+
+        let loaded = load_ip_reputations(tmp.path());
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.contains_key("1.2.3.4"));
+        assert!(!loaded.contains_key("129.950.5.0"));
+
+        // File must have been rewritten — reload a second time and confirm no
+        // pruning pass is needed (because the disk copy is already clean).
+        let round2 = load_ip_reputations(tmp.path());
+        assert_eq!(round2.len(), 1);
+    }
+
+    #[test]
+    fn load_missing_file_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loaded = load_ip_reputations(tmp.path());
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn load_malformed_json_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("ip-reputation.json"), "not json").unwrap();
+        let loaded = load_ip_reputations(tmp.path());
+        assert!(loaded.is_empty());
     }
 }
