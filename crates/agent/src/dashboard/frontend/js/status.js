@@ -142,7 +142,7 @@ function renderStatus(s, collectors) {
   };
 
   const hpMode = (integ.honeypot_mode || 'off').toLowerCase();
-  const hpBadge = hpMode === 'listener' ? 'LIVE' : hpMode === 'demo' ? 'DEMO' : 'OFF';
+  const hpBadge = hpMode === 'always_on' ? 'ON' : hpMode === 'listener' ? 'LIVE' : hpMode === 'demo' ? 'DEMO' : hpMode === 'off' ? 'OFF' : 'ON';
 
   // ── Section 2: Active Integrations — grouped by category ─────────────
   const groupStyle = '<style>' +
@@ -201,7 +201,7 @@ function renderStatus(s, collectors) {
   const kcCard = (function() {
     const kc = s.kill_chain || {};
     const kcTotal = (kc.total_blocked || 0) + (kc.total_pre_chain || 0);
-    const kcOn = kcTotal > 0;
+    const kcOn = (kc.pids_tracked !== undefined) || kcTotal > 0; // ON if tracker is loaded
     const kcDesc = kcTotal > 0
       ? kcTotal + ' chain(s) detected today — ' + (kc.total_blocked||0) + ' blocked, ' + (kc.total_pre_chain||0) + ' pre-chain'
       : 'Multi-step attack correlation — detects reverse shells, privilege escalation chains';
@@ -219,7 +219,7 @@ function renderStatus(s, collectors) {
       card('🤖', 'AI Analysis',   s.ai_enabled,     'Analyzes threats and selects the best response action',       s.ai_enabled ? 'ON' : 'OFF', 'native', 'Built into InnerWarden - no external service needed.', 'innerwarden enable ai'),
       card('🛡️', 'IP Blocker',    resp.enabled,     'Automatically blocks IPs via UFW/iptables when AI decides',   resp.enabled ? 'ON' : 'OFF', 'native', 'Zero cost. Uses your existing firewall.',               'innerwarden enable block-ip'),
       card('🪤', 'Honeypot',      hpMode !== 'off', 'Decoy server that captures and logs attacker behavior',       hpBadge,                     'native', 'listener mode activates on AI demand; always_on keeps it permanently open.', ''),
-      card('⚡', 'XDP Firewall',  true,             'Wire-speed IP blocking at network driver - 10M+ pps drop',    'ON', 'native', 'Active when eBPF sensor runs. Layered: XDP + firewall + Cloudflare + AbuseIPDB.', ''),
+      card('⚡', 'XDP Firewall',  !!s.ebpf_events,  'Wire-speed IP blocking at network driver - 10M+ pps drop',    s.ebpf_events ? 'ON' : 'OFF', 'native', 'Requires eBPF sensor + BPF filesystem mounted. Layered: XDP + firewall + Cloudflare + AbuseIPDB.', ''),
     ], true) +
 
     // ── Kernel Hardening (expanded — v0.6.0 features) ──
@@ -386,10 +386,16 @@ function renderStatus(s, collectors) {
     '<table class="report-table"><thead><tr><th>File</th><th>Status</th><th>Size</th></tr></thead><tbody>';
   Object.entries(files).forEach(([k, v]) => {
     const exists = v.exists;
+    // events.jsonl no longer used — events go to SQLite (spec 016)
+    const isSqlite = (k === 'events' && !exists);
+    const statusLabel = isSqlite
+      ? '<span class="health-ok">✓ SQLite</span>'
+      : exists ? '<span class="health-ok">✓ Present</span>'
+      : '<span style="color:var(--muted)">- Absent</span>';
     html += '<tr>' +
-      '<td style="font-family:\'JetBrains Mono\',monospace;font-size:0.72rem">' + esc(k) + '.jsonl</td>' +
-      '<td>' + (exists ? '<span class="health-ok">✓ Present</span>' : '<span style="color:var(--muted)">- Absent</span>') + '</td>' +
-      '<td style="color:var(--muted)">' + (exists ? fmt(v.size_bytes) : '-') + '</td>' +
+      '<td style="font-family:\'JetBrains Mono\',monospace;font-size:0.72rem">' + esc(k) + (isSqlite ? ' (db)' : '.jsonl') + '</td>' +
+      '<td>' + statusLabel + '</td>' +
+      '<td style="color:var(--muted)">' + (exists ? fmt(v.size_bytes) : isSqlite ? 'innerwarden.db' : '-') + '</td>' +
       '</tr>';
   });
   html += '</tbody></table></div>';
