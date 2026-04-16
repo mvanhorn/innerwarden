@@ -247,31 +247,7 @@ pub(super) async fn api_compliance(State(state): State<DashboardState>) -> Json<
                 Ok(c) => c,
                 Err(_) => return (true, 0, "none".to_string()),
             };
-            let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
-            if lines.is_empty() {
-                return (true, 0, "none".to_string());
-            }
-            let mut intact = true;
-            let mut prev_computed_hash: Option<String> = None;
-            for line in &lines {
-                if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) {
-                    let prev_hash = entry["prev_hash"].as_str().map(|s| s.to_string());
-                    // Verify: if this entry has a prev_hash, it should match our computed hash
-                    if let Some(ref expected) = prev_hash {
-                        if let Some(ref computed) = prev_computed_hash {
-                            if expected != computed {
-                                intact = false;
-                            }
-                        }
-                    }
-                }
-                // Compute hash of this line for next iteration
-                use sha2::Digest;
-                let hash = sha2::Sha256::digest(line.as_bytes());
-                prev_computed_hash = Some(format!("{hash:x}"));
-            }
-            let last = prev_computed_hash.unwrap_or_else(|| "none".to_string());
-            (intact, lines.len(), last)
+            verify_hash_chain(&content)
         }
     })
     .await
@@ -327,4 +303,77 @@ pub(super) async fn api_compliance(State(state): State<DashboardState>) -> Json<
         },
         "version": env!("CARGO_PKG_VERSION"),
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Pure validation logic
+// ---------------------------------------------------------------------------
+
+pub(crate) fn verify_hash_chain(content: &str) -> (bool, usize, String) {
+    let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+    if lines.is_empty() {
+        return (true, 0, "none".to_string());
+    }
+    let mut intact = true;
+    let mut prev_computed_hash: Option<String> = None;
+    for line in &lines {
+        // We tolerate invalid JSON in production stream by just skipping prev_hash checks
+        // but we always hash the exact byte sequence of the string.
+        if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) {
+            let prev_hash = entry["prev_hash"].as_str().map(|s| s.to_string());
+            if let Some(ref expected) = prev_hash {
+                if let Some(ref computed) = prev_computed_hash {
+                    if expected != computed {
+                        intact = false;
+                    }
+                }
+            }
+        }
+        use sha2::Digest;
+        let hash = sha2::Sha256::digest(line.as_bytes());
+        prev_computed_hash = Some(format!("{hash:x}"));
+    }
+    let last = prev_computed_hash.unwrap_or_else(|| "none".to_string());
+    (intact, lines.len(), last)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_verify_hash_chain_empty() {
+        let (intact, len, last) = verify_hash_chain("");
+        assert!(intact);
+        assert_eq!(len, 0);
+        assert_eq!(last, "none");
+    }
+
+    #[test]
+    fn test_verify_hash_chain_valid() {
+        let entry1 = r#"{"action":"block", "prev_hash": null}"#;
+        use sha2::Digest;
+        let hash1 = format!("{:x}", sha2::Sha256::digest(entry1.as_bytes()));
+        let entry2 = format!(r#"{{"action":"monitor", "prev_hash": "{}"}}"#, hash1);
+
+        let content = format!("{}\n{}\n", entry1, entry2);
+        let (intact, len, _) = verify_hash_chain(&content);
+
+        assert!(intact);
+        assert_eq!(len, 2);
+    }
+
+    #[test]
+    fn test_verify_hash_chain_tampered() {
+        // Intentional tamper of prev_hash
+        let entry1 = r#"{"action":"block", "prev_hash": null}"#;
+        // Wrong hash pointing backwards
+        let entry2 = r#"{"action":"monitor", "prev_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}"#;
+
+        let content = format!("{}\n{}\n", entry1, entry2);
+        let (intact, len, _) = verify_hash_chain(&content);
+
+        assert!(!intact);
+        assert_eq!(len, 2);
+    }
 }

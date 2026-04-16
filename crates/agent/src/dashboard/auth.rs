@@ -450,3 +450,66 @@ pub(super) async fn api_auth_sessions(State(state): State<DashboardState>) -> im
         "sessions": items,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_basic_auth_valid() {
+        // "admin:secret" in base64 is "YWRtaW46c2VjcmV0"
+        let header = "Basic YWRtaW46c2VjcmV0";
+        let (user, pass) = parse_basic_auth(header).expect("should parse valid auth");
+        assert_eq!(user, "admin");
+        assert_eq!(pass, "secret");
+    }
+
+    #[test]
+    fn test_parse_basic_auth_malformed() {
+        assert!(parse_basic_auth("Bearer YWRtaW46c2VjcmV0").is_none());
+        assert!(parse_basic_auth("Basic").is_none());
+        assert!(parse_basic_auth("Basic ").is_none()); // empty base64
+                                                       // Not base64
+        assert!(parse_basic_auth("Basic !@#$").is_none());
+        // Valid base64 but no colon
+        // "admin" in base64 is "YWRtaW4="
+        assert!(parse_basic_auth("Basic YWRtaW4=").is_none());
+    }
+
+    #[test]
+    fn test_extract_bearer_token() {
+        let req = Request::builder()
+            .header(header::AUTHORIZATION, "Bearer xyz123")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(extract_bearer_token(&req), Some("xyz123"));
+
+        let req2 = Request::builder()
+            .header(header::AUTHORIZATION, "Basic YWRtaW46c2VjcmV0")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(extract_bearer_token(&req2), None);
+    }
+
+    #[test]
+    fn test_rate_limiter_blocks_abuse() {
+        let ip = "10.0.0.99";
+        clear_rate_limit(ip);
+        assert!(!is_rate_limited(ip));
+
+        // Attempt up to limit
+        for _ in 0..LOGIN_RATE_LIMIT_MAX_ATTEMPTS - 1 {
+            let blocked = check_and_record_failed_login(ip);
+            assert!(!blocked, "should not be blocked yet");
+        }
+
+        // Final attempt exceeds limit
+        let blocked = check_and_record_failed_login(ip);
+        assert!(blocked, "should be blocked");
+        assert!(is_rate_limited(ip));
+
+        // Auth success resets it
+        clear_rate_limit(ip);
+        assert!(!is_rate_limited(ip));
+    }
+}
