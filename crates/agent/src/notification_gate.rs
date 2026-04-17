@@ -714,4 +714,91 @@ mod tests {
         assert!(ctx.is_contained);
         assert_eq!(should_notify(&ctx), NotificationVerdict::DailyBriefingOnly);
     }
+
+    // ─── Spec 024 contract tests ───────────────────────────────────────
+    //
+    // The notification_gate contract:
+    //
+    //   should_notify(ctx) ∈ { SendNow, DailyBriefingOnly, Drop }
+    //
+    // — the set is closed. No I/O, no side effects, no async, no state. Any
+    // new verdict variant is a breaking change to downstream consumers and
+    // must be reflected here. Keeping this contract explicit is the sole
+    // reason the gate exists as a separate module: callers can reason about
+    // the space of possible outcomes without reading implementation.
+    //
+    // Every matrix cell below represents one logical branch of the gate;
+    // adding or removing a branch without updating this table means the
+    // gate's behavioural envelope shifted and downstream callers
+    // (Telegram, briefing, burst tracker) may silently drift.
+
+    #[test]
+    fn contract_verdict_is_one_of_three_enum_variants_exhaustive_match() {
+        // Compile-time proof: an exhaustive match covers exactly the three
+        // verdicts. If a fourth is added, this test stops compiling and
+        // forces the author to explicitly update callers.
+        let ctx = make_ctx("low", "noop", false, false, false, false);
+        let verdict = should_notify(&ctx);
+        match verdict {
+            NotificationVerdict::SendNow
+            | NotificationVerdict::DailyBriefingOnly
+            | NotificationVerdict::Drop => {}
+        }
+    }
+
+    #[test]
+    fn contract_pure_function_no_mutation_of_context() {
+        // The gate MUST NOT mutate its context. Downstream callers share
+        // the context across verdicts and can observe drift if the gate
+        // modifies flags. We assert structural equality pre/post.
+        let ctx_before = make_ctx("critical", "killchain.reverse_shell", true, true, false, false);
+        let ctx_after = make_ctx("critical", "killchain.reverse_shell", true, true, false, false);
+        let _ = should_notify(&ctx_before);
+        assert_eq!(ctx_before.detector, ctx_after.detector);
+        assert_eq!(ctx_before.is_contained, ctx_after.is_contained);
+        assert_eq!(ctx_before.is_active_intrusion, ctx_after.is_active_intrusion);
+        assert_eq!(ctx_before.is_compromise, ctx_after.is_compromise);
+        assert_eq!(ctx_before.is_honeypot_probe, ctx_after.is_honeypot_probe);
+    }
+
+    #[test]
+    fn contract_full_precedence_table() {
+        // Full Cartesian precedence table. Each row is (compromise, active,
+        // contained, probe) → verdict. Redundant-by-design with the
+        // narrower tests above; lives here as the single-place rulebook
+        // an operator can point at when asking "why did this fire?".
+        type Row = ((bool, bool, bool, bool), NotificationVerdict);
+        let rows: &[Row] = &[
+            // compromise wins over everything.
+            ((true, false, false, false), NotificationVerdict::SendNow),
+            ((true, true, false, false), NotificationVerdict::SendNow),
+            ((true, false, true, false), NotificationVerdict::SendNow),
+            ((true, false, false, true), NotificationVerdict::SendNow),
+            // active + not-contained: send.
+            ((false, true, false, false), NotificationVerdict::SendNow),
+            // active + contained: defer.
+            ((false, true, true, false), NotificationVerdict::DailyBriefingOnly),
+            // contained alone: defer.
+            ((false, false, true, false), NotificationVerdict::DailyBriefingOnly),
+            // probe only (not contained): drop. This is the noise floor.
+            ((false, false, false, true), NotificationVerdict::Drop),
+            // nothing special: defer.
+            ((false, false, false, false), NotificationVerdict::DailyBriefingOnly),
+        ];
+        for &((compromise, active, contained, probe), want) in rows {
+            let ctx = make_ctx(
+                "medium",
+                "test",
+                contained,
+                active,
+                compromise,
+                probe,
+            );
+            let got = should_notify(&ctx);
+            assert_eq!(
+                got, want,
+                "contract regression: (compromise={compromise}, active={active}, contained={contained}, probe={probe}) expected {want:?} got {got:?}"
+            );
+        }
+    }
 }

@@ -454,6 +454,88 @@ mod tests {
         );
     }
 
+    // ─── Spec 024 contract tests ───────────────────────────────────────
+    //
+    // PidTracker::process_event contract:
+    //   - Events whose `details.comm` matches `KILLCHAIN_SELF_EXCLUDED_COMMS`
+    //     MUST NOT mutate tracker state. Self-exclusion is the whole reason
+    //     the platform stopped DATA_EXFIL'ing itself in PR #124.
+    //   - Events unrelated to kill-chain bits (e.g. a cold exec that is not
+    //     in any known pattern) MUST NOT emit an incident.
+    //   - When an event DOES advance a pattern, process_event returns a
+    //     non-empty Vec. The specific contents are the PidTracker's own
+    //     business; the agent contract is only about presence/absence.
+
+    #[test]
+    fn contract_excluded_comm_never_mutates_state() {
+        let mut tracker =
+            PidTracker::new().with_excluded_comms(KILLCHAIN_SELF_EXCLUDED_COMMS.iter().copied());
+        let (pids_before, _, _) = tracker.stats();
+
+        for comm in KILLCHAIN_SELF_EXCLUDED_COMMS.iter().copied() {
+            let ev = serde_json::json!({
+                "kind": "network.outbound_connect",
+                "ts": chrono::Utc::now().to_rfc3339(),
+                "host": "h",
+                "details": {
+                    "pid": 1111,
+                    "uid": 0,
+                    "comm": comm,
+                    "dst_ip": "1.1.1.1",
+                    "dst_port": 443
+                }
+            });
+            let incidents = tracker.process_event(&ev);
+            assert!(
+                incidents.is_empty(),
+                "self-excluded comm '{comm}' must never emit incidents"
+            );
+        }
+        let (pids_after, _, _) = tracker.stats();
+        assert_eq!(
+            pids_before, pids_after,
+            "self-excluded comms must not mutate tracker state"
+        );
+    }
+
+    #[test]
+    fn contract_innocent_event_emits_no_incidents() {
+        // A noop event must produce a Vec with zero incidents. We assert
+        // on length (Vec API) rather than identity so the storage layer is
+        // free to change.
+        let mut tracker = PidTracker::new();
+        let ev = serde_json::json!({
+            "kind": "file.read_access",
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "host": "h",
+            "details": {
+                "pid": 9999,
+                "uid": 1000,
+                "comm": "user-shell",
+                "filename": "/home/user/.bashrc"
+            }
+        });
+        let out: Vec<serde_json::Value> = tracker.process_event(&ev);
+        assert_eq!(out.len(), 0);
+    }
+
+    #[test]
+    fn contract_returns_vec_not_option() {
+        // Signature check: if someone ever changes process_event to return
+        // Option<Incident> (which it *has* looked like in the past), scenario
+        // and replay pipelines that iterate will silently lose batches.
+        let mut tracker = PidTracker::new();
+        let out: Vec<serde_json::Value> = tracker.process_event(&serde_json::json!({
+            "kind": "noop",
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "host": "h",
+            "details": {"pid": 1, "comm": "init"}
+        }));
+        // Vec is iterable by reference and by value. Both compile ⇒ contract holds.
+        let _ = out.iter().count();
+        let _ = out.into_iter().count();
+    }
+
     // KILLCHAIN_COMM_ALLOWLIST prevents notification for known service processes
     #[test]
     fn comm_allowlist_blocks_known_services() {

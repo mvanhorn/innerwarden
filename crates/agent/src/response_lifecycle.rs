@@ -1756,4 +1756,98 @@ mod tests {
         }
         assert!(lc.history.len() <= 1000);
     }
+
+    // ─── Spec 024 contract tests ───────────────────────────────────────
+    //
+    // `register` contract:
+    //   - returns a non-empty id.
+    //   - immediately, `is_tracked(target, backend)` ⇒ true.
+    //   - total_registered strictly increases by 1 per call.
+    //   - the entry starts in `LifecycleState::Active`.
+    //   - register does NOT itself validate targets; validation lives
+    //     upstream (decision_block_ip::is_valid_block_target) and in
+    //     `load_snapshot`. The PR #124 zombie-rule bug was the snapshot
+    //     path forgetting that invariant — this test pins it on the
+    //     register contract so any future inversion (e.g. "maybe we
+    //     should validate inside register?") must update the test.
+
+    #[test]
+    fn contract_register_returns_id_and_marks_tracked() {
+        let mut lc = ResponseLifecycle::new();
+        let id = lc.register(
+            ResponseType::BlockIp,
+            ResponseBackend::Ufw,
+            "198.51.100.7",
+            "inc-contract-1",
+            3600,
+            None,
+        );
+        assert!(!id.is_empty(), "register must return a non-empty id");
+        assert!(
+            lc.is_tracked("198.51.100.7", &ResponseBackend::Ufw),
+            "is_tracked must return true immediately after register"
+        );
+        assert_eq!(lc.total_registered, 1);
+        let state = &lc.list_active()[0].state;
+        assert!(matches!(state, LifecycleState::Active));
+    }
+
+    #[test]
+    fn contract_register_accepts_arbitrary_target_string_upstream_validates() {
+        // Register's caller is expected to validate the target. This test
+        // documents that boundary: a malformed target does land in the
+        // lifecycle if someone calls register directly. In production all
+        // callers go through decision_block_ip::execute_block which rejects
+        // invalid IPs upstream.
+        let mut lc = ResponseLifecycle::new();
+        let id = lc.register(
+            ResponseType::BlockIp,
+            ResponseBackend::Ufw,
+            "not-an-ip-at-all",
+            "inc-contract-2",
+            3600,
+            None,
+        );
+        assert!(!id.is_empty());
+        assert!(lc.is_tracked("not-an-ip-at-all", &ResponseBackend::Ufw));
+    }
+
+    #[test]
+    fn contract_register_totals_monotonic_across_calls() {
+        let mut lc = ResponseLifecycle::new();
+        for i in 0..5 {
+            let before = lc.total_registered;
+            lc.register(
+                ResponseType::BlockIp,
+                ResponseBackend::Ufw,
+                &format!("192.0.2.{i}"),
+                &format!("inc-{i}"),
+                60,
+                None,
+            );
+            assert_eq!(lc.total_registered, before + 1);
+        }
+        assert_eq!(lc.list_active().len(), 5);
+    }
+
+    #[test]
+    fn contract_is_tracked_is_backend_scoped() {
+        // Same target, different backends ⇒ must be tracked independently.
+        // This keeps the dedup logic from collapsing e.g. an xdp kernel
+        // rule and a ufw userspace rule for the same IP into one entry.
+        let mut lc = ResponseLifecycle::new();
+        lc.register(
+            ResponseType::BlockIp,
+            ResponseBackend::Xdp,
+            "203.0.113.9",
+            "inc-a",
+            60,
+            None,
+        );
+        assert!(lc.is_tracked("203.0.113.9", &ResponseBackend::Xdp));
+        assert!(
+            !lc.is_tracked("203.0.113.9", &ResponseBackend::Ufw),
+            "backend identity must be part of the tracked key"
+        );
+    }
 }

@@ -392,6 +392,101 @@ mod tests {
         );
     }
 
+    // ─── Spec 024 contract tests ───────────────────────────────────────
+    //
+    // The decision_cooldown module is the join key generator for every
+    // cooldown-gated branch in the agent. Its contract is threefold:
+    //
+    //   1. Key format is stable: `{action}:{detector}:{entity_kind}:{entity}`.
+    //      Any rename here invalidates every persisted cooldown on disk,
+    //      silently turning cooldowns into misses and re-opening the
+    //      dedup-broken re-block loop that triggered spec 015.
+    //
+    //   2. Pure function: `decision_cooldown_key_for_decision` is pure in
+    //      its inputs. It MUST NOT read or mutate the caller's AgentState.
+    //
+    //   3. No-action decisions return `None`. `Ignore` and
+    //      `RequestConfirmation` must not allocate cooldown keys —
+    //      otherwise benign decisions are locked out for DECISION_COOLDOWN_SECS.
+
+    #[test]
+    fn contract_key_format_is_canonical() {
+        // Directly probe the private helper via the public key_for_decision
+        // to pin the format.
+        let inc = mock_incident("ssh_bruteforce:1", vec![EntityRef::ip("198.51.100.10")]);
+        let dec = AiDecision {
+            action: AiAction::BlockIp {
+                ip: "198.51.100.10".to_string(),
+                skill_id: "block-ip-ufw".to_string(),
+            },
+            confidence: 0.9,
+            reason: "test".to_string(),
+            auto_execute: true,
+            estimated_threat: "high".to_string(),
+            alternatives: vec![],
+        };
+        let key = decision_cooldown_key_for_decision(&inc, &dec).unwrap();
+        assert_eq!(
+            key, "block_ip:ssh_bruteforce:ip:198.51.100.10",
+            "cooldown key format is part of the disk ABI — see spec 024 contract"
+        );
+    }
+
+    #[test]
+    fn contract_ignore_actions_return_no_key() {
+        let inc = mock_incident("port_scan:1", vec![EntityRef::ip("1.1.1.1")]);
+        let dec = AiDecision {
+            action: AiAction::Ignore {
+                reason: "fp".into(),
+            },
+            confidence: 1.0,
+            reason: "".into(),
+            auto_execute: false,
+            estimated_threat: "low".into(),
+            alternatives: vec![],
+        };
+        assert_eq!(decision_cooldown_key_for_decision(&inc, &dec), None);
+    }
+
+    #[test]
+    fn contract_request_confirmation_returns_no_key() {
+        // Operator pending actions are NOT cooldown-keyed — they have their
+        // own TTL. Confirming this stops the "pending confirmation locks out
+        // real decisions for an hour" class of bug.
+        let inc = mock_incident("any:1", vec![]);
+        let dec = AiDecision {
+            action: AiAction::RequestConfirmation {
+                summary: "x".into(),
+            },
+            confidence: 0.5,
+            reason: "".into(),
+            auto_execute: false,
+            estimated_threat: "medium".into(),
+            alternatives: vec![],
+        };
+        assert_eq!(decision_cooldown_key_for_decision(&inc, &dec), None);
+    }
+
+    #[test]
+    fn contract_notification_keys_include_every_eligible_entity() {
+        // Notification cooldown keys are generated per-entity so two
+        // attackers from different IPs on the same detector do not shadow
+        // each other's alerts. Verify the invariant.
+        let inc = mock_incident(
+            "ssh_bruteforce:1",
+            vec![
+                EntityRef::ip("1.1.1.1"),
+                EntityRef::ip("2.2.2.2"),
+                EntityRef::user("attacker"),
+            ],
+        );
+        let keys = notification_cooldown_keys(&inc);
+        assert_eq!(keys.len(), 3, "one key per eligible entity, no dedup");
+        assert!(keys.contains(&"ssh_bruteforce:ip:1.1.1.1".to_string()));
+        assert!(keys.contains(&"ssh_bruteforce:ip:2.2.2.2".to_string()));
+        assert!(keys.contains(&"ssh_bruteforce:user:attacker".to_string()));
+    }
+
     #[test]
     fn test_decision_cooldown_key_from_entry() {
         let entry = DecisionEntry {
