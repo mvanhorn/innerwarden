@@ -1,0 +1,24 @@
+# Spec 024 scenario #1 overrides.
+#
+# The scenario runner renders `{{DATA_DIR}}` and `{{AUTH_LOG}}` before
+# handing the file to the sensor and agent. Sections under [sensor.*]
+# go to the sensor config; sections under [agent.*] go to the agent
+# config. Every scenario lists ONLY the knobs it cares about — the
+# runner fills the rest with safe defaults (collectors off, detectors
+# off, responder in dry-run against the scenario data_dir).
+
+[sensor.agent]
+host_id = "scen-01-ssh-brute-single"
+
+[sensor.output]
+data_dir = "{{DATA_DIR}}"
+write_events = true
+
+[sensor.collectors.auth_log]
+enabled = true
+path = "{{AUTH_LOG}}"
+
+[sensor.detectors.ssh_bruteforce]
+enabled = true
+threshold = 5
+window_seconds = 300

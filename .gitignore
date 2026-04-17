@@ -18,6 +18,9 @@ crates/sensor-ebpf/target/
 
 # Build and temp artifacts
 *.log
+# Scenario fixtures are committed syslog-style text; spec 024 depends on
+# them being tracked.
+!testdata/scenarios/**/*.log
 *.bak
 *.pyc
 __pycache__/

@@ -1,0 +1,9 @@
+{
+  "status": "wip",
+  "description": "DDoS SYN flood — 10k syn/s for 60s from 100 IPs. Target envelope per spec 024: 1 incident, 1 telegram, ≥1 mitigation (cloudflare push or xdp block). Envelope is wide pending a shield_inline ingestion hook so the scenario can synthesise the packet rate without eBPF.",
+  "last_reviewed": "2026-04-17",
+  "incidents": { "min": 0, "max": 2 },
+  "telegram_msgs": { "min": 0, "max": 2 },
+  "blocks": { "min": 0, "max": 2 },
+  "decisions_auto_executed": { "min": 0, "max": 2 }
+}

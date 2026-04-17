@@ -1,0 +1,9 @@
+{
+  "status": "ready",
+  "description": "10 distinct public IPs, 5 ssh.login_failed events each inside a 5-minute window. Each IP independently crosses ssh_bruteforce threshold=5 (10 incidents) and the cross-IP distributed_ssh correlator fires once more (1 extra incident) — note that `distributed_ssh.enabled` is wired to `ssh_bruteforce.enabled` in the sensor and cannot be toggled independently; any future decoupling should tighten this envelope. Each incident routes through the auto-rule (bypasses stub AI) and produces a block decision; distributed_ssh escalates to an additional per-IP block pass.",
+  "last_reviewed": "2026-04-17",
+  "incidents": { "min": 10, "max": 12 },
+  "telegram_msgs": { "min": 0, "max": 3 },
+  "blocks": { "min": 10, "max": 18 },
+  "decisions_auto_executed": { "min": 10, "max": 20 }
+}

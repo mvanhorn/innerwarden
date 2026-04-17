@@ -1,0 +1,9 @@
+{
+  "status": "wip",
+  "description": "Honeypot hit from an IP known to be malicious (AbuseIPDB score > 50). Target envelope per spec 024: 1 incident, 1 telegram, 1 block. Current fixture cannot reproduce the honeypot session without root + a real listener, so the envelope is deliberately wide until the runner gains a sqlite-seed mechanism.",
+  "last_reviewed": "2026-04-17",
+  "incidents": { "min": 0, "max": 2 },
+  "telegram_msgs": { "min": 0, "max": 2 },
+  "blocks": { "min": 0, "max": 2 },
+  "decisions_auto_executed": { "min": 0, "max": 2 }
+}

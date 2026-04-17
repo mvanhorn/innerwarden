@@ -52,6 +52,10 @@ test-enable-dry-run: build-ctl
 replay-qa:
 	./scripts/replay_qa.sh
 
+.PHONY: scenario-qa
+scenario-qa:
+	./scripts/scenario_qa.sh
+
 .PHONY: ops-check
 ops-check:
 	./scripts/ops-check.sh $(DATA_DIR)

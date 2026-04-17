@@ -1,0 +1,11 @@
+# Spec 024 scenario #5 — port scan from a single IP.
+#
+# STATUS: WIP. The port_scan detector is driven by eBPF connect
+# syscalls (`ebpf.syscall.connect`) which cannot be synthesised from
+# a userspace log fixture. Once the runner gains a sqlite-seed
+# mechanism for pre-built events we'll feed 50 connect events across
+# distinct ports in 30s from 1.2.3.4 and assert the envelope per spec
+# 024: 1 incident, ≤1 telegram, 1 block.
+
+[sensor.agent]
+host_id = "scen-05-port-scan"

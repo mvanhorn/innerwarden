@@ -1,0 +1,11 @@
+# Spec 024 scenario #4 — honeypot hit from a clean IP.
+#
+# STATUS: WIP. See 03-honeypot-known-bad for fixture plan — the
+# agent-side behaviour contract ("unknown IPs stay on Monitor, honeypot
+# lets them in") is already covered by the StubAiProvider unit test
+# `honeypot_unknown_ip_monitors_not_blocks`. The scenario exists so
+# that the full composition can assert the same contract end-to-end
+# once the pre-seed path lands.
+
+[sensor.agent]
+host_id = "scen-04-honeypot-unknown"

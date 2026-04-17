@@ -1,0 +1,9 @@
+{
+  "status": "wip",
+  "description": "50 connections to distinct ports from 1.2.3.4 in 30s. Target envelope per spec 024: 1 incident, ≤1 telegram, 1 block. Envelope is wide pending a sqlite-seed fixture that can inject synthetic ebpf.syscall.connect events on non-Linux runners.",
+  "last_reviewed": "2026-04-17",
+  "incidents": { "min": 0, "max": 2 },
+  "telegram_msgs": { "min": 0, "max": 2 },
+  "blocks": { "min": 0, "max": 2 },
+  "decisions_auto_executed": { "min": 0, "max": 2 }
+}

@@ -1,0 +1,22 @@
+# Spec 024 scenario #2 — coordinated ssh brute force from 10 IPs.
+#
+# Each of 10 distinct public IPs lands 5 ssh.login_failed events inside a
+# single 300s window. Every IP independently crosses the detector threshold
+# so the sensor emits 10 incidents. The stub AI auto-blocks each one.
+
+[sensor.agent]
+host_id = "scen-02-ssh-brute-coordinated"
+
+[sensor.collectors.auth_log]
+enabled = true
+path = "{{AUTH_LOG}}"
+
+[sensor.detectors.ssh_bruteforce]
+enabled = true
+threshold = 5
+window_seconds = 300
+
+# distributed_ssh is enabled implicitly by ssh_bruteforce.enabled in
+# the sensor; it cannot be toggled from config today. The envelope in
+# expected.json accounts for the extra cross-IP correlator incident and
+# its follow-on block decisions.

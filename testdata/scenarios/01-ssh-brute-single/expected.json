@@ -1,0 +1,9 @@
+{
+  "status": "ready",
+  "description": "20 ssh.login_failed events from a single IP (1.2.3.4) in under 60s crossing ssh_bruteforce threshold=5, dedup holds the re-alert until the full 300s window elapses. Stub AI auto-blocks. Gate defers the contained threat to daily briefing.",
+  "last_reviewed": "2026-04-17",
+  "incidents": { "min": 1, "max": 1 },
+  "telegram_msgs": { "min": 0, "max": 1 },
+  "blocks": { "min": 1, "max": 1 },
+  "decisions_auto_executed": { "min": 1, "max": 1 }
+}

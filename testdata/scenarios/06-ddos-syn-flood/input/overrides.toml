@@ -1,0 +1,10 @@
+# Spec 024 scenario #6 — DDoS SYN flood.
+#
+# STATUS: WIP. The packet_flood detector is eBPF-backed and fires on
+# kernel-observed SYN/HTTP rates. A userspace fixture cannot produce
+# that signal, so the scenario scaffolds the directory + expected.json
+# for parity with spec 024 and will tighten once sqlite-seed (or a
+# direct shield_inline ingestion API) lands.
+
+[sensor.agent]
+host_id = "scen-06-ddos-syn-flood"

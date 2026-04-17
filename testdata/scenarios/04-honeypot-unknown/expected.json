@@ -1,0 +1,9 @@
+{
+  "status": "wip",
+  "description": "Honeypot hit from a clean IP (AbuseIPDB score low or absent). Target envelope per spec 024: 1 incident, ≤1 telegram, 0 blocks — the honeypot is supposed to let unknown attackers in so they stay observable. Envelope is wide until sqlite-seed lands.",
+  "last_reviewed": "2026-04-17",
+  "incidents": { "min": 0, "max": 2 },
+  "telegram_msgs": { "min": 0, "max": 1 },
+  "blocks": { "min": 0, "max": 0 },
+  "decisions_auto_executed": { "min": 0, "max": 1 }
+}

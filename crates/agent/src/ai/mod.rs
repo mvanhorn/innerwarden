@@ -1,6 +1,7 @@
 mod anthropic;
 mod ollama;
 mod openai;
+mod stub;
 
 use std::collections::HashSet;
 use std::net::IpAddr;
@@ -325,6 +326,14 @@ fn validate_ai_base_url(url: &str) -> Result<()> {
 }
 
 pub fn build_provider(cfg: &AiConfig) -> Result<Box<dyn AiProvider>> {
+    // Spec 024 — deterministic stub used by the scenario-qa harness. Returns
+    // fixed decisions per detector kind so scenario envelopes stay stable
+    // across runs. Opt-in only (provider = "stub"); has no effect on
+    // production configs.
+    if cfg.provider == "stub" {
+        return Ok(Box::new(stub::StubAiProvider::new()));
+    }
+
     // Check if provider is OpenAI-compatible (including "openai" itself)
     if let Some(&(_, default_url, default_model)) = OPENAI_COMPATIBLE
         .iter()
@@ -538,5 +547,18 @@ mod tests {
         };
         let result = build_provider(&cfg);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn build_provider_stub_succeeds_without_api_key() {
+        // Spec 024: the scenario-qa harness must be able to build a provider
+        // without any API key or external service. This is the contract.
+        let cfg = crate::config::AiConfig {
+            enabled: true,
+            provider: "stub".into(),
+            ..Default::default()
+        };
+        let provider = build_provider(&cfg).expect("stub provider must build offline");
+        assert_eq!(provider.name(), "stub");
     }
 }
