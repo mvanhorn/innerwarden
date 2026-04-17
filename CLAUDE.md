@@ -28,22 +28,23 @@ integrations/   Declarative integration recipes
 ## Comandos
 
 ```bash
-make test         # todos os testes (~1900)
+make test         # todos os testes (workspace)
 make build        # debug build
-make check        # clippy + fmt
-make replay-qa    # validacao E2E
+make check        # clippy -D warnings + fmt --check
+make replay-qa    # validacao E2E multi-source
 ```
 
-## Estado (2026-04-11)
+## Estado (2026-04-17)
 
-- 49 sensor detectors + 27 graph detectors (Phase 3A-C complete), 40 eBPF hooks, 65 MITRE IDs, 47 correlation rules (CL-001 to CL-047, includes 5 AlphaZero V4 discoveries + 3 hypervisor rules + 3 cross-module integration rules) + 10 graph correlation rules
-- Knowledge graph: in-memory directed graph (11 node types, 50 relation types, 60 event kinds mapped). Dashboard tab + AI triage integration + 58-feature autoencoder (10 graph structural features). **Phase 6 + Phase 7 complete**: graph is single source of truth. Daily dated snapshots (`graph-snapshot-YYYY-MM-DD.json`), 7-day retention. FP tracking in graph (false_positive, fp_reporter, fp_reported_at on Incident nodes). decision_cooldown, report, neural_lifecycle, threat_report all read from graph snapshots (JSONL fallback). ~30+ JSONL reads eliminated. Snapshot rotation (3 backups) + integrity check + corruption fallback.
-- 2475 tests passing
-- Server producao: ver config local (nao expor no repo publico)
+- 49 sensor detectors + 27 graph detectors, 40 eBPF hooks, 65 MITRE IDs, 47 correlation rules (CL-001..CL-047 incl. 5 AlphaZero V4 discoveries + 3 hypervisor + 3 cross-module) + 10 graph correlation rules
+- Knowledge graph e unica fonte de verdade para dashboard/bot/reports. In-memory directed graph (11 node types, 50 relations, 60 event kinds mapped). Snapshots diarios dated + 7d retention + 3-backup rotation + integrity check. FP tracking in graph. decision_cooldown/report/neural_lifecycle/threat_report leem do graph (JSONL fallback). Dashboard "Graph" tab removido — stats migrados pra Health.
+- 3102 tests passing workspace
+- Coverage: ~45% overall (2026-04-17 baseline). Codecov configurado com 12 components per-crate + patch gate 70% em PRs (spec 023).
+- Server producao: Oracle Cloud London (ver config local, nao expor no repo publico)
 - Branches: main = stable, develop = bleeding edge
-- CI: `make check` + `make test` + `make spec-check`
+- CI: `make check` + `make test` + `make spec-check` + coverage via tarpaulin 0.33
 - Licenca: Apache-2.0 (migrado de BUSL-1.1 em 2026-04-03)
-- Release atual: v0.11.0
+- Release atual: v0.11.1
 - CTL reestruturado: 8 grupos (get, stream, action, trust, config, system, module, agent)
 
 ## Convencoes
@@ -99,29 +100,39 @@ ADR: `docs/internal/adr/0001-project-taxonomy.md`
 
 ## Features — Status
 
+Ordenado por numero. ✅ merged, 🚧 in-progress, 📝 draft/planned, ⏸ deferred.
+
 | ID | Feature | Status |
 |----|---------|--------|
-| 001 | Telegram Interactive Triage | Concluida |
-| 002 | Telegram Triage v2 (2FA + Undo + Auto-Learn) | Auto-Learn, Undo e 2FA Telegram concluidos. Pendente: dashboard 2FA endpoints (A5) |
-| 003 | Setup Ready To Use | Concluida |
-| 004 | Setup Zero Friction | Concluida |
-| 005 | Intelligent Notifications | Spec pronto. Grouping + channel filter + env calibration + AI batch triage |
-| 012 | Eliminate JSONL Dependency (Phase 6) | **Concluida**. 6A-6F done. Graph primary for dashboard/bot/reports. Deferred: FP tracking, multi-day snapshots, telemetry (spec 013) |
-| 010 | Detector Migration (Phase 3) | **3A-3C Done**: 27 graph detectors + 10 correlation rules + dedup + config flag. 3D partial (metrics deferred). 29 tests. |
-| 013 | Graph Single Source of Truth (Phase 7) | **COMPLETE** (Gaps 1,2,4,5 done). Daily dated snapshots, FP tracking in graph, monthly report from snapshots, 6h window from event_timeline. Gap 3 deferred (telemetry stays JSONL by design). |
-| 014 | Graph Full Connectivity | **COMPLETE** (Phases A-D + leftover). 8 → 18 active relations. tcp_stream/eBPF/memory/cgroup/incident-PID all ingested. Bug fixes: missing `--features ebpf` flag, filename/path field mismatch, 200MB JSONL cap dropping events. Edges 12K → 33K, Process nodes 411 → 4470. |
-| 016 | Unified SQLite Store | **COMPLETE** (v0.11.0). Single `innerwarden.db` replaces 15 storage artifacts. 8 phases + cleanup. redb removed, JSONL removed, 14 maintenance tasks, legacy migration. |
-| 017 | Dashboard Operator UX | **Draft** P1. Two personas (primary operator + technical fallback). 15 FRs covering state consistency, non-alarmist tone, mobile legibility, stale-data indicators. Spec validated, no plan yet. |
-| 019 | Test Coverage Gaps (Batches 2–7) | **In progress** (Gemini-owned). Batch 1 landed in PR #110. Batches 2–7 outstanding: agent + ctl pure-logic extraction. Target 42.85% → 50%. |
-| 022 | Dashboard Test Coverage | **Draft** P0. 6 batches covering 16 dashboard files (9,709 lines, 24 tests total). HTML escaping, auth, investigation journeys, sensors status bugs, actions validation. Target 0% → 30%+ on dashboard. |
-| 023 | Coverage Closeout (project-wide) | **In progress** — Batches 1..11 done, awaiting codecov refresh |
-| 024 | Regression Safety Net | **Draft** P0. Three layers: canonical scenario volume tests (`make scenario-qa`), `/metrics` endpoint + drift alerts, contract tests at subsystem boundaries. Kills the whack-a-mole pattern (fix A, break B). Unblocks spec 005 as Phase 3. ~7 AI sessions for Phases A+B. |
+| 001 | Telegram Interactive Triage | ✅ |
+| 002 | Telegram Triage v2 (2FA + Undo + Auto-Learn) | ✅ Auto-Learn, Undo, 2FA Telegram. Pendente: dashboard 2FA endpoints (GET/POST `/api/2fa/*`) |
+| 003 | Setup Ready To Use | ✅ |
+| 004 | Setup Zero Friction | ✅ |
+| 005 | Intelligent Notifications | 📝 Spec pronto. Grouping + channel filter + env calibration + AI batch triage. Bloqueado por ninguem — candidato pra proxima fila depois de 023/022 fecharem. |
+| 010 | Detector Migration (Phase 3) | ✅ Phases 3A-3C. 27 graph detectors + 10 correlation rules + dedup + config flag. Phase 3D metrics diferida. |
+| 012 | Eliminate JSONL Dependency (Phase 6) | ✅ Phases 6A-6F. Graph primary for dashboard/bot/reports. |
+| 013 | Graph Single Source of Truth (Phase 7) | ✅ Gaps 1/2/4/5 done. Daily dated snapshots, FP tracking in graph, monthly report from snapshots, 6h window from event_timeline. Gap 3 (telemetry JSONL) por design. |
+| 014 | Graph Full Connectivity | ✅ Phases A-D. 8→18 active relations. Edges 12K→33K, Process nodes 411→4470. |
+| 015 | Graph Signal Quality | ✅ Auditoria dos 27 graph detectors + 3,954 FP `graph_user_creation` caçados. Ver [Signal quality principle](#signal-quality-principle-spec-015). |
+| 016 | Unified SQLite Store | ✅ v0.11.0. Single `innerwarden.db` substitui 15 storage artifacts. redb removido, JSONL removido, 14 maintenance tasks, migration legada. |
+| 017 | Dashboard Operator UX | 🚧 Phase 1 merged (Home + Threats tabs AI-first, 16 detector FP fixes). Demais fases em backlog. |
+| 018 | Autonomous Response | ✅ Phases A-D. Layer 2 correlation-driven escalation + trusted_processes filter. Graduated enforcement state machine (Phase F) parcial no spec 020. |
+| 019 | Test Coverage Gaps (Batches 2–7) | 🚧 Batch 1 em PR #110 (merged). Batches 2-7 outstanding (Gemini-owned). Alvo 42.85%→50%. |
+| 020 | Zero-Trust MDR | 🚧 Phases C + D merged (continuous trust scoring + AI SOC daily checks com 11 system parsers). Phase F-partial (graduated enforcement state machine) merged. |
+| 021 | Observation Verification | ✅ Phases A-D. Score engine + integracao no agent loop + AI batch verification + dashboard score display. Active FP clearing funcional. |
+| 022 | Dashboard Test Coverage | ✅ 6 batches merged + 2 expansoes. Cobertura do dashboard de 0% pra ~30%+. HTML escape, auth, investigation, sensors, actions — tudo testado. |
+| 023 | Coverage Closeout (project-wide) | 🚧 Batches 1-11 merged em PR #125 (aguardando review + codecov refresh). Codecov.yml configurado. Alvo 45%→65%. |
+| 024 | Regression Safety Net | 📝 Draft P0. Scenario volume tests + `/metrics` drift alerts + contract tests. Kills whack-a-mole. Depende de 023 consolidar antes. |
+| 025 | Structured AI Prompt | 📝 Draft P1. Bench mostrou qwen2.5:3b: 53%→73% accuracy (prose→JSON subgraph). Implementacao: 2 AI sessions. Bench em `innerwarden-test/ai-grounding/`. |
 
 ## Divida tecnica
 
-- **2FA dashboard endpoints (A5)**: TOTP funciona no Telegram. Falta implementar `GET /api/2fa/pending`, `POST /api/2fa/approve`, `POST /api/2fa/deny` para o metodo "dashboard".
-- **Agent main.rs**: 4396 linhas. Modularizacao avancou muito mas `process_incidents` e `process_telegram_approval` ainda concentram orquestracao. Proximos candidatos: Telegram bot commands/status, integracoes.
-- **CTL main.rs**: 2201 linhas. Aceitavel. Ponto de manutencao atingido.
+- **2FA dashboard endpoints**: TOTP funciona no Telegram. Falta `GET /api/2fa/pending` + `POST /api/2fa/approve` + `POST /api/2fa/deny` pro metodo "dashboard".
+- **Agent main.rs**: 5610 linhas (cresceu de 4396). `process_incidents` e `process_telegram_approval` ainda concentram orquestracao. Proximos candidatos pra extrair: Telegram bot commands/status, integracoes.
+- **CTL main.rs**: 2936 linhas (cresceu de 2201). Aceitavel; tende a crescer com novos subcomandos. Extracao ainda nao urgente.
+- **Coverage ~45%**: spec 023 em andamento ataca. Codecov.yml configurado pra visibilidade.
+- **Spec 005 (Intelligent Notifications) nao implementada**: agent ainda manda 1 Telegram por incident. Grouping + batch triage seria melhoria de UX significativa.
+- **Spec 017 fases > 1**: apenas Phase 1 merged. 15 FRs do spec ainda na fila.
 
 ## Docs detalhados
 
