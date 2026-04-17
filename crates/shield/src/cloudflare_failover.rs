@@ -220,6 +220,8 @@ mod tests {
 
     #[test]
     fn disabled_does_nothing() {
+        // Disabled path: failover should remain inactive with zero activations
+        // when the feature toggle is off.
         let failover = CloudflareFailover::new(make_config(false));
         assert!(!failover.is_active());
         assert_eq!(failover.status().activation_count, 0);
@@ -227,6 +229,7 @@ mod tests {
 
     #[test]
     fn status_reports_correctly() {
+        // Status path: initial state should be inactive with no timestamps.
         let failover = CloudflareFailover::new(make_config(true));
         let status = failover.status();
         assert!(status.enabled);
@@ -236,6 +239,8 @@ mod tests {
 
     #[test]
     fn default_config() {
+        // Default path: baseline configuration should keep auto-failover off
+        // and use a 5-minute minimum proxy duration.
         let config = CloudflareFailoverConfig::default();
         assert!(!config.enabled);
         assert_eq!(config.min_proxy_duration_secs, 300);
@@ -244,10 +249,50 @@ mod tests {
 
     #[test]
     fn activate_on_contains_correct_states() {
+        // Trigger path: activation states should include only attack levels.
         let config = make_config(true);
         assert!(config.activate_on.contains(&"UnderAttack".to_string()));
         assert!(config.activate_on.contains(&"Critical".to_string()));
         assert!(!config.activate_on.contains(&"Normal".to_string()));
         assert!(!config.activate_on.contains(&"Elevated".to_string()));
+    }
+
+    #[test]
+    fn disabled_config_preserves_inactive_status_snapshot() {
+        // Guard path: disabled failover should remain inactive and expose no
+        // activation timestamps in status snapshots.
+        let failover = CloudflareFailover::new(make_config(false));
+        let status = failover.status();
+        assert!(!status.enabled);
+        assert!(!status.proxy_active);
+        assert!(status.proxy_activated_at.is_none());
+    }
+
+    #[test]
+    fn status_reflects_manually_set_activation_metadata() {
+        // Serialization path: status output should expose activation timestamps
+        // and counters when state has already been toggled.
+        let mut failover = CloudflareFailover::new(make_config(true));
+        let now = Utc::now();
+        failover.proxy_active = true;
+        failover.proxy_activated_at = Some(now);
+        failover.proxy_deactivated_at = Some(now);
+        failover.activation_count = 4;
+
+        let status = failover.status();
+        assert!(status.proxy_active);
+        assert_eq!(status.activation_count, 4);
+        assert!(status.proxy_activated_at.is_some());
+        assert!(status.proxy_deactivated_at.is_some());
+    }
+
+    #[test]
+    fn is_active_tracks_internal_proxy_flag() {
+        // Accessor path: `is_active` should mirror the internal proxy state
+        // used by orchestration logic.
+        let mut failover = CloudflareFailover::new(make_config(true));
+        assert!(!failover.is_active());
+        failover.proxy_active = true;
+        assert!(failover.is_active());
     }
 }

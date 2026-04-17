@@ -234,6 +234,8 @@ mod tests {
 
     #[test]
     fn identify_known_vendors() {
+        // Mapping path: common vendor strings should map to stable hypervisor
+        // names used by downstream summary and trust calculations.
         assert_eq!(
             identify_hypervisor(&Some("KVM".into())),
             Some("KVM/QEMU".into())
@@ -252,7 +254,45 @@ mod tests {
 
     #[test]
     fn check_runs() {
+        // Smoke path: CPUID detector should always return the expected check
+        // identifier regardless of host environment.
         let r = check_hypervisor_cpuid();
         assert_eq!(r.id, "HV-001");
+    }
+
+    #[test]
+    fn identify_cloud_provider_hypervisors() {
+        // Cloud path: provider-flavored vendor strings should map to the
+        // correct hypervisor labels rather than unknown.
+        assert_eq!(
+            identify_hypervisor(&Some("Amazon EC2".into())),
+            Some("AWS Nitro".into())
+        );
+        assert_eq!(
+            identify_hypervisor(&Some("Google Compute Engine".into())),
+            Some("Google Compute".into())
+        );
+        assert_eq!(
+            identify_hypervisor(&Some("Oracle VM Server".into())),
+            Some("Oracle VM".into())
+        );
+    }
+
+    #[test]
+    fn known_vendor_table_contains_core_signatures() {
+        // Signature path: known CPUID signatures should keep representative
+        // entries for KVM, VMware and Hyper-V.
+        let signatures: Vec<&str> = KNOWN_VENDORS.iter().map(|(sig, _)| *sig).collect();
+        assert!(signatures.contains(&"KVMKVMKVM\0\0\0"));
+        assert!(signatures.contains(&"VMwareVMware"));
+        assert!(signatures.contains(&"Microsoft Hv"));
+    }
+
+    #[test]
+    fn cpuid_consistency_check_exposes_stable_id() {
+        // Contract path: CPUID consistency probe must always publish the
+        // canonical check id for dashboard and CLI aggregation.
+        let result = check_cpuid_consistency();
+        assert_eq!(result.id, "HV-002");
     }
 }

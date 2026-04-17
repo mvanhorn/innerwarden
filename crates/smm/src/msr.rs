@@ -223,6 +223,8 @@ mod tests {
 
     #[test]
     fn feature_control_unlocked_detection() {
+        // Safety path: lock bit absence must be detectable for feature-control
+        // validation.
         let raw: u64 = 0x4; // VMX enabled but NOT locked → dangerous
         let locked = raw & 1 == 1;
         assert!(!locked);
@@ -236,5 +238,30 @@ mod tests {
             assert_eq!(result.status, CheckStatus::Unavailable);
         }
         // On x86 without root, also Unavailable (no /dev/cpu/0/msr access).
+    }
+
+    #[test]
+    fn msr_addresses_match_expected_constants() {
+        // Constant path: critical MSR addresses should remain stable to avoid
+        // reading the wrong firmware registers.
+        assert_eq!(MSR_SMI_COUNT, 0x34);
+        assert_eq!(IA32_SMRR_PHYSBASE, 0x1F2);
+        assert_eq!(IA32_SMRR_PHYSMASK, 0x1F3);
+        assert_eq!(IA32_FEATURE_CONTROL, 0x3A);
+    }
+
+    #[test]
+    fn try_read_msr_returns_none_for_impossible_cpu() {
+        // Error path: invalid CPU index should return None instead of
+        // panicking when device files are absent.
+        assert!(try_read_msr(u32::MAX, MSR_SMI_COUNT).is_none());
+    }
+
+    #[test]
+    fn check_smi_count_exposes_stable_check_id() {
+        // Contract path: SMI counter check must keep the canonical id for
+        // report correlation.
+        let result = check_smi_count();
+        assert_eq!(result.id, "SMM-002");
     }
 }

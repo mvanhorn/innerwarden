@@ -122,6 +122,8 @@ mod tests {
 
     #[test]
     fn rate_calculation() {
+        // Arithmetic path: SMI/min conversion should scale deltas from the
+        // sampling window into per-minute rates.
         let rate = SmiRate {
             count_start: 100,
             count_end: 110,
@@ -133,6 +135,8 @@ mod tests {
 
     #[test]
     fn normal_rate() {
+        // Baseline path: no SMI growth across the window should stay below the
+        // normal threshold.
         let rate = SmiRate {
             count_start: 100,
             count_end: 100, // no new SMIs
@@ -140,5 +144,35 @@ mod tests {
             rate_per_min: 0.0,
         };
         assert!(rate.rate_per_min < SMI_RATE_NORMAL);
+    }
+
+    #[test]
+    fn thresholds_are_strictly_ordered() {
+        // Constant path: threshold ordering must remain normal < warning <
+        // critical for deterministic severity classification.
+        assert!(SMI_RATE_NORMAL < SMI_RATE_WARNING);
+        assert!(SMI_RATE_WARNING < SMI_RATE_CRITICAL);
+    }
+
+    #[test]
+    fn warning_band_sits_between_normal_and_critical() {
+        // Boundary path: values in the warning band should exceed normal but
+        // remain below critical storm levels.
+        let rate = SmiRate {
+            count_start: 0,
+            count_end: 2,
+            window_secs: 2.0,
+            rate_per_min: 60.0,
+        };
+        assert!(rate.rate_per_min >= SMI_RATE_WARNING);
+        assert!(rate.rate_per_min < SMI_RATE_CRITICAL);
+    }
+
+    #[test]
+    fn check_smi_rate_exposes_stable_check_id() {
+        // Contract path: the SMI detector must always emit the canonical id
+        // expected by report aggregation.
+        let result = check_smi_rate();
+        assert_eq!(result.id, "SMI-001");
     }
 }

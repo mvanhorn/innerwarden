@@ -11,6 +11,18 @@ fn main() {
     }
 }
 
+fn drift_style(severity: &baseline::DriftSeverity) -> (&'static str, &'static str) {
+    match severity {
+        baseline::DriftSeverity::Info => ("~", "\x1b[36m"),
+        baseline::DriftSeverity::Suspicious => ("?", "\x1b[33m"),
+        baseline::DriftSeverity::Critical => ("!", "\x1b[31m"),
+    }
+}
+
+fn has_json_flag(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--json")
+}
+
 /// `innerwarden-smm baseline` — capture firmware baseline.
 fn cmd_baseline() {
     let path = baseline::FirmwareBaseline::default_path();
@@ -48,11 +60,7 @@ fn cmd_drift() {
     }
 
     for d in &drift.drifts {
-        let (icon, color) = match d.severity {
-            baseline::DriftSeverity::Info => ("~", "\x1b[36m"),
-            baseline::DriftSeverity::Suspicious => ("?", "\x1b[33m"),
-            baseline::DriftSeverity::Critical => ("!", "\x1b[31m"),
-        };
+        let (icon, color) = drift_style(&d.severity);
         println!(
             "  {color}{icon}\x1b[0m {}: {color}{}\x1b[0m",
             d.component, d.detail
@@ -177,7 +185,7 @@ fn cmd_audit(args: &[String]) {
     }
 
     // JSON output.
-    if args.iter().any(|a| a == "--json") {
+    if has_json_flag(args) {
         println!();
         println!("{}", serde_json::to_string_pretty(&report).unwrap());
     }
@@ -195,4 +203,71 @@ fn format_trust(score: f64) -> String {
         ("\x1b[31;1m", "COMPROMISED")
     };
     format!("{color}{pct}% — {label}\x1b[0m")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_trust_marks_trusted_and_degraded_ranges() {
+        // Covers upper trust bands so secure and degraded states are rendered
+        // with their expected labels and percentages.
+        let trusted = format_trust(0.95);
+        let degraded = format_trust(0.70);
+        assert!(trusted.contains("TRUSTED"));
+        assert!(trusted.contains("95%"));
+        assert!(degraded.contains("DEGRADED"));
+        assert!(degraded.contains("70%"));
+    }
+
+    #[test]
+    fn format_trust_marks_at_risk_and_compromised_ranges() {
+        // Covers lower trust bands so dangerous firmware states communicate
+        // urgency in CLI output.
+        let at_risk = format_trust(0.45);
+        let compromised = format_trust(0.10);
+        assert!(at_risk.contains("AT RISK"));
+        assert!(at_risk.contains("45%"));
+        assert!(compromised.contains("COMPROMISED"));
+        assert!(compromised.contains("10%"));
+    }
+
+    #[test]
+    fn drift_style_maps_every_drift_severity() {
+        // Guards icon/color mapping used by drift reports across all severity
+        // classes.
+        assert_eq!(
+            drift_style(&baseline::DriftSeverity::Info),
+            ("~", "\x1b[36m")
+        );
+        assert_eq!(
+            drift_style(&baseline::DriftSeverity::Suspicious),
+            ("?", "\x1b[33m")
+        );
+        assert_eq!(
+            drift_style(&baseline::DriftSeverity::Critical),
+            ("!", "\x1b[31m")
+        );
+    }
+
+    #[test]
+    fn has_json_flag_detects_opt_in_output_mode() {
+        // Flag path: JSON mode should enable only when `--json` appears in
+        // command arguments.
+        let args = vec![
+            "innerwarden-smm".to_string(),
+            "audit".to_string(),
+            "--json".to_string(),
+        ];
+        assert!(has_json_flag(&args));
+    }
+
+    #[test]
+    fn has_json_flag_is_false_when_absent() {
+        // Negative path: normal runs without `--json` should remain in
+        // human-readable mode.
+        let args = vec!["innerwarden-smm".to_string(), "audit".to_string()];
+        assert!(!has_json_flag(&args));
+    }
 }

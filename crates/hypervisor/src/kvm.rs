@@ -216,6 +216,8 @@ mod tests {
 
     #[test]
     fn detect_runs() {
+        // Smoke path: host-state detection should never panic, even when KVM
+        // debugfs or modules are unavailable on the current machine.
         let state = KvmState::detect();
         // Should not panic on any system.
         let _ = state;
@@ -223,13 +225,34 @@ mod tests {
 
     #[test]
     fn check_kvm_host_runs() {
+        // Contract path: KVM host check must always return its stable check id.
         let r = check_kvm_host();
         assert_eq!(r.id, "KVM-001");
     }
 
     #[test]
     fn check_modules_runs() {
+        // Contract path: KVM module integrity check must always return its
+        // stable check id.
         let r = check_kvm_modules();
         assert_eq!(r.id, "KVM-002");
+    }
+
+    #[test]
+    fn detect_kvm_modules_only_returns_kvm_prefixed_entries() {
+        // Filter path: module detection should keep only KVM-related entries
+        // from `/proc/modules` parsing.
+        let modules = detect_kvm_modules();
+        assert!(modules.iter().all(|module| module.starts_with("kvm")));
+    }
+
+    #[test]
+    fn count_running_vms_reports_unique_pid_list() {
+        // Parsing path: VM debugfs enumeration should return a pid list whose
+        // length matches the reported VM count without duplicates.
+        let (count, pids) = count_running_vms();
+        let unique: BTreeSet<u32> = pids.iter().copied().collect();
+        assert_eq!(count, pids.len());
+        assert_eq!(unique.len(), pids.len());
     }
 }

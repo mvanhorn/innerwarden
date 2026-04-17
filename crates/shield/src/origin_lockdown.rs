@@ -51,6 +51,21 @@ const CHAIN_NAME: &str = "INNERWARDEN_LOCKDOWN";
 /// ipset name for Cloudflare CIDRs.
 const IPSET_NAME: &str = "cloudflare_cidrs";
 
+fn state_requires_lockdown(state: crate::escalation::EscalationState) -> bool {
+    matches!(
+        state,
+        crate::escalation::EscalationState::UnderAttack
+            | crate::escalation::EscalationState::Critical
+    )
+}
+
+fn parse_cloudflare_cidrs(body: &str) -> Vec<String> {
+    body.lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty() && line.contains('/'))
+        .collect()
+}
+
 pub struct OriginLockdown {
     /// Whether lockdown is currently active.
     active: bool,
@@ -238,11 +253,7 @@ impl OriginLockdown {
 
     /// Check escalation state and toggle lockdown.
     pub fn check_and_toggle(&mut self, state: crate::escalation::EscalationState) {
-        let should_lock = matches!(
-            state,
-            crate::escalation::EscalationState::UnderAttack
-                | crate::escalation::EscalationState::Critical
-        );
+        let should_lock = state_requires_lockdown(state);
 
         if should_lock && !self.active {
             if let Err(e) = self.activate() {
@@ -284,11 +295,7 @@ impl OriginLockdown {
         {
             Ok(resp) if resp.status().is_success() => match resp.text().await {
                 Ok(body) => {
-                    let cidrs: Vec<String> = body
-                        .lines()
-                        .map(|l| l.trim().to_string())
-                        .filter(|l| !l.is_empty() && l.contains('/'))
-                        .collect();
+                    let cidrs = parse_cloudflare_cidrs(&body);
                     if cidrs.len() >= 10 {
                         info!(count = cidrs.len(), "Fetched Cloudflare CIDRs from API");
                         return cidrs;
@@ -332,6 +339,8 @@ mod tests {
 
     #[test]
     fn new_defaults() {
+        // Initialization path: constructor should start inactive and protect
+        // the standard HTTP/HTTPS/dashboard ports.
         let lock = OriginLockdown::new();
         assert!(!lock.active);
         assert!(lock.locked_ports.contains(&80));
@@ -341,16 +350,56 @@ mod tests {
 
     #[test]
     fn fallback_cidrs_count() {
+        // Data path: embedded fallback list must contain enough CIDRs to keep
+        // lockdown usable when remote fetch fails.
         assert!(CF_IPV4_FALLBACK.len() >= 14);
     }
 
     #[test]
     fn fallback_cidrs_are_valid() {
+        // Validation path: fallback CIDRs should stay parseable as prefix
+        // notation.
         for cidr in CF_IPV4_FALLBACK {
             assert!(cidr.contains('/'), "invalid CIDR: {cidr}");
             let parts: Vec<&str> = cidr.split('/').collect();
             assert_eq!(parts.len(), 2);
             let _prefix: u8 = parts[1].parse().expect("invalid prefix length");
         }
+    }
+
+    #[test]
+    fn state_requires_lockdown_only_for_attack_states() {
+        // State path: lockdown should be enabled only for attack states and
+        // disabled for normal/elevated operation.
+        assert!(state_requires_lockdown(
+            crate::escalation::EscalationState::UnderAttack
+        ));
+        assert!(state_requires_lockdown(
+            crate::escalation::EscalationState::Critical
+        ));
+        assert!(!state_requires_lockdown(
+            crate::escalation::EscalationState::Normal
+        ));
+        assert!(!state_requires_lockdown(
+            crate::escalation::EscalationState::Elevated
+        ));
+    }
+
+    #[test]
+    fn parse_cloudflare_cidrs_filters_noise_lines() {
+        // Parser path: CIDR parser should drop blank and malformed rows while
+        // preserving valid prefixes.
+        let body = "173.245.48.0/20\n\n#comment\ninvalid\n104.16.0.0/13\n";
+        let cidrs = parse_cloudflare_cidrs(body);
+        assert_eq!(cidrs, vec!["173.245.48.0/20", "104.16.0.0/13"]);
+    }
+
+    #[test]
+    fn parse_cloudflare_cidrs_accepts_whitespace_trim() {
+        // Parser path: leading/trailing spaces from API responses should be
+        // trimmed before CIDRs are inserted into ipset.
+        let body = "  198.41.128.0/17  \n\t172.64.0.0/13\t\n";
+        let cidrs = parse_cloudflare_cidrs(body);
+        assert_eq!(cidrs, vec!["198.41.128.0/17", "172.64.0.0/13"]);
     }
 }

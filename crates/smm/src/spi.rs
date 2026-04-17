@@ -119,6 +119,8 @@ mod tests {
 
     #[test]
     fn baseline_match() {
+        // Match path: identical baseline/current hashes should yield secure
+        // integrity status.
         let base = SpiBaseline {
             sha256: "abc123".into(),
             size: 8 * 1024 * 1024,
@@ -132,6 +134,7 @@ mod tests {
 
     #[test]
     fn baseline_mismatch_critical() {
+        // Mismatch path: hash drift from baseline must escalate to critical.
         let base = SpiBaseline {
             sha256: "abc123".into(),
             size: 8 * 1024 * 1024,
@@ -145,5 +148,35 @@ mod tests {
         let result = verify_against_baseline(&tampered, &base);
         assert_eq!(result.status, CheckStatus::Critical);
         assert!(result.detail.contains("FIRMWARE MODIFIED"));
+    }
+
+    #[test]
+    fn verify_against_baseline_keeps_spi_check_id() {
+        // Contract path: SPI integrity verifier should always emit the stable
+        // check id used in report correlation.
+        let base = SpiBaseline {
+            sha256: "111".into(),
+            size: 16,
+            captured_at: "2026-01-01T00:00:00Z".into(),
+            method: "flashrom".into(),
+        };
+        let result = verify_against_baseline(&base, &base);
+        assert_eq!(result.id, "SPI-001");
+    }
+
+    #[test]
+    fn check_flash_baseline_returns_spi_identifier() {
+        // Smoke path: top-level readiness check should return the canonical
+        // SPI check id regardless of host tooling availability.
+        let result = check_flash_baseline();
+        assert_eq!(result.id, "SPI-001");
+    }
+
+    #[test]
+    fn flashrom_available_is_boolean_smoke_check() {
+        // Capability path: helper should execute safely and return a boolean
+        // without panicking when flashrom is missing.
+        let available = flashrom_available();
+        assert!(matches!(available, true | false));
     }
 }

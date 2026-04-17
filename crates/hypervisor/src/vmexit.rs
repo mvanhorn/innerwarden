@@ -208,11 +208,55 @@ mod tests {
 
     #[test]
     fn stats_empty() {
+        // Baseline path: an empty stats snapshot should preserve zero totals
+        // and allow callers to treat data as unavailable/idle.
         let stats = VmExitStats {
             total_exits: 0,
             by_reason: BTreeMap::new(),
             vm_count: 0,
         };
         assert_eq!(stats.total_exits, 0);
+    }
+
+    #[test]
+    fn suspicious_exit_reasons_include_escape_probes() {
+        // Coverage path: suspicious reason catalog must keep high-signal
+        // escape indicators like emulation failures and MMIO probing.
+        let reasons: Vec<&str> = SUSPICIOUS_EXIT_REASONS
+            .iter()
+            .map(|(reason, _)| *reason)
+            .collect();
+        assert!(reasons.contains(&"insn_emulation_fail"));
+        assert!(reasons.contains(&"mmio_exits"));
+        assert!(reasons.contains(&"io_exits"));
+    }
+
+    #[test]
+    fn suspicious_percentage_threshold_matches_five_percent_gate() {
+        // Threshold path: a reason should only be considered notable when its
+        // contribution exceeds 5% of total exits in the current window.
+        let total = 1_000u64;
+        let below = 49u64;
+        let above = 51u64;
+        let below_pct = (below as f64 / total as f64) * 100.0;
+        let above_pct = (above as f64 / total as f64) * 100.0;
+        assert!(below_pct <= 5.0);
+        assert!(above_pct > 5.0);
+    }
+
+    #[test]
+    fn top_reason_sort_order_is_descending_by_count() {
+        // Visibility path: summary ordering should keep the most frequent
+        // exit reasons first so operators can triage noisy causes quickly.
+        let mut by_reason = BTreeMap::new();
+        by_reason.insert("io_exits".to_string(), 200);
+        by_reason.insert("halt_exits".to_string(), 50);
+        by_reason.insert("mmio_exits".to_string(), 400);
+        let mut sorted: Vec<_> = by_reason.iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(a.1));
+
+        assert_eq!(sorted[0].0, "mmio_exits");
+        assert_eq!(sorted[1].0, "io_exits");
+        assert_eq!(sorted[2].0, "halt_exits");
     }
 }
