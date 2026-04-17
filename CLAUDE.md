@@ -115,6 +115,7 @@ ADR: `docs/internal/adr/0001-project-taxonomy.md`
 | 019 | Test Coverage Gaps (Batches 2–7) | **In progress** (Gemini-owned). Batch 1 landed in PR #110. Batches 2–7 outstanding: agent + ctl pure-logic extraction. Target 42.85% → 50%. |
 | 022 | Dashboard Test Coverage | **Draft** P0. 6 batches covering 16 dashboard files (9,709 lines, 24 tests total). HTML escaping, auth, investigation journeys, sensors status bugs, actions validation. Target 0% → 30%+ on dashboard. |
 | 023 | Coverage Closeout (project-wide) | **Draft** P1. 11 batches, 56 files, ~335 tests across ctl/sensor/agent/hypervisor/smm/shield. Picks up what 019 and 022 don't cover. Target 45% → 65% (stretch 70%). Coordination rules + lint traps documented. |
+| 024 | Regression Safety Net | **Draft** P0. Three layers: canonical scenario volume tests (`make scenario-qa`), `/metrics` endpoint + drift alerts, contract tests at subsystem boundaries. Kills the whack-a-mole pattern (fix A, break B). Unblocks spec 005 as Phase 3. ~7 AI sessions for Phases A+B. |
 
 ## Divida tecnica
 
