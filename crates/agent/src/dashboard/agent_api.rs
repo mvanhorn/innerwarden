@@ -618,8 +618,7 @@ pub(super) fn append_spec024_metrics(
     // ── 3. innerwarden_blocks_per_hour{backend} ─────────────────────
     out.push_str("# HELP innerwarden_blocks_per_hour Block decisions in the last hour, grouped by backend. Spec 024.\n");
     out.push_str("# TYPE innerwarden_blocks_per_hour gauge\n");
-    let backend_counts =
-        count_blocks_last_hour_by_backend(&state.data_dir, &today, &hour_ago);
+    let backend_counts = count_blocks_last_hour_by_backend(&state.data_dir, &today, &hour_ago);
     for backend in &[
         "ufw",
         "xdp",
@@ -689,8 +688,7 @@ pub(super) fn append_spec024_metrics(
     // ── 8. innerwarden_ai_provider_errors_per_hour{provider} ───────
     out.push_str("# HELP innerwarden_ai_provider_errors_per_hour AI provider errors today by provider name. Spec 024.\n");
     out.push_str("# TYPE innerwarden_ai_provider_errors_per_hour gauge\n");
-    let ai_err =
-        read_telemetry_error_count(&state.data_dir, &today, "ai_provider");
+    let ai_err = read_telemetry_error_count(&state.data_dir, &today, "ai_provider");
     // Provider label is the configured provider or "unknown". Telemetry
     // does not tag the provider per error today (see spec 024 follow-ups),
     // so we use "unknown" as a placeholder until that lands.
@@ -736,9 +734,9 @@ fn count_incidents_last_hour_by_severity(
         return out;
     };
     let threshold = hour_ago.to_rfc3339();
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT severity, COUNT(*) FROM incidents WHERE ts > ?1 GROUP BY severity",
-    ) else {
+    let Ok(mut stmt) =
+        conn.prepare("SELECT severity, COUNT(*) FROM incidents WHERE ts > ?1 GROUP BY severity")
+    else {
         return out;
     };
     let iter = stmt.query_map([threshold.as_str()], |row| {
@@ -874,19 +872,15 @@ fn count_killchain_last_hour_by_pattern(
     };
     let threshold = hour_ago.to_rfc3339();
     // Kill chain incident_ids take the form "kill_chain:detected:<PATTERN>:<pid>:<ts>".
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT incident_id FROM incidents WHERE ts > ?1 AND detector = 'kill_chain'",
-    ) else {
+    let Ok(mut stmt) =
+        conn.prepare("SELECT incident_id FROM incidents WHERE ts > ?1 AND detector = 'kill_chain'")
+    else {
         return out;
     };
     let iter = stmt.query_map([threshold.as_str()], |row| row.get::<_, String>(0));
     if let Ok(rows) = iter {
         for row in rows.flatten() {
-            let pattern = row
-                .split(':')
-                .nth(2)
-                .unwrap_or("unknown")
-                .to_lowercase();
+            let pattern = row.split(':').nth(2).unwrap_or("unknown").to_lowercase();
             *out.entry(pattern).or_insert(0) += 1;
         }
     }
@@ -936,9 +930,7 @@ fn compute_gate_suppressed_estimate(state: &DashboardState, today: &str) -> u64 
             let mut stmt = c
                 .prepare("SELECT COUNT(*) FROM incidents WHERE ts >= ?1")
                 .ok()?;
-            let n: i64 = stmt
-                .query_row([start.as_str()], |row| row.get(0))
-                .ok()?;
+            let n: i64 = stmt.query_row([start.as_str()], |row| row.get(0)).ok()?;
             Some(n as u64)
         })
         .unwrap_or(0);
@@ -946,11 +938,7 @@ fn compute_gate_suppressed_estimate(state: &DashboardState, today: &str) -> u64 
         let path = state.data_dir.join("telegram-outbox.jsonl");
         std::fs::read_to_string(&path)
             .ok()
-            .map(|c| {
-                c.lines()
-                    .filter(|l| !l.trim().is_empty())
-                    .count() as u64
-            })
+            .map(|c| c.lines().filter(|l| !l.trim().is_empty()).count() as u64)
             .unwrap_or(0)
     };
     incidents_today.saturating_sub(telegram_today)
@@ -975,6 +963,45 @@ fn read_event_rate_per_hour(
     // Deterministic ordering makes the endpoint easy to diff.
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
+}
+
+/// GET /api/incident-groups — spec 005 T017.
+///
+/// Returns the grouping engine's active-group snapshot. The agent writes
+/// `incident-groups.json` in `data_dir` at every slow-loop tick; this handler
+/// reads that file. Missing file means the agent has not emitted a snapshot
+/// yet (normal right after boot) — return an empty shape rather than 404 so
+/// the dashboard can render "no active campaigns" calmly.
+pub(super) async fn api_incident_groups(
+    State(state): State<DashboardState>,
+) -> axum::response::Response {
+    // Canonicalize data_dir to prevent path traversal (matches the pattern used
+    // by api_responses).
+    let snapshot = std::fs::canonicalize(&state.data_dir)
+        .ok()
+        .and_then(|canonical| {
+            let target = canonical.join("incident-groups.json");
+            if !target.starts_with(&canonical) {
+                return None;
+            }
+            std::fs::read_to_string(target).ok()
+        });
+
+    let payload = match snapshot {
+        Some(text) => text,
+        None => serde_json::json!({
+            "active_count": 0,
+            "groups": [],
+            "snapshot_ts": chrono::Utc::now().to_rfc3339(),
+        })
+        .to_string(),
+    };
+
+    axum::response::Response::builder()
+        .header("content-type", "application/json")
+        .body(Body::from(payload))
+        .unwrap()
+        .into_response()
 }
 
 /// GET /api/responses — active and historical response actions with TTL.
@@ -1231,7 +1258,10 @@ enabled = false
     #[test]
     fn count_outbox_last_hour_handles_missing_file() {
         let td = tmpdir();
-        let n = count_outbox_last_hour(td.path(), &(chrono::Utc::now() - chrono::Duration::hours(1)));
+        let n = count_outbox_last_hour(
+            td.path(),
+            &(chrono::Utc::now() - chrono::Duration::hours(1)),
+        );
         assert_eq!(n, 0);
     }
 
@@ -1411,8 +1441,18 @@ enabled = false
             dry_run_execution_count: 0,
             real_execution_count: 0,
         };
-        std::fs::write(&path, format!("{}\n", serde_json::to_string(&snap).unwrap())).unwrap();
-        assert_eq!(read_telemetry_error_count(td.path(), date, "ai_provider"), 7);
-        assert_eq!(read_telemetry_error_count(td.path(), date, "nonexistent"), 0);
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&snap).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            read_telemetry_error_count(td.path(), date, "ai_provider"),
+            7
+        );
+        assert_eq!(
+            read_telemetry_error_count(td.path(), date, "nonexistent"),
+            0
+        );
     }
 }

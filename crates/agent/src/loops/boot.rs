@@ -1069,6 +1069,18 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                                 }
                             }
                         }
+                        // Spec 005 T017: snapshot active groups to disk so the
+                        // dashboard can serve /api/incident-groups without
+                        // holding a lock on AgentState. Best-effort — failures
+                        // are logged and never break the tick.
+                        let snap = state.grouping_engine.snapshot_json();
+                        let path = cli.data_dir.join("incident-groups.json");
+                        if let Err(e) = std::fs::write(
+                            &path,
+                            serde_json::to_string(&snap).unwrap_or_else(|_| "{}".into()),
+                        ) {
+                            warn!(path = %path.display(), "incident-groups snapshot failed: {e}");
+                        }
                     }
 
                     // Refresh operator IPs from active SSH sessions (every 30s).

@@ -441,6 +441,8 @@ pub async fn serve(
         .route("/api/graph/threats", get(api_graph_threats))
         .route("/api/playbook-log", get(api_playbook_log))
         .route("/api/responses", get(api_responses))
+        // Spec 005 T017: active incident groups snapshot (noise-reduction view).
+        .route("/api/incident-groups", get(api_incident_groups))
         .route("/api/mitre/navigator", get(api_mitre_navigator))
         .route("/api/mitre/coverage", get(api_mitre_coverage))
         // Defender Brain (AlphaZero)

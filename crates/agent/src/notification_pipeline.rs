@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use innerwarden_core::entities::EntityType;
 use innerwarden_core::event::Severity;
 use innerwarden_core::incident::Incident;
+use serde::Serialize;
 
 use crate::config::{ChannelFilterLevel, NotificationPipelineConfig};
 
@@ -17,7 +18,7 @@ use crate::config::{ChannelFilterLevel, NotificationPipelineConfig};
 // ---------------------------------------------------------------------------
 
 /// A group of related incidents (same detector + entity) within a time window.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 #[allow(dead_code)]
 pub(crate) struct IncidentGroup {
     pub detector: String,
@@ -30,8 +31,10 @@ pub(crate) struct IncidentGroup {
     pub auto_resolved: bool,
     pub sample_incident_id: String,
     /// Whether the first notification for this group has been dispatched.
+    #[serde(skip)]
     first_notified: bool,
     /// Whether a count-threshold summary has already been emitted.
+    #[serde(skip)]
     threshold_summary_sent: bool,
 }
 
@@ -279,6 +282,21 @@ impl GroupingEngine {
     #[allow(dead_code)]
     pub fn active_groups(&self) -> Vec<IncidentGroup> {
         self.groups.values().cloned().collect()
+    }
+
+    /// Serialise active groups to a JSON value suitable for the dashboard
+    /// `/api/incident-groups` endpoint. Spec 005 T017 / SC3 — ensures the
+    /// dashboard shows the full incident picture with live counters while
+    /// Telegram stays quiet on already-handled activity.
+    pub fn snapshot_json(&self) -> serde_json::Value {
+        // Sort by last_seen descending so the busiest group is at the top.
+        let mut groups: Vec<&IncidentGroup> = self.groups.values().collect();
+        groups.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+        serde_json::json!({
+            "active_count": groups.len(),
+            "groups": groups,
+            "snapshot_ts": chrono::Utc::now().to_rfc3339(),
+        })
     }
 
     /// Evict the oldest group (by first_seen) to make room.
@@ -1073,5 +1091,58 @@ mod tests {
         assert!(is_immediate_threat(&inc1));
         let inc2 = make_incident("systemd_persistence", "unknown", Severity::High);
         assert!(is_immediate_threat(&inc2));
+    }
+
+    // ─── Spec 005 T017 — snapshot for dashboard /api/incident-groups ───
+
+    #[test]
+    fn snapshot_json_empty_engine_has_zero_groups() {
+        let engine = GroupingEngine::new(&default_config());
+        let snap = engine.snapshot_json();
+        assert_eq!(snap["active_count"].as_u64(), Some(0));
+        assert!(snap["groups"].as_array().unwrap().is_empty());
+        assert!(snap["snapshot_ts"].as_str().is_some());
+    }
+
+    #[test]
+    fn snapshot_json_reflects_inserted_groups() {
+        let mut engine = GroupingEngine::new(&default_config());
+        let base = Utc::now() - chrono::Duration::minutes(5);
+        let inc_a = make_incident_at("ssh_bruteforce", "1.1.1.1", Severity::High, base);
+        engine.insert(&inc_a);
+        let inc_b = make_incident_at(
+            "port_scan",
+            "2.2.2.2",
+            Severity::Medium,
+            base + chrono::Duration::minutes(2),
+        );
+        engine.insert(&inc_b);
+
+        let snap = engine.snapshot_json();
+        assert_eq!(snap["active_count"].as_u64(), Some(2));
+        let groups = snap["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2);
+
+        // Most recently-seen first: port_scan (2 min later) precedes ssh_bruteforce.
+        assert_eq!(groups[0]["detector"], "port_scan");
+        assert_eq!(groups[0]["entity_type"], "ip");
+        assert_eq!(groups[0]["entity_value"], "2.2.2.2");
+        assert_eq!(groups[0]["count"].as_u64(), Some(1));
+        assert_eq!(groups[0]["auto_resolved"].as_bool(), Some(false));
+        assert_eq!(groups[1]["detector"], "ssh_bruteforce");
+    }
+
+    #[test]
+    fn snapshot_json_preserves_auto_resolved_flag() {
+        let mut engine = GroupingEngine::new(&default_config());
+        let inc = make_incident("ssh_bruteforce", "1.2.3.4", Severity::High);
+        engine.insert(&inc);
+        engine.mark_auto_resolved(&inc);
+        let snap = engine.snapshot_json();
+        assert_eq!(
+            snap["groups"][0]["auto_resolved"].as_bool(),
+            Some(true),
+            "mark_auto_resolved must round-trip through the dashboard snapshot"
+        );
     }
 }
