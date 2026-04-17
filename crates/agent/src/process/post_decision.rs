@@ -1,0 +1,368 @@
+use anyhow::Result;
+use std::path::Path;
+
+use tracing::warn;
+
+use crate::{
+    ai, config, decision_block_ip, decision_confirmation, decision_honeypot,
+    decision_skill_actions, skills, AgentState,
+};
+
+/// Execute an AI decision by finding and running the appropriate skill.
+/// Returns (execution_message, cloudflare_pushed).
+pub(crate) async fn execute_decision(
+    decision: &ai::AiDecision,
+    incident: &innerwarden_core::incident::Incident,
+    data_dir: &Path,
+    cfg: &config::AgentConfig,
+    state: &mut AgentState,
+) -> (String, bool) {
+    use ai::AiAction;
+
+    if let Some(result) = decision_skill_actions::execute_simple_action(
+        &decision.action,
+        incident,
+        data_dir,
+        cfg,
+        state,
+    )
+    .await
+    {
+        return result;
+    }
+
+    match &decision.action {
+        AiAction::BlockIp { ip, skill_id } => {
+            decision_block_ip::execute_block_ip_decision(
+                ip, skill_id, decision, incident, data_dir, cfg, state,
+            )
+            .await
+        }
+        AiAction::Honeypot { ip } => {
+            decision_honeypot::execute_honeypot_decision(ip, incident, data_dir, cfg, state).await
+        }
+        AiAction::SuspendUserSudo {
+            user,
+            duration_secs,
+        } => {
+            let skill_id = "suspend-user-sudo";
+            if !cfg.responder.allowed_skills.iter().any(|id| id == skill_id) {
+                return (
+                    format!("skipped: skill '{skill_id}' not in allowed_skills"),
+                    false,
+                );
+            }
+            if let Some(skill) = state.skill_registry.get(skill_id) {
+                let ctx = skills::SkillContext {
+                    incident: incident.clone(),
+                    target_ip: None,
+                    target_user: Some(user.clone()),
+                    target_container: None,
+                    duration_secs: Some(*duration_secs),
+                    host: incident.host.clone(),
+                    data_dir: data_dir.to_path_buf(),
+                    honeypot: honeypot_runtime(cfg),
+                    ai_provider: state.ai_provider.clone(),
+                };
+                (
+                    skill.execute(&ctx, cfg.responder.dry_run).await.message,
+                    false,
+                )
+            } else {
+                (
+                    "skipped: suspend-user-sudo skill not available".to_string(),
+                    false,
+                )
+            }
+        }
+        AiAction::KillProcess {
+            user,
+            duration_secs,
+        } => {
+            let skill_id = "kill-process";
+            if !cfg.responder.allowed_skills.iter().any(|id| id == skill_id) {
+                return (
+                    format!("skipped: skill '{skill_id}' not in allowed_skills"),
+                    false,
+                );
+            }
+            if let Some(skill) = state.skill_registry.get(skill_id) {
+                let ctx = skills::SkillContext {
+                    incident: incident.clone(),
+                    target_ip: None,
+                    target_user: Some(user.clone()),
+                    target_container: None,
+                    duration_secs: Some(*duration_secs),
+                    host: incident.host.clone(),
+                    data_dir: data_dir.to_path_buf(),
+                    honeypot: honeypot_runtime(cfg),
+                    ai_provider: state.ai_provider.clone(),
+                };
+                (
+                    skill.execute(&ctx, cfg.responder.dry_run).await.message,
+                    false,
+                )
+            } else {
+                (
+                    "skipped: kill-process skill not available".to_string(),
+                    false,
+                )
+            }
+        }
+        AiAction::BlockContainer {
+            container_id,
+            action: _,
+        } => {
+            let skill_id = "block-container";
+            if !cfg.responder.allowed_skills.iter().any(|id| id == skill_id) {
+                return (
+                    format!("skipped: skill '{skill_id}' not in allowed_skills"),
+                    false,
+                );
+            }
+            if let Some(skill) = state.skill_registry.get(skill_id) {
+                let ctx = skills::SkillContext {
+                    incident: incident.clone(),
+                    target_ip: None,
+                    target_user: None,
+                    target_container: Some(container_id.clone()),
+                    duration_secs: None,
+                    host: incident.host.clone(),
+                    data_dir: data_dir.to_path_buf(),
+                    honeypot: honeypot_runtime(cfg),
+                    ai_provider: state.ai_provider.clone(),
+                };
+                (
+                    skill.execute(&ctx, cfg.responder.dry_run).await.message,
+                    false,
+                )
+            } else {
+                (
+                    "skipped: block-container skill not available".to_string(),
+                    false,
+                )
+            }
+        }
+        AiAction::RequestConfirmation { summary } => {
+            decision_confirmation::execute_request_confirmation(
+                summary, decision, incident, cfg, state,
+            )
+            .await
+        }
+        _ => unreachable!("unsupported action path in execute_decision"),
+    }
+}
+
+pub(crate) fn honeypot_runtime(cfg: &config::AgentConfig) -> skills::HoneypotRuntimeConfig {
+    let mode = cfg.honeypot.mode.trim().to_ascii_lowercase();
+    let normalized_mode = match mode.as_str() {
+        "demo" | "listener" => mode,
+        // `always_on` keeps a permanent listener running from startup (handled
+        // separately in `main`). When a skill-level honeypot action is
+        // requested, it should behave like `listener` — a real listener, not
+        // the demo text response — since that is the semantic the operator
+        // opted into by enabling always-on mode.
+        "always_on" => "listener".to_string(),
+        other => {
+            warn!(mode = other, "unknown honeypot mode; falling back to demo");
+            "demo".to_string()
+        }
+    };
+    skills::HoneypotRuntimeConfig {
+        mode: normalized_mode,
+        bind_addr: cfg.honeypot.bind_addr.clone(),
+        port: cfg.honeypot.port,
+        http_port: cfg.honeypot.http_port,
+        duration_secs: cfg.honeypot.duration_secs,
+        services: if cfg.honeypot.services.is_empty() {
+            vec!["ssh".to_string()]
+        } else {
+            cfg.honeypot.services.clone()
+        },
+        strict_target_only: cfg.honeypot.strict_target_only,
+        allow_public_listener: cfg.honeypot.allow_public_listener,
+        max_connections: cfg.honeypot.max_connections,
+        max_payload_bytes: cfg.honeypot.max_payload_bytes,
+        isolation_profile: cfg.honeypot.isolation_profile.clone(),
+        require_high_ports: cfg.honeypot.require_high_ports,
+        forensics_keep_days: cfg.honeypot.forensics_keep_days,
+        forensics_max_total_mb: cfg.honeypot.forensics_max_total_mb,
+        transcript_preview_bytes: cfg.honeypot.transcript_preview_bytes,
+        lock_stale_secs: cfg.honeypot.lock_stale_secs,
+        sandbox_enabled: cfg.honeypot.sandbox.enabled,
+        sandbox_runner_path: cfg.honeypot.sandbox.runner_path.clone(),
+        sandbox_clear_env: cfg.honeypot.sandbox.clear_env,
+        pcap_handoff_enabled: cfg.honeypot.pcap_handoff.enabled,
+        pcap_handoff_timeout_secs: cfg.honeypot.pcap_handoff.timeout_secs,
+        pcap_handoff_max_packets: cfg.honeypot.pcap_handoff.max_packets,
+        containment_mode: cfg.honeypot.containment.mode.clone(),
+        containment_require_success: cfg.honeypot.containment.require_success,
+        containment_namespace_runner: cfg.honeypot.containment.namespace_runner.clone(),
+        containment_namespace_args: cfg.honeypot.containment.namespace_args.clone(),
+        containment_jail_runner: cfg.honeypot.containment.jail_runner.clone(),
+        containment_jail_args: cfg.honeypot.containment.jail_args.clone(),
+        containment_jail_profile: cfg.honeypot.containment.jail_profile.clone(),
+        containment_allow_namespace_fallback: cfg.honeypot.containment.allow_namespace_fallback,
+        external_handoff_enabled: cfg.honeypot.external_handoff.enabled,
+        external_handoff_command: cfg.honeypot.external_handoff.command.clone(),
+        external_handoff_args: cfg.honeypot.external_handoff.args.clone(),
+        external_handoff_timeout_secs: cfg.honeypot.external_handoff.timeout_secs,
+        external_handoff_require_success: cfg.honeypot.external_handoff.require_success,
+        external_handoff_clear_env: cfg.honeypot.external_handoff.clear_env,
+        external_handoff_allowed_commands: cfg.honeypot.external_handoff.allowed_commands.clone(),
+        external_handoff_enforce_allowlist: cfg.honeypot.external_handoff.enforce_allowlist,
+        external_handoff_signature_enabled: cfg.honeypot.external_handoff.signature_enabled,
+        external_handoff_signature_key_env: cfg.honeypot.external_handoff.signature_key_env.clone(),
+        external_handoff_attestation_enabled: cfg.honeypot.external_handoff.attestation_enabled,
+        external_handoff_attestation_key_env: cfg
+            .honeypot
+            .external_handoff
+            .attestation_key_env
+            .clone(),
+        external_handoff_attestation_prefix: cfg
+            .honeypot
+            .external_handoff
+            .attestation_prefix
+            .clone(),
+        external_handoff_attestation_expected_receiver: cfg
+            .honeypot
+            .external_handoff
+            .attestation_expected_receiver
+            .clone(),
+        redirect_enabled: cfg.honeypot.redirect.enabled,
+        redirect_backend: cfg.honeypot.redirect.backend.clone(),
+        interaction: cfg.honeypot.interaction.trim().to_ascii_lowercase(),
+        ssh_max_auth_attempts: cfg.honeypot.ssh_max_auth_attempts,
+        http_max_requests: cfg.honeypot.http_max_requests,
+        // Populated at the call site when the AI provider is available.
+        ai_provider: None,
+    }
+}
+
+pub(crate) async fn append_honeypot_marker_event(
+    data_dir: &Path,
+    incident: &innerwarden_core::incident::Incident,
+    ip: &str,
+    dry_run: bool,
+    runtime: &skills::HoneypotRuntimeConfig,
+) -> Result<std::path::PathBuf> {
+    use tokio::io::AsyncWriteExt;
+
+    let today = chrono::Local::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+    let events_path = data_dir.join(format!("events-{today}.jsonl"));
+
+    let is_listener = runtime.mode == "listener" && !dry_run;
+    let (source, kind, summary) = if is_listener {
+        let mut endpoints = Vec::new();
+        if runtime
+            .services
+            .iter()
+            .any(|svc| svc.eq_ignore_ascii_case("ssh"))
+        {
+            endpoints.push(format!("ssh:{}:{}", runtime.bind_addr, runtime.port));
+        }
+        if runtime
+            .services
+            .iter()
+            .any(|svc| svc.eq_ignore_ascii_case("http"))
+        {
+            endpoints.push(format!("http:{}:{}", runtime.bind_addr, runtime.http_port));
+        }
+        if endpoints.is_empty() {
+            endpoints.push(format!("ssh:{}:{}", runtime.bind_addr, runtime.port));
+        }
+        (
+            "agent.honeypot_listener",
+            "honeypot.listener_session_started",
+            format!(
+                "Honeypot listener session started for attacker {ip} at {}",
+                endpoints.join(", ")
+            ),
+        )
+    } else {
+        (
+            "agent.honeypot_demo",
+            "honeypot.demo_decoy_hit",
+            format!(
+                "DEMO/SIMULATION/DECOY: attacker {ip} marked as honeypot hit (controlled marker only)"
+            ),
+        )
+    };
+
+    let event = innerwarden_core::event::Event {
+        ts: chrono::Utc::now(),
+        host: incident.host.clone(),
+        source: source.to_string(),
+        kind: kind.to_string(),
+        severity: innerwarden_core::event::Severity::Info,
+        summary,
+        details: serde_json::json!({
+            "mode": runtime.mode,
+            "simulation": !is_listener,
+            "decoy": true,
+            "target_ip": ip,
+            "incident_id": incident.incident_id,
+            "dry_run": dry_run,
+            "listener_bind_addr": runtime.bind_addr,
+            "listener_services": runtime.services.clone(),
+            "listener_ssh_port": runtime.port,
+            "listener_http_port": runtime.http_port,
+            "listener_duration_secs": runtime.duration_secs,
+            "listener_strict_target_only": runtime.strict_target_only,
+            "listener_max_connections": runtime.max_connections,
+            "listener_max_payload_bytes": runtime.max_payload_bytes,
+            "listener_isolation_profile": runtime.isolation_profile,
+            "listener_require_high_ports": runtime.require_high_ports,
+            "listener_forensics_keep_days": runtime.forensics_keep_days,
+            "listener_forensics_max_total_mb": runtime.forensics_max_total_mb,
+            "listener_transcript_preview_bytes": runtime.transcript_preview_bytes,
+            "listener_lock_stale_secs": runtime.lock_stale_secs,
+            "listener_sandbox_enabled": runtime.sandbox_enabled,
+            "listener_containment_mode": runtime.containment_mode,
+            "listener_containment_jail_runner": runtime.containment_jail_runner,
+            "listener_containment_jail_profile": runtime.containment_jail_profile,
+            "listener_external_handoff_enabled": runtime.external_handoff_enabled,
+            "listener_external_handoff_allowlist": runtime.external_handoff_enforce_allowlist,
+            "listener_external_handoff_signature": runtime.external_handoff_signature_enabled,
+            "listener_external_handoff_attestation": runtime.external_handoff_attestation_enabled,
+            "listener_pcap_handoff_enabled": runtime.pcap_handoff_enabled,
+            "listener_redirect_enabled": runtime.redirect_enabled,
+            "listener_redirect_backend": runtime.redirect_backend,
+            "note": if is_listener {
+                "Real honeypot listener mode active with bounded decoys and local forensics."
+            } else {
+                "Demo-only marker; no real honeypot infrastructure is deployed in this mode."
+            }
+        }),
+        tags: vec![
+            "honeypot".to_string(),
+            "decoy".to_string(),
+            if is_listener {
+                "listener".to_string()
+            } else {
+                "demo".to_string()
+            },
+            if is_listener {
+                "real_mode".to_string()
+            } else {
+                "simulation".to_string()
+            },
+        ],
+        entities: vec![innerwarden_core::entities::EntityRef::ip(ip)],
+    };
+
+    let line = serde_json::to_string(&event)?;
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&events_path)
+        .await?;
+    file.write_all(line.as_bytes()).await?;
+    file.write_all(b"\n").await?;
+    file.flush().await?;
+
+    Ok(events_path)
+}
