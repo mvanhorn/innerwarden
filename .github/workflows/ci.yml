@@ -49,3 +49,29 @@ jobs:
 
       - name: Run end-to-end replay validation
         run: make replay-qa
+
+  # Spec 024 regression safety net: canonical scenarios assert expected
+  # incident / telegram / block volumes on every PR. Drift (intentional
+  # or accidental) outside the envelope in testdata/scenarios/*/expected.json
+  # fails CI here, catching the "fix A → break B" class of bug that unit
+  # tests alone miss.
+  scenario-qa:
+    runs-on: ubuntu-latest
+    needs: [validate]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: Set up Python (scenario-qa runner dependency)
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5
+        with:
+          python-version: "3.x"
+
+      - name: Run spec 024 scenario volume tests
+        run: make scenario-qa
