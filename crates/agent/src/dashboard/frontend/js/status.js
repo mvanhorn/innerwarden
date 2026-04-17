@@ -454,10 +454,10 @@ const METRICS_DRIFT_KEYS = [
   { key: 'innerwarden_honeypot_sessions_per_hour',  labelDim: null,       heading: 'Honeypot sessions / hour',     alert: '0 for 24h · warn' },
   { key: 'innerwarden_tracker_detections_per_hour', labelDim: 'pattern',  heading: 'Tracker detections / hour',    alert: '0 for 24h when incidents>10 · warn' },
   { key: 'innerwarden_orphaned_responses_total',    labelDim: null,       heading: 'Orphaned responses (total)',   alert: 'Any increment · critical' },
-  { key: 'innerwarden_revert_failures_per_hour',    labelDim: null,       heading: 'Revert failures / hour',       alert: '>10/h · warn' },
+  { key: 'innerwarden_revert_failures_total',       labelDim: null,       heading: 'Revert failures (total)',      alert: 'increase over 1h >10 · warn' },
   { key: 'innerwarden_ai_provider_errors_per_hour', labelDim: 'provider', heading: 'AI provider errors / hour',    alert: '>5/h · warn' },
-  { key: 'innerwarden_gate_suppressed_total',       labelDim: null,       heading: 'Gate suppressed (delta)',      alert: 'Divergence from incidents = gate drift' },
-  { key: 'innerwarden_event_rate_per_hour',         labelDim: 'source',   heading: 'Event rate / hour',            alert: 'Anomaly detector (baseline)' },
+  { key: 'innerwarden_gate_suppressed_total',       labelDim: null,       heading: 'Gate suppressed (total)',      alert: 'low rate + high telegram volume = gate drift' },
+  { key: 'innerwarden_event_rate_per_hour',         labelDim: 'source',   heading: 'Event rate / hour',            alert: '0 for 1h = source silent' },
 ];
 
 async function loadMetricsDrift() {
@@ -554,4 +554,3 @@ function collapseLeftOnMobile() {
     toggleLeftPanel();
   }
 }
-

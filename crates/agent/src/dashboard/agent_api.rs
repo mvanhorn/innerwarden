@@ -595,6 +595,7 @@ pub(super) fn append_spec024_metrics(
 ) {
     let hour_ago = now - chrono::Duration::hours(1);
     let today = now.date_naive().format("%Y-%m-%d").to_string();
+    let hour_ago_date = hour_ago.date_naive().format("%Y-%m-%d").to_string();
 
     // ── 1. innerwarden_incidents_per_hour{severity} ─────────────────
     out.push_str("# HELP innerwarden_incidents_per_hour Incidents emitted in the last hour, grouped by severity. Spec 024.\n");
@@ -610,7 +611,7 @@ pub(super) fn append_spec024_metrics(
     // ── 2. innerwarden_telegram_msgs_per_hour ───────────────────────
     out.push_str("# HELP innerwarden_telegram_msgs_per_hour Telegram messages sent in the last hour. Spec 024.\n");
     out.push_str("# TYPE innerwarden_telegram_msgs_per_hour gauge\n");
-    let telegram_n = count_outbox_last_hour(&state.data_dir, &hour_ago);
+    let telegram_n = read_telegram_msgs_last_hour(&state.data_dir, now);
     out.push_str(&format!(
         "innerwarden_telegram_msgs_per_hour {telegram_n}\n"
     ));
@@ -618,7 +619,8 @@ pub(super) fn append_spec024_metrics(
     // ── 3. innerwarden_blocks_per_hour{backend} ─────────────────────
     out.push_str("# HELP innerwarden_blocks_per_hour Block decisions in the last hour, grouped by backend. Spec 024.\n");
     out.push_str("# TYPE innerwarden_blocks_per_hour gauge\n");
-    let backend_counts = count_blocks_last_hour_by_backend(&state.data_dir, &today, &hour_ago);
+    let backend_counts =
+        count_blocks_last_hour_by_backend(&state.data_dir, &today, &hour_ago_date, &hour_ago);
     for backend in &[
         "ufw",
         "xdp",
@@ -637,7 +639,8 @@ pub(super) fn append_spec024_metrics(
     // ── 4. innerwarden_honeypot_sessions_per_hour ──────────────────
     out.push_str("# HELP innerwarden_honeypot_sessions_per_hour Honeypot sessions recorded in the last hour. Spec 024.\n");
     out.push_str("# TYPE innerwarden_honeypot_sessions_per_hour gauge\n");
-    let honeypot_n = count_honeypot_sessions_last_hour(&state.data_dir, &today, &hour_ago);
+    let honeypot_n =
+        count_honeypot_sessions_last_hour(&state.data_dir, &today, &hour_ago_date, &hour_ago);
     out.push_str(&format!(
         "innerwarden_honeypot_sessions_per_hour {honeypot_n}\n"
     ));
@@ -675,14 +678,14 @@ pub(super) fn append_spec024_metrics(
         "innerwarden_orphaned_responses_total {orphaned}\n"
     ));
 
-    // ── 7. innerwarden_revert_failures_per_hour ────────────────────
-    out.push_str("# HELP innerwarden_revert_failures_per_hour Revert command failures in the last hour. Spec 024.\n");
-    out.push_str("# TYPE innerwarden_revert_failures_per_hour gauge\n");
-    // We only have a cumulative counter; approximate per-hour as the delta
-    // observed in this process. A sidecar recorder is a follow-up.
+    // ── 7. innerwarden_revert_failures_total ───────────────────────
+    out.push_str(
+        "# HELP innerwarden_revert_failures_total Cumulative revert command failures. Spec 024.\n",
+    );
+    out.push_str("# TYPE innerwarden_revert_failures_total counter\n");
     let revert_total = read_responses_total(state, "revert_failures");
     out.push_str(&format!(
-        "innerwarden_revert_failures_per_hour {revert_total}\n"
+        "innerwarden_revert_failures_total {revert_total}\n"
     ));
 
     // ── 8. innerwarden_ai_provider_errors_per_hour{provider} ───────
@@ -699,13 +702,13 @@ pub(super) fn append_spec024_metrics(
     // ── 9. innerwarden_gate_suppressed_total ───────────────────────
     out.push_str("# HELP innerwarden_gate_suppressed_total Notifications dropped by notification_gate (DailyBriefingOnly + Drop). Spec 024.\n");
     out.push_str("# TYPE innerwarden_gate_suppressed_total counter\n");
-    // Proxy: (total incidents today with IP) − (telegram messages sent today).
-    // A suppression delta that trends to zero means the gate has degraded.
-    let suppressed = compute_gate_suppressed_estimate(state, &today);
+    let suppressed = read_gate_suppressed_total(&state.data_dir, &today);
     out.push_str(&format!("innerwarden_gate_suppressed_total {suppressed}\n"));
 
     // ── 10. innerwarden_event_rate_per_hour{source} ────────────────
-    out.push_str("# HELP innerwarden_event_rate_per_hour Events observed today per source, expressed as an hourly rate. Spec 024.\n");
+    // Intentionally a trailing-1h delta from telemetry snapshots (not
+    // day-to-date average) so a silent source legitimately reaches 0/h.
+    out.push_str("# HELP innerwarden_event_rate_per_hour Events observed in the last hour per source. Spec 024.\n");
     out.push_str("# TYPE innerwarden_event_rate_per_hour gauge\n");
     let per_source = read_event_rate_per_hour(&state.data_dir, &today, now);
     for (source, rate) in &per_source {
@@ -752,72 +755,72 @@ fn count_incidents_last_hour_by_severity(
     out
 }
 
-fn count_outbox_last_hour(
+fn read_telegram_msgs_last_hour(
     data_dir: &std::path::Path,
-    hour_ago: &chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> u64 {
-    let path = data_dir.join("telegram-outbox.jsonl");
-    let Ok(content) = std::fs::read_to_string(&path) else {
+    let today = now.date_naive().format("%Y-%m-%d").to_string();
+    let Some(latest) = crate::telemetry::read_latest_snapshot(data_dir, &today) else {
         return 0;
     };
-    let mut n = 0u64;
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let ts = v.get("ts").and_then(|t| t.as_str());
-        let Some(ts) = ts else { continue };
-        let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) else {
-            continue;
-        };
-        if parsed.with_timezone(&chrono::Utc) > *hour_ago {
-            n += 1;
-        }
-    }
-    n
+    let hour_ago = now - chrono::Duration::hours(1);
+    let hour_ago_date = hour_ago.date_naive().format("%Y-%m-%d").to_string();
+    let baseline = crate::telemetry::read_snapshot_at(data_dir, &hour_ago_date, hour_ago)
+        .map(|snap| snap.telegram_sent_count)
+        .unwrap_or(0);
+    latest.telegram_sent_count.saturating_sub(baseline)
 }
 
 fn count_blocks_last_hour_by_backend(
     data_dir: &std::path::Path,
     today: &str,
+    hour_ago_date: &str,
     hour_ago: &chrono::DateTime<chrono::Utc>,
 ) -> std::collections::HashMap<String, u64> {
     let mut out = std::collections::HashMap::new();
-    let path = data_dir.join(format!("decisions-{today}.jsonl"));
-    let Ok(content) = std::fs::read_to_string(&path) else {
+    let Some(canonical) = std::fs::canonicalize(data_dir).ok() else {
         return out;
     };
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() {
+    let mut dates = vec![today.to_string()];
+    if hour_ago_date != today {
+        dates.push(hour_ago_date.to_string());
+    }
+    for date in dates {
+        let target = canonical.join(format!("decisions-{date}.jsonl"));
+        if !target.starts_with(&canonical) {
             continue;
         }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        let Ok(content) = std::fs::read_to_string(&target) else {
             continue;
         };
-        let action = v.get("action_type").and_then(|a| a.as_str()).unwrap_or("");
-        if action != "block_ip" {
-            continue;
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let action = v.get("action_type").and_then(|a| a.as_str()).unwrap_or("");
+            if action != "block_ip" {
+                continue;
+            }
+            let ts = v.get("ts").and_then(|t| t.as_str()).unwrap_or("");
+            let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) else {
+                continue;
+            };
+            if parsed.with_timezone(&chrono::Utc) <= *hour_ago {
+                continue;
+            }
+            // Backend is encoded in skill_id ("block-ip-ufw" → "ufw").
+            let backend = v
+                .get("skill_id")
+                .and_then(|s| s.as_str())
+                .and_then(|s| s.strip_prefix("block-ip-"))
+                .unwrap_or("unknown")
+                .to_string();
+            *out.entry(backend).or_insert(0) += 1;
         }
-        let ts = v.get("ts").and_then(|t| t.as_str()).unwrap_or("");
-        let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) else {
-            continue;
-        };
-        if parsed.with_timezone(&chrono::Utc) <= *hour_ago {
-            continue;
-        }
-        // Backend is encoded in skill_id ("block-ip-ufw" → "ufw").
-        let backend = v
-            .get("skill_id")
-            .and_then(|s| s.as_str())
-            .and_then(|s| s.strip_prefix("block-ip-"))
-            .unwrap_or("unknown")
-            .to_string();
-        *out.entry(backend).or_insert(0) += 1;
     }
     out
 }
@@ -825,35 +828,48 @@ fn count_blocks_last_hour_by_backend(
 fn count_honeypot_sessions_last_hour(
     data_dir: &std::path::Path,
     today: &str,
+    hour_ago_date: &str,
     hour_ago: &chrono::DateTime<chrono::Utc>,
 ) -> u64 {
     // Honeypot sessions are written to honeypot-sessions-YYYY-MM-DD.jsonl when
     // the always-on listener is enabled. Absence of the file is a legitimate
     // zero.
-    let path = data_dir.join(format!("honeypot-sessions-{today}.jsonl"));
-    let Ok(content) = std::fs::read_to_string(&path) else {
+    let Some(canonical) = std::fs::canonicalize(data_dir).ok() else {
         return 0;
     };
+    let mut dates = vec![today.to_string()];
+    if hour_ago_date != today {
+        dates.push(hour_ago_date.to_string());
+    }
     let mut n = 0u64;
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() {
+    for date in dates {
+        let target = canonical.join(format!("honeypot-sessions-{date}.jsonl"));
+        if !target.starts_with(&canonical) {
             continue;
         }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        let Ok(content) = std::fs::read_to_string(&target) else {
             continue;
         };
-        let ts = v
-            .get("ended_at")
-            .or_else(|| v.get("started_at"))
-            .or_else(|| v.get("ts"))
-            .and_then(|t| t.as_str())
-            .unwrap_or("");
-        let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) else {
-            continue;
-        };
-        if parsed.with_timezone(&chrono::Utc) > *hour_ago {
-            n += 1;
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let ts = v
+                .get("ended_at")
+                .or_else(|| v.get("started_at"))
+                .or_else(|| v.get("ts"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) else {
+                continue;
+            };
+            if parsed.with_timezone(&chrono::Utc) > *hour_ago {
+                n += 1;
+            }
         }
     }
     n
@@ -918,30 +934,11 @@ fn read_telemetry_error_count(data_dir: &std::path::Path, date: &str, component:
         .unwrap_or(0)
 }
 
-fn compute_gate_suppressed_estimate(state: &DashboardState, today: &str) -> u64 {
-    // incidents_today − telegram_sent_today. Negative values clamp to zero
-    // (shouldn't happen unless the outbox is polluted by an external writer).
-    let incidents_today = state
-        .sqlite_store
-        .as_ref()
-        .and_then(|sq| sq.conn().ok())
-        .and_then(|c| {
-            let start = format!("{today}T00:00:00Z");
-            let mut stmt = c
-                .prepare("SELECT COUNT(*) FROM incidents WHERE ts >= ?1")
-                .ok()?;
-            let n: i64 = stmt.query_row([start.as_str()], |row| row.get(0)).ok()?;
-            Some(n as u64)
-        })
-        .unwrap_or(0);
-    let telegram_today = {
-        let path = state.data_dir.join("telegram-outbox.jsonl");
-        std::fs::read_to_string(&path)
-            .ok()
-            .map(|c| c.lines().filter(|l| !l.trim().is_empty()).count() as u64)
-            .unwrap_or(0)
+fn read_gate_suppressed_total(data_dir: &std::path::Path, date: &str) -> u64 {
+    let Some(snapshot) = crate::telemetry::read_latest_snapshot(data_dir, date) else {
+        return 0;
     };
-    incidents_today.saturating_sub(telegram_today)
+    snapshot.gate_suppressed_total
 }
 
 fn read_event_rate_per_hour(
@@ -949,18 +946,37 @@ fn read_event_rate_per_hour(
     date: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<(String, f64)> {
-    use chrono::Timelike;
-    let Some(snapshot) = crate::telemetry::read_latest_snapshot(data_dir, date) else {
+    let Some(latest) = crate::telemetry::read_latest_snapshot(data_dir, date) else {
         return Vec::new();
     };
-    let hour = now.hour() as f64 + now.minute() as f64 / 60.0;
-    let hour = hour.max(0.5); // avoid absurd rates just after midnight
-    let mut out: Vec<(String, f64)> = snapshot
-        .events_by_collector
+
+    let hour_ago = now - chrono::Duration::hours(1);
+    let hour_ago_date = hour_ago.date_naive().format("%Y-%m-%d").to_string();
+    let baseline = crate::telemetry::read_snapshot_at(data_dir, &hour_ago_date, hour_ago);
+
+    let mut sources = std::collections::BTreeSet::new();
+    sources.extend(latest.events_by_collector.keys().cloned());
+    if let Some(ref previous) = baseline {
+        sources.extend(previous.events_by_collector.keys().cloned());
+    }
+
+    let mut out: Vec<(String, f64)> = sources
         .into_iter()
-        .map(|(src, total)| (src, total as f64 / hour))
+        .map(|source| {
+            let current = latest
+                .events_by_collector
+                .get(&source)
+                .copied()
+                .unwrap_or(0);
+            let previous = baseline
+                .as_ref()
+                .and_then(|snap| snap.events_by_collector.get(&source).copied())
+                .unwrap_or(0);
+            let delta = current.saturating_sub(previous);
+            (source, delta as f64)
+        })
         .collect();
-    // Deterministic ordering makes the endpoint easy to diff.
+
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
 }
@@ -1224,59 +1240,135 @@ enabled = false
 
     // ─── Spec 024 /metrics helpers ──────────────────────────────────
     //
-    // Each helper is tested in isolation because constructing a full
-    // DashboardState is heavyweight. The append_spec024_metrics function
-    // itself is covered by the scenario-qa path: a passing run emits
-    // every metric into its scratch data_dir, and the envelope test
-    // doubles as a live smoke test.
+    // scenario-qa validates the underlying sqlite/JSONL artifacts that
+    // feed these metrics but does not exercise GET /metrics or
+    // append_spec024_metrics end-to-end.
 
     fn tmpdir() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")
     }
 
-    #[test]
-    fn count_outbox_last_hour_rejects_old_entries() {
-        let td = tmpdir();
-        let now = chrono::Utc::now();
-        let recent = now - chrono::Duration::minutes(10);
-        let old = now - chrono::Duration::hours(2);
-        let path = td.path().join("telegram-outbox.jsonl");
-        let mut contents = String::new();
-        contents.push_str(&format!(
-            "{{\"ts\":\"{}\",\"method\":\"sendMessage\"}}\n",
-            recent.to_rfc3339()
-        ));
-        contents.push_str(&format!(
-            "{{\"ts\":\"{}\",\"method\":\"sendMessage\"}}\n",
-            old.to_rfc3339()
-        ));
-        std::fs::write(&path, contents).unwrap();
-        let n = count_outbox_last_hour(td.path(), &(now - chrono::Duration::hours(1)));
-        assert_eq!(n, 1, "only entries newer than hour_ago must count");
+    fn telemetry_snapshot(
+        ts: chrono::DateTime<chrono::Utc>,
+        events: &[(&str, u64)],
+        telegram_sent_count: u64,
+        gate_suppressed_total: u64,
+        ai_provider_errors: u64,
+    ) -> crate::telemetry::TelemetrySnapshot {
+        crate::telemetry::TelemetrySnapshot {
+            ts,
+            tick: "incident_tick".into(),
+            events_by_collector: events.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
+            incidents_by_detector: Default::default(),
+            gate_pass_count: 0,
+            gate_suppressed_total,
+            ai_sent_count: 0,
+            telegram_sent_count,
+            ai_decision_count: 0,
+            avg_decision_latency_ms: 0.0,
+            errors_by_component: std::collections::BTreeMap::from([(
+                "ai_provider".to_string(),
+                ai_provider_errors,
+            )]),
+            decisions_by_action: Default::default(),
+            dry_run_execution_count: 0,
+            real_execution_count: 0,
+        }
+    }
+
+    fn write_telemetry_snapshots(
+        dir: &std::path::Path,
+        date: &str,
+        snapshots: &[crate::telemetry::TelemetrySnapshot],
+    ) {
+        let path = dir.join(format!("telemetry-{date}.jsonl"));
+        let content = snapshots
+            .iter()
+            .map(|snap| serde_json::to_string(snap).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(path, format!("{content}\n")).unwrap();
+    }
+
+    fn dashboard_state_for_metrics(
+        data_dir: &std::path::Path,
+        sqlite_store: Option<std::sync::Arc<innerwarden_store::Store>>,
+    ) -> DashboardState {
+        let (event_tx, _) = tokio::sync::broadcast::channel(8);
+        let (agent_alert_tx, _agent_alert_rx) = tokio::sync::mpsc::channel(8);
+        DashboardState {
+            data_dir: data_dir.to_path_buf(),
+            action_cfg: std::sync::Arc::new(DashboardActionConfig::default()),
+            event_tx,
+            web_push_vapid_public_key: String::new(),
+            insecure_http: false,
+            last_activity: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sensor_cache: std::sync::Arc::new(tokio::sync::Mutex::new((0, serde_json::json!({})))),
+            trusted_proxies: std::sync::Arc::new(Vec::new()),
+            sessions: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            session_timeout_minutes: 30,
+            max_sessions: 16,
+            advisory_cache: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::VecDeque::new(),
+            )),
+            agent_registry: std::sync::Arc::new(tokio::sync::Mutex::new(
+                innerwarden_agent_guard::registry::Registry::new(),
+            )),
+            rule_engine: std::sync::Arc::new(innerwarden_agent_guard::rules::RuleEngine::empty()),
+            agent_alert_tx,
+            deep_security: std::sync::Arc::new(std::sync::RwLock::new(
+                DeepSecuritySnapshot::default(),
+            )),
+            knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(
+                crate::knowledge_graph::KnowledgeGraph::new(),
+            )),
+            ai_provider: None,
+            latest_briefing: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            briefing_hour: 0,
+            briefing_minute: 0,
+            sqlite_store,
+        }
     }
 
     #[test]
-    fn count_outbox_last_hour_handles_missing_file() {
+    fn read_telegram_msgs_last_hour_uses_snapshot_delta() {
         let td = tmpdir();
-        let n = count_outbox_last_hour(
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-17T12:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let date = "2026-04-17";
+        write_telemetry_snapshots(
             td.path(),
-            &(chrono::Utc::now() - chrono::Duration::hours(1)),
+            date,
+            &[
+                telemetry_snapshot(
+                    chrono::DateTime::parse_from_rfc3339("2026-04-17T11:20:00Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                    &[("auth.log", 10)],
+                    12,
+                    0,
+                    0,
+                ),
+                telemetry_snapshot(
+                    chrono::DateTime::parse_from_rfc3339("2026-04-17T12:25:00Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                    &[("auth.log", 30)],
+                    20,
+                    0,
+                    0,
+                ),
+            ],
         );
-        assert_eq!(n, 0);
+        assert_eq!(read_telegram_msgs_last_hour(td.path(), now), 8);
     }
 
     #[test]
-    fn count_outbox_last_hour_skips_malformed_lines() {
+    fn read_telegram_msgs_last_hour_returns_zero_when_snapshot_missing() {
         let td = tmpdir();
-        let path = td.path().join("telegram-outbox.jsonl");
         let now = chrono::Utc::now();
-        let contents = format!(
-            "{{\"ts\":\"{}\",\"method\":\"sendMessage\"}}\nnot-json\n{{}}\n",
-            now.to_rfc3339()
-        );
-        std::fs::write(&path, contents).unwrap();
-        let n = count_outbox_last_hour(td.path(), &(now - chrono::Duration::hours(1)));
-        assert_eq!(n, 1);
+        assert_eq!(read_telegram_msgs_last_hour(td.path(), now), 0);
     }
 
     #[test]
@@ -1308,6 +1400,7 @@ enabled = false
         let counts = count_blocks_last_hour_by_backend(
             td.path(),
             &today,
+            &today,
             &(now - chrono::Duration::hours(1)),
         );
         assert_eq!(counts.get("ufw").copied(), Some(1));
@@ -1330,6 +1423,7 @@ enabled = false
         let counts = count_blocks_last_hour_by_backend(
             td.path(),
             &today,
+            &today,
             &(now - chrono::Duration::hours(1)),
         );
         assert_eq!(counts.get("unknown").copied(), Some(1));
@@ -1343,6 +1437,7 @@ enabled = false
         // No file ⇒ 0.
         let n = count_honeypot_sessions_last_hour(
             td.path(),
+            &today,
             &today,
             &(now - chrono::Duration::hours(1)),
         );
@@ -1366,41 +1461,87 @@ enabled = false
         let n = count_honeypot_sessions_last_hour(
             td.path(),
             &today,
+            &today,
             &(now - chrono::Duration::hours(1)),
         );
         assert_eq!(n, 1);
     }
 
     #[test]
-    fn read_event_rate_per_hour_scales_by_hour_of_day() {
-        // A synthetic telemetry file with two collectors at fixed counts
-        // should divide by the hour of day to produce the per-hour gauge.
+    fn file_backed_last_hour_metrics_include_previous_day_after_midnight() {
+        let td = tmpdir();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-18T00:15:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let hour_ago = now - chrono::Duration::hours(1);
+        let today = now.date_naive().format("%Y-%m-%d").to_string();
+        let yesterday = hour_ago.date_naive().format("%Y-%m-%d").to_string();
+
+        std::fs::write(
+            td.path().join(format!("decisions-{yesterday}.jsonl")),
+            format!(
+                "{{\"ts\":\"2026-04-17T23:50:00Z\",\"action_type\":\"block_ip\",\"skill_id\":\"block-ip-ufw\"}}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            td.path().join(format!("decisions-{today}.jsonl")),
+            format!(
+                "{{\"ts\":\"2026-04-18T00:05:00Z\",\"action_type\":\"block_ip\",\"skill_id\":\"block-ip-xdp\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        std::fs::write(
+            td.path()
+                .join(format!("honeypot-sessions-{yesterday}.jsonl")),
+            "{\"ended_at\":\"2026-04-17T23:50:00Z\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            td.path().join(format!("honeypot-sessions-{today}.jsonl")),
+            "{\"ended_at\":\"2026-04-18T00:05:00Z\"}\n",
+        )
+        .unwrap();
+
+        let block_counts =
+            count_blocks_last_hour_by_backend(td.path(), &today, &yesterday, &hour_ago);
+        assert_eq!(block_counts.get("ufw").copied(), Some(1));
+        assert_eq!(block_counts.get("xdp").copied(), Some(1));
+
+        let honeypot_n =
+            count_honeypot_sessions_last_hour(td.path(), &today, &yesterday, &hour_ago);
+        assert_eq!(honeypot_n, 2);
+    }
+
+    #[test]
+    fn read_event_rate_per_hour_uses_trailing_hour_delta() {
         let td = tmpdir();
         let date = "2026-04-17";
-        let path = td.path().join(format!("telemetry-{date}.jsonl"));
-        let snap = crate::telemetry::TelemetrySnapshot {
-            ts: chrono::DateTime::parse_from_rfc3339("2026-04-17T12:00:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc),
-            tick: "incident_tick".into(),
-            events_by_collector: std::collections::BTreeMap::from([
-                ("auth.log".to_string(), 120u64),
-                ("journald".to_string(), 60u64),
-            ]),
-            incidents_by_detector: Default::default(),
-            gate_pass_count: 0,
-            ai_sent_count: 0,
-            ai_decision_count: 0,
-            avg_decision_latency_ms: 0.0,
-            errors_by_component: Default::default(),
-            decisions_by_action: Default::default(),
-            dry_run_execution_count: 0,
-            real_execution_count: 0,
-        };
-        let line = serde_json::to_string(&snap).unwrap();
-        std::fs::write(&path, format!("{line}\n")).unwrap();
-
-        // 12:30 = 12.5 hours elapsed.
+        write_telemetry_snapshots(
+            td.path(),
+            date,
+            &[
+                telemetry_snapshot(
+                    chrono::DateTime::parse_from_rfc3339("2026-04-17T11:25:00Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                    &[("auth.log", 100), ("journald", 60)],
+                    0,
+                    0,
+                    0,
+                ),
+                telemetry_snapshot(
+                    chrono::DateTime::parse_from_rfc3339("2026-04-17T12:20:00Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                    &[("auth.log", 130), ("journald", 60)],
+                    0,
+                    0,
+                    0,
+                ),
+            ],
+        );
         let now = chrono::DateTime::parse_from_rfc3339("2026-04-17T12:30:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
@@ -1408,8 +1549,8 @@ enabled = false
         assert_eq!(rates.len(), 2);
         let auth = rates.iter().find(|(s, _)| s == "auth.log").unwrap().1;
         let journal = rates.iter().find(|(s, _)| s == "journald").unwrap().1;
-        assert!((auth - (120.0 / 12.5)).abs() < 0.01);
-        assert!((journal - (60.0 / 12.5)).abs() < 0.01);
+        assert!((auth - 30.0).abs() < 0.01);
+        assert!((journal - 0.0).abs() < 0.01);
     }
 
     #[test]
@@ -1417,6 +1558,102 @@ enabled = false
         let td = tmpdir();
         let rates = read_event_rate_per_hour(td.path(), "2026-04-17", chrono::Utc::now());
         assert!(rates.is_empty());
+    }
+
+    #[test]
+    fn append_spec024_metrics_emits_expected_lines_from_artifacts() {
+        let td = tmpdir();
+        let store = std::sync::Arc::new(innerwarden_store::Store::open(td.path()).unwrap());
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-17T12:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let today = now.date_naive().format("%Y-%m-%d").to_string();
+
+        let high_incident = innerwarden_core::incident::Incident {
+            ts: now - chrono::Duration::minutes(5),
+            host: "srv-01".to_string(),
+            incident_id: "ssh_bruteforce:198.51.100.10:test".to_string(),
+            severity: innerwarden_core::event::Severity::High,
+            title: "SSH brute force".to_string(),
+            summary: "many failed logins".to_string(),
+            evidence: serde_json::json!({}),
+            recommended_checks: Vec::new(),
+            tags: Vec::new(),
+            entities: vec![innerwarden_core::entities::EntityRef::ip("198.51.100.10")],
+        };
+        store.insert_incident(&high_incident).unwrap();
+
+        let killchain_incident = innerwarden_core::incident::Incident {
+            ts: now - chrono::Duration::minutes(3),
+            host: "srv-01".to_string(),
+            incident_id: "kill_chain:detected:reverse_shell:42:2026-04-17T12:27:00Z".to_string(),
+            severity: innerwarden_core::event::Severity::Critical,
+            title: "Kill chain".to_string(),
+            summary: "reverse shell sequence".to_string(),
+            evidence: serde_json::json!({}),
+            recommended_checks: Vec::new(),
+            tags: Vec::new(),
+            entities: vec![innerwarden_core::entities::EntityRef::ip("203.0.113.2")],
+        };
+        store.insert_incident(&killchain_incident).unwrap();
+
+        store
+            .set_blob(
+                "responses",
+                r#"{"totals":{"orphaned":2,"revert_failures":3}}"#,
+            )
+            .unwrap();
+
+        std::fs::write(
+            td.path().join(format!("decisions-{today}.jsonl")),
+            "{\"ts\":\"2026-04-17T12:22:00Z\",\"action_type\":\"block_ip\",\"skill_id\":\"block-ip-ufw\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            td.path().join(format!("honeypot-sessions-{today}.jsonl")),
+            "{\"ended_at\":\"2026-04-17T12:15:00Z\"}\n",
+        )
+        .unwrap();
+
+        write_telemetry_snapshots(
+            td.path(),
+            &today,
+            &[
+                telemetry_snapshot(
+                    chrono::DateTime::parse_from_rfc3339("2026-04-17T11:20:00Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                    &[("auth.log", 100), ("journald", 40)],
+                    10,
+                    2,
+                    1,
+                ),
+                telemetry_snapshot(
+                    chrono::DateTime::parse_from_rfc3339("2026-04-17T12:25:00Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                    &[("auth.log", 130), ("journald", 40)],
+                    18,
+                    5,
+                    4,
+                ),
+            ],
+        );
+
+        let state = dashboard_state_for_metrics(td.path(), Some(store));
+        let mut out = String::new();
+        append_spec024_metrics(&mut out, &state, now);
+
+        assert!(out.contains("innerwarden_incidents_per_hour{severity=\"high\"} 1"));
+        assert!(out.contains("innerwarden_incidents_per_hour{severity=\"critical\"} 1"));
+        assert!(out.contains("innerwarden_telegram_msgs_per_hour 8"));
+        assert!(out.contains("innerwarden_blocks_per_hour{backend=\"ufw\"} 1"));
+        assert!(out.contains("innerwarden_honeypot_sessions_per_hour 1"));
+        assert!(out.contains("innerwarden_orphaned_responses_total 2"));
+        assert!(out.contains("innerwarden_revert_failures_total 3"));
+        assert!(out.contains("innerwarden_ai_provider_errors_per_hour{provider=\"unknown\"} 4"));
+        assert!(out.contains("innerwarden_gate_suppressed_total 5"));
+        assert!(out.contains("innerwarden_event_rate_per_hour{source=\"auth.log\"} 30.00"));
     }
 
     #[test]
@@ -1430,7 +1667,9 @@ enabled = false
             events_by_collector: Default::default(),
             incidents_by_detector: Default::default(),
             gate_pass_count: 0,
+            gate_suppressed_total: 0,
             ai_sent_count: 0,
+            telegram_sent_count: 0,
             ai_decision_count: 0,
             avg_decision_latency_ms: 0.0,
             errors_by_component: std::collections::BTreeMap::from([(

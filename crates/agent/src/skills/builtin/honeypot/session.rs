@@ -1316,7 +1316,7 @@ async fn run_pcap_handoff(
 
     let pcap_path = session_dir.join(format!("listener-session-{session_id}.pcap"));
     let cmd = format!(
-        "sudo timeout {timeout_secs}s tcpdump -nn -i any host {target_ip} -c {max_packets} -w {}",
+        "sudo -n timeout {timeout_secs}s tcpdump -nn -i any host {target_ip} -c {max_packets} -w {}",
         pcap_path.display()
     );
     let mut status = PcapHandoffStatus {
@@ -1344,7 +1344,7 @@ async fn run_pcap_handoff(
         "-w".to_string(),
         pcap_path.display().to_string(),
     ];
-    match Command::new("sudo").args(&args).output().await {
+    match Command::new("sudo").arg("-n").args(&args).output().await {
         Ok(out) => {
             let code = out.status.code().unwrap_or_default();
             if out.status.success() || code == 124 {
@@ -2402,7 +2402,7 @@ fn preview_redirect_commands(
         .iter()
         .map(|endpoint| {
             format!(
-                "sudo iptables -t nat -A PREROUTING -p tcp -s {} --dport {} -j REDIRECT --to-ports {}",
+                "sudo -n iptables -t nat -A PREROUTING -p tcp -s {} --dport {} -j REDIRECT --to-ports {}",
                 target_ip, endpoint.redirect_from_port, endpoint.listen_port
             )
         })
@@ -2455,10 +2455,14 @@ async fn apply_redirect_rules(
             endpoint.listen_port.to_string(),
         ];
 
-        let add_cmd = format!("sudo {}", add_args.join(" "));
-        let del_cmd = format!("sudo {}", del_args.join(" "));
+        let add_cmd = format!("sudo -n {}", add_args.join(" "));
+        let del_cmd = format!("sudo -n {}", del_args.join(" "));
 
-        let output = Command::new("sudo").args(&add_args).output().await;
+        let output = Command::new("sudo")
+            .arg("-n")
+            .args(&add_args)
+            .output()
+            .await;
         let status = match output {
             Ok(out) if out.status.success() => RedirectRuleStatus {
                 service: endpoint.service.clone(),
@@ -2517,7 +2521,12 @@ async fn cleanup_redirect_rules(rules: &mut [RedirectRuleStatus]) {
         }
 
         let del_args = redirect_rule_args(rule, "D");
-        match Command::new("sudo").args(&del_args).output().await {
+        match Command::new("sudo")
+            .arg("-n")
+            .args(&del_args)
+            .output()
+            .await
+        {
             Ok(out) if out.status.success() => {
                 rule.cleanup_ok = Some(true);
                 rule.cleanup_error = None;
@@ -2533,7 +2542,12 @@ async fn cleanup_redirect_rules(rules: &mut [RedirectRuleStatus]) {
         }
 
         let check_args = redirect_rule_args(rule, "C");
-        match Command::new("sudo").args(&check_args).output().await {
+        match Command::new("sudo")
+            .arg("-n")
+            .args(&check_args)
+            .output()
+            .await
+        {
             Ok(out) if out.status.success() => {
                 rule.cleanup_verified_absent = Some(false);
                 if rule.cleanup_error.is_none() {

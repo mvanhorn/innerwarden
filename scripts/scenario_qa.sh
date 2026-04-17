@@ -260,6 +260,23 @@ count_lines() {
   echo "$n"
 }
 
+wait_for_pid_exit() {
+  local pid="$1"
+  local timeout_s="${2:-3}"
+  local polls=$((timeout_s * 10))
+  local i
+  for ((i = 0; i < polls; i++)); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    return 1
+  fi
+  return 0
+}
+
 evaluate_envelope() {
   # $1 = expected.json, $2..N = pairs of (field count)
   "$PYTHON_BIN" - "$@" <<'PY'
@@ -292,6 +309,7 @@ PY
 run_scenario() {
   local scenario_dir="$1"
   local scenario="$2"
+  local scenario_status="${3:-ready}"
   local work_dir
   work_dir="$(mktemp -d "${TMPDIR:-/tmp}/scenario-${scenario}.XXXXXX")"
   local data_dir="$work_dir/data"
@@ -322,17 +340,35 @@ run_scenario() {
   local sensor_pid=$!
   sleep 3
   kill -INT "$sensor_pid" 2>/dev/null || true
-  for _ in $(seq 1 30); do
-    kill -0 "$sensor_pid" 2>/dev/null || break
-    sleep 0.1
-  done
-  kill -TERM "$sensor_pid" 2>/dev/null || true
+  if ! wait_for_pid_exit "$sensor_pid" 3; then
+    kill -TERM "$sensor_pid" 2>/dev/null || true
+    if ! wait_for_pid_exit "$sensor_pid" 2; then
+      kill -KILL "$sensor_pid" 2>/dev/null || true
+    fi
+  fi
   wait "$sensor_pid" 2>/dev/null || true
 
+  local agent_exit_code=0
+  set +e
   INNERWARDEN_MOCK_TELEGRAM=1 \
   INNERWARDEN_MOCK_TELEGRAM_PATH="$outbox" \
   "$AGENT_BIN" --data-dir "$data_dir" --config "$agent_cfg" --once \
-    > "$agent_log" 2>&1 || true
+    > "$agent_log" 2>&1
+  agent_exit_code=$?
+  set -e
+  if (( agent_exit_code != 0 )); then
+    if [[ "$scenario_status" == "ready" ]]; then
+      echo "[scenario-qa] ready scenario agent exited with code ${agent_exit_code}: $scenario" >&2
+      cat "$agent_log" >&2
+      if [[ "$KEEP_TMP" != "1" ]]; then
+        rm -rf "$work_dir"
+      else
+        echo "[scenario-qa] kept work dir: $work_dir"
+      fi
+      return 1
+    fi
+    echo "[scenario-qa] wip scenario agent exited with code ${agent_exit_code}: $scenario (non-blocking)" >&2
+  fi
 
   # Collect metrics. Spec 016 moved incidents to the unified SQLite store
   # (innerwarden.db); treat the sqlite count as authoritative. JSONL remains
@@ -473,12 +509,12 @@ print(o.get("status", "ready"))
       continue
       ;;
     wip)
-      if ! run_scenario "$dir" "$scenario"; then
+      if ! run_scenario "$dir" "$scenario" "$status"; then
         echo "[scenario-qa] WIP-FAIL $scenario (status=wip — not blocking CI)"
       fi
       ;;
     ready|*)
-      if ! run_scenario "$dir" "$scenario"; then
+      if ! run_scenario "$dir" "$scenario" "$status"; then
         overall_rc=1
       fi
       ;;

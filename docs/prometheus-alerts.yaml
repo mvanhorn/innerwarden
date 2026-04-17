@@ -158,7 +158,7 @@ groups:
 
       # ── 7. Revert failures per hour ────────────────────────────────
       - alert: InnerWardenRevertFailures
-        expr: innerwarden_revert_failures_per_hour > 10
+        expr: increase(innerwarden_revert_failures_total[1h]) > 10
         for: 30m
         labels:
           severity: warning
@@ -166,10 +166,10 @@ groups:
         annotations:
           summary: "Revert failure rate elevated on {{ $labels.instance }}"
           description: |
-            innerwarden_revert_failures_per_hour has been above 10/h for
-            30 minutes. Backend outage (iptables / ufw / nftables) or a
-            permissions regression. Investigate before orphaned counts
-            start climbing.
+            innerwarden_revert_failures_total increased by more than 10
+            in the last hour for 30 minutes. Backend outage (iptables /
+            ufw / nftables) or a permissions regression. Investigate
+            before orphaned counts start climbing.
 
       # ── 8. AI provider errors per hour ─────────────────────────────
       - alert: InnerWardenAIProviderErrors
