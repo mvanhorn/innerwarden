@@ -104,7 +104,7 @@ pub(crate) async fn maybe_write_daily_summary_and_digest(
                             // Drain deferred incidents for digest breakdown.
                             let mut deferred: Vec<(String, u32)> =
                                 state.telegram_deferred.drain().collect();
-                            deferred.sort_by_key(|x| std::cmp::Reverse(x.1));
+                            deferred.sort_by(|a, b| b.1.cmp(&a.1));
                             let text = telegram::format_daily_digest_enriched(
                                 incidents_today,
                                 blocks_today,

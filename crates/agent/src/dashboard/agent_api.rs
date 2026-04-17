@@ -133,7 +133,7 @@ pub(super) async fn api_agent_security_context(
     }
 
     let mut top: Vec<_> = detector_counts.into_iter().collect();
-    top.sort_by_key(|x| std::cmp::Reverse(x.1));
+    top.sort_by(|a, b| b.1.cmp(&a.1));
     let top_threats: Vec<String> = top.iter().take(5).map(|(k, _)| k.clone()).collect();
 
     let threat_level = security_context_level(total_incidents);

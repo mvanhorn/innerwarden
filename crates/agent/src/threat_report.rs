@@ -402,7 +402,7 @@ pub fn generate_monthly(
         .values()
         .filter(|p| p.visit_dates.iter().any(|d| d.starts_with(month)))
         .collect();
-    month_profiles.sort_by_key(|x| std::cmp::Reverse(x.risk_score));
+    month_profiles.sort_by(|a, b| b.risk_score.cmp(&a.risk_score));
 
     let top_attackers: Vec<AttackerSummaryCompact> = month_profiles
         .iter()
@@ -728,7 +728,7 @@ fn build_mitre_coverage(
             attacker_count: attackers.len() as u64,
         })
         .collect();
-    seen.sort_by_key(|x| std::cmp::Reverse(x.incident_count));
+    seen.sort_by(|a, b| b.incident_count.cmp(&a.incident_count));
 
     let total = seen.len();
     MitreCoverage {
@@ -762,7 +762,7 @@ fn build_geo_distribution(profiles: &[&AttackerProfile]) -> GeoDistribution {
             incident_count: incidents,
         })
         .collect();
-    stats.sort_by_key(|x| std::cmp::Reverse(x.attacker_count));
+    stats.sort_by(|a, b| b.attacker_count.cmp(&a.attacker_count));
 
     GeoDistribution { by_country: stats }
 }
@@ -795,11 +795,11 @@ fn build_honeypot_intel(profiles: &[&AttackerProfile]) -> HoneypotIntel {
         .into_iter()
         .map(|((u, p), c)| (u, p, c))
         .collect();
-    top_credentials.sort_by_key(|x| std::cmp::Reverse(x.2));
+    top_credentials.sort_by(|a, b| b.2.cmp(&a.2));
     top_credentials.truncate(15);
 
     let mut top_commands: Vec<(String, u64)> = cmd_counts.into_iter().collect();
-    top_commands.sort_by_key(|x| std::cmp::Reverse(x.1));
+    top_commands.sort_by(|a, b| b.1.cmp(&a.1));
     top_commands.truncate(15);
 
     HoneypotIntel {

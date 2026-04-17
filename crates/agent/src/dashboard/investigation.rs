@@ -135,7 +135,7 @@ pub(super) async fn api_clusters(
         }
     }
 
-    items.sort_by_key(|x| std::cmp::Reverse(x.incident_count));
+    items.sort_by(|a, b| b.incident_count.cmp(&a.incident_count));
     items.truncate(limit);
 
     Json(ClusterResponse {
@@ -381,7 +381,7 @@ pub(super) fn build_pivots_from_graph(
                 }
             })
             .collect();
-        items.sort_by_key(|x| std::cmp::Reverse(x.incident_count));
+        items.sort_by(|a, b| b.incident_count.cmp(&a.incident_count));
         items.truncate(limit);
         return items;
     }
@@ -2221,7 +2221,7 @@ mod tests {
                 data: serde_json::json!({}),
             },
         ];
-        entries.sort_by_key(|x| std::cmp::Reverse(x.ts));
+        entries.sort_by(|a, b| b.ts.cmp(&a.ts));
         assert!(entries[0].ts >= entries[1].ts);
     }
 

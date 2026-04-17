@@ -220,7 +220,7 @@ pub(super) async fn api_incidents(
         })
         .collect();
 
-    incident_views.sort_by_key(|x| std::cmp::Reverse(x.ts));
+    incident_views.sort_by(|a, b| b.ts.cmp(&a.ts));
     let total = incident_views.len();
     let items: Vec<IncidentView> = incident_views.into_iter().take(limit).collect();
 
@@ -273,7 +273,7 @@ pub(super) async fn api_decisions(
         })
         .collect();
 
-    views.sort_by_key(|x| std::cmp::Reverse(x.ts));
+    views.sort_by(|a, b| b.ts.cmp(&a.ts));
     let total = views.len();
     let items: Vec<DecisionView> = views.into_iter().take(limit).collect();
 

@@ -46,7 +46,7 @@ pub(super) async fn api_sensors_inner(state: &DashboardState) -> serde_json::Val
             .iter()
             .map(|(s, &c)| (s.clone(), c))
             .collect();
-        s.sort_by_key(|x| std::cmp::Reverse(x.1));
+        s.sort_by(|a, b| b.1.cmp(&a.1));
         (graph.total_events_ingested, s)
     } else {
         // Fallback: read from telemetry snapshot (has events_by_collector)
@@ -59,7 +59,7 @@ pub(super) async fn api_sensors_inner(state: &DashboardState) -> serde_json::Val
                     .into_iter()
                     .map(|(k, v)| (k, v as usize))
                     .collect();
-                s.sort_by_key(|x| std::cmp::Reverse(x.1));
+                s.sort_by(|a, b| b.1.cmp(&a.1));
                 (total, s)
             }
             None => (0, vec![]),
@@ -71,7 +71,7 @@ pub(super) async fn api_sensors_inner(state: &DashboardState) -> serde_json::Val
         .iter()
         .map(|(k, &c)| (k.clone(), c))
         .collect();
-    kinds.sort_by_key(|x| std::cmp::Reverse(x.1));
+    kinds.sort_by(|a, b| b.1.cmp(&a.1));
     kinds.truncate(15);
 
     // Detector counts from Incident nodes
@@ -101,7 +101,7 @@ pub(super) async fn api_sensors_inner(state: &DashboardState) -> serde_json::Val
     }
 
     let mut detectors: Vec<_> = detector_counts.into_iter().collect();
-    detectors.sort_by_key(|x| std::cmp::Reverse(x.1));
+    detectors.sort_by(|a, b| b.1.cmp(&a.1));
 
     // event_timeline may be empty after restart (cursor/snapshot race).
     // Use detector_timeline as fallback — it's rebuilt from persisted Incident nodes.

@@ -600,7 +600,7 @@ pub(super) async fn api_live_feed_mitre(
                 .into_iter()
                 .map(|((id, name), count)| MitreTechniqueSummary { id, name, count })
                 .collect();
-            techniques.sort_by_key(|x| std::cmp::Reverse(x.count));
+            techniques.sort_by(|a, b| b.count.cmp(&a.count));
             let count = techniques.iter().map(|t| t.count).sum();
             MitreTacticSummary {
                 tactic,

@@ -102,7 +102,8 @@ pub fn generate_with_responder(
 
         // Sort groups by highest severity (descending)
         let mut sorted_groups: Vec<&IncidentGroup> = groups.values().collect();
-        sorted_groups.sort_by_key(|b| std::cmp::Reverse(severity_rank(&b.max_severity)));
+        sorted_groups
+            .sort_by(|a, b| severity_rank(&b.max_severity).cmp(&severity_rank(&a.max_severity)));
 
         for group in &sorted_groups {
             let icon = severity_icon(&group.max_severity);
@@ -196,7 +197,7 @@ pub fn generate_with_responder(
             *by_kind.entry(ev.kind.as_str()).or_insert(0) += 1;
         }
         let mut kinds: Vec<(&&str, &usize)> = by_kind.iter().collect();
-        kinds.sort_by_key(|x| std::cmp::Reverse(*x.1));
+        kinds.sort_by(|a, b| b.1.cmp(a.1));
         for (kind, count) in &kinds {
             out.push_str(&format!("| {} | {count} |\n", human_event_kind(kind)));
         }

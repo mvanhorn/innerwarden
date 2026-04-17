@@ -395,7 +395,7 @@ pub(crate) fn cmd_sensor_status(cli: &Cli, data_dir: &Path) -> Result<()> {
                 .iter()
                 .map(|(k, v)| (k, v.as_u64().unwrap_or(0)))
                 .collect();
-            pairs.sort_by_key(|x| std::cmp::Reverse(x.1));
+            pairs.sort_by(|a, b| b.1.cmp(&a.1));
             for (source, count) in &pairs {
                 println!("  ● {:<30} {:>6} events", source, count);
             }
@@ -412,7 +412,7 @@ pub(crate) fn cmd_sensor_status(cli: &Cli, data_dir: &Path) -> Result<()> {
                 .iter()
                 .map(|(k, v)| (k, v.as_u64().unwrap_or(0)))
                 .collect();
-            pairs.sort_by_key(|x| std::cmp::Reverse(x.1));
+            pairs.sort_by(|a, b| b.1.cmp(&a.1));
             for (detector, count) in &pairs {
                 println!("  ⚠  {:<30} {:>6} incidents", detector, count);
             }
@@ -602,7 +602,7 @@ pub(crate) fn cmd_metrics(cli: &Cli, data_dir: &Path) -> Result<()> {
                     (k, c)
                 })
                 .collect();
-            pairs.sort_by_key(|x| std::cmp::Reverse(x.1));
+            pairs.sort_by(|a, b| b.1.cmp(&a.1));
             for (source, count) in &pairs {
                 println!("  {:<30} {:>6}", source, count);
             }
@@ -625,7 +625,7 @@ pub(crate) fn cmd_metrics(cli: &Cli, data_dir: &Path) -> Result<()> {
                     (k, c)
                 })
                 .collect();
-            pairs.sort_by_key(|x| std::cmp::Reverse(x.1));
+            pairs.sort_by(|a, b| b.1.cmp(&a.1));
             for (detector, count) in &pairs {
                 println!("  {:<30} {:>6}", detector, count);
             }
@@ -648,7 +648,7 @@ pub(crate) fn cmd_metrics(cli: &Cli, data_dir: &Path) -> Result<()> {
                     (k, c)
                 })
                 .collect();
-            pairs.sort_by_key(|x| std::cmp::Reverse(x.1));
+            pairs.sort_by(|a, b| b.1.cmp(&a.1));
             for (action, count) in &pairs {
                 println!("  {:<30} {:>6}", action, count);
             }

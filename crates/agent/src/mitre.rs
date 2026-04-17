@@ -557,7 +557,7 @@ pub fn coverage_by_tactic(
     }
 
     // Sort recommendations by impact (most techniques first)
-    recs.sort_by_key(|x| std::cmp::Reverse(x.techniques_gained));
+    recs.sort_by(|a, b| b.techniques_gained.cmp(&a.techniques_gained));
     recs.truncate(10); // Top 10 recommendations
 
     (tactics, recs)

@@ -205,7 +205,7 @@ pub(super) async fn api_graph_view(State(state): State<DashboardState>) -> Json<
             _ => None,
         })
         .collect();
-    incidents.sort_by_key(|x| std::cmp::Reverse(x.1));
+    incidents.sort_by(|a, b| b.1.cmp(&a.1));
     incidents.truncate(20);
     for (id, _) in &incidents {
         keep.insert(*id);
@@ -229,7 +229,7 @@ pub(super) async fn api_graph_view(State(state): State<DashboardState>) -> Json<
             })
             .filter(|(_, degree)| *degree >= 3)
             .collect();
-        scored.sort_by_key(|x| std::cmp::Reverse(x.1));
+        scored.sort_by(|a, b| b.1.cmp(&a.1));
         for (id, _) in scored.into_iter().take(80 - keep.len()) {
             keep.insert(id);
         }

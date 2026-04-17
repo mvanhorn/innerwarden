@@ -519,7 +519,7 @@ pub fn persist_snapshot(
     store: Option<&innerwarden_store::Store>,
 ) {
     let mut sorted: Vec<&AttackerProfile> = profiles.values().collect();
-    sorted.sort_by_key(|x| std::cmp::Reverse(x.risk_score));
+    sorted.sort_by(|a, b| b.risk_score.cmp(&a.risk_score));
 
     let path = data_dir.join("attacker-profiles.json");
     match serde_json::to_string(&sorted) {

@@ -176,12 +176,12 @@ pub fn build_briefing_context(kg: &Arc<RwLock<KnowledgeGraph>>) -> String {
         }
     }
     let mut top_attackers: Vec<_> = ip_data.into_iter().collect();
-    top_attackers.sort_by_key(|x| std::cmp::Reverse(x.1 .0));
+    top_attackers.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
     top_attackers.truncate(10);
 
     // Detectors sorted
     let mut sorted_detectors: Vec<_> = by_detector.into_iter().collect();
-    sorted_detectors.sort_by_key(|x| std::cmp::Reverse(x.1));
+    sorted_detectors.sort_by(|a, b| b.1.cmp(&a.1));
     sorted_detectors.truncate(10);
 
     // Threat level — based on UNRESOLVED, not total

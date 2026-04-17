@@ -70,7 +70,7 @@ pub(crate) fn graph_last_incidents(
     }
 
     // Sort by ts descending, take last N
-    items.sort_by_key(|x| std::cmp::Reverse(x.0));
+    items.sort_by(|a, b| b.0.cmp(&a.0));
     items.truncate(n);
 
     let now = chrono::Utc::now();
@@ -144,7 +144,7 @@ pub(crate) fn graph_last_decisions(
         return "\u{2696}\u{fe0f} No decisions yet today - standing by.".to_string();
     }
 
-    items.sort_by_key(|x| std::cmp::Reverse(x.0));
+    items.sort_by(|a, b| b.0.cmp(&a.0));
     items.truncate(n);
 
     let action_icon = |a: &str| {
@@ -210,7 +210,7 @@ pub(crate) fn graph_last_incidents_raw(
         return String::new();
     }
 
-    items.sort_by_key(|x| std::cmp::Reverse(x.0));
+    items.sort_by(|a, b| b.0.cmp(&a.0));
     items.truncate(n);
 
     items
