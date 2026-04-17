@@ -930,4 +930,135 @@ mod tests {
         assert_eq!(key.src_ip_str(), "10.0.1.1");
         assert_eq!(key.dst_ip_str(), "192.168.0.1");
     }
+
+    #[test]
+    fn test_stream_buffer_out_of_order_gap_advances_cursor() {
+        // Covers the gap path where an out-of-order segment is observed and
+        // the cursor advances without buffering bytes for v1 reassembly.
+        let mut buf = StreamBuffer::new(100, 4096);
+        assert!(!buf.add_segment(110, b"gap"));
+        assert_eq!(buf.data(), b"");
+        assert_eq!(buf.total_bytes(), 3);
+        assert_eq!(buf.next_seq, 113);
+
+        // Once the stream catches up, in-order data is accepted again.
+        assert!(buf.add_segment(113, b"ok"));
+        assert_eq!(buf.data(), b"ok");
+    }
+
+    #[test]
+    fn test_probe_protocol_detects_smb_magic_signature() {
+        // Exercises SMB detection on NetBIOS+SMB magic bytes so lateral-move
+        // traffic is classified correctly even on non-standard ports.
+        let mut data = [0u8; 8];
+        data[4] = 0xFF;
+        data[5] = b'S';
+        data[6] = b'M';
+        data[7] = b'B';
+        assert_eq!(probe_protocol(&data), AppProtocol::Smb);
+    }
+
+    #[test]
+    fn test_midstream_payload_emits_http_event_on_fin() {
+        // Covers mid-stream flow creation (no SYN observed) and verifies that
+        // closing the flow emits a protocol-classified event with payload data.
+        let mut table = FlowTable::new(16, 4096);
+        let started = Utc::now();
+        let key = FlowKey {
+            src_ip: 10,
+            dst_ip: 20,
+            src_port: 40400,
+            dst_port: 8080,
+            proto: 6,
+        };
+        let payload = b"GET /health HTTP/1.1\r\n";
+
+        assert!(table
+            .process_packet(key.clone(), 0x10, 9000, payload, started)
+            .is_none());
+
+        let evt = table
+            .process_packet(
+                key.clone(),
+                0x11, // FIN + ACK
+                9000 + payload.len() as u32,
+                &[],
+                started + chrono::Duration::seconds(2),
+            )
+            .expect("flow close should emit a summary event");
+        assert_eq!(evt.app_proto, AppProtocol::Http);
+        assert_eq!(evt.client_data, payload);
+        assert_eq!(table.active_flows(), 0);
+    }
+
+    #[test]
+    fn test_fin_without_payload_does_not_emit_event() {
+        // Exercises close-without-data behavior to ensure handshake-only flows
+        // are removed quietly instead of producing noisy empty events.
+        let mut table = FlowTable::new(16, 4096);
+        let now = Utc::now();
+        let key = FlowKey {
+            src_ip: 30,
+            dst_ip: 40,
+            src_port: 50000,
+            dst_port: 443,
+            proto: 6,
+        };
+
+        assert!(table
+            .process_packet(key.clone(), 0x02, 1000, &[], now)
+            .is_none());
+        assert!(table
+            .process_packet(key.clone(), 0x11, 1001, &[], now)
+            .is_none());
+        assert_eq!(table.active_flows(), 0);
+    }
+
+    #[test]
+    fn test_cleanup_stale_emits_only_expired_flow_with_data() {
+        // Covers stale cleanup by ensuring only flows older than the timeout
+        // and containing useful payload data are emitted and removed.
+        let mut table = FlowTable::new(16, 4096);
+        let now = Utc::now();
+        let stale_time = now - chrono::Duration::seconds(120);
+        let fresh_time = now - chrono::Duration::seconds(5);
+        let stale_key = FlowKey {
+            src_ip: 1,
+            dst_ip: 2,
+            src_port: 1111,
+            dst_port: 80,
+            proto: 6,
+        };
+        let fresh_key = FlowKey {
+            src_ip: 3,
+            dst_ip: 4,
+            src_port: 2222,
+            dst_port: 443,
+            proto: 6,
+        };
+
+        assert!(table
+            .process_packet(
+                stale_key.clone(),
+                0x10,
+                7000,
+                b"GET / HTTP/1.1\r\n",
+                stale_time
+            )
+            .is_none());
+        assert!(table
+            .process_packet(
+                fresh_key.clone(),
+                0x10,
+                8000,
+                b"\x16\x03\x01\x00",
+                fresh_time
+            )
+            .is_none());
+
+        let events = table.cleanup_stale(now, 60);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].key.src_ip, stale_key.src_ip);
+        assert_eq!(table.active_flows(), 1);
+    }
 }

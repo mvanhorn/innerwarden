@@ -791,6 +791,8 @@ mod tests {
 
     #[test]
     fn sample_pairs_clean() {
+        // Clean-channel path: SPA score should stay low for structured,
+        // non-stego data.
         let channel: Vec<u8> = (0..1000).map(|i| ((i * 3 + i / 7) % 256) as u8).collect();
         let score = sample_pairs_analysis(&channel);
         assert!(score < 0.3, "clean data SPA score {score} should be low");
@@ -798,6 +800,8 @@ mod tests {
 
     #[test]
     fn primary_sets_clean() {
+        // Clean-channel path: primary-sets score should remain low when PoV
+        // histogram differences are not equalized by embedding.
         let channel: Vec<u8> = (0..1000).map(|i| ((i * 3 + i / 7) % 256) as u8).collect();
         let score = primary_sets(&channel);
         assert!(score < 0.3, "clean data PS score {score} should be low");
@@ -855,7 +859,7 @@ mod tests {
         bmp[58] = 255; // G
         bmp[59] = 0; // R  → pixel 2 = (0, 255, 0) = green
 
-        let pixels = extract_bmp_pixels(&bmp).unwrap();
+        let pixels = extract_bmp_pixels(&bmp).expect("valid BMP fixture should decode");
         assert_eq!(pixels.len(), 6); // 2 pixels * 3 channels
         assert_eq!(pixels[0], 0); // R of pixel 1 (was BGR blue)
         assert_eq!(pixels[1], 0); // G
@@ -868,5 +872,63 @@ mod tests {
         assert!((ln_gamma(1.0)).abs() < 0.001);
         // Gamma(5) = 24, ln(24) ≈ 3.178
         assert!((ln_gamma(5.0) - 3.178).abs() < 0.01);
+    }
+
+    #[test]
+    fn flip_negative_handles_edges_and_parity() {
+        // Helper path: RS analysis relies on exact negative-flip behavior for
+        // boundary and odd/even values when building comparison groups.
+        assert_eq!(flip_negative(0), 1);
+        assert_eq!(flip_negative(255), 254);
+        assert_eq!(flip_negative(2), 1);
+        assert_eq!(flip_negative(3), 4);
+    }
+
+    #[test]
+    fn chi_square_cdf_grows_with_larger_x() {
+        // Numerical path: CDF approximation should stay finite for positive
+        // inputs and react to input changes instead of returning constants.
+        let dof = 16.0;
+        let low = chi_square_cdf(2.0, dof);
+        let mid = chi_square_cdf(10.0, dof);
+        let high = chi_square_cdf(25.0, dof);
+        assert!(low.is_finite());
+        assert!(mid.is_finite());
+        assert!(high.is_finite());
+        assert!((low - mid).abs() > f64::EPSILON || (mid - high).abs() > f64::EPSILON);
+    }
+
+    #[test]
+    fn truncate_path_returns_tail_when_input_is_longer() {
+        // Formatting path: incident titles should preserve the path suffix
+        // where filenames are usually located.
+        let path = "/very/long/path/to/suspicious/image-with-hidden-payload.bmp";
+        assert_eq!(truncate_path(path, 10), "ayload.bmp");
+        assert_eq!(truncate_path(path, path.len()), path);
+    }
+
+    #[test]
+    fn sample_pairs_short_inputs_return_zero_score() {
+        // Guard path: SPA should bail out safely on undersized channels.
+        assert_eq!(sample_pairs_analysis(&[]), 0.0);
+        assert_eq!(sample_pairs_analysis(&[7]), 0.0);
+    }
+
+    #[test]
+    fn extract_pixels_rejects_unknown_file_extension() {
+        // Decoder path: unsupported extensions must return None so callers
+        // avoid attempting statistical analysis on non-image payloads.
+        let data = [0u8; 32];
+        assert!(extract_pixels(&data, "archive.zip").is_none());
+    }
+
+    #[test]
+    fn analyze_pixels_forces_detection_with_negative_threshold() {
+        // Threshold path: passing a negative threshold should always classify
+        // non-empty input as stego, validating the final comparison branch.
+        let rgb: Vec<u8> = (0..300).map(|i| (i % 251) as u8).collect();
+        let result = analyze_pixels(&rgb, -1.0);
+        assert!(result.is_stego);
+        assert!((0.0..=1.0).contains(&result.fusion));
     }
 }

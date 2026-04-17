@@ -298,6 +298,8 @@ mod tests {
 
     #[test]
     fn shannon_entropy_moderate_for_text() {
+        // Baseline path: human-readable text should sit in a moderate entropy
+        // band and not look like encrypted blob data.
         let data = b"Hello, this is a normal text file with moderate entropy";
         let e = shannon_entropy(data);
         assert!(e > 3.0 && e < 6.0);
@@ -305,24 +307,28 @@ mod tests {
 
     #[test]
     fn file_state_computation() {
-        let dir = tempfile::TempDir::new().unwrap();
+        // Hash path: file-state snapshots should include stable hash and size
+        // metadata for change detection between polling intervals.
+        let dir = tempfile::TempDir::new().expect("temporary directory should be created");
         let path = dir.path().join("test.txt");
-        std::fs::write(&path, "hello world").unwrap();
+        std::fs::write(&path, "hello world").expect("fixture file should be written");
 
-        let state = compute_file_state(&path).unwrap();
+        let state = compute_file_state(&path).expect("file state should be computed");
         assert!(!state.hash.is_empty());
         assert_eq!(state.size, 11);
     }
 
     #[test]
     fn file_state_detects_change() {
-        let dir = tempfile::TempDir::new().unwrap();
+        // Diff path: content changes must produce a new digest so realtime
+        // modification alerts trigger reliably.
+        let dir = tempfile::TempDir::new().expect("temporary directory should be created");
         let path = dir.path().join("test.txt");
-        std::fs::write(&path, "hello").unwrap();
-        let state1 = compute_file_state(&path).unwrap();
+        std::fs::write(&path, "hello").expect("initial fixture should be written");
+        let state1 = compute_file_state(&path).expect("initial state should load");
 
-        std::fs::write(&path, "world").unwrap();
-        let state2 = compute_file_state(&path).unwrap();
+        std::fs::write(&path, "world").expect("updated fixture should be written");
+        let state2 = compute_file_state(&path).expect("updated state should load");
 
         assert_ne!(state1.hash, state2.hash);
     }
@@ -338,5 +344,41 @@ mod tests {
         let text = b"The quick brown fox jumps over the lazy dog. This is normal text content.";
         let e = shannon_entropy(text);
         assert!(e < ENCRYPTION_ENTROPY_THRESHOLD);
+    }
+
+    #[test]
+    fn shannon_entropy_empty_input_is_zero() {
+        // Edge path: empty byte slices should return zero entropy instead of
+        // producing NaN values that could poison downstream comparisons.
+        assert_eq!(shannon_entropy(&[]), 0.0);
+    }
+
+    #[test]
+    fn compute_file_entropy_returns_none_for_tiny_files() {
+        // Size guard path: entropy analysis should skip very small files where
+        // statistics are too noisy to be meaningful.
+        let dir = tempfile::TempDir::new().expect("temporary directory should be created");
+        let path = dir.path().join("tiny.bin");
+        std::fs::write(&path, vec![0xAA; MIN_ENTROPY_SIZE - 1])
+            .expect("tiny fixture should be written");
+        assert!(compute_file_entropy(&path).is_none());
+    }
+
+    #[test]
+    fn compute_file_entropy_returns_none_for_missing_paths() {
+        // Missing-file path: collector should tolerate racey deletes and
+        // simply return None when the target no longer exists.
+        let dir = tempfile::TempDir::new().expect("temporary directory should be created");
+        let path = dir.path().join("missing.bin");
+        assert!(compute_file_entropy(&path).is_none());
+    }
+
+    #[test]
+    fn default_watch_paths_include_high_value_targets() {
+        // Configuration path: default watchlist should include critical auth
+        // and boot files so tampering is observed out of the box.
+        assert!(DEFAULT_WATCH_PATHS.contains(&"/etc/shadow"));
+        assert!(DEFAULT_WATCH_PATHS.contains(&"/etc/sudoers"));
+        assert!(DEFAULT_WATCH_PATHS.contains(&"/boot/grub/grub.cfg"));
     }
 }

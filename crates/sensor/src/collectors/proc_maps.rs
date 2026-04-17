@@ -433,4 +433,47 @@ mod tests {
         assert_eq!(RegionType::ExecutableStack.severity(), Severity::High);
         assert_eq!(RegionType::ExecutableHeap.severity(), Severity::High);
     }
+
+    #[test]
+    fn region_type_labels_are_stable_for_event_kinds() {
+        // Verifies event-kind labels for every region type so downstream
+        // routing and alert suppression rules keep matching expected strings.
+        assert_eq!(RegionType::Rwx.label(), "rwx_memory");
+        assert_eq!(RegionType::AnonExecutable.label(), "anon_executable");
+        assert_eq!(RegionType::DeletedFile.label(), "deleted_file_mapping");
+        assert_eq!(RegionType::ExecutableStack.label(), "executable_stack");
+        assert_eq!(RegionType::ExecutableHeap.label(), "executable_heap");
+    }
+
+    #[test]
+    fn should_skip_matches_prefix_not_middle_substring() {
+        // Covers prefix semantics to avoid skipping userland processes whose
+        // names merely contain kernel-thread tokens in the middle.
+        assert!(should_skip("rcu_sched"));
+        assert!(!should_skip("mykworker-agent"));
+        assert!(!should_skip("custom-systemd-journal-proxy"));
+    }
+
+    #[test]
+    fn check_ld_preload_missing_pid_returns_none() {
+        // Exercises the missing-proc path to ensure the collector degrades
+        // safely when a PID disappears before inspection.
+        assert!(check_ld_preload(u32::MAX).is_none());
+    }
+
+    #[test]
+    fn scan_pid_nonexistent_process_returns_empty_findings() {
+        // Validates the early-return path when `/proc/<pid>/comm` is absent so
+        // on-demand scans remain resilient to races with exiting processes.
+        assert!(scan_pid(u32::MAX).is_empty());
+    }
+
+    #[test]
+    fn known_rwx_path_markers_cover_jit_libraries() {
+        // Ensures library-path heuristics keep suppressing expected JIT-backed
+        // executable mappings that are common in benign runtimes.
+        assert!(is_known_rwx("custom-runtime", "/opt/lib/libv8_snapshot.so"));
+        assert!(is_known_rwx("custom-runtime", "/usr/lib/jvm/libjvm.so"));
+        assert!(!is_known_rwx("custom-runtime", "/tmp/unknown_payload.bin"));
+    }
 }

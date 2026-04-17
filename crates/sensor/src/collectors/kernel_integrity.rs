@@ -358,4 +358,45 @@ mod tests {
         // bpftool may not be available — just verify no crash
         let _ = result.len();
     }
+
+    #[test]
+    fn monitored_syscalls_are_unique_and_high_impact() {
+        // Guards detector scope so integrity checks keep watching critical
+        // privilege and execution syscalls without duplicates.
+        let unique: HashSet<&str> = MONITORED_SYSCALLS.iter().copied().collect();
+        assert_eq!(unique.len(), MONITORED_SYSCALLS.len());
+        assert!(MONITORED_SYSCALLS.contains(&"__x64_sys_execve"));
+        assert!(MONITORED_SYSCALLS.contains(&"__x64_sys_setuid"));
+        assert!(MONITORED_SYSCALLS.contains(&"__x64_sys_mount"));
+    }
+
+    #[test]
+    fn kallsyms_result_is_subset_of_monitored_targets() {
+        // Ensures parsing never introduces unexpected symbol names beyond the
+        // explicit syscall watchlist configured for this collector.
+        let parsed = read_kallsyms();
+        assert!(parsed
+            .keys()
+            .all(|name| MONITORED_SYSCALLS.contains(&name.as_str())));
+    }
+
+    #[test]
+    fn kernel_modules_are_trimmed_tokens() {
+        // Validates module-name parsing from `/proc/modules` stays whitespace
+        // free so downstream entity IDs remain canonical.
+        for module in read_kernel_modules() {
+            assert!(!module.is_empty());
+            assert!(!module.chars().any(char::is_whitespace));
+        }
+    }
+
+    #[test]
+    fn bpf_program_info_handles_missing_ids_safely() {
+        // Covers the bpftool lookup failure path for unknown IDs to ensure
+        // callers receive `None` instead of panicking.
+        let info = read_bpf_program_info(u32::MAX);
+        if let Some(name) = info {
+            assert!(!name.trim().is_empty());
+        }
+    }
 }
