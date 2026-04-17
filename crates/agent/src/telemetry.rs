@@ -21,8 +21,15 @@ pub struct TelemetrySnapshot {
     pub events_by_collector: BTreeMap<String, u64>,
     pub incidents_by_detector: BTreeMap<String, u64>,
     pub gate_pass_count: u64,
+    /// Added by spec 024 Phase 7 (feedback loop). Snapshots written before
+    /// that land on disk without this field, so default to 0 on replay.
+    #[serde(default)]
     pub gate_suppressed_total: u64,
     pub ai_sent_count: u64,
+    /// Added by spec 024 Phase 7 (telegram-sent counter for the
+    /// `innerwarden_telegram_msgs_per_hour` drift metric). Default to 0
+    /// on replay of pre-Phase-7 snapshots.
+    #[serde(default)]
     pub telegram_sent_count: u64,
     pub ai_decision_count: u64,
     pub avg_decision_latency_ms: f64,
@@ -485,5 +492,33 @@ mod tests {
         let chosen = read_snapshot_at(dir.path(), &date, threshold).unwrap();
         assert_eq!(chosen.tick, "near");
         assert_eq!(chosen.telegram_sent_count, 2);
+    }
+
+    #[test]
+    fn snapshot_deserialises_without_gate_suppressed_or_telegram_sent() {
+        // Pre-spec-024-Phase-7 snapshots landed on disk without the new
+        // fields. After the upgrade they would fail parsing and flood the
+        // log with warnings. `#[serde(default)]` on both fields makes
+        // replay tolerant.
+        let legacy = r#"{
+            "ts": "2026-04-17T16:50:00Z",
+            "tick": "incident_tick",
+            "events_by_collector": {"auth.log": 42},
+            "incidents_by_detector": {},
+            "gate_pass_count": 3,
+            "ai_sent_count": 1,
+            "ai_decision_count": 1,
+            "avg_decision_latency_ms": 120.0,
+            "errors_by_component": {},
+            "decisions_by_action": {},
+            "dry_run_execution_count": 1,
+            "real_execution_count": 0
+        }"#;
+        let parsed: TelemetrySnapshot =
+            serde_json::from_str(legacy).expect("legacy snapshot must parse");
+        assert_eq!(parsed.gate_suppressed_total, 0);
+        assert_eq!(parsed.telegram_sent_count, 0);
+        assert_eq!(parsed.gate_pass_count, 3);
+        assert_eq!(parsed.ai_sent_count, 1);
     }
 }
