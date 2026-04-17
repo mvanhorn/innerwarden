@@ -194,6 +194,7 @@ pub(crate) fn triage_test_state(data_dir: &Path) -> AgentState {
             &crate::config::NotificationPipelineConfig::default(),
         ),
         environment_profile: environment_profile::EnvironmentProfile::default(),
+        last_env_census_at: None,
         anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
         neural_incidents: Vec::new(),
         trust_rules: std::collections::HashSet::new(),
@@ -261,6 +262,8 @@ pub(crate) fn triage_test_state(data_dir: &Path) -> AgentState {
         #[cfg(feature = "redis-reader")]
         redis_reader: None,
         notification_burst_tracker: notification_gate::BurstTracker::new(),
+        feedback_tracker: notification_pipeline::FeedbackTracker::new(),
+        last_feedback_tick_at: None,
     }
 }
 
@@ -477,6 +480,7 @@ async fn golden_path_dry_run_produces_decision_entry() {
             &crate::config::NotificationPipelineConfig::default(),
         ),
         environment_profile: environment_profile::EnvironmentProfile::default(),
+        last_env_census_at: None,
         anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
         neural_incidents: Vec::new(),
         trust_rules: std::collections::HashSet::new(),
@@ -544,6 +548,8 @@ async fn golden_path_dry_run_produces_decision_entry() {
         #[cfg(feature = "redis-reader")]
         redis_reader: None,
         notification_burst_tracker: notification_gate::BurstTracker::new(),
+        feedback_tracker: notification_pipeline::FeedbackTracker::new(),
+        last_feedback_tick_at: None,
     };
 
     // 4. Run the incident tick
@@ -658,6 +664,7 @@ async fn allowed_skills_whitelist_enforced() {
             &crate::config::NotificationPipelineConfig::default(),
         ),
         environment_profile: environment_profile::EnvironmentProfile::default(),
+        last_env_census_at: None,
         anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
         neural_incidents: Vec::new(),
         trust_rules: std::collections::HashSet::new(),
@@ -725,6 +732,8 @@ async fn allowed_skills_whitelist_enforced() {
         #[cfg(feature = "redis-reader")]
         redis_reader: None,
         notification_burst_tracker: notification_gate::BurstTracker::new(),
+        feedback_tracker: notification_pipeline::FeedbackTracker::new(),
+        last_feedback_tick_at: None,
     };
 
     let mut cursor = reader::AgentCursor::default();
@@ -820,6 +829,7 @@ async fn same_ip_in_same_tick_triggers_single_ai_call() {
             &crate::config::NotificationPipelineConfig::default(),
         ),
         environment_profile: environment_profile::EnvironmentProfile::default(),
+        last_env_census_at: None,
         anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
         neural_incidents: Vec::new(),
         trust_rules: std::collections::HashSet::new(),
@@ -887,6 +897,8 @@ async fn same_ip_in_same_tick_triggers_single_ai_call() {
         #[cfg(feature = "redis-reader")]
         redis_reader: None,
         notification_burst_tracker: notification_gate::BurstTracker::new(),
+        feedback_tracker: notification_pipeline::FeedbackTracker::new(),
+        last_feedback_tick_at: None,
     };
 
     let mut cursor = reader::AgentCursor::default();
@@ -983,6 +995,7 @@ async fn temporal_correlation_context_is_passed_to_ai() {
             &crate::config::NotificationPipelineConfig::default(),
         ),
         environment_profile: environment_profile::EnvironmentProfile::default(),
+        last_env_census_at: None,
         anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
         neural_incidents: Vec::new(),
         trust_rules: std::collections::HashSet::new(),
@@ -1050,6 +1063,8 @@ async fn temporal_correlation_context_is_passed_to_ai() {
         #[cfg(feature = "redis-reader")]
         redis_reader: None,
         notification_burst_tracker: notification_gate::BurstTracker::new(),
+        feedback_tracker: notification_pipeline::FeedbackTracker::new(),
+        last_feedback_tick_at: None,
     };
 
     let mut cursor = reader::AgentCursor::default();
@@ -1131,6 +1146,7 @@ async fn honeypot_demo_writes_synthetic_decoy_event() {
             &crate::config::NotificationPipelineConfig::default(),
         ),
         environment_profile: environment_profile::EnvironmentProfile::default(),
+        last_env_census_at: None,
         anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
         neural_incidents: Vec::new(),
         trust_rules: std::collections::HashSet::new(),
@@ -1198,6 +1214,8 @@ async fn honeypot_demo_writes_synthetic_decoy_event() {
         #[cfg(feature = "redis-reader")]
         redis_reader: None,
         notification_burst_tracker: notification_gate::BurstTracker::new(),
+        feedback_tracker: notification_pipeline::FeedbackTracker::new(),
+        last_feedback_tick_at: None,
     };
 
     let mut cursor = reader::AgentCursor::default();
@@ -1289,6 +1307,7 @@ async fn decision_cooldown_suppresses_repeat() {
             &crate::config::NotificationPipelineConfig::default(),
         ),
         environment_profile: environment_profile::EnvironmentProfile::default(),
+        last_env_census_at: None,
         anomaly_engine: neural_lifecycle::AnomalyEngine::new(Default::default()),
         neural_incidents: Vec::new(),
         trust_rules: std::collections::HashSet::new(),
@@ -1356,6 +1375,8 @@ async fn decision_cooldown_suppresses_repeat() {
         #[cfg(feature = "redis-reader")]
         redis_reader: None,
         notification_burst_tracker: notification_gate::BurstTracker::new(),
+        feedback_tracker: notification_pipeline::FeedbackTracker::new(),
+        last_feedback_tick_at: None,
     };
 
     let mut cursor = reader::AgentCursor::default();

@@ -786,7 +786,27 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         #[cfg(feature = "redis-reader")]
         redis_reader: None,
         notification_burst_tracker: notification_gate::BurstTracker::new(),
+        feedback_tracker: notification_pipeline::FeedbackTracker::new(),
+        last_feedback_tick_at: None,
     };
+
+    // Spec 005 Phase 7: replay persisted feedback so demotions survive
+    // restarts. Events older than IGNORE_WINDOW_SECS still contribute to
+    // the ignore tally; only the `pending` projection is freshness-filtered.
+    {
+        let replay_now = chrono::Utc::now();
+        let events = notification_pipeline::feedback_store::load(&cli.data_dir);
+        for event in &events {
+            state.feedback_tracker.replay_event(event, replay_now);
+        }
+        if !events.is_empty() {
+            info!(
+                count = events.len(),
+                pending = state.feedback_tracker.pending_count(),
+                "notification feedback replayed"
+            );
+        }
+    }
 
     // Seed operator IPs from active SSH sessions (who -i).
     // Only publickey SSH sessions from trusted_users are considered operators.
@@ -1507,6 +1527,35 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                                 state.sqlite_store.as_deref(),
                             );
                             state.last_intel_consolidation_at = Some(Instant::now());
+                        }
+
+                        // ── Feedback tracker tick (spec 005 Phase 7) ──
+                        //
+                        // Once per hour: any pending notification that has
+                        // aged past 24h converts into an ignore event. Once
+                        // a (detector, entity_type) key accumulates 3 ignores,
+                        // future non-critical notifications are demoted.
+                        {
+                            let feedback_interval = std::time::Duration::from_secs(3_600);
+                            let due = state
+                                .last_feedback_tick_at
+                                .map(|t| t.elapsed() >= feedback_interval)
+                                .unwrap_or(true);
+                            if due {
+                                let events =
+                                    state.feedback_tracker.tick(chrono::Utc::now());
+                                if !events.is_empty() {
+                                    if let Err(e) =
+                                        notification_pipeline::feedback_store::append_many(
+                                            &cli.data_dir,
+                                            &events,
+                                        )
+                                    {
+                                        warn!("feedback tick persist failed: {e:#}");
+                                    }
+                                }
+                                state.last_feedback_tick_at = Some(Instant::now());
+                            }
                         }
 
                         // ── Environment periodic census (spec 005 Phase 6) ──

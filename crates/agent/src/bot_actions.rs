@@ -15,6 +15,33 @@ pub(crate) async fn handle_telegram_action_callback(
     cfg: &config::AgentConfig,
     state: &mut AgentState,
 ) -> bool {
+    // Spec 005 Phase 7: any operator tap — regardless of the chosen action —
+    // clears the pending feedback entry and resets the ignore tally for the
+    // underlying (detector, entity_type) key. This keeps the tracker
+    // responsive to renewed operator engagement after a previous stretch of
+    // ignores had demoted the class.
+    {
+        let action_label = if result.chosen_action.is_empty() {
+            if result.approved {
+                "approve"
+            } else {
+                "deny"
+            }
+        } else {
+            result.chosen_action.as_str()
+        };
+        if let Some(ev) = state.feedback_tracker.on_operator_action(
+            &result.incident_id,
+            action_label,
+            chrono::Utc::now(),
+        ) {
+            if let Err(e) = crate::notification_pipeline::feedback_store::append(data_dir, &ev)
+            {
+                tracing::warn!("feedback action persist failed: {e:#}");
+            }
+        }
+    }
+
     // Quick-block sentinel: "quick:block:<ip>" - initiated from the inline keyboard on T.1 alerts
     if let Some(ip) = result.incident_id.strip_prefix("__quick_block__:") {
         let ip = ip.to_string();

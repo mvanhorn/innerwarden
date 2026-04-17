@@ -540,6 +540,10 @@ struct AgentState {
     redis_reader: Option<redis_reader::RedisStreamReader>,
     /// Notification gate burst tracker — counts contained threats for burst summary.
     notification_burst_tracker: notification_gate::BurstTracker,
+    /// Spec 005 Phase 7 — implicit operator feedback (ignore-driven demotion).
+    feedback_tracker: notification_pipeline::FeedbackTracker,
+    /// Last time the feedback tracker ticked 24h-old pendings into ignores.
+    last_feedback_tick_at: Option<std::time::Instant>,
 }
 
 /// Tracks a deferred honeypot-or-block decision waiting for operator input via Telegram.

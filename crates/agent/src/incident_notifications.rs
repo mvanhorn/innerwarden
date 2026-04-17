@@ -105,6 +105,46 @@ pub(crate) async fn dispatch_incident_notifications(
 
     match action {
         GroupAction::NotifyImmediately => {
+            // Spec 005 Phase 7: operator-ignored detectors are demoted to
+            // daily briefing before the gate even sees them. Critical
+            // severity bypasses the demotion — "Not a threat" taps never
+            // silence a real compromise.
+            let detector = incident.incident_id.split(':').next().unwrap_or("unknown");
+            let primary_entity = incident
+                .entities
+                .iter()
+                .find(|e| {
+                    matches!(
+                        e.r#type,
+                        innerwarden_core::entities::EntityType::Ip
+                            | innerwarden_core::entities::EntityType::User
+                    )
+                })
+                .cloned();
+            let is_critical = matches!(
+                incident.severity,
+                innerwarden_core::event::Severity::Critical
+            );
+            if !is_critical {
+                if let Some(entity) = &primary_entity {
+                    if state
+                        .feedback_tracker
+                        .is_demoted(detector, &entity.r#type)
+                    {
+                        *state
+                            .telegram_deferred
+                            .entry(detector.to_string())
+                            .or_insert(0) += 1;
+                        info!(
+                            detector = %detector,
+                            entity_type = ?entity.r#type,
+                            "notification demoted by feedback tracker (spec 005 Phase 7)"
+                        );
+                        return;
+                    }
+                }
+            }
+
             // Centralized notification gate: evaluate policy BEFORE any channel dispatch.
             // Only uncontained active intrusions and confirmed compromises get
             // immediate notification on ANY channel. Everything else → daily briefing.
@@ -192,6 +232,24 @@ pub(crate) async fn dispatch_incident_notifications(
             let wp_level = cfg.web_push.channel_notifications.notification_level;
             if passes_channel_filter(wp_level, &incident.severity) {
                 web_push::notify_incident(incident, data_dir, &cfg.web_push).await;
+            }
+
+            // Spec 005 Phase 7: record that we notified the operator for this
+            // incident so the tracker can observe whether the operator
+            // engaged with it in the next 24h.
+            if let Some(entity) = &primary_entity {
+                let ev = state.feedback_tracker.on_notification_sent(
+                    detector,
+                    entity.r#type.clone(),
+                    &entity.value,
+                    &incident.incident_id,
+                    chrono::Utc::now(),
+                );
+                if let Err(e) =
+                    notification_pipeline::feedback_store::append(data_dir, &ev)
+                {
+                    warn!("feedback persist failed: {e:#}");
+                }
             }
         }
         GroupAction::Suppress => {

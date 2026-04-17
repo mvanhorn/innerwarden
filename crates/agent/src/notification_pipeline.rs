@@ -487,6 +487,272 @@ pub(crate) fn is_admin_routine(
 }
 
 // ---------------------------------------------------------------------------
+// Spec 005 Phase 7 — Operator Feedback Loop
+// ---------------------------------------------------------------------------
+//
+// Implicit feedback via "absence of operator action". Each time the pipeline
+// emits a first notification for a group, we log a pending entry. An entry
+// older than IGNORE_WINDOW_SECS with no operator action recorded against the
+// same (detector, entity_type) key is converted into a persistent "ignore"
+// tally. Once a key has `IGNORE_THRESHOLD` tallies, future groups with that
+// key are considered operator-desensitised: the gate demotes them from
+// Actionable to daily-briefing.
+//
+// Explicit feedback — operator taps "Not a threat" / "Block" / "Allow" — is
+// routed through `on_operator_action`, which clears any pending entry AND
+// resets the tally for that key (positive signal: the operator is still
+// engaged with this class of threat).
+//
+// Persistence: `notification-feedback.jsonl` — one JSON line per event
+// (`sent`, `ignored`, `action`). The in-memory state is a pure projection
+// of the file and is rebuilt at startup, so the loop survives restarts.
+
+const IGNORE_WINDOW_SECS: i64 = 86_400; // 24h
+const IGNORE_THRESHOLD: u32 = 3;
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum FeedbackEvent {
+    Sent {
+        ts: DateTime<Utc>,
+        detector: String,
+        entity_type: EntityType,
+        entity_value: String,
+        incident_id: String,
+    },
+    Ignored {
+        ts: DateTime<Utc>,
+        detector: String,
+        entity_type: EntityType,
+        incident_id: String,
+    },
+    Action {
+        ts: DateTime<Utc>,
+        detector: String,
+        entity_type: EntityType,
+        action: String,
+    },
+}
+
+/// Tracks pending notifications and ignore tallies. Not Send+Sync because the
+/// agent only holds it inside AgentState which is already single-threaded in
+/// the main loop path.
+#[derive(Debug, Default)]
+pub(crate) struct FeedbackTracker {
+    /// Pending notifications that have not yet received operator attention.
+    /// Keyed by incident_id so operator actions can retire the exact entry.
+    pending: HashMap<String, PendingNotification>,
+    /// Count of ignored (detector, entity_type) pairs. Resets on any operator
+    /// action for the same key.
+    ignored_tally: HashMap<(String, EntityType), u32>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingNotification {
+    sent_at: DateTime<Utc>,
+    detector: String,
+    entity_type: EntityType,
+    entity_value: String,
+    incident_id: String,
+}
+
+impl FeedbackTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that a notification was sent for an incident. Idempotent: a
+    /// second call for the same incident_id updates the timestamp only.
+    pub fn on_notification_sent(
+        &mut self,
+        detector: &str,
+        entity_type: EntityType,
+        entity_value: &str,
+        incident_id: &str,
+        now: DateTime<Utc>,
+    ) -> FeedbackEvent {
+        self.pending.insert(
+            incident_id.to_string(),
+            PendingNotification {
+                sent_at: now,
+                detector: detector.to_string(),
+                entity_type: entity_type.clone(),
+                entity_value: entity_value.to_string(),
+                incident_id: incident_id.to_string(),
+            },
+        );
+        FeedbackEvent::Sent {
+            ts: now,
+            detector: detector.to_string(),
+            entity_type,
+            entity_value: entity_value.to_string(),
+            incident_id: incident_id.to_string(),
+        }
+    }
+
+    /// Record an operator action for an incident (tap on Block / Ignore /
+    /// Allow). Clears any pending entry and resets the ignore tally for the
+    /// owning key.
+    pub fn on_operator_action(
+        &mut self,
+        incident_id: &str,
+        action: &str,
+        now: DateTime<Utc>,
+    ) -> Option<FeedbackEvent> {
+        let pending = self.pending.remove(incident_id)?;
+        let key = (pending.detector.clone(), pending.entity_type.clone());
+        self.ignored_tally.remove(&key);
+        Some(FeedbackEvent::Action {
+            ts: now,
+            detector: pending.detector,
+            entity_type: pending.entity_type,
+            action: action.to_string(),
+        })
+    }
+
+    /// Move every pending entry older than `IGNORE_WINDOW_SECS` into the
+    /// ignore tally and return the corresponding FeedbackEvents for
+    /// persistence.
+    pub fn tick(&mut self, now: DateTime<Utc>) -> Vec<FeedbackEvent> {
+        let cutoff = now - chrono::Duration::seconds(IGNORE_WINDOW_SECS);
+        let ripe: Vec<String> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| p.sent_at < cutoff)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut events = Vec::with_capacity(ripe.len());
+        for id in ripe {
+            if let Some(p) = self.pending.remove(&id) {
+                let key = (p.detector.clone(), p.entity_type.clone());
+                *self.ignored_tally.entry(key).or_insert(0) += 1;
+                events.push(FeedbackEvent::Ignored {
+                    ts: now,
+                    detector: p.detector,
+                    entity_type: p.entity_type,
+                    incident_id: p.incident_id,
+                });
+            }
+        }
+        events
+    }
+
+    /// True when the (detector, entity_type) pair has reached the ignore
+    /// threshold and should be demoted. Used by the notification gate.
+    pub fn is_demoted(&self, detector: &str, entity_type: &EntityType) -> bool {
+        self.ignored_tally
+            .get(&(detector.to_string(), entity_type.clone()))
+            .copied()
+            .unwrap_or(0)
+            >= IGNORE_THRESHOLD
+    }
+
+    /// Number of pending notifications — surfaced for tests and dashboard.
+    #[allow(dead_code)]
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Apply a persisted FeedbackEvent to in-memory state during startup
+    /// replay. `Sent` is only honoured if the notification is still fresh;
+    /// older `Sent` entries are ignored (the `Ignored` follow-up will have
+    /// been logged already).
+    pub fn replay_event(&mut self, event: &FeedbackEvent, now: DateTime<Utc>) {
+        let cutoff = now - chrono::Duration::seconds(IGNORE_WINDOW_SECS);
+        match event {
+            FeedbackEvent::Sent {
+                ts,
+                detector,
+                entity_type,
+                entity_value,
+                incident_id,
+            } => {
+                if *ts > cutoff {
+                    self.pending.insert(
+                        incident_id.clone(),
+                        PendingNotification {
+                            sent_at: *ts,
+                            detector: detector.clone(),
+                            entity_type: entity_type.clone(),
+                            entity_value: entity_value.clone(),
+                            incident_id: incident_id.clone(),
+                        },
+                    );
+                }
+            }
+            FeedbackEvent::Ignored {
+                detector,
+                entity_type,
+                incident_id,
+                ..
+            } => {
+                self.pending.remove(incident_id);
+                let key = (detector.clone(), entity_type.clone());
+                *self.ignored_tally.entry(key).or_insert(0) += 1;
+            }
+            FeedbackEvent::Action {
+                detector,
+                entity_type,
+                ..
+            } => {
+                let key = (detector.clone(), entity_type.clone());
+                self.ignored_tally.remove(&key);
+            }
+        }
+    }
+}
+
+/// File-based persistence for feedback events. JSONL, append-only.
+pub(crate) mod feedback_store {
+    use super::FeedbackEvent;
+    use std::io::Write;
+    use std::path::Path;
+
+    pub fn path(data_dir: &Path) -> std::path::PathBuf {
+        data_dir.join("notification-feedback.jsonl")
+    }
+
+    pub fn append(data_dir: &Path, event: &FeedbackEvent) -> anyhow::Result<()> {
+        let p = path(data_dir);
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)?;
+        let line = serde_json::to_string(event)?;
+        writeln!(f, "{line}")?;
+        Ok(())
+    }
+
+    pub fn append_many(data_dir: &Path, events: &[FeedbackEvent]) -> anyhow::Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let p = path(data_dir);
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)?;
+        for event in events {
+            let line = serde_json::to_string(event)?;
+            writeln!(f, "{line}")?;
+        }
+        Ok(())
+    }
+
+    pub fn load(data_dir: &Path) -> Vec<FeedbackEvent> {
+        let p = path(data_dir);
+        let Ok(content) = std::fs::read_to_string(p) else {
+            return Vec::new();
+        };
+        content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Digest Stats — accumulated from closed groups
 // ---------------------------------------------------------------------------
 
@@ -1144,5 +1410,147 @@ mod tests {
             Some(true),
             "mark_auto_resolved must round-trip through the dashboard snapshot"
         );
+    }
+
+    // ─── Spec 005 Phase 7 — Feedback tracker tests ────────────────────
+
+    fn now() -> DateTime<Utc> {
+        Utc::now()
+    }
+
+    #[test]
+    fn feedback_pending_increments_and_decrements() {
+        let mut t = FeedbackTracker::new();
+        assert_eq!(t.pending_count(), 0);
+        t.on_notification_sent(
+            "ssh_bruteforce",
+            EntityType::Ip,
+            "1.2.3.4",
+            "inc-1",
+            now(),
+        );
+        assert_eq!(t.pending_count(), 1);
+        let _ = t.on_operator_action("inc-1", "block", now());
+        assert_eq!(t.pending_count(), 0);
+    }
+
+    #[test]
+    fn feedback_aged_pending_converts_to_ignore_tally() {
+        let mut t = FeedbackTracker::new();
+        let old = Utc::now() - chrono::Duration::hours(25);
+        t.on_notification_sent(
+            "ssh_bruteforce",
+            EntityType::Ip,
+            "1.2.3.4",
+            "inc-a",
+            old,
+        );
+        let events = t.tick(Utc::now());
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], FeedbackEvent::Ignored { .. }));
+        assert_eq!(t.pending_count(), 0);
+        assert!(!t.is_demoted("ssh_bruteforce", &EntityType::Ip));
+    }
+
+    #[test]
+    fn feedback_demotes_after_three_ignores() {
+        let mut t = FeedbackTracker::new();
+        let old = Utc::now() - chrono::Duration::hours(25);
+        for i in 0..3 {
+            t.on_notification_sent(
+                "ssh_bruteforce",
+                EntityType::Ip,
+                "1.2.3.4",
+                &format!("inc-{i}"),
+                old,
+            );
+        }
+        t.tick(Utc::now());
+        assert!(t.is_demoted("ssh_bruteforce", &EntityType::Ip));
+        // Different entity type → independent tally.
+        assert!(!t.is_demoted("ssh_bruteforce", &EntityType::User));
+    }
+
+    #[test]
+    fn feedback_operator_action_resets_ignore_tally() {
+        let mut t = FeedbackTracker::new();
+        let old = Utc::now() - chrono::Duration::hours(25);
+        for i in 0..3 {
+            t.on_notification_sent(
+                "ssh_bruteforce",
+                EntityType::Ip,
+                "1.2.3.4",
+                &format!("inc-{i}"),
+                old,
+            );
+        }
+        t.tick(Utc::now());
+        assert!(t.is_demoted("ssh_bruteforce", &EntityType::Ip));
+
+        // Operator now engages with a fresh notification for the same key.
+        t.on_notification_sent(
+            "ssh_bruteforce",
+            EntityType::Ip,
+            "1.2.3.4",
+            "inc-fresh",
+            Utc::now(),
+        );
+        let _ = t.on_operator_action("inc-fresh", "block", Utc::now());
+        assert!(
+            !t.is_demoted("ssh_bruteforce", &EntityType::Ip),
+            "explicit operator engagement must clear the demotion"
+        );
+    }
+
+    #[test]
+    fn feedback_replay_reconstructs_state() {
+        // Simulate: three ignored events recorded historically, then an
+        // operator action — replay must land on "not demoted".
+        let mut t = FeedbackTracker::new();
+        let past = Utc::now() - chrono::Duration::hours(48);
+        for _ in 0..3 {
+            let ev = FeedbackEvent::Ignored {
+                ts: past,
+                detector: "ssh_bruteforce".into(),
+                entity_type: EntityType::Ip,
+                incident_id: "x".into(),
+            };
+            t.replay_event(&ev, Utc::now());
+        }
+        assert!(t.is_demoted("ssh_bruteforce", &EntityType::Ip));
+
+        let action = FeedbackEvent::Action {
+            ts: past,
+            detector: "ssh_bruteforce".into(),
+            entity_type: EntityType::Ip,
+            action: "block".into(),
+        };
+        t.replay_event(&action, Utc::now());
+        assert!(!t.is_demoted("ssh_bruteforce", &EntityType::Ip));
+    }
+
+    #[test]
+    fn feedback_store_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = vec![
+            FeedbackEvent::Sent {
+                ts: Utc::now(),
+                detector: "ssh_bruteforce".into(),
+                entity_type: EntityType::Ip,
+                entity_value: "1.2.3.4".into(),
+                incident_id: "inc-1".into(),
+            },
+            FeedbackEvent::Action {
+                ts: Utc::now(),
+                detector: "ssh_bruteforce".into(),
+                entity_type: EntityType::Ip,
+                action: "block".into(),
+            },
+        ];
+        feedback_store::append_many(dir.path(), &events).unwrap();
+        let loaded = feedback_store::load(dir.path());
+        assert_eq!(loaded.len(), 2);
+        assert!(matches!(loaded[0], FeedbackEvent::Sent { .. }));
+        assert!(matches!(loaded[1], FeedbackEvent::Action { .. }));
     }
 }
