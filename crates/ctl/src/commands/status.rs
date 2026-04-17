@@ -10,6 +10,25 @@ use crate::{
     systemd, today_date_string, unknown_cap_error, yesterday_date_string, Cli,
 };
 
+fn resolve_report_date(date_arg: &str, today: &str, yesterday: &str) -> String {
+    match date_arg {
+        "today" => today.to_string(),
+        "yesterday" => yesterday.to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn summary_dates_from_filenames(names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .filter_map(|name| {
+            name.strip_prefix("summary-")
+                .and_then(|s| s.strip_suffix(".md"))
+                .map(|d| d.to_string())
+        })
+        .collect()
+}
+
 pub(crate) fn cmd_status(cli: &Cli, registry: &CapabilityRegistry, id: &str) -> Result<()> {
     let cap = registry.get(id).ok_or_else(|| unknown_cap_error(id))?;
     let opts = make_opts(cli, HashMap::new(), false);
@@ -171,26 +190,18 @@ pub(crate) fn cmd_report(cli: &Cli, date_arg: &str, data_dir: &Path) -> Result<(
         data_dir.to_path_buf()
     };
 
-    let date = match date_arg {
-        "today" => today_date_string(),
-        "yesterday" => yesterday_date_string(),
-        other => other.to_string(),
-    };
+    let date = resolve_report_date(date_arg, &today_date_string(), &yesterday_date_string());
 
     let summary_path = effective_dir.join(format!("summary-{date}.md"));
 
     if !summary_path.exists() {
-        let mut available: Vec<String> = std::fs::read_dir(&effective_dir)
+        let entries: Vec<String> = std::fs::read_dir(&effective_dir)
             .into_iter()
             .flatten()
             .flatten()
-            .filter_map(|e| {
-                let name = e.file_name().to_string_lossy().to_string();
-                name.strip_prefix("summary-")
-                    .and_then(|s| s.strip_suffix(".md"))
-                    .map(|d| d.to_string())
-            })
+            .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
+        let mut available = summary_dates_from_filenames(&entries);
 
         if available.is_empty() {
             println!("No summary found for {date}.");
@@ -441,6 +452,110 @@ pub(crate) fn cmd_sensor_status(cli: &Cli, data_dir: &Path) -> Result<()> {
 
     println!();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_report_date_expands_relative_keywords() {
+        // Ensures user-friendly date shortcuts map to concrete dates consistently.
+        assert_eq!(
+            resolve_report_date("today", "2026-04-16", "2026-04-15"),
+            "2026-04-16"
+        );
+        assert_eq!(
+            resolve_report_date("yesterday", "2026-04-16", "2026-04-15"),
+            "2026-04-15"
+        );
+    }
+
+    #[test]
+    fn resolve_report_date_keeps_explicit_date_strings() {
+        // Covers pass-through behavior for explicit date arguments.
+        assert_eq!(
+            resolve_report_date("2026-04-01", "2026-04-16", "2026-04-15"),
+            "2026-04-01"
+        );
+    }
+
+    #[test]
+    fn summary_dates_from_filenames_extracts_only_summary_files() {
+        // Verifies summary date discovery ignores unrelated files and keeps valid report dates.
+        let names = vec![
+            "summary-2026-04-16.md".to_string(),
+            "summary-2026-04-15.md".to_string(),
+            "events-2026-04-16.jsonl".to_string(),
+            "summary-2026-04-14.txt".to_string(),
+        ];
+        let dates = summary_dates_from_filenames(&names);
+        assert_eq!(dates, vec!["2026-04-16", "2026-04-15"]);
+    }
+
+    #[test]
+    fn generate_navigator_layer_has_expected_metadata() {
+        // Ensures exported ATT&CK layer preserves required metadata used by the Navigator UI.
+        let layer = generate_navigator_layer();
+        assert_eq!(
+            layer["name"].as_str().expect("layer name"),
+            "InnerWarden Detection Coverage"
+        );
+        assert_eq!(
+            layer["domain"].as_str().expect("layer domain"),
+            "enterprise-attack"
+        );
+        assert_eq!(
+            layer["versions"]["layer"].as_str().expect("layer version"),
+            "4.5"
+        );
+    }
+
+    #[test]
+    fn generate_navigator_layer_contains_known_techniques() {
+        // Guards the detector-to-technique map so key ATT&CK IDs are not lost during refactors.
+        let layer = generate_navigator_layer();
+        let techniques = layer["techniques"]
+            .as_array()
+            .expect("techniques must be array");
+        let ids: Vec<&str> = techniques
+            .iter()
+            .filter_map(|t| t["techniqueID"].as_str())
+            .collect();
+        assert!(ids.contains(&"T1110.001"));
+        assert!(ids.contains(&"T1485"));
+    }
+
+    #[test]
+    fn generate_navigator_layer_sets_visual_defaults_for_each_technique() {
+        // Confirms each technique entry keeps score/color/display defaults expected by ATT&CK Navigator.
+        let layer = generate_navigator_layer();
+        let techniques = layer["techniques"]
+            .as_array()
+            .expect("techniques must be array");
+        let first = techniques.first().expect("at least one technique");
+        assert_eq!(first["score"].as_i64().expect("score"), 1);
+        assert_eq!(first["color"].as_str().expect("color"), "#00ff00");
+        assert_eq!(first["enabled"].as_bool().expect("enabled"), true);
+        assert_eq!(
+            first["showSubtechniques"]
+                .as_bool()
+                .expect("showSubtechniques"),
+            true
+        );
+    }
+
+    #[test]
+    fn generate_navigator_layer_technique_count_matches_description() {
+        // Ensures description count stays in sync with actual entries to avoid stale exported metadata.
+        let layer = generate_navigator_layer();
+        let techniques = layer["techniques"]
+            .as_array()
+            .expect("techniques must be array");
+        let description = layer["description"].as_str().expect("description");
+        assert!(description.contains(&techniques.len().to_string()));
+        assert!(techniques.len() >= 40);
+    }
 }
 
 pub(crate) fn cmd_metrics(cli: &Cli, data_dir: &Path) -> Result<()> {

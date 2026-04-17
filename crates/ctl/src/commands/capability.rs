@@ -6,6 +6,11 @@ use innerwarden_core::audit::{append_admin_action, current_operator, AdminAction
 
 use crate::{make_opts, require_sudo, unknown_cap_error, CapabilityRegistry, Cli};
 
+fn confirmation_accepted(answer: &str) -> bool {
+    let normalized = answer.trim().to_lowercase();
+    normalized.is_empty() || normalized == "y" || normalized == "yes"
+}
+
 pub(crate) fn parse_params(raw: &[String]) -> Result<HashMap<String, String>> {
     let mut map = HashMap::new();
     for item in raw {
@@ -90,8 +95,7 @@ pub(crate) fn cmd_enable_with_deferred_restart(
         std::io::stdout().flush()?;
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
-        let answer = input.trim().to_lowercase();
-        if !answer.is_empty() && answer != "y" && answer != "yes" {
+        if !confirmation_accepted(&input) {
             println!("Aborted.");
             return Ok(());
         }
@@ -162,8 +166,7 @@ pub(crate) fn cmd_disable(
         std::io::stdout().flush()?;
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
-        let answer = input.trim().to_lowercase();
-        if !answer.is_empty() && answer != "y" && answer != "yes" {
+        if !confirmation_accepted(&input) {
             println!("Aborted.");
             return Ok(());
         }
@@ -196,4 +199,75 @@ pub(crate) fn cmd_disable(
 
     println!("\nCapability '{}' is now disabled.", cap.id());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confirmation_accepted_allows_empty_response() {
+        // Confirms default-enter behavior still applies the action when operator just presses Enter.
+        assert!(confirmation_accepted(""));
+        assert!(confirmation_accepted("   "));
+    }
+
+    #[test]
+    fn confirmation_accepted_allows_yes_variants() {
+        // Covers positive confirmations so both short and full forms remain accepted.
+        assert!(confirmation_accepted("y"));
+        assert!(confirmation_accepted("yes"));
+        assert!(confirmation_accepted(" YES "));
+    }
+
+    #[test]
+    fn confirmation_accepted_rejects_non_yes_values() {
+        // Ensures abort path is triggered for explicit negative or unrelated responses.
+        assert!(!confirmation_accepted("n"));
+        assert!(!confirmation_accepted("no"));
+        assert!(!confirmation_accepted("later"));
+    }
+
+    #[test]
+    fn parse_params_parses_multiple_entries() {
+        // Exercises standard KEY=VALUE parsing for capability parameter forwarding.
+        let raw = vec![
+            "mode=strict".to_string(),
+            "timeout=30".to_string(),
+            "region=eu".to_string(),
+        ];
+        let parsed = parse_params(&raw).expect("valid params should parse");
+
+        assert_eq!(parsed.get("mode").expect("mode key"), "strict");
+        assert_eq!(parsed.get("timeout").expect("timeout key"), "30");
+        assert_eq!(parsed.get("region").expect("region key"), "eu");
+    }
+
+    #[test]
+    fn parse_params_rejects_missing_separator() {
+        // Guards validation branch so malformed CLI params fail fast with a clear error.
+        let raw = vec!["mode".to_string()];
+        let err = parse_params(&raw).expect_err("missing '=' must error");
+        assert!(err.to_string().contains("expected KEY=VALUE format"));
+    }
+
+    #[test]
+    fn parse_params_allows_empty_value_after_separator() {
+        // Documents accepted behavior for explicitly clearing a value via KEY= syntax.
+        let raw = vec!["token=".to_string()];
+        let parsed = parse_params(&raw).expect("empty values are currently allowed");
+        assert_eq!(parsed.get("token").expect("token key"), "");
+    }
+
+    #[test]
+    fn parse_params_last_duplicate_wins() {
+        // Verifies deterministic overwrite behavior when user provides same key multiple times.
+        let raw = vec![
+            "level=low".to_string(),
+            "level=high".to_string(),
+            "level=critical".to_string(),
+        ];
+        let parsed = parse_params(&raw).expect("duplicate keys should still parse");
+        assert_eq!(parsed.get("level").expect("level key"), "critical");
+    }
 }

@@ -5,16 +5,49 @@ use anyhow::Result;
 
 use crate::{commands, make_opts, welcome, CapabilityRegistry, Cli, DailyCommand};
 
+fn capability_status_label(enabled: bool) -> &'static str {
+    if enabled {
+        "enabled"
+    } else {
+        "disabled"
+    }
+}
+
+fn daily_help_lines() -> &'static [&'static str] {
+    &[
+        "InnerWarden Daily Commands",
+        "Use these for day-to-day operations:",
+        "  innerwarden daily status",
+        "  innerwarden daily threats",
+        "  innerwarden daily actions",
+        "  innerwarden daily report",
+        "  innerwarden daily doctor",
+        "  innerwarden daily test",
+        "  innerwarden daily agent",
+        "",
+        "Short aliases:",
+        "  innerwarden quick status",
+        "  innerwarden day threats --live",
+        "  innerwarden quick agent scan",
+        "",
+        "Need advanced operations?",
+        "  innerwarden --help",
+        "  innerwarden <command> --help",
+    ]
+}
+
+fn count_innerwarden_programs(output: &[u8]) -> u32 {
+    String::from_utf8_lossy(output)
+        .matches("innerwarden")
+        .count() as u32
+}
+
 pub(crate) fn cmd_list(cli: &Cli, registry: &CapabilityRegistry) -> Result<()> {
     println!("{:<20} {:<10} Description", "Capability", "Status");
     println!("{}", "─".repeat(72));
     for cap in registry.all() {
         let opts = make_opts(cli, HashMap::new(), false);
-        let status = if cap.is_enabled(&opts) {
-            "enabled"
-        } else {
-            "disabled"
-        };
+        let status = capability_status_label(cap.is_enabled(&opts));
         println!("{:<20} {:<10} {}", cap.id(), status, cap.description());
     }
 
@@ -64,25 +97,12 @@ pub(crate) fn cmd_daily(
         }
         Some(DailyCommand::Agent { command }) => commands::agent::cmd_agent(cli, command.as_ref()),
         None => {
-            println!("InnerWarden Daily Commands");
+            let lines = daily_help_lines();
+            println!("{}", lines[0]);
             println!("{}", "═".repeat(52));
-            println!("Use these for day-to-day operations:");
-            println!("  innerwarden daily status");
-            println!("  innerwarden daily threats");
-            println!("  innerwarden daily actions");
-            println!("  innerwarden daily report");
-            println!("  innerwarden daily doctor");
-            println!("  innerwarden daily test");
-            println!("  innerwarden daily agent");
-            println!();
-            println!("Short aliases:");
-            println!("  innerwarden quick status");
-            println!("  innerwarden day threats --live");
-            println!("  innerwarden quick agent scan");
-            println!();
-            println!("Need advanced operations?");
-            println!("  innerwarden --help");
-            println!("  innerwarden <command> --help");
+            for line in lines.iter().skip(1) {
+                println!("{line}");
+            }
             Ok(())
         }
     }
@@ -93,12 +113,47 @@ pub(crate) fn cmd_welcome() -> Result<()> {
         .args(["prog", "list"])
         .output()
         .ok()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .matches("innerwarden")
-                .count() as u32
-        })
+        .map(|o| count_innerwarden_programs(&o.stdout))
         .unwrap_or(0);
     welcome::run_welcome(ebpf);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capability_status_label_enabled_branch() {
+        // Exercises the enabled branch so status output stays consistent in capability listings.
+        assert_eq!(capability_status_label(true), "enabled");
+    }
+
+    #[test]
+    fn capability_status_label_disabled_branch() {
+        // Exercises the disabled branch so status output doesn't regress for inactive capabilities.
+        assert_eq!(capability_status_label(false), "disabled");
+    }
+
+    #[test]
+    fn daily_help_lines_contains_expected_commands() {
+        // Verifies the daily command help text includes critical operator paths and aliases.
+        let lines = daily_help_lines();
+        assert!(lines.contains(&"  innerwarden daily status"));
+        assert!(lines.contains(&"  innerwarden daily test"));
+        assert!(lines.contains(&"  innerwarden quick status"));
+    }
+
+    #[test]
+    fn count_innerwarden_programs_counts_every_match() {
+        // Ensures welcome-mode eBPF count reflects multiple innerwarden program occurrences.
+        let output = b"prog_a innerwarden\nprog_b innerwarden\nprog_c";
+        assert_eq!(count_innerwarden_programs(output), 2);
+    }
+
+    #[test]
+    fn count_innerwarden_programs_returns_zero_without_matches() {
+        // Guards the no-match path so welcome output remains deterministic when bpftool output is unrelated.
+        assert_eq!(count_innerwarden_programs(b"prog_a\nprog_b"), 0);
+    }
 }

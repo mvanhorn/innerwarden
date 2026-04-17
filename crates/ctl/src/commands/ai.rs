@@ -94,36 +94,17 @@ pub(crate) const WIZARD_PROVIDERS: &[WizardProvider] = &[
     },
 ];
 
-pub(crate) fn fetch_models(base_url: &str, api_key: &str, api_style: &str) -> Vec<String> {
-    let url = match api_style {
+fn models_url(base_url: &str, api_key: &str, api_style: &str) -> String {
+    match api_style {
         "anthropic" => format!("{base_url}/v1/models"),
         "ollama" => format!("{base_url}/api/tags"),
         "gemini" => format!("{base_url}/v1beta/models?key={api_key}"),
         _ => format!("{base_url}/v1/models"),
-    };
+    }
+}
 
-    let resp = match api_style {
-        "anthropic" => ureq::get(&url)
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01")
-            .call(),
-        "gemini" => ureq::get(&url).call(),
-        _ => ureq::get(&url)
-            .header("Authorization", &format!("Bearer {api_key}"))
-            .call(),
-    };
-
-    let resp = match resp {
-        Ok(r) => r,
-        Err(_) => return vec![],
-    };
-
-    let body: serde_json::Value = match resp.into_body().read_json() {
-        Ok(v) => v,
-        Err(_) => return vec![],
-    };
-
-    let models: Vec<String> = if api_style == "gemini" {
+fn parse_models_response(body: &serde_json::Value, api_style: &str) -> Vec<String> {
+    if api_style == "gemini" {
         body.get("models")
             .and_then(|m| m.as_array())
             .map(|arr| {
@@ -166,24 +147,68 @@ pub(crate) fn fetch_models(base_url: &str, api_key: &str, api_style: &str) -> Ve
                     .collect()
             })
             .unwrap_or_default()
-    };
+    }
+}
 
+fn is_inference_model(model: &str) -> bool {
+    let l = model.to_lowercase();
+    !l.contains("embed")
+        && !l.contains("tts")
+        && !l.contains("whisper")
+        && !l.contains("dall-e")
+        && !l.contains("davinci")
+        && !l.contains("babbage")
+        && !l.contains("moderation")
+        && !l.contains("search")
+}
+
+fn filter_inference_models(models: Vec<String>) -> Vec<String> {
     let mut filtered: Vec<String> = models
         .into_iter()
-        .filter(|m| {
-            let l = m.to_lowercase();
-            !l.contains("embed")
-                && !l.contains("tts")
-                && !l.contains("whisper")
-                && !l.contains("dall-e")
-                && !l.contains("davinci")
-                && !l.contains("babbage")
-                && !l.contains("moderation")
-                && !l.contains("search")
-        })
+        .filter(|m| is_inference_model(m))
         .collect();
     filtered.sort();
     filtered
+}
+
+fn choose_model_from_input(models: &[String], choice: &str) -> String {
+    let trimmed = choice.trim();
+    if trimmed.is_empty() {
+        return models[0].clone();
+    }
+    if let Ok(idx) = trimmed.parse::<usize>() {
+        let idx = idx.saturating_sub(1).min(models.len() - 1);
+        return models[idx].clone();
+    }
+    trimmed.to_string()
+}
+
+pub(crate) fn fetch_models(base_url: &str, api_key: &str, api_style: &str) -> Vec<String> {
+    let url = models_url(base_url, api_key, api_style);
+
+    let resp = match api_style {
+        "anthropic" => ureq::get(&url)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .call(),
+        "gemini" => ureq::get(&url).call(),
+        _ => ureq::get(&url)
+            .header("Authorization", &format!("Bearer {api_key}"))
+            .call(),
+    };
+
+    let resp = match resp {
+        Ok(r) => r,
+        Err(_) => return vec![],
+    };
+
+    let body: serde_json::Value = match resp.into_body().read_json() {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+
+    let models = parse_models_response(&body, api_style);
+    filter_inference_models(models)
 }
 
 fn ask_key_and_model(
@@ -225,16 +250,7 @@ fn ask_key_and_model(
     }
     println!();
     let model_choice = prompt(&format!("Model [1-{show}, or type name, default=1]"))?;
-    let trimmed = model_choice.trim();
-
-    let model = if trimmed.is_empty() {
-        models[0].clone()
-    } else if let Ok(idx) = trimmed.parse::<usize>() {
-        let idx = idx.saturating_sub(1).min(models.len() - 1);
-        models[idx].clone()
-    } else {
-        trimmed.to_string()
-    };
+    let model = choose_model_from_input(&models, &model_choice);
 
     Ok((key, Some(model)))
 }
@@ -318,14 +334,7 @@ pub(crate) fn cmd_configure_ai_interactive(cli: &Cli) -> Result<()> {
             }
             println!();
             let mc = prompt(&format!("Model [1-{show}, default=1]"))?;
-            let trimmed = mc.trim();
-            Some(if trimmed.is_empty() {
-                models[0].clone()
-            } else if let Ok(idx) = trimmed.parse::<usize>() {
-                models[idx.saturating_sub(1).min(models.len() - 1)].clone()
-            } else {
-                trimmed.to_string()
-            })
+            Some(choose_model_from_input(&models, &mc))
         };
         cmd_configure_ai(cli, &name, Some(&key), model.as_deref(), Some(&base_url))
     } else {
@@ -507,4 +516,111 @@ pub(crate) fn prompt_ollama_api_key() -> Result<String> {
         );
     }
     Ok(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn models_url_builds_expected_paths_per_api_style() {
+        // Ensures provider-specific model-discovery endpoints remain stable.
+        assert_eq!(
+            models_url("https://api.example.com", "k", "openai"),
+            "https://api.example.com/v1/models"
+        );
+        assert_eq!(
+            models_url("https://api.example.com", "k", "anthropic"),
+            "https://api.example.com/v1/models"
+        );
+        assert_eq!(
+            models_url("https://api.example.com", "k", "ollama"),
+            "https://api.example.com/api/tags"
+        );
+        assert_eq!(
+            models_url("https://api.example.com", "k", "gemini"),
+            "https://api.example.com/v1beta/models?key=k"
+        );
+    }
+
+    #[test]
+    fn parse_models_response_openai_reads_data_ids() {
+        // Covers OpenAI-compatible response parsing used by most providers in the wizard.
+        let body = serde_json::json!({
+            "data": [
+                { "id": "gpt-4.1" },
+                { "id": "gpt-4o-mini" }
+            ]
+        });
+        let models = parse_models_response(&body, "openai");
+        assert_eq!(models, vec!["gpt-4.1", "gpt-4o-mini"]);
+    }
+
+    #[test]
+    fn parse_models_response_ollama_reads_model_names() {
+        // Ensures Ollama local model listing maps from "models[].name" correctly.
+        let body = serde_json::json!({
+            "models": [
+                { "name": "qwen3:latest" },
+                { "name": "llama3.3:70b" }
+            ]
+        });
+        let models = parse_models_response(&body, "ollama");
+        assert_eq!(models, vec!["qwen3:latest", "llama3.3:70b"]);
+    }
+
+    #[test]
+    fn parse_models_response_gemini_filters_non_generation_models() {
+        // Verifies Gemini parsing keeps generation-capable models and excludes embed/aqa variants.
+        let body = serde_json::json!({
+            "models": [
+                { "name": "models/gemini-2.5-pro" },
+                { "name": "models/gemini-embedding-001" },
+                { "name": "models/aqa" },
+                { "name": "models/gemini-2.5-flash" }
+            ]
+        });
+        let models = parse_models_response(&body, "gemini");
+        assert_eq!(models, vec!["gemini-2.5-pro", "gemini-2.5-flash"]);
+    }
+
+    #[test]
+    fn is_inference_model_rejects_non_inference_families() {
+        // Guards model filtering so text-only and admin endpoints don't appear in responder choices.
+        assert!(is_inference_model("gpt-4o-mini"));
+        assert!(!is_inference_model("text-embedding-3-large"));
+        assert!(!is_inference_model("dall-e-3"));
+        assert!(!is_inference_model("whisper-1"));
+        assert!(!is_inference_model("omni-moderation-latest"));
+    }
+
+    #[test]
+    fn filter_inference_models_filters_and_sorts_models() {
+        // Ensures final model list is deterministic and excludes unsupported classes.
+        let models = vec![
+            "zeta-model".to_string(),
+            "text-embedding-3-small".to_string(),
+            "alpha-model".to_string(),
+        ];
+        let filtered = filter_inference_models(models);
+        assert_eq!(filtered, vec!["alpha-model", "zeta-model"]);
+    }
+
+    #[test]
+    fn choose_model_from_input_uses_default_for_empty_choice() {
+        // Covers default-selection branch to keep interactive UX predictable.
+        let models = vec!["first".to_string(), "second".to_string()];
+        assert_eq!(choose_model_from_input(&models, ""), "first");
+    }
+
+    #[test]
+    fn choose_model_from_input_supports_index_and_name() {
+        // Exercises numeric selection and free-form model selection in one place.
+        let models = vec!["first".to_string(), "second".to_string()];
+        assert_eq!(choose_model_from_input(&models, "2"), "second");
+        assert_eq!(
+            choose_model_from_input(&models, "custom-model"),
+            "custom-model"
+        );
+    }
 }

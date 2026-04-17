@@ -5,6 +5,33 @@ use innerwarden_core::audit::{append_admin_action, current_operator, AdminAction
 
 use crate::{config_editor, prompt, require_sudo, restart_agent, Cli};
 
+fn requires_live_confirmation(enable: bool, dry_run_flag: Option<bool>, cli_dry_run: bool) -> bool {
+    enable && dry_run_flag == Some(false) && !cli_dry_run
+}
+
+fn responder_outcome_message(
+    enable: bool,
+    disable: bool,
+    dry_run_flag: Option<bool>,
+) -> &'static str {
+    if enable && dry_run_flag == Some(false) {
+        "Responder is LIVE. Decisions will execute automatically."
+    } else if disable {
+        "Responder disabled. System observes only."
+    } else {
+        "Responder updated. Run 'innerwarden status' to confirm."
+    }
+}
+
+fn parse_responder_interactive_choice(choice: &str) -> Option<u8> {
+    match choice.trim() {
+        "1" => Some(1),
+        "2" => Some(2),
+        "3" => Some(3),
+        _ => None,
+    }
+}
+
 pub(crate) fn cmd_configure_responder(
     cli: &Cli,
     enable: bool,
@@ -21,7 +48,7 @@ pub(crate) fn cmd_configure_responder(
     if enable || disable {
         let value = enable;
 
-        if enable && dry_run_flag == Some(false) && !cli.dry_run {
+        if requires_live_confirmation(enable, dry_run_flag, cli.dry_run) {
             println!("  WARNING: This will enable LIVE execution of security responses.");
             println!("  InnerWarden will run commands like 'ufw deny from <IP>' automatically.");
             println!();
@@ -60,13 +87,10 @@ pub(crate) fn cmd_configure_responder(
 
     restart_agent(cli);
     println!();
-    if enable && dry_run_flag == Some(false) {
-        println!("Responder is LIVE. Decisions will execute automatically.");
-    } else if disable {
-        println!("Responder disabled. System observes only.");
-    } else {
-        println!("Responder updated. Run 'innerwarden status' to confirm.");
-    }
+    println!(
+        "{}",
+        responder_outcome_message(enable, disable, dry_run_flag)
+    );
 
     let mut audit = AdminActionEntry {
         ts: chrono::Utc::now(),
@@ -102,8 +126,8 @@ fn cmd_configure_responder_interactive(cli: &Cli) -> Result<()> {
 
     let choice = prompt("Choose [1/2/3]")?;
 
-    match choice.trim() {
-        "1" => {
+    match parse_responder_interactive_choice(&choice) {
+        Some(1) => {
             if !cli.dry_run {
                 config_editor::write_bool(&cli.agent_config, "responder", "enabled", false)?;
                 println!("  [ok] responder disabled - observe only");
@@ -113,7 +137,7 @@ fn cmd_configure_responder_interactive(cli: &Cli) -> Result<()> {
             restart_agent(cli);
             println!("\nSystem is in observe mode. No automatic actions will be taken.");
         }
-        "2" => {
+        Some(2) => {
             if !cli.dry_run {
                 config_editor::write_bool(&cli.agent_config, "responder", "enabled", true)?;
                 config_editor::write_bool(&cli.agent_config, "responder", "dry_run", true)?;
@@ -128,7 +152,7 @@ fn cmd_configure_responder_interactive(cli: &Cli) -> Result<()> {
             println!("Check decisions-*.jsonl to review. When ready, run:");
             println!("  innerwarden configure responder --enable --dry-run false");
         }
-        "3" => {
+        Some(3) => {
             println!();
             println!("  WARNING: In live mode, InnerWarden will automatically:");
             println!("    - Block IPs with: sudo ufw deny from <IP>  (or iptables/nftables)");
@@ -164,4 +188,61 @@ fn cmd_configure_responder_interactive(cli: &Cli) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn requires_live_confirmation_only_for_real_live_mode() {
+        // Covers the dangerous-mode guard so explicit confirmation is required only when it should be.
+        assert!(requires_live_confirmation(true, Some(false), false));
+        assert!(!requires_live_confirmation(true, Some(true), false));
+        assert!(!requires_live_confirmation(false, Some(false), false));
+        assert!(!requires_live_confirmation(true, Some(false), true));
+    }
+
+    #[test]
+    fn responder_outcome_message_live_path() {
+        // Ensures operator-facing messaging matches live execution mode.
+        assert_eq!(
+            responder_outcome_message(true, false, Some(false)),
+            "Responder is LIVE. Decisions will execute automatically."
+        );
+    }
+
+    #[test]
+    fn responder_outcome_message_disabled_path() {
+        // Ensures disabled mode reports observe-only behavior instead of generic text.
+        assert_eq!(
+            responder_outcome_message(false, true, None),
+            "Responder disabled. System observes only."
+        );
+    }
+
+    #[test]
+    fn responder_outcome_message_default_path() {
+        // Covers the default informational branch for non-live/non-disable updates.
+        assert_eq!(
+            responder_outcome_message(true, false, Some(true)),
+            "Responder updated. Run 'innerwarden status' to confirm."
+        );
+    }
+
+    #[test]
+    fn parse_responder_interactive_choice_accepts_supported_values() {
+        // Verifies canonical interactive options resolve to stable branch identifiers.
+        assert_eq!(parse_responder_interactive_choice("1"), Some(1));
+        assert_eq!(parse_responder_interactive_choice("2"), Some(2));
+        assert_eq!(parse_responder_interactive_choice("3"), Some(3));
+    }
+
+    #[test]
+    fn parse_responder_interactive_choice_rejects_invalid_input() {
+        // Guards invalid-choice branch to preserve explicit error behavior in interactive flow.
+        assert_eq!(parse_responder_interactive_choice("0"), None);
+        assert_eq!(parse_responder_interactive_choice("4"), None);
+        assert_eq!(parse_responder_interactive_choice("abc"), None);
+    }
 }
