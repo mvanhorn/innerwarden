@@ -6,6 +6,31 @@ use innerwarden_core::audit::{append_admin_action, current_operator, AdminAction
 
 use crate::{config_editor, prompt, require_sudo, restart_agent, write_env_key, Cli};
 
+fn has_min_secret_length(value: &str, min: usize) -> bool {
+    value.len() >= min
+}
+
+fn parse_abuseipdb_threshold_input(raw: &str) -> Option<u8> {
+    raw.parse::<u8>().ok()
+}
+
+fn build_watchdog_cron_line(interval_mins: u64, bin: &str) -> String {
+    format!("*/{interval_mins} * * * * {bin} watchdog --notify")
+}
+
+fn contains_watchdog_entry(current_crontab: &str) -> bool {
+    current_crontab.contains("innerwarden watchdog")
+}
+
+fn append_cron_line(current_crontab: &str, cron_line: &str) -> String {
+    if current_crontab.trim().is_empty() {
+        format!("{cron_line}\n")
+    } else {
+        let trimmed = current_crontab.trim_end();
+        format!("{trimmed}\n{cron_line}\n")
+    }
+}
+
 pub(crate) fn cmd_configure_abuseipdb(
     cli: &Cli,
     api_key_arg: Option<&str>,
@@ -39,7 +64,7 @@ pub(crate) fn cmd_configure_abuseipdb(
         k
     };
 
-    if api_key.len() < 10 {
+    if !has_min_secret_length(&api_key, 10) {
         anyhow::bail!("API key looks too short - copy the full key from abuseipdb.com");
     }
 
@@ -54,11 +79,11 @@ pub(crate) fn cmd_configure_abuseipdb(
         let raw = prompt("Auto-block threshold [80]")?;
         if raw.is_empty() {
             80
+        } else if let Some(parsed) = parse_abuseipdb_threshold_input(&raw) {
+            parsed
         } else {
-            raw.parse::<u8>().unwrap_or_else(|_| {
-                println!("  Invalid value - using 80");
-                80
-            })
+            println!("  Invalid value - using 80");
+            80
         }
     } else {
         80
@@ -224,10 +249,10 @@ pub(crate) fn cmd_configure_cloudflare(
         }
     };
 
-    if zone_id.len() < 10 {
+    if !has_min_secret_length(&zone_id, 10) {
         anyhow::bail!("Zone ID looks too short - copy it from the Cloudflare dashboard");
     }
-    if api_token.len() < 10 {
+    if !has_min_secret_length(&api_token, 10) {
         anyhow::bail!("API token looks too short - copy the full token from Cloudflare");
     }
 
@@ -289,7 +314,7 @@ pub(crate) fn cmd_configure_watchdog(cli: &Cli, interval_mins: u64) -> Result<()
     let bin = which_bin("innerwarden")
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "/usr/local/bin/innerwarden".to_string());
-    let cron_line = format!("*/{interval_mins} * * * * {bin} watchdog --notify");
+    let cron_line = build_watchdog_cron_line(interval_mins, &bin);
 
     if cli.dry_run {
         println!("[dry-run] would add to crontab:");
@@ -305,7 +330,7 @@ pub(crate) fn cmd_configure_watchdog(cli: &Cli, interval_mins: u64) -> Result<()
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
         .unwrap_or_default();
 
-    if current.contains("innerwarden watchdog") {
+    if contains_watchdog_entry(&current) {
         println!("Watchdog cron is already installed:");
         for line in current
             .lines()
@@ -318,12 +343,7 @@ pub(crate) fn cmd_configure_watchdog(cli: &Cli, interval_mins: u64) -> Result<()
         return Ok(());
     }
 
-    let new_crontab = if current.trim().is_empty() {
-        format!("{cron_line}\n")
-    } else {
-        let trimmed = current.trim_end();
-        format!("{trimmed}\n{cron_line}\n")
-    };
+    let new_crontab = append_cron_line(&current, &cron_line);
 
     let mut child = std::process::Command::new("crontab")
         .arg("-")
@@ -375,4 +395,69 @@ fn which_bin(name: &str) -> Option<PathBuf> {
             None
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn has_min_secret_length_enforces_minimum_length() {
+        // Ensures API credential validation rejects obviously truncated secrets.
+        assert!(has_min_secret_length("1234567890", 10));
+        assert!(!has_min_secret_length("12345", 10));
+    }
+
+    #[test]
+    fn parse_abuseipdb_threshold_input_accepts_numeric_values() {
+        // Covers successful threshold parsing for valid integer user input.
+        assert_eq!(parse_abuseipdb_threshold_input("0"), Some(0));
+        assert_eq!(parse_abuseipdb_threshold_input("80"), Some(80));
+        assert_eq!(parse_abuseipdb_threshold_input("100"), Some(100));
+    }
+
+    #[test]
+    fn parse_abuseipdb_threshold_input_rejects_invalid_values() {
+        // Guards fallback path so malformed thresholds trigger default handling upstream.
+        assert_eq!(parse_abuseipdb_threshold_input(""), None);
+        assert_eq!(parse_abuseipdb_threshold_input("abc"), None);
+        assert_eq!(parse_abuseipdb_threshold_input("-1"), None);
+    }
+
+    #[test]
+    fn parse_abuseipdb_threshold_input_keeps_u8_values_without_range_clamp() {
+        // Documents current behavior: parser accepts any valid u8 and leaves policy range checks to callers.
+        assert_eq!(parse_abuseipdb_threshold_input("200"), Some(200));
+    }
+
+    #[test]
+    fn build_watchdog_cron_line_renders_expected_schedule() {
+        // Verifies cron command generation remains deterministic for watchdog setup.
+        let line = build_watchdog_cron_line(15, "/usr/local/bin/innerwarden");
+        assert_eq!(
+            line,
+            "*/15 * * * * /usr/local/bin/innerwarden watchdog --notify"
+        );
+    }
+
+    #[test]
+    fn contains_watchdog_entry_detects_existing_installation() {
+        // Ensures duplicate-installation guard triggers when a watchdog entry already exists.
+        let current =
+            "0 0 * * * backup\n*/5 * * * * /usr/local/bin/innerwarden watchdog --notify\n";
+        assert!(contains_watchdog_entry(current));
+        assert!(!contains_watchdog_entry("0 0 * * * backup\n"));
+    }
+
+    #[test]
+    fn append_cron_line_handles_empty_and_existing_crontabs() {
+        // Covers merge behavior for first install and append-to-existing installs.
+        let cron_line = "*/10 * * * * /usr/local/bin/innerwarden watchdog --notify";
+        let empty = append_cron_line("", cron_line);
+        assert_eq!(empty, format!("{cron_line}\n"));
+
+        let current = "0 0 * * * backup\n";
+        let merged = append_cron_line(current, cron_line);
+        assert_eq!(merged, format!("0 0 * * * backup\n{cron_line}\n"));
+    }
 }

@@ -9,6 +9,53 @@ use crate::{
     send_telegram_message_md, systemd, write_env_key, Cli,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DigestHourConfig {
+    Disabled,
+    Hour(u8),
+}
+
+fn is_valid_telegram_token(token: &str) -> bool {
+    token.contains(':') && token.split(':').next().is_some_and(|s| !s.is_empty())
+}
+
+fn is_numeric_chat_id(chat_id: &str) -> bool {
+    chat_id
+        .trim_start_matches('-')
+        .chars()
+        .all(|c| c.is_ascii_digit())
+}
+
+fn is_valid_alert_severity(min_severity: &str) -> bool {
+    matches!(min_severity, "low" | "medium" | "high" | "critical")
+}
+
+fn is_valid_slack_webhook_url(url: &str) -> bool {
+    url.starts_with("https://hooks.slack.com/")
+}
+
+fn is_valid_webhook_url(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
+fn channel_selected(test_only: Option<&str>, channel: &str) -> bool {
+    test_only.is_none_or(|candidate| candidate == channel)
+}
+
+fn parse_digest_hour_config(hour_str: &str) -> Result<DigestHourConfig> {
+    if matches!(hour_str, "off" | "none" | "disable") {
+        return Ok(DigestHourConfig::Disabled);
+    }
+
+    let hour: u8 = hour_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("expected a number 0-23 or 'off', got '{hour_str}'"))?;
+    if hour > 23 {
+        anyhow::bail!("hour must be 0-23, got {hour}");
+    }
+    Ok(DigestHourConfig::Hour(hour))
+}
+
 pub(crate) fn cmd_configure_telegram(
     cli: &Cli,
     token_arg: Option<&str>,
@@ -42,7 +89,7 @@ pub(crate) fn cmd_configure_telegram(
     };
 
     // Basic format check: digits : alphanumeric
-    if !token.contains(':') || token.split(':').next().is_none_or(|s| s.is_empty()) {
+    if !is_valid_telegram_token(&token) {
         anyhow::bail!(
             "token looks wrong - expected format: 123456789:ABCdef...\nGet one from @BotFather on Telegram."
         );
@@ -114,8 +161,7 @@ pub(crate) fn cmd_configure_telegram(
     };
 
     // Validate chat_id is numeric (may be negative for groups)
-    let chat_id_trimmed = chat_id.trim_start_matches('-');
-    if !chat_id_trimmed.chars().all(|c| c.is_ascii_digit()) {
+    if !is_numeric_chat_id(&chat_id) {
         anyhow::bail!(
             "chat ID must be a number (e.g. 123456789 for a user, -100... for a group).\nGet yours by messaging @userinfobot on Telegram."
         );
@@ -305,14 +351,14 @@ pub(crate) fn cmd_configure_slack(
         u
     };
 
-    if !webhook_url.starts_with("https://hooks.slack.com/") {
+    if !is_valid_slack_webhook_url(&webhook_url) {
         anyhow::bail!(
             "webhook URL should start with https://hooks.slack.com/\nGet one at https://api.slack.com/apps"
         );
     }
 
     // Validate severity
-    if !matches!(min_severity, "low" | "medium" | "high" | "critical") {
+    if !is_valid_alert_severity(min_severity) {
         anyhow::bail!("min-severity must be one of: low, medium, high, critical");
     }
 
@@ -413,7 +459,7 @@ pub(crate) fn cmd_configure_webhook(
         require_sudo(cli);
     }
     // Validate severity
-    if !matches!(min_severity, "low" | "medium" | "high" | "critical") {
+    if !is_valid_alert_severity(min_severity) {
         anyhow::bail!("min-severity must be one of: low, medium, high, critical");
     }
 
@@ -434,7 +480,7 @@ pub(crate) fn cmd_configure_webhook(
         u
     };
 
-    if !url.starts_with("http://") && !url.starts_with("https://") {
+    if !is_valid_webhook_url(&url) {
         anyhow::bail!("URL must start with http:// or https://");
     }
 
@@ -772,7 +818,7 @@ pub(crate) fn cmd_test_alert(cli: &Cli, channel: Option<&str>) -> Result<()> {
     println!("InnerWarden - test alert\n");
 
     // ── Telegram ─────────────────────────────────────────────────────────
-    let try_telegram = test_only.is_none_or(|c| c == "telegram");
+    let try_telegram = channel_selected(test_only, "telegram");
     if try_telegram {
         let token = env_vars
             .get("TELEGRAM_BOT_TOKEN")
@@ -808,7 +854,7 @@ pub(crate) fn cmd_test_alert(cli: &Cli, channel: Option<&str>) -> Result<()> {
     }
 
     // ── Slack ─────────────────────────────────────────────────────────────
-    let try_slack = test_only.is_none_or(|c| c == "slack");
+    let try_slack = channel_selected(test_only, "slack");
     if try_slack {
         let webhook = env_vars
             .get("SLACK_WEBHOOK_URL")
@@ -845,7 +891,7 @@ pub(crate) fn cmd_test_alert(cli: &Cli, channel: Option<&str>) -> Result<()> {
     }
 
     // ── Webhook ───────────────────────────────────────────────────────────
-    let try_webhook = test_only.is_none_or(|c| c == "webhook");
+    let try_webhook = channel_selected(test_only, "webhook");
     if try_webhook {
         // Read webhook URL and enabled flag from agent.toml
         let agent_doc: Option<toml_edit::DocumentMut> = cli
@@ -1059,7 +1105,9 @@ pub(crate) fn cmd_configure_digest(cli: &Cli, hour_str: &str) -> Result<()> {
         require_sudo(cli);
     }
 
-    if hour_str == "off" || hour_str == "none" || hour_str == "disable" {
+    let digest_config = parse_digest_hour_config(hour_str)?;
+
+    if digest_config == DigestHourConfig::Disabled {
         if cli.dry_run {
             println!("  [dry-run] would remove [telegram] daily_summary_hour");
         } else {
@@ -1070,12 +1118,10 @@ pub(crate) fn cmd_configure_digest(cli: &Cli, hour_str: &str) -> Result<()> {
         return Ok(());
     }
 
-    let hour: u8 = hour_str
-        .parse()
-        .map_err(|_| anyhow::anyhow!("expected a number 0-23 or 'off', got '{hour_str}'"))?;
-    if hour > 23 {
-        anyhow::bail!("hour must be 0-23, got {hour}");
-    }
+    let hour = match digest_config {
+        DigestHourConfig::Hour(hour) => hour,
+        DigestHourConfig::Disabled => unreachable!("handled above"),
+    };
 
     if cli.dry_run {
         println!("  [dry-run] would set [telegram] daily_summary_hour = {hour}");
@@ -1109,6 +1155,112 @@ pub(crate) fn cmd_configure_digest(cli: &Cli, hour_str: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_valid_telegram_token_accepts_botfather_shape() {
+        // Protects the happy path where a BotFather-style token should pass lightweight validation.
+        assert!(is_valid_telegram_token("123456789:ABCdef_token"));
+    }
+
+    #[test]
+    fn is_valid_telegram_token_rejects_missing_prefix_or_separator() {
+        // Covers malformed token branches so obvious copy/paste mistakes fail fast.
+        assert!(!is_valid_telegram_token("123456789"));
+        assert!(!is_valid_telegram_token(":ABCdef_token"));
+    }
+
+    #[test]
+    fn is_numeric_chat_id_accepts_user_and_group_formats() {
+        // Ensures both direct-user and negative group IDs remain accepted by CLI validation.
+        assert!(is_numeric_chat_id("123456789"));
+        assert!(is_numeric_chat_id("-1001234567890"));
+    }
+
+    #[test]
+    fn is_numeric_chat_id_rejects_non_numeric_values() {
+        // Guards error path for chat IDs containing letters or punctuation.
+        assert!(!is_numeric_chat_id("chat_123"));
+        assert!(!is_numeric_chat_id("-100abc"));
+    }
+
+    #[test]
+    fn is_valid_alert_severity_accepts_supported_values() {
+        // Verifies channel filtering only accepts known severity levels used by notification config.
+        assert!(is_valid_alert_severity("low"));
+        assert!(is_valid_alert_severity("medium"));
+        assert!(is_valid_alert_severity("high"));
+        assert!(is_valid_alert_severity("critical"));
+    }
+
+    #[test]
+    fn is_valid_alert_severity_rejects_unknown_value() {
+        // Covers rejection branch to prevent unsupported levels from silently entering config.
+        assert!(!is_valid_alert_severity("urgent"));
+    }
+
+    #[test]
+    fn webhook_validators_enforce_expected_schemes() {
+        // Confirms Slack and generic webhook validators keep provider-specific URL constraints.
+        assert!(is_valid_slack_webhook_url(
+            "https://hooks.slack.com/services/T000/B000/XXX"
+        ));
+        assert!(!is_valid_slack_webhook_url("https://example.com/webhook"));
+        assert!(is_valid_webhook_url("http://localhost:8080/hook"));
+        assert!(is_valid_webhook_url("https://example.com/hook"));
+        assert!(!is_valid_webhook_url("ftp://example.com/hook"));
+    }
+
+    #[test]
+    fn channel_selected_matches_optional_filter() {
+        // Ensures test-alert channel targeting executes exactly the requested channel when provided.
+        assert!(channel_selected(None, "telegram"));
+        assert!(channel_selected(Some("telegram"), "telegram"));
+        assert!(!channel_selected(Some("slack"), "telegram"));
+    }
+
+    #[test]
+    fn parse_digest_hour_config_maps_disable_aliases() {
+        // Verifies all disable aliases land in the same branch that removes the digest key.
+        assert_eq!(
+            parse_digest_hour_config("off").expect("off should parse"),
+            DigestHourConfig::Disabled
+        );
+        assert_eq!(
+            parse_digest_hour_config("none").expect("none should parse"),
+            DigestHourConfig::Disabled
+        );
+        assert_eq!(
+            parse_digest_hour_config("disable").expect("disable should parse"),
+            DigestHourConfig::Disabled
+        );
+    }
+
+    #[test]
+    fn parse_digest_hour_config_accepts_hour_bounds() {
+        // Covers accepted numeric range boundaries used for digest scheduling.
+        assert_eq!(
+            parse_digest_hour_config("0").expect("0 should parse"),
+            DigestHourConfig::Hour(0)
+        );
+        assert_eq!(
+            parse_digest_hour_config("23").expect("23 should parse"),
+            DigestHourConfig::Hour(23)
+        );
+    }
+
+    #[test]
+    fn parse_digest_hour_config_rejects_invalid_inputs() {
+        // Protects failure branches for non-numeric and out-of-range values.
+        let err = parse_digest_hour_config("24").expect_err("24 must be rejected");
+        assert!(err.to_string().contains("hour must be 0-23"));
+        let err = parse_digest_hour_config("1h").expect_err("1h must be rejected");
+        assert!(err.to_string().contains("expected a number"));
+    }
 }
 
 pub(crate) fn cmd_configure_budget(cli: &Cli, max: u32) -> Result<()> {

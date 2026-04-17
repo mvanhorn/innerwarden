@@ -5,6 +5,62 @@ use anyhow::{Context, Result};
 
 use crate::{load_env_file, systemd, Cli};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceAction {
+    Restart,
+    Start,
+    Skip,
+}
+
+fn release_date_suffix(release_date: Option<&str>) -> String {
+    release_date.map(|d| format!("  [{d}]")).unwrap_or_default()
+}
+
+fn release_date_display(release_date: Option<&str>) -> String {
+    release_date.map(|d| format!(" ({d})")).unwrap_or_default()
+}
+
+fn telegram_notification_ready(bot_token: &str, chat_id: &str) -> bool {
+    !bot_token.is_empty() && !chat_id.is_empty()
+}
+
+fn changelog_snippet(body: Option<&str>, max_chars: usize) -> String {
+    body.unwrap_or("")
+        .chars()
+        .take(max_chars)
+        .collect::<String>()
+}
+
+fn render_upgrade_notification(
+    latest: &str,
+    current: &str,
+    date_suffix: &str,
+    changelog: &str,
+) -> String {
+    format!(
+        "🆕 <b>Inner Warden {latest} available</b>\n\n\
+         Current: {current}\n\
+         New: {latest}{date_suffix}\n\n\
+         {changelog}\n\n\
+         Upgrade: <code>innerwarden upgrade --yes</code>"
+    )
+}
+
+fn confirmation_accepted(answer: &str) -> bool {
+    let normalized = answer.trim().to_lowercase();
+    normalized.is_empty() || normalized == "y" || normalized == "yes"
+}
+
+fn classify_service_action(is_active: bool, unit_exists: bool) -> ServiceAction {
+    if is_active {
+        ServiceAction::Restart
+    } else if unit_exists {
+        ServiceAction::Start
+    } else {
+        ServiceAction::Skip
+    }
+}
+
 pub(crate) fn cmd_upgrade(
     cli: &Cli,
     check_only: bool,
@@ -22,10 +78,7 @@ pub(crate) fn cmd_upgrade(
     let current = CURRENT_VERSION;
     let latest = strip_v(&release.tag_name);
 
-    let date_suffix = release
-        .release_date()
-        .map(|d| format!("  [{d}]"))
-        .unwrap_or_default();
+    let date_suffix = release_date_suffix(release.release_date());
 
     println!("  Current version:  {current}");
 
@@ -57,22 +110,10 @@ pub(crate) fn cmd_upgrade(
             .cloned()
             .or_else(|| std::env::var("TELEGRAM_CHAT_ID").ok())
             .unwrap_or_default();
-        if !bot_token.is_empty() && !chat_id.is_empty() {
+        if telegram_notification_ready(&bot_token, &chat_id) {
             // Extract changelog from release body
-            let changelog = release
-                .body
-                .as_deref()
-                .unwrap_or("")
-                .chars()
-                .take(500)
-                .collect::<String>();
-            let text = format!(
-                "🆕 <b>Inner Warden {latest} available</b>\n\n\
-                 Current: {current}\n\
-                 New: {latest}{date_suffix}\n\n\
-                 {changelog}\n\n\
-                 Upgrade: <code>innerwarden upgrade --yes</code>"
-            );
+            let changelog = changelog_snippet(release.body.as_deref(), 500);
+            let text = render_upgrade_notification(latest, current, &date_suffix, &changelog);
             let url = format!("https://api.telegram.org/bot{bot_token}/sendMessage");
             let _ = ureq::post(&url).send_json(serde_json::json!({
                 "chat_id": chat_id,
@@ -185,8 +226,7 @@ pub(crate) fn cmd_upgrade(
         std::io::stdout().flush()?;
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
-        let answer = input.trim().to_lowercase();
-        if !answer.is_empty() && answer != "y" && answer != "yes" {
+        if !confirmation_accepted(&input) {
             println!("Aborted.");
             return Ok(());
         }
@@ -251,25 +291,26 @@ pub(crate) fn cmd_upgrade(
     for unit in &["innerwarden-sensor", "innerwarden-agent"] {
         let unit_path = format!("/etc/systemd/system/{unit}.service");
         let unit_exists = std::path::Path::new(&unit_path).exists();
-        if systemd::is_service_active(unit) {
-            systemd::restart_service(unit, false)?;
-            println!("  [done] Restarted {unit}");
-        } else if unit_exists {
-            // Unit is installed but stopped - try to start it
-            match systemd::restart_service(unit, false) {
-                Ok(()) => println!("  [done] Started {unit}"),
-                Err(e) => {
-                    println!("  [warn] Could not start {unit}: {e}");
-                    println!("         Check logs: journalctl -u {unit} -n 30");
+        match classify_service_action(systemd::is_service_active(unit), unit_exists) {
+            ServiceAction::Restart => {
+                systemd::restart_service(unit, false)?;
+                println!("  [done] Restarted {unit}");
+            }
+            ServiceAction::Start => {
+                // Unit is installed but stopped - try to start it
+                match systemd::restart_service(unit, false) {
+                    Ok(()) => println!("  [done] Started {unit}"),
+                    Err(e) => {
+                        println!("  [warn] Could not start {unit}: {e}");
+                        println!("         Check logs: journalctl -u {unit} -n 30");
+                    }
                 }
             }
+            ServiceAction::Skip => {}
         }
     }
 
-    let date_display = release
-        .release_date()
-        .map(|d| format!(" ({d})"))
-        .unwrap_or_default();
+    let date_display = release_date_display(release.release_date());
 
     println!(
         "\nInnerWarden upgraded to {}{} successfully.",
@@ -309,5 +350,69 @@ fn fix_config_dir_permissions(config_dir: &Path) {
                 .arg(&path)
                 .output();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_date_formatters_render_expected_shapes() {
+        // Ensures release date decorations remain stable for summary and success output lines.
+        assert_eq!(release_date_suffix(Some("2026-04-17")), "  [2026-04-17]");
+        assert_eq!(release_date_display(Some("2026-04-17")), " (2026-04-17)");
+        assert_eq!(release_date_suffix(None), "");
+        assert_eq!(release_date_display(None), "");
+    }
+
+    #[test]
+    fn telegram_notification_ready_requires_both_values() {
+        // Covers notify precondition gating so partial credentials do not trigger outbound requests.
+        assert!(telegram_notification_ready("token", "chat"));
+        assert!(!telegram_notification_ready("", "chat"));
+        assert!(!telegram_notification_ready("token", ""));
+    }
+
+    #[test]
+    fn changelog_snippet_truncates_to_limit() {
+        // Verifies changelog extraction keeps deterministic maximum length for Telegram notifications.
+        let body = "abcdef";
+        assert_eq!(changelog_snippet(Some(body), 3), "abc");
+        assert_eq!(changelog_snippet(Some(body), 10), "abcdef");
+    }
+
+    #[test]
+    fn changelog_snippet_handles_missing_body() {
+        // Protects optional-release-body path used when GitHub release notes are empty.
+        assert_eq!(changelog_snippet(None, 500), "");
+    }
+
+    #[test]
+    fn render_upgrade_notification_includes_core_fields() {
+        // Ensures notification text preserves key fields and upgrade command guidance.
+        let text = render_upgrade_notification("0.12.0", "0.11.0", "  [2026-04-17]", "notes");
+        assert!(text.contains("Inner Warden 0.12.0 available"));
+        assert!(text.contains("Current: 0.11.0"));
+        assert!(text.contains("New: 0.12.0  [2026-04-17]"));
+        assert!(text.contains("innerwarden upgrade --yes"));
+    }
+
+    #[test]
+    fn confirmation_accepted_matches_cli_prompt_behavior() {
+        // Guards confirmation parser so Enter/y/yes continue and other values abort.
+        assert!(confirmation_accepted(""));
+        assert!(confirmation_accepted("y"));
+        assert!(confirmation_accepted("YES"));
+        assert!(!confirmation_accepted("n"));
+        assert!(!confirmation_accepted("later"));
+    }
+
+    #[test]
+    fn classify_service_action_covers_all_runtime_states() {
+        // Ensures restart loop keeps the same branch decisions for active, installed, and missing units.
+        assert_eq!(classify_service_action(true, true), ServiceAction::Restart);
+        assert_eq!(classify_service_action(false, true), ServiceAction::Start);
+        assert_eq!(classify_service_action(false, false), ServiceAction::Skip);
     }
 }

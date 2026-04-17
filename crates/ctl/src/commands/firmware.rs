@@ -175,18 +175,7 @@ pub fn cmd_hypervisor(json: bool) -> Result<()> {
     println!("╚══════════════════════════════════════════════╝");
     println!();
 
-    let env_str = match &report.environment {
-        innerwarden_hypervisor::Environment::BareMetal => "\x1b[32mBare Metal\x1b[0m".to_string(),
-        innerwarden_hypervisor::Environment::VirtualMachine { hypervisor } => {
-            format!("\x1b[36mVirtual Machine ({hypervisor})\x1b[0m")
-        }
-        innerwarden_hypervisor::Environment::HypervisorHost { vm_count } => {
-            format!("\x1b[35mKVM Host ({vm_count} VMs)\x1b[0m")
-        }
-        innerwarden_hypervisor::Environment::UnknownHypervisor => {
-            "\x1b[31;1mUNKNOWN HYPERVISOR\x1b[0m".to_string()
-        }
-    };
+    let env_str = hypervisor_environment_label(&report.environment);
     println!("  Environment: {env_str}");
     println!(
         "  VM Score:    {}/100 ({} evidence signals)",
@@ -201,17 +190,8 @@ pub fn cmd_hypervisor(json: bool) -> Result<()> {
     println!("  \x1b[1m── Deep Checks ──\x1b[0m");
     println!();
     for check in &report.checks {
-        let (icon, color) = match check.status {
-            innerwarden_hypervisor::CheckStatus::Secure => ("✓", "\x1b[32m"),
-            innerwarden_hypervisor::CheckStatus::Warning => ("⚠", "\x1b[33m"),
-            innerwarden_hypervisor::CheckStatus::Critical => ("✗", "\x1b[31m"),
-            innerwarden_hypervisor::CheckStatus::Unavailable => ("–", "\x1b[90m"),
-        };
-        let conf = if check.confidence > 0.0 {
-            format!(" \x1b[90m({:.0}%)\x1b[0m", check.confidence * 100.0)
-        } else {
-            String::new()
-        };
+        let (icon, color) = hypervisor_status_icon(check.status);
+        let conf = confidence_suffix(check.confidence);
         println!(
             "  {color}{icon}\x1b[0m [{id}] {name}{conf}",
             id = check.id,
@@ -302,20 +282,49 @@ impl StatusIcon for innerwarden_smm::CheckResult {
     }
 }
 
-fn print_check((icon, color): (&str, &str), id: &str, name: &str, confidence: f64, detail: &str) {
-    let conf = if confidence > 0.0 {
+fn hypervisor_environment_label(environment: &innerwarden_hypervisor::Environment) -> String {
+    match environment {
+        innerwarden_hypervisor::Environment::BareMetal => "\x1b[32mBare Metal\x1b[0m".to_string(),
+        innerwarden_hypervisor::Environment::VirtualMachine { hypervisor } => {
+            format!("\x1b[36mVirtual Machine ({hypervisor})\x1b[0m")
+        }
+        innerwarden_hypervisor::Environment::HypervisorHost { vm_count } => {
+            format!("\x1b[35mKVM Host ({vm_count} VMs)\x1b[0m")
+        }
+        innerwarden_hypervisor::Environment::UnknownHypervisor => {
+            "\x1b[31;1mUNKNOWN HYPERVISOR\x1b[0m".to_string()
+        }
+    }
+}
+
+fn hypervisor_status_icon(
+    status: innerwarden_hypervisor::CheckStatus,
+) -> (&'static str, &'static str) {
+    match status {
+        innerwarden_hypervisor::CheckStatus::Secure => ("✓", "\x1b[32m"),
+        innerwarden_hypervisor::CheckStatus::Warning => ("⚠", "\x1b[33m"),
+        innerwarden_hypervisor::CheckStatus::Critical => ("✗", "\x1b[31m"),
+        innerwarden_hypervisor::CheckStatus::Unavailable => ("–", "\x1b[90m"),
+    }
+}
+
+fn confidence_suffix(confidence: f64) -> String {
+    if confidence > 0.0 {
         format!(" \x1b[90m({:.0}%)\x1b[0m", confidence * 100.0)
     } else {
         String::new()
-    };
+    }
+}
+
+fn print_check((icon, color): (&str, &str), id: &str, name: &str, confidence: f64, detail: &str) {
+    let conf = confidence_suffix(confidence);
     println!("  {color}{icon}\x1b[0m [{id}] {name}{conf}");
     println!("    {color}{detail}\x1b[0m");
     println!();
 }
 
-fn format_trust(score: f64) -> String {
-    let pct = (score * 100.0) as u32;
-    let (color, label) = if pct >= 90 {
+fn trust_bucket(pct: u32) -> (&'static str, &'static str) {
+    if pct >= 90 {
         ("\x1b[32m", "TRUSTED")
     } else if pct >= 60 {
         ("\x1b[33m", "DEGRADED")
@@ -323,6 +332,117 @@ fn format_trust(score: f64) -> String {
         ("\x1b[31m", "AT RISK")
     } else {
         ("\x1b[31;1m", "COMPROMISED")
-    };
+    }
+}
+
+fn format_trust(score: f64) -> String {
+    let pct = (score * 100.0) as u32;
+    let (color, label) = trust_bucket(pct);
     format!("{color}{pct}% — {label}\x1b[0m")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hypervisor_environment_label_formats_all_variants() {
+        // Ensures each environment variant maps to the intended operator-facing label text.
+        assert!(
+            hypervisor_environment_label(&innerwarden_hypervisor::Environment::BareMetal)
+                .contains("Bare Metal")
+        );
+        assert!(hypervisor_environment_label(
+            &innerwarden_hypervisor::Environment::VirtualMachine {
+                hypervisor: "KVM".to_string(),
+            }
+        )
+        .contains("Virtual Machine (KVM)"));
+        assert!(hypervisor_environment_label(
+            &innerwarden_hypervisor::Environment::HypervisorHost { vm_count: 4 }
+        )
+        .contains("KVM Host (4 VMs)"));
+        assert!(hypervisor_environment_label(
+            &innerwarden_hypervisor::Environment::UnknownHypervisor
+        )
+        .contains("UNKNOWN HYPERVISOR"));
+    }
+
+    #[test]
+    fn hypervisor_status_icon_maps_each_status() {
+        // Guards per-status icon/color mapping used when rendering deep check rows.
+        assert_eq!(
+            hypervisor_status_icon(innerwarden_hypervisor::CheckStatus::Secure),
+            ("✓", "\x1b[32m")
+        );
+        assert_eq!(
+            hypervisor_status_icon(innerwarden_hypervisor::CheckStatus::Warning),
+            ("⚠", "\x1b[33m")
+        );
+        assert_eq!(
+            hypervisor_status_icon(innerwarden_hypervisor::CheckStatus::Critical),
+            ("✗", "\x1b[31m")
+        );
+        assert_eq!(
+            hypervisor_status_icon(innerwarden_hypervisor::CheckStatus::Unavailable),
+            ("–", "\x1b[90m")
+        );
+    }
+
+    #[test]
+    fn confidence_suffix_only_renders_for_positive_values() {
+        // Verifies confidence rendering is omitted at 0 and shown for positive confidence values.
+        assert_eq!(confidence_suffix(0.0), "");
+        assert!(confidence_suffix(0.42).contains("42%"));
+    }
+
+    #[test]
+    fn trust_bucket_classifies_threshold_ranges() {
+        // Covers all trust threshold bands so risk labels do not drift during refactors.
+        assert_eq!(trust_bucket(95), ("\x1b[32m", "TRUSTED"));
+        assert_eq!(trust_bucket(70), ("\x1b[33m", "DEGRADED"));
+        assert_eq!(trust_bucket(45), ("\x1b[31m", "AT RISK"));
+        assert_eq!(trust_bucket(10), ("\x1b[31;1m", "COMPROMISED"));
+    }
+
+    #[test]
+    fn format_trust_includes_percentage_and_label() {
+        // Ensures final trust string carries both numeric percentage and severity label.
+        let trusted = format_trust(0.97);
+        assert!(trusted.contains("97%"));
+        assert!(trusted.contains("TRUSTED"));
+
+        let compromised = format_trust(0.05);
+        assert!(compromised.contains("5%"));
+        assert!(compromised.contains("COMPROMISED"));
+    }
+
+    #[test]
+    fn smm_status_icon_maps_each_status() {
+        // Confirms SMM check rendering keeps stable icons for every CheckStatus variant.
+        let mk = |status| innerwarden_smm::CheckResult {
+            id: "id",
+            name: "name",
+            status,
+            confidence: 0.5,
+            detail: "detail".to_string(),
+        };
+
+        assert_eq!(
+            mk(innerwarden_smm::CheckStatus::Secure).status_icon(),
+            ("✓", "\x1b[32m")
+        );
+        assert_eq!(
+            mk(innerwarden_smm::CheckStatus::Warning).status_icon(),
+            ("⚠", "\x1b[33m")
+        );
+        assert_eq!(
+            mk(innerwarden_smm::CheckStatus::Critical).status_icon(),
+            ("✗", "\x1b[31m")
+        );
+        assert_eq!(
+            mk(innerwarden_smm::CheckStatus::Unavailable).status_icon(),
+            ("–", "\x1b[90m")
+        );
+    }
 }
