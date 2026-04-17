@@ -117,7 +117,7 @@ Ordenado por numero. ✅ merged, 🚧 in-progress, 📝 draft/planned, ⏸ defer
 | 016 | Unified SQLite Store | ✅ v0.11.0. Single `innerwarden.db` substitui 15 storage artifacts. redb removido, JSONL removido, 14 maintenance tasks, migration legada. |
 | 017 | Dashboard Operator UX | 🚧 Phase 1 merged (Home + Threats tabs AI-first, 16 detector FP fixes). Demais fases em backlog. |
 | 018 | Autonomous Response | ✅ Phases A-D. Layer 2 correlation-driven escalation + trusted_processes filter. Graduated enforcement state machine (Phase F) parcial no spec 020. |
-| 019 | Test Coverage Gaps (Batches 2–7) | 🚧 Batch 1 em PR #110 (merged). Batches 2-7 outstanding (Gemini-owned). Alvo 42.85%→50%. |
+| 019 | Test Coverage Gaps | ✅ Closed. Batch 1 merged (PR #110). Batches 2-7 subsumed by spec 023 Coverage Closeout (PR #125, 11 batches) + spec 026 decomposition phases. |
 | 020 | Zero-Trust MDR | 🚧 Phases C + D merged (continuous trust scoring + AI SOC daily checks com 11 system parsers). Phase F-partial (graduated enforcement state machine) merged. |
 | 021 | Observation Verification | ✅ Phases A-D. Score engine + integracao no agent loop + AI batch verification + dashboard score display. Active FP clearing funcional. |
 | 022 | Dashboard Test Coverage | ✅ 6 batches merged + 2 expansoes. Cobertura do dashboard de 0% pra ~30%+. HTML escape, auth, investigation, sensors, actions — tudo testado. |

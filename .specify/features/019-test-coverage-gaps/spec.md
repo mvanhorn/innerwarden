@@ -2,9 +2,10 @@
 
 **Feature Branch**: `019-test-coverage-gaps`
 **Created**: 2026-04-15
-**Status**: Batch 1 delivered (PR #110, 19 tests). Batches 2-7 pending.
+**Status**: ✅ Closed. Batch 1 delivered (PR #110, 19 tests). Batches 2-7 subsumed by spec 023 Coverage Closeout (PR #125, 11 batches across ctl/sensor/agent/knowledge-graph/neural/hypervisor/smm/shield) plus spec 026 decomposition phases A/B/C. The modules this spec targeted (incident_enrichment, decision_block_ip, narrative, inline ticks, skills, CTL commands, honeypot, bot commands) all gained coverage under those later specs' crate-level cuts. No remaining work belongs to 019 as such — new test gaps should be filed under the relevant component spec or a fresh coverage spec.
 **Priority**: P1 (42.85% coverage → target 55%+)
 **Depends on**: nothing
+**Superseded by**: spec 023 + spec 026
 
 ## Current state (post PR #110)
 
