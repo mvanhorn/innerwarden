@@ -1197,9 +1197,26 @@ fn fp_detector_to_kind_indices(detectors: &HashSet<String>) -> HashSet<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use innerwarden_core::event::Severity;
+
+    fn make_event(kind: &str, src_ip: &str) -> Event {
+        Event {
+            ts: chrono::Utc::now(),
+            host: "prod-01".to_string(),
+            source: "ebpf".to_string(),
+            kind: kind.to_string(),
+            severity: Severity::Medium,
+            summary: "event".to_string(),
+            details: serde_json::json!({"src_ip": src_ip}),
+            tags: Vec::new(),
+            entities: Vec::new(),
+        }
+    }
 
     #[test]
     fn feature_extraction_correct_size() {
+        // Feature-shape contract: every extraction must produce the exact
+        // fixed vector size expected by the autoencoder input layer.
         let kinds = vec![Some(1), Some(7), Some(0), None, Some(14)];
         let f = window_features(&kinds);
         assert_eq!(f.len(), NUM_FEATURES);
@@ -1207,6 +1224,8 @@ mod tests {
 
     #[test]
     fn bigram_features_nonzero() {
+        // Signal path: attack bigrams should activate their dedicated slots
+        // so transition patterns influence anomaly scoring.
         // ssh_failed → ssh_success should activate bigram feature 24
         let kinds = vec![Some(14), Some(13)];
         let f = window_features(&kinds);
@@ -1218,6 +1237,8 @@ mod tests {
 
     #[test]
     fn kill_chain_stage_progression() {
+        // Sequence-path coverage: stage progression should rise only when
+        // the event sequence moves forward through distinct kill-chain stages.
         // Full kill chain: Recon → Access → Exec → Persist → Escalate → Evade → Exfil
         let kinds: Vec<Option<usize>> = vec![
             Some(14), // ssh_failed = stage 1 (recon)
@@ -1242,6 +1263,8 @@ mod tests {
 
     #[test]
     fn autoencoder_reconstruction() {
+        // Learning path: training steps should reduce reconstruction error
+        // on a repeated input pattern.
         let mut net = AutoencoderNet::new(&[NUM_FEATURES, 16, 8, 16, NUM_FEATURES], 0.01);
         let input = vec![0.5f32; NUM_FEATURES];
 
@@ -1261,6 +1284,8 @@ mod tests {
 
     #[test]
     fn maturity_increases() {
+        // Lifecycle path: maturity must grow monotonically with completed
+        // training cycles and approach 1.0 asymptotically.
         let config = AnomalyConfig {
             data_dir: PathBuf::from("/tmp/nonexistent"),
             ..Default::default()
@@ -1284,6 +1309,8 @@ mod tests {
 
     #[test]
     fn fp_detector_mapping_ssh() {
+        // Mapping path: SSH detector aliases must map to login kind indices
+        // so FP weighting can target both failed and successful auth events.
         let mut detectors = HashSet::new();
         detectors.insert("ssh_bruteforce".to_string());
         let indices = fp_detector_to_kind_indices(&detectors);
@@ -1294,6 +1321,8 @@ mod tests {
 
     #[test]
     fn fp_detector_mapping_unknown_falls_back() {
+        // Fallback path: unknown detector names should still map to a generic
+        // shell-exec signal instead of producing an empty mapping.
         let mut detectors = HashSet::new();
         detectors.insert("some_custom_detector".to_string());
         let indices = fp_detector_to_kind_indices(&detectors);
@@ -1302,6 +1331,8 @@ mod tests {
 
     #[test]
     fn extract_entity_from_incident_id_works() {
+        // Parsing path: incident IDs should extract actionable entities while
+        // rejecting numeric score placeholders.
         assert_eq!(
             extract_entity_from_incident_id("ssh_bruteforce:1.2.3.4:2026-01-01T00:00:00Z"),
             "1.2.3.4"
@@ -1319,6 +1350,8 @@ mod tests {
 
     #[test]
     fn fp_weight_reduction_applied() {
+        // Weighting path: windows that match known-FP detector kinds should
+        // be down-weighted deterministically during training feature build.
         let mut fp = HashSet::new();
         fp.insert("ssh_bruteforce".to_string());
         let fp_indices = fp_detector_to_kind_indices(&fp);
@@ -1347,7 +1380,9 @@ mod tests {
 
     #[test]
     fn read_fp_report_detectors_from_temp_dir() {
-        let dir = tempfile::tempdir().unwrap();
+        // Fallback-reader path: detector names should be collected from recent
+        // fp-reports JSONL files when snapshots are unavailable.
+        let dir = tempfile::tempdir().expect("temporary directory should be created");
         let today = chrono::Utc::now().format("%Y-%m-%d");
         let fp_path = dir.path().join(format!("fp-reports-{today}.jsonl"));
         std::fs::write(
@@ -1356,7 +1391,7 @@ mod tests {
 {"ts":"2026-01-01T00:00:00Z","incident_id":"port_scan:5.6.7.8:ts","detector":"port_scan","reporter":"alice","action":"reported_fp"}
 "#,
         )
-        .unwrap();
+        .expect("fixture fp report file should be written");
 
         let detectors = read_fp_report_detectors(dir.path(), 7);
         assert!(detectors.contains("ssh_bruteforce"));
@@ -1366,7 +1401,9 @@ mod tests {
 
     #[test]
     fn read_fp_report_counts_from_temp_dir() {
-        let dir = tempfile::tempdir().unwrap();
+        // Counting path: repeated (detector, entity) pairs should aggregate
+        // into stable counts for FP weighting heuristics.
+        let dir = tempfile::tempdir().expect("temporary directory should be created");
         let today = chrono::Utc::now().format("%Y-%m-%d");
         let fp_path = dir.path().join(format!("fp-reports-{today}.jsonl"));
         std::fs::write(
@@ -1376,14 +1413,238 @@ mod tests {
 {"ts":"2026-01-01T00:00:00Z","incident_id":"ssh_bruteforce:1.2.3.4:ts3","detector":"ssh_bruteforce","reporter":"alice","action":"reported_fp"}
 "#,
         )
-        .unwrap();
+        .expect("fixture fp count file should be written");
 
         let counts = read_fp_report_counts(dir.path(), 7);
         let ssh_count = counts
             .iter()
             .find(|(d, e, _)| d == "ssh_bruteforce" && e == "1.2.3.4");
         assert!(ssh_count.is_some());
-        assert_eq!(ssh_count.unwrap().2, 3);
+        assert_eq!(
+            ssh_count
+                .expect("ssh detector entity count should be present")
+                .2,
+            3
+        );
+    }
+
+    #[test]
+    fn kind_index_maps_known_and_unknown_kinds() {
+        // Dispatch-map path: known event kinds should resolve to stable
+        // feature slots while unknown kinds remain intentionally unmapped.
+        assert_eq!(kind_index("network.listen"), Some(23));
+        assert_eq!(kind_index("dns.query"), Some(18));
+        assert_eq!(kind_index("totally.unknown"), None);
+    }
+
+    #[test]
+    fn enrich_features_with_graph_clamps_and_writes_expected_slots() {
+        // Enrichment path: graph metrics should populate slots 48-57 and
+        // clamp oversized values into [0, 1].
+        let mut f = vec![0.0f32; NUM_FEATURES];
+        let gf = GraphFeatures {
+            avg_process_degree: 100.0,
+            max_process_tree_depth: 42,
+            threat_intel_ip_count: 99,
+            writes_to_sensitive: 99,
+            connected_components: 99,
+            process_ip_ratio: 10.0,
+            high_degree_nodes: 99,
+            incident_count: 99,
+            total_edges: 500_000,
+            active_sessions: 99,
+        };
+        enrich_features_with_graph(&mut f, &gf);
+
+        for slot in &f[48..58] {
+            assert!(
+                (0.0..=1.0).contains(slot),
+                "enriched graph slot should be normalized into [0,1]"
+            );
+        }
+        assert_eq!(f[48], 1.0);
+        assert_eq!(f[49], 1.0);
+        assert_eq!(f[50], 1.0);
+        assert_eq!(f[57], 1.0);
+    }
+
+    #[test]
+    fn enrich_features_with_graph_returns_early_for_short_vectors() {
+        // Guard path: short vectors (legacy callers) should be left untouched
+        // rather than causing out-of-bounds writes.
+        let mut short = vec![0.5f32; 8];
+        let before = short.clone();
+        enrich_features_with_graph(&mut short, &GraphFeatures::default());
+        assert_eq!(short, before);
+    }
+
+    #[test]
+    fn anomaly_config_defaults_match_nightly_training_contract() {
+        // Configuration path: defaults must preserve the documented nightly
+        // 03:00 UTC schedule and safe baseline threshold.
+        let cfg = AnomalyConfig::default();
+        assert_eq!(cfg.training_schedule, "0 3 * * *");
+        assert_eq!(cfg.threshold, 0.75);
+        assert_eq!(cfg.training_retention_days, 7);
+    }
+
+    #[test]
+    fn maturity_description_covers_all_ranges() {
+        // Status-label path: each maturity range should map to an operator
+        // friendly lifecycle description.
+        let config = AnomalyConfig {
+            data_dir: PathBuf::from("/tmp/nonexistent"),
+            ..Default::default()
+        };
+        let mut engine = AnomalyEngine::new(config);
+        engine.maturity = 0.0;
+        assert_eq!(engine.maturity_description(), "observation (no model)");
+        engine.maturity = 0.15;
+        assert_eq!(engine.maturity_description(), "learning (low confidence)");
+        engine.maturity = 0.35;
+        assert_eq!(
+            engine.maturity_description(),
+            "training (moderate confidence)"
+        );
+        engine.maturity = 0.7;
+        assert_eq!(engine.maturity_description(), "active (good confidence)");
+        engine.maturity = 0.95;
+        assert_eq!(engine.maturity_description(), "mature (high confidence)");
+    }
+
+    #[test]
+    fn observe_needs_full_window_before_scoring() {
+        // Windowing path: inference must stay disabled until the sliding
+        // window reaches WINDOW_SIZE samples.
+        let dir = tempfile::tempdir().expect("temporary directory should be created");
+        let mut engine = AnomalyEngine::new(AnomalyConfig {
+            data_dir: dir.path().to_path_buf(),
+            threshold: 0.0,
+            ..Default::default()
+        });
+        engine.net = Some(AutoencoderNet::new(
+            &[NUM_FEATURES, 16, 8, 16, NUM_FEATURES],
+            0.001,
+        ));
+        engine.maturity = 1.0;
+        engine.baseline_mse = -1.0;
+        engine.baseline_std = 1.0;
+
+        for _ in 0..(WINDOW_SIZE - 1) {
+            let ev = make_event("shell.command_exec", "203.0.113.10");
+            assert!(
+                engine.observe(&ev).is_none(),
+                "scores should not emit before window is full"
+            );
+        }
+    }
+
+    #[test]
+    fn observe_sets_latest_score_and_applies_source_cooldown() {
+        // Cooldown path: first high anomaly from a source should emit a score,
+        // immediate follow-up from the same source should be suppressed.
+        let dir = tempfile::tempdir().expect("temporary directory should be created");
+        let mut engine = AnomalyEngine::new(AnomalyConfig {
+            data_dir: dir.path().to_path_buf(),
+            threshold: 0.0,
+            ..Default::default()
+        });
+        engine.net = Some(AutoencoderNet::new(
+            &[NUM_FEATURES, 16, 8, 16, NUM_FEATURES],
+            0.001,
+        ));
+        engine.maturity = 1.0;
+        engine.baseline_mse = -1.0;
+        engine.baseline_std = 1.0;
+
+        for _ in 0..WINDOW_SIZE {
+            let ev = make_event("shell.command_exec", "198.51.100.5");
+            let _ = engine.observe(&ev);
+        }
+        assert!(
+            engine.latest_score() > 0.0,
+            "latest_score should be updated after first emitted anomaly"
+        );
+
+        let immediate = engine.observe(&make_event("shell.command_exec", "198.51.100.5"));
+        assert!(
+            immediate.is_none(),
+            "cooldown should suppress repeated immediate alerts from same source"
+        );
+    }
+
+    #[test]
+    fn load_blocked_ips_reads_decisions_and_plaintext_block_file() {
+        // Data-source path: blocked IP ingestion should combine decision logs
+        // and blocked-ips.txt fallback data.
+        let dir = tempfile::tempdir().expect("temporary directory should be created");
+        let decisions = dir.path().join("decisions-2026-04-17.jsonl");
+        std::fs::write(
+            &decisions,
+            r#"{"action_type":"block_ip","target_ip":"203.0.113.8"}
+{"action":"monitor","target_ip":"198.51.100.1"}
+{"action_type":"block_ip","target_ip":"198.51.100.9"}"#,
+        )
+        .expect("decisions fixture should be written");
+        std::fs::write(
+            dir.path().join("blocked-ips.txt"),
+            "# comment\n203.0.113.99\n",
+        )
+        .expect("blocked ips fixture should be written");
+
+        let blocked = load_blocked_ips(dir.path());
+        assert!(blocked.contains("203.0.113.8"));
+        assert!(blocked.contains("198.51.100.9"));
+        assert!(blocked.contains("203.0.113.99"));
+        assert!(!blocked.contains("198.51.100.1"));
+    }
+
+    #[test]
+    fn read_fp_report_detectors_respects_days_cutoff() {
+        // Retention path: files older than the requested days window should
+        // not contribute detector names.
+        let dir = tempfile::tempdir().expect("temporary directory should be created");
+        let old_date = (chrono::Utc::now() - chrono::Duration::days(30))
+            .format("%Y-%m-%d")
+            .to_string();
+        let recent_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        std::fs::write(
+            dir.path().join(format!("fp-reports-{old_date}.jsonl")),
+            r#"{"detector":"old_detector","incident_id":"old:1.1.1.1:ts"}"#,
+        )
+        .expect("old fp fixture should be written");
+        std::fs::write(
+            dir.path().join(format!("fp-reports-{recent_date}.jsonl")),
+            r#"{"detector":"recent_detector","incident_id":"recent:1.1.1.1:ts"}"#,
+        )
+        .expect("recent fp fixture should be written");
+
+        let detectors = read_fp_report_detectors(dir.path(), 7);
+        assert!(detectors.contains("recent_detector"));
+        assert!(!detectors.contains("old_detector"));
+    }
+
+    #[test]
+    fn read_fp_report_counts_skips_numeric_entity_placeholders() {
+        // Entity-extraction path: numeric middle fields (scores) should be
+        // ignored so FP counts only track actionable entities.
+        let dir = tempfile::tempdir().expect("temporary directory should be created");
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        std::fs::write(
+            dir.path().join(format!("fp-reports-{today}.jsonl")),
+            r#"{"detector":"neural_anomaly","incident_id":"neural_anomaly:85:ts"}
+{"detector":"ssh_bruteforce","incident_id":"ssh_bruteforce:203.0.113.4:ts"}"#,
+        )
+        .expect("fp count fixture should be written");
+
+        let counts = read_fp_report_counts(dir.path(), 7);
+        assert!(counts
+            .iter()
+            .any(|(d, e, c)| d == "ssh_bruteforce" && e == "203.0.113.4" && *c == 1));
+        assert!(
+            counts.iter().all(|(d, _, _)| d != "neural_anomaly"),
+            "numeric entity placeholders must be ignored"
+        );
     }
 }
 

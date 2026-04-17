@@ -2054,8 +2054,35 @@ mod tests {
 
     #[test]
     fn source_icon_picks_correct_icon() {
+        // Mapping path: source tags should collapse to the expected icon set
+        // so alerts keep a consistent visual cue in chat.
         assert_eq!(source_icon(&["ssh".to_string()]), "🔐");
         assert_eq!(source_icon(&["other".to_string()]), "📋");
+    }
+
+    #[test]
+    fn entity_summary_limits_to_three_entities_and_escapes_html() {
+        // Formatting path: entity summary must cap list length and HTML-escape
+        // values before rendering in Telegram parse_mode=HTML.
+        let inc = make_incident(
+            Severity::High,
+            vec![],
+            vec![
+                EntityRef::ip("198.51.100.3".to_string()),
+                EntityRef::user("alice<root>".to_string()),
+                EntityRef::path("/tmp/evil&file".to_string()),
+                EntityRef::service("ignored-after-three".to_string()),
+            ],
+        );
+        let summary = entity_summary(&inc);
+
+        assert!(summary.contains("IP: <code>198.51.100.3</code>"));
+        assert!(summary.contains("alice&lt;root&gt;"));
+        assert!(summary.contains("/tmp/evil&amp;file"));
+        assert!(
+            !summary.contains("ignored-after-three"),
+            "summary should only include first three entities"
+        );
     }
 
     #[test]
@@ -2075,8 +2102,33 @@ mod tests {
 
     #[test]
     fn parse_callback_unknown_returns_none() {
+        // Fallback path: unknown callback prefixes should not be accepted by
+        // the parser to avoid accidental command routing.
         assert!(parse_callback("unknown:foo", "user").is_none());
         assert!(parse_callback("", "user").is_none());
+    }
+
+    #[test]
+    fn parse_callback_handles_always_sensitivity_profile_and_enable() {
+        // Routing path: callback parser must preserve admin actions for
+        // "always", sensitivity toggles, profile toggles and capability enable.
+        let always =
+            parse_callback("always:incident:123", "Alice").expect("always callback should parse");
+        assert!(always.always);
+        assert!(always.approved);
+        assert_eq!(always.incident_id, "incident:123");
+
+        let sensitivity = parse_callback("sensitivity:quiet", "Alice")
+            .expect("sensitivity callback should parse");
+        assert_eq!(sensitivity.incident_id, "__sensitivity__:quiet");
+
+        let profile =
+            parse_callback("profile:simple", "Alice").expect("profile callback should parse");
+        assert_eq!(profile.incident_id, "__profile__:simple");
+
+        let enable =
+            parse_callback("enable:hardening", "Alice").expect("capability callback should parse");
+        assert_eq!(enable.incident_id, "enable:hardening");
     }
 
     #[test]
@@ -2132,7 +2184,9 @@ mod tests {
         let data = "quick:block:1.2.3.4";
         let operator = "Alice";
 
-        let ip = data.strip_prefix("quick:block:").unwrap();
+        let ip = data
+            .strip_prefix("quick:block:")
+            .expect("quick:block prefix should be present");
         assert_eq!(ip, "1.2.3.4");
 
         let result = ApprovalResult {
@@ -2192,7 +2246,9 @@ mod tests {
     fn test_hpot_callback_routing() {
         // Simulate the run_polling routing logic for hpot: callbacks
         let data = "hpot:honeypot:1.2.3.4";
-        let rest = data.strip_prefix("hpot:").unwrap();
+        let rest = data
+            .strip_prefix("hpot:")
+            .expect("hpot prefix should be present");
         let parts: Vec<&str> = rest.splitn(2, ':').collect();
         assert_eq!(parts.len(), 2);
         let action = parts[0];
@@ -2213,7 +2269,9 @@ mod tests {
 
         // ignore action should produce approved=false
         let data_ignore = "hpot:ignore:5.6.7.8";
-        let rest_i = data_ignore.strip_prefix("hpot:").unwrap();
+        let rest_i = data_ignore
+            .strip_prefix("hpot:")
+            .expect("hpot prefix should be present");
         let parts_i: Vec<&str> = rest_i.splitn(2, ':').collect();
         let action_i = parts_i[0];
         assert_eq!(action_i, "ignore");
@@ -2330,9 +2388,63 @@ mod tests {
 
     #[test]
     fn callback_data_preserves_utf8_boundaries() {
+        // UTF-8 safety path: callback truncation should never split a
+        // multibyte character and produce invalid UTF-8.
         let cb = callback_data("fp:", &"á".repeat(100));
         assert!(cb.len() <= TELEGRAM_MAX_CALLBACK_BYTES);
         assert!(std::str::from_utf8(cb.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn plain_action_translates_firewall_monitor_and_honeypot_paths() {
+        // Explanation path: technical action strings should be translated into
+        // operator-friendly phrases for Telegram messages.
+        let firewall = plain_action("ufw deny from 198.51.100.1");
+        assert!(firewall.contains("Drop 198.51.100.1"));
+
+        let monitor = plain_action("monitor with tcpdump 198.51.100.2");
+        assert!(monitor.contains("packet capture"));
+        assert!(monitor.contains("198.51.100.2"));
+
+        let honeypot = plain_action("route to honeypot");
+        assert!(honeypot.contains("honeypot"));
+    }
+
+    #[test]
+    fn friendly_detector_name_returns_known_label_or_fallback() {
+        // Label path: known detectors should map to human-readable digest
+        // labels while unknown strings pass through unchanged.
+        assert_eq!(
+            friendly_detector_name("ssh_bruteforce"),
+            "SSH brute force attempts blocked"
+        );
+        assert_eq!(
+            friendly_detector_name("unknown-detector"),
+            "unknown-detector"
+        );
+    }
+
+    #[test]
+    fn reputation_score_bar_and_country_flag_cover_edges() {
+        // Visual helper path: score bars and flags should format deterministic
+        // compact telemetry markers for reputation snippets.
+        assert_eq!(reputation_score_bar(0), "[░░░░░░░░]");
+        assert_eq!(reputation_score_bar(100), "[████████]");
+        assert_eq!(country_flag_emoji("us"), "🇺🇸");
+        assert_eq!(country_flag_emoji("U"), "");
+    }
+
+    #[test]
+    fn format_incident_message_with_dashboard_without_ip_omits_link() {
+        // Link-building path: dashboard links should only render when an IP
+        // entity exists, preventing broken subject links in notifications.
+        let inc = make_incident(
+            Severity::High,
+            vec!["network".to_string()],
+            vec![EntityRef::user("alice".to_string())],
+        );
+        let msg = format_incident_message(&inc, Some("http://127.0.0.1:8787"), GuardianMode::Watch);
+        assert!(!msg.contains("Investigate"));
     }
 
     #[test]
