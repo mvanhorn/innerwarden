@@ -1438,8 +1438,11 @@ fn detect_crypto_miner(
         .collect();
 
     for &pid_id in graph.nodes_of_type(NodeType::Process).iter() {
-        let comm = match graph.get_node(pid_id) {
-            Some(Node::Process { comm, .. }) => comm.clone(),
+        // Fetch comm + pid + uid in a single match so the incident evidence
+        // below can populate the Phase 014-D ingestion path (pid/uid) without
+        // needing a second get_node call and a separate defensive fallback.
+        let (comm, pid, uid) = match graph.get_node(pid_id) {
+            Some(Node::Process { comm, pid, uid, .. }) => (comm.clone(), *pid, *uid),
             _ => continue,
         };
 
@@ -1466,20 +1469,6 @@ fn detect_crypto_miner(
         if !state.check_and_set(&key, now, 1800) {
             continue;
         }
-
-        // Extract pid and uid from the graph node so the incident can be
-        // linked back to the originating process via the evidence-array
-        // ingestion path (ingestion.rs Phase 014-D). Without pid/uid the
-        // incident ends up with no TriggeredBy edge, so the Threats tab
-        // cannot pivot to it. The let-else is defensive: `pid_id` was
-        // produced from `nodes_of_type(NodeType::Process)` above, so the
-        // node is always Process — but if the graph was mutated between
-        // the two calls, skipping this iteration is safer than emitting
-        // a bogus incident with pid=0.
-        let Some(Node::Process { pid, uid, .. }) = graph.get_node(pid_id) else {
-            continue;
-        };
-        let (pid, uid) = (*pid, *uid);
 
         incidents.push(Incident {
             ts: now,
