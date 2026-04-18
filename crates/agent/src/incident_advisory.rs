@@ -97,3 +97,79 @@ fn check_advisory_match(
         .find(|e| e.command_hash == command_hash)
         .cloned()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn advisory_entry(id: &str, command: &str) -> AdvisoryEntry {
+        AdvisoryEntry {
+            advisory_id: id.to_string(),
+            command_hash: innerwarden_core::audit::sha256_hex(&command.to_lowercase()),
+            command_preview: command.to_string(),
+            risk_score: 87,
+            recommendation: "blocked".to_string(),
+            signals: vec!["dangerous-command".to_string()],
+            ts: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_advisory_violation_consumes_matching_advisory_entry() {
+        // Invariant: a matching advisory must be consumed exactly once after a tagged incident.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::tests::triage_test_state(dir.path());
+        let command = "rm -rf /tmp/suspicious";
+        let cache = Arc::new(RwLock::new(VecDeque::from([advisory_entry(
+            "adv-1", command,
+        )])));
+        let mut incident = crate::tests::test_incident("203.0.113.21");
+        incident.tags = vec!["execution".to_string()];
+        incident.evidence = serde_json::json!([{ "command": command }]);
+
+        handle_advisory_violation(&incident, &cache, &state).await;
+
+        let remaining = cache.read().expect("cache read lock");
+        assert!(remaining.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_advisory_violation_skips_when_trigger_tags_are_absent() {
+        // Invariant: incidents without `execution`/`suspicious` tags must not touch advisory cache.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::tests::triage_test_state(dir.path());
+        let cache = Arc::new(RwLock::new(VecDeque::from([advisory_entry(
+            "adv-2",
+            "cat /etc/shadow",
+        )])));
+        let mut incident = crate::tests::test_incident("203.0.113.22");
+        incident.tags = vec!["ssh".to_string()];
+        incident.evidence = serde_json::json!([{ "command": "cat /etc/shadow" }]);
+
+        handle_advisory_violation(&incident, &cache, &state).await;
+
+        let remaining = cache.read().expect("cache read lock");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].advisory_id, "adv-2");
+    }
+
+    #[tokio::test]
+    async fn handle_advisory_violation_keeps_cache_when_no_advisory_match_exists() {
+        // Invariant: upstream `None` matches must be a no-op and leave advisory entries intact.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::tests::triage_test_state(dir.path());
+        let cache = Arc::new(RwLock::new(VecDeque::from([advisory_entry(
+            "adv-3", "whoami",
+        )])));
+        let mut incident = crate::tests::test_incident("203.0.113.23");
+        incident.tags = vec!["execution".to_string()];
+        incident.evidence = serde_json::json!([{ "command": "ls -la /tmp" }]);
+
+        handle_advisory_violation(&incident, &cache, &state).await;
+
+        let remaining = cache.read().expect("cache read lock");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].advisory_id, "adv-3");
+    }
+}
