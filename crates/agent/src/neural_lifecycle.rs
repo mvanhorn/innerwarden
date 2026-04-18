@@ -337,9 +337,29 @@ impl AutoencoderNet {
         if data.len() < 24 || &data[0..4] != b"IWAE" {
             return None;
         }
-        // Skip header: magic(4) + version(4) + baseline_mse(4) + baseline_std(4) + samples(8)
-        let net_len = u32::from_le_bytes([data[24], data[25], data[26], data[27]]) as usize;
-        let net_json = &data[28..28 + net_len];
+        // Header: magic(4) + version(4) + baseline_mse(4) + baseline_std(4) + samples(8).
+        // Version 2 adds `BASELINE_PERCENTILES * 4` bytes of anchor table
+        // before the length-prefixed JSON weights. Older v1 files keep the
+        // original 24-byte header.
+        let version = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        let net_offset = match version {
+            v if v >= 2 => 24 + BASELINE_PERCENTILES * 4,
+            _ => 24,
+        };
+        if data.len() < net_offset + 4 {
+            return None;
+        }
+        let net_len = u32::from_le_bytes([
+            data[net_offset],
+            data[net_offset + 1],
+            data[net_offset + 2],
+            data[net_offset + 3],
+        ]) as usize;
+        let start = net_offset + 4;
+        if data.len() < start + net_len {
+            return None;
+        }
+        let net_json = &data[start..start + net_len];
 
         // Parse the JSON-serialized network
         let net: serde_json::Value = serde_json::from_slice(net_json).ok()?;
@@ -483,6 +503,216 @@ pub struct AnomalyConfig {
     pub training_epochs: u64,
     /// How often to train (cron-style, e.g., "0 3 * * *")
     pub training_schedule: String,
+    /// Fraction of training windows held out for baseline computation
+    /// (range 0.0..=0.5). Computing `baseline_mse` / `baseline_std` on the
+    /// same windows the autoencoder memorised produces a tiny, saturated
+    /// baseline — every live window then sigmoids to ~1.0. A ~20% holdout
+    /// gives a realistic variance estimate. Set to 0.0 to fall back to the
+    /// legacy single-set baseline (not recommended; retained for
+    /// small-dataset scenarios where splitting the training set would drop
+    /// it below `MIN_TRAIN_WINDOWS`).
+    pub training_holdout_fraction: f32,
+}
+
+/// Minimum number of windows required for training after the holdout split.
+/// The older in-place baseline enforced `all_kinds.len() >= 100` — we keep
+/// that floor on the training portion.
+const MIN_TRAIN_WINDOWS: usize = 100;
+
+/// Deterministic train/holdout split used by `train_nightly`. Every Nth
+/// index goes into the holdout bucket so the split is reproducible across
+/// runs (no RNG dependency, no test flake). `N` is derived from the
+/// requested fraction: 0.2 → every 5th window, 0.1 → every 10th, etc.
+#[derive(Debug, Clone)]
+pub(crate) struct TrainTestSplit {
+    train: Vec<usize>,
+    holdout: Vec<usize>,
+}
+
+impl TrainTestSplit {
+    /// Build a split covering `[0, total)`. `fraction` is clamped to
+    /// `0.0..=0.5` (holding out more than half the data would starve the
+    /// trainer). `total == 0` is legal and yields two empty vectors.
+    pub(crate) fn from_fraction(total: usize, fraction: f32) -> Self {
+        if total == 0 {
+            return Self {
+                train: Vec::new(),
+                holdout: Vec::new(),
+            };
+        }
+        let clamped = fraction.clamp(0.0, 0.5);
+        if clamped <= f32::EPSILON {
+            return Self {
+                train: (0..total).collect(),
+                holdout: Vec::new(),
+            };
+        }
+        // `stride = round(1 / fraction)` gives the expected every-Nth
+        // cadence; clamped to [2, total] so the holdout always has at
+        // least one element when the fraction is non-zero + data fits.
+        let stride = ((1.0 / clamped).round() as usize).clamp(2, total);
+        let mut train = Vec::with_capacity(total - total / stride);
+        let mut holdout = Vec::with_capacity(total / stride);
+        for i in 0..total {
+            if i % stride == stride - 1 {
+                holdout.push(i);
+            } else {
+                train.push(i);
+            }
+        }
+        Self { train, holdout }
+    }
+
+    pub(crate) fn indices(&self) -> (Vec<usize>, Vec<usize>) {
+        (self.train.clone(), self.holdout.clone())
+    }
+}
+
+/// Mean reconstruction error over a selection of feature windows.
+fn mean_reconstruction_error(net: &AutoencoderNet, features: &[Vec<f32>], idx: &[usize]) -> f32 {
+    if idx.is_empty() {
+        return 0.0;
+    }
+    let sum: f32 = idx
+        .iter()
+        .map(|&i| net.reconstruction_error(&features[i]))
+        .sum();
+    sum / idx.len() as f32
+}
+
+/// Number of evenly-spaced percentile anchors retained from the baseline
+/// distribution. 101 keeps storage at 404 bytes (101 × f32) and gives
+/// 1%-granularity scoring — enough to separate normal / elevated /
+/// anomaly without the full histogram.
+pub(crate) const BASELINE_PERCENTILES: usize = 101;
+
+/// Compress a sorted-ascending `errors` vector into `BASELINE_PERCENTILES`
+/// anchors. `anchor[k]` is the baseline MSE at the `k/(BASELINE_PERCENTILES-1)`
+/// quantile. Empty input yields `vec![0.0; BASELINE_PERCENTILES]`.
+fn compute_percentile_anchors(mut errors: Vec<f32>) -> Vec<f32> {
+    if errors.is_empty() {
+        return vec![0.0; BASELINE_PERCENTILES];
+    }
+    errors.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let last = errors.len() - 1;
+    (0..BASELINE_PERCENTILES)
+        .map(|k| {
+            let pos = (k as f64 * last as f64 / (BASELINE_PERCENTILES - 1) as f64).round();
+            errors[pos as usize]
+        })
+        .collect()
+}
+
+/// Compute `(baseline_mse, baseline_std, percentile_anchors)` over a
+/// selection of feature windows. Mean + std keep legacy telemetry values;
+/// the anchors drive the percentile-based score that replaces the
+/// z-score + sigmoid path (which saturated to 1.0 on production's
+/// homogeneous event distribution).
+fn compute_baseline(
+    net: &AutoencoderNet,
+    features: &[Vec<f32>],
+    idx: &[usize],
+) -> (f32, f32, Vec<f32>) {
+    if idx.is_empty() {
+        return (0.0, 0.0, vec![0.0; BASELINE_PERCENTILES]);
+    }
+    let errors: Vec<f32> = idx
+        .iter()
+        .map(|&i| net.reconstruction_error(&features[i]))
+        .collect();
+    let n = errors.len() as f32;
+    let mean = errors.iter().sum::<f32>() / n;
+    let variance = errors.iter().map(|e| (e - mean).powi(2)).sum::<f32>() / n;
+    let anchors = compute_percentile_anchors(errors);
+    (mean, variance.sqrt(), anchors)
+}
+
+/// Model file format constants. Version 1 is the legacy layout (header
+/// has no percentile table); version 2 adds `BASELINE_PERCENTILES × f32`
+/// after the 24-byte header, followed by the usual JSON weights blob.
+const MODEL_MAGIC: &[u8; 4] = b"IWAE";
+const MODEL_VERSION_V2: u32 = 2;
+const MODEL_HEADER_LEN: usize = 24;
+type ParsedModel = (
+    Option<AutoencoderNet>,
+    f32,      // baseline_mse
+    f32,      // baseline_std
+    Vec<f32>, // percentile anchors
+    f32,      // maturity
+    u32,      // training cycles
+);
+
+/// Parse a saved `anomaly-model.bin` into engine fields. Accepts both the
+/// pre-percentile v1 layout (where we synthesise a flat anchor table —
+/// forces the new inference path to fall back to z-score until the next
+/// training cycle) and the v2 layout that embeds anchors after the
+/// header. Returns `None` when the file is truncated / malformed; the
+/// caller constructs a fresh engine.
+fn parse_model_file(data: &[u8]) -> Option<ParsedModel> {
+    if data.len() < MODEL_HEADER_LEN || &data[..4] != MODEL_MAGIC {
+        return None;
+    }
+    let version = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+    let baseline_mse = f32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+    let baseline_std = f32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+    let samples = u64::from_le_bytes([
+        data[16], data[17], data[18], data[19], data[20], data[21], data[22], data[23],
+    ]);
+    let maturity = (samples as f32 / 500_000.0).min(1.0);
+    let cycles = (samples / 100_000) as u32;
+
+    let anchors = if version == MODEL_VERSION_V2 {
+        let expected = MODEL_HEADER_LEN + BASELINE_PERCENTILES * 4;
+        if data.len() < expected {
+            return None;
+        }
+        let mut v = Vec::with_capacity(BASELINE_PERCENTILES);
+        for k in 0..BASELINE_PERCENTILES {
+            let off = MODEL_HEADER_LEN + k * 4;
+            v.push(f32::from_le_bytes([
+                data[off],
+                data[off + 1],
+                data[off + 2],
+                data[off + 3],
+            ]));
+        }
+        v
+    } else {
+        // v1 layout: no anchors — seed with zeros so `percentile_score`
+        // returns `None` and `observe()` falls back to z-score. Next
+        // training cycle will overwrite with real data.
+        vec![0.0; BASELINE_PERCENTILES]
+    };
+
+    // `AutoencoderNet::load` reads the full file (including IWAE header)
+    // and skips past the anchor table itself based on the version byte.
+    let net = AutoencoderNet::load(data);
+    if net.is_some() {
+        info!(
+            "anomaly: loaded model ({} bytes, version {}, baseline MSE {:.6}, maturity {:.2})",
+            data.len(),
+            version,
+            baseline_mse,
+            maturity
+        );
+    }
+    Some((net, baseline_mse, baseline_std, anchors, maturity, cycles))
+}
+
+/// Rank a live reconstruction error against the baseline percentile
+/// anchors. Returns `Some(0.0..=1.0)`: 0 = better than everything,
+/// 1 = worse than everything. Degenerate tables (empty or all-zero)
+/// return `None` so the caller can fall back to the legacy z-score
+/// path during the transition period.
+pub(crate) fn percentile_score(mse: f32, anchors: &[f32]) -> Option<f32> {
+    if anchors.len() < 2 {
+        return None;
+    }
+    if !anchors.iter().any(|&x| x > 0.0) {
+        return None;
+    }
+    let below = anchors.iter().filter(|&&a| a <= mse).count();
+    Some(below as f32 / anchors.len() as f32)
 }
 
 impl Default for AnomalyConfig {
@@ -495,6 +725,7 @@ impl Default for AnomalyConfig {
             training_retention_days: 7,
             training_epochs: 50,
             training_schedule: "0 3 * * *".to_string(),
+            training_holdout_fraction: 0.2,
         }
     }
 }
@@ -506,8 +737,14 @@ pub struct AnomalyEngine {
     window: VecDeque<Option<usize>>,
     /// Baseline MSE from training (what "normal" looks like).
     baseline_mse: f32,
-    /// Baseline standard deviation.
+    /// Baseline standard deviation. Retained for telemetry + the legacy
+    /// z-score fallback path; the live score now comes from the
+    /// percentile anchors below.
     baseline_std: f32,
+    /// Sorted-ascending reconstruction-error anchors over the baseline
+    /// windows (length `BASELINE_PERCENTILES`). Populated by training and
+    /// consumed by `percentile_score` at inference time.
+    baseline_percentile_anchors: Vec<f32>,
     /// Maturity: 0.0 (just installed) → 1.0 (fully trained).
     /// Increases with each successful training cycle.
     pub maturity: f32,
@@ -528,49 +765,23 @@ impl AnomalyEngine {
     /// Create a new anomaly engine, attempting to load a saved model.
     pub fn new(config: AnomalyConfig) -> Self {
         let model_path = config.data_dir.join("anomaly-model.bin");
-        let (net, baseline_mse, baseline_std, maturity, cycles) = if let Ok(data) =
-            std::fs::read(&model_path)
-        {
-            let net = AutoencoderNet::load(&data);
-            let mse = if data.len() >= 12 {
-                f32::from_le_bytes([data[8], data[9], data[10], data[11]])
+        let (net, baseline_mse, baseline_std, anchors, maturity, cycles) =
+            if let Ok(data) = std::fs::read(&model_path) {
+                parse_model_file(&data).unwrap_or_else(|| {
+                    info!("anomaly: existing model rejected by loader, starting fresh");
+                    (None, 0.0, 1.0, vec![0.0; BASELINE_PERCENTILES], 0.0, 0)
+                })
             } else {
-                0.0
+                info!("anomaly: no saved model found, starting fresh (observation mode)");
+                (None, 0.0, 1.0, vec![0.0; BASELINE_PERCENTILES], 0.0, 0)
             };
-            let std = if data.len() >= 16 {
-                f32::from_le_bytes([data[12], data[13], data[14], data[15]])
-            } else {
-                1.0
-            };
-            let samples = if data.len() >= 24 {
-                u64::from_le_bytes([
-                    data[16], data[17], data[18], data[19], data[20], data[21], data[22], data[23],
-                ])
-            } else {
-                0
-            };
-            // Estimate maturity from samples seen
-            let mat = (samples as f32 / 500_000.0).min(1.0);
-            let cyc = (samples / 100_000) as u32;
-            if net.is_some() {
-                info!(
-                    "anomaly: loaded model ({} bytes, baseline MSE {:.6}, maturity {:.2})",
-                    data.len(),
-                    mse,
-                    mat
-                );
-            }
-            (net, mse, std, mat, cyc)
-        } else {
-            info!("anomaly: no saved model found, starting fresh (observation mode)");
-            (None, 0.0, 1.0, 0.0, 0)
-        };
 
         Self {
             net,
             window: VecDeque::with_capacity(WINDOW_SIZE),
             baseline_mse,
             baseline_std,
+            baseline_percentile_anchors: anchors,
             maturity,
             training_cycles: cycles,
             config,
@@ -618,17 +829,20 @@ impl AnomalyEngine {
         }
         let mse = net.reconstruction_error(&features);
 
-        // Normalize to 0-1 via z-score + sigmoid
-        let z = if self.baseline_std > 0.0 {
-            (mse - self.baseline_mse) / self.baseline_std
-        } else {
-            if mse > self.baseline_mse {
+        // Primary path: percentile score against the baseline distribution.
+        // Returns `None` when the baseline is empty/degenerate (v1 model
+        // files, or very small datasets) — fall back to the legacy
+        // z-score + sigmoid so the engine keeps producing signal.
+        let score = percentile_score(mse, &self.baseline_percentile_anchors).unwrap_or_else(|| {
+            let z = if self.baseline_std > 0.0 {
+                (mse - self.baseline_mse) / self.baseline_std
+            } else if mse > self.baseline_mse {
                 3.0
             } else {
                 -3.0
-            }
-        };
-        let score = 1.0 / (1.0 + (-z).exp());
+            };
+            1.0 / (1.0 + (-z).exp())
+        });
         let weighted = score * self.maturity * 0.3; // max contribution = 0.3
 
         debug!(
@@ -896,6 +1110,26 @@ impl AnomalyEngine {
             HashSet::new()
         };
 
+        // Split into train/holdout BEFORE feature extraction so the holdout
+        // baseline reflects windows the network never saw during
+        // backpropagation. See `TrainTestSplit` comments for the rationale.
+        let split =
+            TrainTestSplit::from_fraction(all_kinds.len(), self.config.training_holdout_fraction);
+        let (train_idx, holdout_idx) = split.indices();
+        info!(
+            train_windows = train_idx.len(),
+            holdout_windows = holdout_idx.len(),
+            "anomaly: split windows train/holdout"
+        );
+        if train_idx.len() < MIN_TRAIN_WINDOWS {
+            warn!(
+                "anomaly: training set below floor after split ({} < {})",
+                train_idx.len(),
+                MIN_TRAIN_WINDOWS
+            );
+            return Err("insufficient data".to_string());
+        }
+
         // Extract features, reducing weight for windows matching FP detector patterns
         let features: Vec<Vec<f32>> = all_kinds
             .iter()
@@ -918,10 +1152,11 @@ impl AnomalyEngine {
         // Create or reinitialize network
         let mut net = AutoencoderNet::new(&[NUM_FEATURES, 16, 8, 16, NUM_FEATURES], 0.001);
 
-        // Train
+        // Train ONLY on the training partition so the holdout stays
+        // representative of "unseen normal" windows at baseline time.
         for epoch in 1..=self.config.training_epochs {
-            for f in &features {
-                net.train_reconstruction(f);
+            for &i in &train_idx {
+                net.train_reconstruction(&features[i]);
             }
 
             if start.elapsed().as_secs() > self.config.training_timeout_secs {
@@ -930,34 +1165,48 @@ impl AnomalyEngine {
             }
 
             if epoch % 10 == 0 {
-                let avg_mse: f32 = features
+                let avg_mse: f32 = train_idx
                     .iter()
-                    .map(|f| net.reconstruction_error(f))
+                    .map(|&i| net.reconstruction_error(&features[i]))
                     .sum::<f32>()
-                    / features.len() as f32;
+                    / train_idx.len() as f32;
                 info!(
-                    "anomaly: epoch {}/{} MSE {:.6}",
+                    "anomaly: epoch {}/{} train-MSE {:.6}",
                     epoch, self.config.training_epochs, avg_mse
                 );
             }
         }
 
-        // Compute baseline
-        let errors: Vec<f32> = features
-            .iter()
-            .map(|f| net.reconstruction_error(f))
-            .collect();
-        let n = errors.len() as f32;
-        let baseline_mse = errors.iter().sum::<f32>() / n;
-        let variance = errors
-            .iter()
-            .map(|e| (e - baseline_mse).powi(2))
-            .sum::<f32>()
-            / n;
-        let baseline_std = variance.sqrt();
+        // Compute baseline on the held-out windows. This is the core of the
+        // scoring fix: the autoencoder memorised the training set (MSE
+        // collapses toward 0), so computing baseline there produces a tiny
+        // std that saturates sigmoid(z) to 1.0 on live traffic. Held-out
+        // MSE is an order of magnitude larger + has realistic variance.
+        //
+        // Fallback: when holdout is empty (fraction == 0 or dataset too
+        // small) compute baseline on the training set — preserves legacy
+        // behaviour, no silent panic.
+        let baseline_idx: &[usize] = if holdout_idx.is_empty() {
+            info!("anomaly: holdout empty — falling back to train-set baseline");
+            &train_idx
+        } else {
+            &holdout_idx
+        };
+        let (baseline_mse, baseline_std, anchors) = compute_baseline(&net, &features, baseline_idx);
+        let train_mse = mean_reconstruction_error(&net, &features, &train_idx);
+        info!(
+            "anomaly: baseline from holdout (train MSE {:.6}, holdout MSE {:.6} ± {:.6}, p50 {:.6}, p95 {:.6}, p99 {:.6})",
+            train_mse,
+            baseline_mse,
+            baseline_std,
+            anchors.get(50).copied().unwrap_or(0.0),
+            anchors.get(95).copied().unwrap_or(0.0),
+            anchors.get(99).copied().unwrap_or(0.0),
+        );
 
         self.baseline_mse = baseline_mse;
         self.baseline_std = baseline_std;
+        self.baseline_percentile_anchors = anchors;
         self.net = Some(net);
         self.training_cycles += 1;
 
@@ -981,15 +1230,29 @@ impl AnomalyEngine {
             let _ = std::fs::rename(&model_path, &backup_path);
         }
 
-        // Serialize (simple format: IWAE header + JSON weights)
+        // Serialize as the v2 format: IWAE header + percentile anchor
+        // table + length-prefixed JSON weights. Readers (both `new()` and
+        // the AutoencoderNet loader) branch on the version byte.
         if let Some(ref net) = self.net {
             let mut data = Vec::new();
-            data.extend_from_slice(b"IWAE");
-            data.extend_from_slice(&1u32.to_le_bytes());
+            data.extend_from_slice(MODEL_MAGIC);
+            data.extend_from_slice(&MODEL_VERSION_V2.to_le_bytes());
             data.extend_from_slice(&self.baseline_mse.to_le_bytes());
             data.extend_from_slice(&self.baseline_std.to_le_bytes());
             let total_samples = total_events;
             data.extend_from_slice(&total_samples.to_le_bytes());
+
+            // Percentile anchor table — pad with zeros if for any reason
+            // the trainer produced a shorter-than-expected vector (should
+            // not happen, but defence-in-depth).
+            for k in 0..BASELINE_PERCENTILES {
+                let v = self
+                    .baseline_percentile_anchors
+                    .get(k)
+                    .copied()
+                    .unwrap_or(0.0);
+                data.extend_from_slice(&v.to_le_bytes());
+            }
 
             // Serialize weights as JSON
             let weights: Vec<Vec<Vec<f32>>> =
@@ -1303,6 +1566,163 @@ mod tests {
     use super::*;
     use innerwarden_core::event::Severity;
 
+    #[test]
+    fn train_test_split_happy_path_every_fifth() {
+        // 20% fraction on 10 items: stride=5 → indices 4, 9 go to holdout,
+        // 0..3 and 5..8 go to train. Deterministic, no RNG.
+        let s = TrainTestSplit::from_fraction(10, 0.2);
+        let (train, holdout) = s.indices();
+        assert_eq!(holdout, vec![4, 9]);
+        assert_eq!(train, vec![0, 1, 2, 3, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn train_test_split_empty_input() {
+        let s = TrainTestSplit::from_fraction(0, 0.2);
+        assert!(s.indices().0.is_empty());
+        assert!(s.indices().1.is_empty());
+    }
+
+    #[test]
+    fn train_test_split_zero_fraction_yields_everything_to_train() {
+        // Legacy fallback: fraction=0 means the caller wants the pre-fix
+        // single-set baseline. Must not return an empty train set.
+        let s = TrainTestSplit::from_fraction(10, 0.0);
+        let (train, holdout) = s.indices();
+        assert_eq!(train.len(), 10);
+        assert!(holdout.is_empty());
+    }
+
+    #[test]
+    fn train_test_split_fraction_clamped_to_half() {
+        // Holdout > 50% would starve the trainer; clamp silently so
+        // operators don't configure themselves into "no training" by
+        // setting an absurd fraction.
+        let s = TrainTestSplit::from_fraction(10, 0.9);
+        let (train, holdout) = s.indices();
+        assert!(
+            train.len() >= 5,
+            "clamp must preserve at least half for training"
+        );
+        assert!(!holdout.is_empty());
+    }
+
+    #[test]
+    fn compute_percentile_anchors_sorted_and_cover_extremes() {
+        // Shuffled input — anchors must still come out monotone
+        // non-decreasing, starting at min and ending at max.
+        let anchors = compute_percentile_anchors(vec![3.0, 1.0, 2.0, 5.0, 4.0]);
+        assert_eq!(anchors.len(), BASELINE_PERCENTILES);
+        assert_eq!(anchors.first().copied(), Some(1.0));
+        assert_eq!(anchors.last().copied(), Some(5.0));
+        for w in anchors.windows(2) {
+            assert!(w[0] <= w[1], "anchors must be monotone non-decreasing");
+        }
+    }
+
+    #[test]
+    fn compute_percentile_anchors_empty_input_is_all_zero() {
+        let anchors = compute_percentile_anchors(vec![]);
+        assert_eq!(anchors.len(), BASELINE_PERCENTILES);
+        assert!(anchors.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn percentile_score_matches_expected_quantiles() {
+        // Linear ramp [0..100] → anchor[k] = k as f32. A live MSE of 50
+        // lies at the 51st anchor (51 of 101 <= 50) → score ≈ 0.505.
+        let anchors: Vec<f32> = (0..=100).map(|k| k as f32).collect();
+        let s = percentile_score(50.0, &anchors).expect("ramp anchors should score");
+        assert!(
+            (s - 0.505).abs() < 1e-4,
+            "expected ≈0.505 at median, got {s}"
+        );
+        let s_low = percentile_score(-1.0, &anchors).expect("score below min");
+        assert_eq!(s_low, 0.0);
+        let s_high = percentile_score(200.0, &anchors).expect("score above max");
+        assert_eq!(s_high, 1.0);
+    }
+
+    #[test]
+    fn percentile_score_returns_none_on_degenerate_table() {
+        // `None` is the trigger for the caller to fall back to z-score.
+        let all_zero = vec![0.0f32; BASELINE_PERCENTILES];
+        assert!(percentile_score(1.0, &all_zero).is_none());
+        let too_short = vec![1.0f32];
+        assert!(percentile_score(1.0, &too_short).is_none());
+    }
+
+    #[test]
+    fn parse_model_file_rejects_garbage() {
+        assert!(parse_model_file(&[]).is_none());
+        assert!(parse_model_file(b"NOT_AN_IWAE_HEADER_AT_ALL").is_none());
+    }
+
+    #[test]
+    fn parse_model_file_roundtrips_v2_anchors() {
+        // Minimal v2 synthetic payload — real training roundtrip is
+        // exercised by the full `train_nightly_with_store` integration
+        // test elsewhere; this one just pins the header format so a
+        // future bump forces the spec to update with it.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MODEL_MAGIC);
+        buf.extend_from_slice(&MODEL_VERSION_V2.to_le_bytes());
+        buf.extend_from_slice(&0.42f32.to_le_bytes()); // baseline_mse
+        buf.extend_from_slice(&0.37f32.to_le_bytes()); // baseline_std
+        buf.extend_from_slice(&1_000_000u64.to_le_bytes()); // samples
+        for k in 0..BASELINE_PERCENTILES {
+            buf.extend_from_slice(&(k as f32).to_le_bytes());
+        }
+        // Length-prefixed malformed JSON — loader returns None for net.
+        let payload = b"not-json";
+        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        buf.extend_from_slice(payload);
+
+        let parsed = parse_model_file(&buf).expect("header + anchors must parse");
+        assert_eq!(parsed.1, 0.42); // baseline_mse
+        assert_eq!(parsed.2, 0.37); // baseline_std
+        assert_eq!(parsed.3.len(), BASELINE_PERCENTILES);
+        assert_eq!(parsed.3[50], 50.0);
+        assert!(parsed.5 >= 1, "cycles derived from samples count");
+        // Malformed JSON → net = None; this is tolerated so a corrupted
+        // weights blob doesn't discard the baseline anchors.
+        assert!(parsed.0.is_none());
+    }
+
+    #[test]
+    fn parse_model_file_handles_v1_layout_without_anchors() {
+        // v1 header is 24 bytes + length-prefixed JSON. The loader must
+        // read it without touching the anchor region + return an
+        // all-zero anchor table so `percentile_score` falls back to
+        // z-score until the next training cycle.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MODEL_MAGIC);
+        buf.extend_from_slice(&1u32.to_le_bytes()); // version 1
+        buf.extend_from_slice(&0.1f32.to_le_bytes());
+        buf.extend_from_slice(&0.2f32.to_le_bytes());
+        buf.extend_from_slice(&500_000u64.to_le_bytes());
+        let payload = b"{}";
+        buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        buf.extend_from_slice(payload);
+        let parsed = parse_model_file(&buf).expect("v1 header must still parse");
+        assert!(parsed.3.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn mean_reconstruction_error_empty_is_zero() {
+        let net = AutoencoderNet::new(&[NUM_FEATURES, 4, NUM_FEATURES], 0.01);
+        assert_eq!(mean_reconstruction_error(&net, &[], &[]), 0.0);
+    }
+
+    #[test]
+    fn compute_baseline_empty_returns_zero_anchors() {
+        let net = AutoencoderNet::new(&[NUM_FEATURES, 4, NUM_FEATURES], 0.01);
+        let (mse, std, anchors) = compute_baseline(&net, &[], &[]);
+        assert_eq!(mse, 0.0);
+        assert_eq!(std, 0.0);
+        assert!(anchors.iter().all(|&v| v == 0.0));
+    }
+
     fn make_event(kind: &str, src_ip: &str) -> Event {
         Event {
             ts: chrono::Utc::now(),
@@ -1612,7 +2032,9 @@ mod tests {
             "tcp_stream.ssh",
         ];
         let mut events = Vec::new();
-        for i in 0..600 {
+        // 1000 events → ~197 sliding windows. After the 20% holdout split
+        // the train set still clears `MIN_TRAIN_WINDOWS=100` comfortably.
+        for i in 0..1000 {
             let kind = kinds[i % kinds.len()];
             events.push(Event {
                 ts: Utc::now(),
@@ -1664,9 +2086,9 @@ mod tests {
         let today = Utc::now().format("%Y-%m-%d");
         let jsonl_path = dir.path().join(format!("events-{today}.jsonl"));
         let mut contents = String::new();
-        // 600 events → ~116 sliding windows at WINDOW_SIZE=20 / stride=5, just
-        // above the 100-window floor enforced by train_nightly.
-        for i in 0..600 {
+        // 1000 events → ~197 sliding windows. After the 20% holdout split
+        // the train set still clears `MIN_TRAIN_WINDOWS=100` comfortably.
+        for i in 0..1000 {
             let kind = if i % 2 == 0 {
                 "file.read_access"
             } else {

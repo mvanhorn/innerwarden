@@ -2178,7 +2178,9 @@ mod tests {
             "tcp_stream.ssh",
         ];
         let mut events = Vec::new();
-        for i in 0..600 {
+        // 1000 events keeps the training slice above MIN_TRAIN_WINDOWS after
+        // the 20% holdout split introduced in the percentile-scoring fix.
+        for i in 0..1000 {
             let kind = kinds[i % kinds.len()];
             events.push(Event {
                 ts: Utc::now(),
