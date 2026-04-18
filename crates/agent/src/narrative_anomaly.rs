@@ -77,13 +77,7 @@ pub(crate) fn process_anomalies(
                 severity: innerwarden_core::event::Severity::Medium,
                 title: "AI + Statistical convergence — both models flagged unusual activity"
                     .to_string(),
-                summary: format!(
-                    "Two independent detection systems agreed within {gap} seconds: \
-                     the statistical baseline model and the neural autoencoder ({cycles} days \
-                     of training) both flagged anomalous behavior. When two different \
-                     approaches converge, confidence is high that something genuinely \
-                     unusual is happening on your server."
-                ),
+                summary: format_correlated_anomaly_summary(gap, cycles),
                 evidence: serde_json::json!({
                     "baseline_anomaly_ts": baseline_ts.to_rfc3339(),
                     "autoencoder_anomaly_ts": autoencoder_ts.to_rfc3339(),
@@ -111,6 +105,16 @@ pub(crate) fn process_anomalies(
             state.last_autoencoder_anomaly_ts = None;
         }
     }
+}
+
+fn format_correlated_anomaly_summary(gap: u64, cycles: u32) -> String {
+    format!(
+        "Two independent detection systems agreed within {gap} seconds: \
+         the statistical baseline model and the neural autoencoder ({cycles} days \
+         of training) both flagged anomalous behavior. When two different \
+         approaches converge, confidence is high that something genuinely \
+         unusual is happening on your server."
+    )
 }
 
 fn anomaly_gap_seconds(
@@ -181,5 +185,43 @@ mod tests {
         let id = correlated_anomaly_incident_id(now);
         assert!(id.starts_with("correlated_anomaly:baseline_neural:"));
         assert!(id.ends_with("2026-04-17T09:30Z"));
+    }
+
+    #[test]
+    fn test_format_correlated_anomaly_summary() {
+        let summary = format_correlated_anomaly_summary(45, 14);
+        assert!(summary.contains("agreed within 45 seconds"));
+        assert!(summary.contains("autoencoder (14 days of training)"));
+        assert!(summary.contains("When two different approaches converge"));
+    }
+
+    #[test]
+    fn test_format_correlated_anomaly_summary_edge_cases() {
+        let zero_summary = format_correlated_anomaly_summary(0, 0);
+        assert!(zero_summary.contains("agreed within 0 seconds"));
+        assert!(zero_summary.contains("autoencoder (0 days of training)"));
+
+        let large_summary = format_correlated_anomaly_summary(3600, 365);
+        assert!(large_summary.contains("agreed within 3600 seconds"));
+        assert!(large_summary.contains("autoencoder (365 days of training)"));
+    }
+
+    #[test]
+    fn test_anomalies_converged_within_window_boundary() {
+        let now = Utc::now();
+        // Exact boundary
+        assert!(anomalies_converged_within_window(
+            now,
+            now - Duration::seconds(60),
+            60
+        ));
+        // One second outside
+        assert!(!anomalies_converged_within_window(
+            now,
+            now - Duration::seconds(61),
+            60
+        ));
+        // Same timestamp
+        assert!(anomalies_converged_within_window(now, now, 60));
     }
 }
