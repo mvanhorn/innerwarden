@@ -336,3 +336,272 @@ pub(crate) fn notify_telegram(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    fn rl_config(
+        bucket_max_tokens: f64,
+        bucket_refill_rate: f64,
+        window_secs: i64,
+        window_max_rate: u64,
+    ) -> RateLimiterConfig {
+        RateLimiterConfig {
+            bucket_max_tokens,
+            bucket_refill_rate,
+            window_secs,
+            sub_window_count: 1,
+            window_max_rate,
+            ema_alpha: 0.3,
+            ema_alpha_var: 0.1,
+            ema_threshold_multiplier: 3.0,
+            // Keep EMA effectively out of the way for deterministic matrix tests.
+            ema_min_samples: 10_000,
+        }
+    }
+
+    fn make_shield_state(config: RateLimiterConfig) -> (tempfile::TempDir, ShieldState) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut shield = ShieldState::new(dir.path(), "/sys/fs/bpf/innerwarden", true);
+        shield.rate_limiter.reset_config(config);
+        (dir, shield)
+    }
+
+    fn network_event(ip: &str, kind: &str, bytes: u64) -> innerwarden_core::event::Event {
+        innerwarden_core::event::Event {
+            ts: chrono::Utc::now(),
+            host: "unit-host".to_string(),
+            source: "unit-test".to_string(),
+            kind: kind.to_string(),
+            severity: innerwarden_core::event::Severity::Info,
+            summary: format!("test event {kind}"),
+            details: serde_json::json!({
+                "src_ip": ip,
+                "bytes": bytes,
+                "window_size": 1024,
+                "ttl": 64
+            }),
+            tags: vec![],
+            entities: vec![],
+        }
+    }
+
+    #[test]
+    fn new_restores_persisted_escalation_state() {
+        // Invariant: shield initialization must restore previously persisted escalation state.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::new(dir.path());
+        let entered_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let persisted = innerwarden_shield::store::ShieldState {
+            escalation_state: EscalationState::Elevated,
+            state_entered_at: entered_at.to_rfc3339(),
+            blocked_ips: vec![],
+            last_saved: chrono::Utc::now().to_rfc3339(),
+        };
+        store.save_state(&persisted).expect("save shield state");
+        store.save_ddos_history(&[]).expect("save ddos history");
+
+        let shield = ShieldState::new(dir.path(), "/sys/fs/bpf/innerwarden", true);
+        assert_eq!(shield.escalation.state(), EscalationState::Elevated);
+        assert_eq!(shield.tick_counter, 0);
+    }
+
+    #[test]
+    fn process_events_under_limit_allows_without_block_mutation() {
+        // Invariant: traffic under both limiters must be allowed and keep block state untouched.
+        let (_dir, mut shield) = make_shield_state(rl_config(10.0, 0.0, 10, 10));
+        let events = vec![network_event("198.51.100.10", "network.tcp", 128)];
+
+        let (drops, incidents, blocked_ips) = process_events(&mut shield, &events, &HashMap::new());
+
+        assert_eq!(drops, 0);
+        assert!(incidents.is_empty());
+        assert!(blocked_ips.is_empty());
+        assert_eq!(shield.rate_limiter.get_metrics().total_allowed, 1);
+        assert_eq!(shield.tick_counter, 1);
+    }
+
+    #[test]
+    fn process_events_at_limit_keeps_boundary_packet_allowed() {
+        // Invariant: packets that land exactly on configured limits should still be allowed.
+        let (_dir, mut shield) = make_shield_state(rl_config(2.0, 0.0, 10, 2));
+        let events = vec![
+            network_event("198.51.100.11", "network.tcp", 64),
+            network_event("198.51.100.11", "network.tcp", 64),
+        ];
+
+        let (drops, incidents, blocked_ips) = process_events(&mut shield, &events, &HashMap::new());
+
+        let metrics = shield.rate_limiter.get_metrics();
+        assert_eq!(drops, 0);
+        assert!(incidents.is_empty());
+        assert!(blocked_ips.is_empty());
+        assert_eq!(metrics.total_allowed, 2);
+        assert_eq!(metrics.total_challenged, 0);
+        assert_eq!(metrics.total_dropped, 0);
+    }
+
+    #[test]
+    fn process_events_burst_eligible_returns_challenge_without_drop() {
+        // Invariant: a single-tripped limiter (burst-only pressure) must challenge, not drop.
+        let (_dir, mut shield) = make_shield_state(rl_config(1.0, 0.0, 10, 10));
+        let events = vec![
+            network_event("198.51.100.12", "network.tcp", 64),
+            network_event("198.51.100.12", "network.tcp", 64),
+        ];
+
+        let (drops, _incidents, blocked_ips) =
+            process_events(&mut shield, &events, &HashMap::new());
+
+        let metrics = shield.rate_limiter.get_metrics();
+        assert_eq!(drops, 0);
+        assert!(blocked_ips.is_empty());
+        assert_eq!(metrics.total_allowed, 1);
+        assert_eq!(metrics.total_challenged, 1);
+        assert_eq!(metrics.total_dropped, 0);
+        assert!(shield.xdp.get_blocklist_entries().is_empty());
+    }
+
+    #[test]
+    fn process_events_window_rollover_resets_window_pressure() {
+        // Invariant: once the sliding window expires, new traffic should be evaluated fresh.
+        let (_dir, mut shield) = make_shield_state(rl_config(5_000.0, 5_000.0, 1, 1));
+        let ip = "198.51.100.13";
+        let burst: Vec<_> = (0..1_200)
+            .map(|_| network_event(ip, "network.tcp", 64))
+            .collect();
+        process_events(&mut shield, &burst, &HashMap::new());
+        let before_rollover = shield.rate_limiter.get_metrics();
+        assert!(
+            before_rollover.total_challenged > 0,
+            "window pressure should produce at least one challenge before rollover"
+        );
+        assert_eq!(before_rollover.total_dropped, 0);
+
+        std::thread::sleep(std::time::Duration::from_millis(2_100));
+        let later = vec![network_event(ip, "network.tcp", 64)];
+        process_events(&mut shield, &later, &HashMap::new());
+
+        let after_rollover = shield.rate_limiter.get_metrics();
+        assert_eq!(
+            after_rollover.total_allowed,
+            before_rollover.total_allowed + 1
+        );
+        assert_eq!(
+            after_rollover.total_challenged,
+            before_rollover.total_challenged
+        );
+        assert_eq!(after_rollover.total_dropped, before_rollover.total_dropped);
+    }
+
+    #[test]
+    fn process_events_drop_path_blocks_ip_and_updates_drop_counters() {
+        // Invariant: when both limiters fail, the packet is dropped and the IP is blocklisted.
+        let (_dir, mut shield) = make_shield_state(rl_config(1.0, 0.0, 10, 0));
+        let ip = "198.51.100.14";
+        let events = vec![
+            network_event(ip, "network.tcp", 64),
+            network_event(ip, "network.tcp", 64),
+        ];
+
+        let (drops, _incidents, blocked_ips) =
+            process_events(&mut shield, &events, &HashMap::new());
+
+        let metrics = shield.rate_limiter.get_metrics();
+        assert_eq!(drops, 1);
+        assert_eq!(blocked_ips, vec![ip.to_string()]);
+        assert_eq!(metrics.total_dropped, 1);
+        assert_eq!(metrics.blocked_ips, 1);
+        assert!(shield.xdp.is_blocked(ip));
+
+        // Already-blocked traffic must continue to count as dropped.
+        let follow_up = vec![network_event(ip, "network.tcp", 64)];
+        let (second_drops, _incidents, _blocked_ips) =
+            process_events(&mut shield, &follow_up, &HashMap::new());
+        assert_eq!(second_drops, 1);
+        assert_eq!(shield.rate_limiter.get_metrics().total_dropped, 2);
+    }
+
+    #[test]
+    fn write_incidents_empty_input_does_not_create_daily_file() {
+        // Invariant: empty incident batches must be a no-op and not create output artifacts.
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_incidents(dir.path(), &[]);
+
+        let today = chrono::Local::now().date_naive().format("%Y-%m-%d");
+        let path = dir.path().join(format!("incidents-{today}.jsonl"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn write_incidents_non_empty_batch_appends_jsonl_lines() {
+        // Invariant: each emitted incident must be persisted as one JSONL line.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let incidents = vec![
+            serde_json::json!({"severity": "high", "title": "first"}),
+            serde_json::json!({"severity": "critical", "title": "second"}),
+        ];
+        write_incidents(dir.path(), &incidents);
+
+        let today = chrono::Local::now().date_naive().format("%Y-%m-%d");
+        let path = dir.path().join(format!("incidents-{today}.jsonl"));
+        let content = std::fs::read_to_string(path).expect("read incidents file");
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let first: serde_json::Value = serde_json::from_str(lines[0]).expect("first line json");
+        let second: serde_json::Value = serde_json::from_str(lines[1]).expect("second line json");
+        assert_eq!(first["title"], "first");
+        assert_eq!(second["title"], "second");
+    }
+
+    #[test]
+    fn notify_telegram_without_client_is_noop() {
+        // Invariant: no Telegram client means no gate/deferred mutations and no side effects.
+        let incidents = vec![serde_json::json!({
+            "severity": "high",
+            "title": "Shield escalation",
+            "summary": "blocked"
+        })];
+        let burst_tracker = crate::notification_gate::BurstTracker::new();
+        let mut deferred = HashMap::new();
+        let counter = AtomicU64::new(0);
+
+        notify_telegram(&None, &incidents, &burst_tracker, &mut deferred, &counter);
+
+        assert!(deferred.is_empty());
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+        assert_eq!(burst_tracker.count(), 0);
+    }
+
+    #[test]
+    fn notify_telegram_daily_briefing_path_increments_deferred_and_counter() {
+        // Invariant: contained high/critical shield events must defer to daily briefing, not send now.
+        let telegram_client = Some(Arc::new(
+            crate::telegram::TelegramClient::new("token", "123", None).expect("telegram client"),
+        ));
+        let incidents = vec![serde_json::json!({
+            "severity": "high",
+            "title": "Shield escalation",
+            "summary": "contained attack"
+        })];
+        let burst_tracker = crate::notification_gate::BurstTracker::new();
+        let mut deferred = HashMap::new();
+        let counter = AtomicU64::new(0);
+
+        notify_telegram(
+            &telegram_client,
+            &incidents,
+            &burst_tracker,
+            &mut deferred,
+            &counter,
+        );
+
+        assert_eq!(deferred.get("shield").copied(), Some(1));
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        assert_eq!(burst_tracker.count(), 1);
+    }
+}

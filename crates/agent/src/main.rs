@@ -13,6 +13,7 @@
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod abuseipdb;
+mod abuseipdb_report_budget;
 mod agent_context;
 mod ai;
 mod allowlist;

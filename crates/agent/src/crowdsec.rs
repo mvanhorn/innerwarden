@@ -203,6 +203,14 @@ impl CrowdSecState {
     }
 }
 
+#[cfg(test)]
+impl CrowdSecState {
+    /// Test-only helper to seed known threats without network sync.
+    pub(crate) fn insert_known_threat_for_test(&mut self, ip: &str) {
+        self.threat_list.insert(ip.to_string());
+    }
+}
+
 /// Update the threat list from CrowdSec LAPI (delta stream).
 /// Called from the agent's slow loop. Returns (added, removed) counts.
 pub async fn sync_threat_list(cs: &mut CrowdSecState) -> (usize, usize) {

@@ -1519,28 +1519,32 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                             .filter(|(_, _, _, ts)| *ts < report_cutoff)
                             .cloned()
                             .collect();
-                        let mut dropped_cloud = 0usize;
+                        let today = chrono::Local::now()
+                            .date_naive()
+                            .format("%Y-%m-%d")
+                            .to_string();
+                        let daily_cap = cfg.abuseipdb.report_daily_cap;
+                        // Plan every decision up-front in a pure helper so
+                        // the full decision matrix (cloud safelist → dedup →
+                        // cap) is unit-testable without a Tokio runtime or
+                        // a live AbuseIPDB client. The slow loop here only
+                        // keeps the I/O (HTTP call + commit write).
+                        let outcomes = abuseipdb_report_budget::plan_queue_flush(
+                            &ready,
+                            state.sqlite_store.as_deref(),
+                            cloud_safelist::identify_provider,
+                            &today,
+                            daily_cap,
+                        );
                         if let Some(ref client) = state.abuseipdb {
-                            for (ip, comment, categories, _) in &ready {
-                                if let Some(provider) = cloud_safelist::identify_provider(ip) {
-                                    dropped_cloud += 1;
-                                    warn!(
-                                        ip,
-                                        provider,
-                                        "AbuseIPDB report dropped: target is in cloud safelist"
-                                    );
-                                    continue;
-                                }
-                                client.report(ip, categories, comment).await;
-                                info!(ip, "AbuseIPDB report sent (after 5min delay)");
-                            }
-                        }
-                        if dropped_cloud > 0 {
-                            info!(
-                                dropped_cloud,
-                                "AbuseIPDB queue flush: dropped {} cloud-provider entries",
-                                dropped_cloud
-                            );
+                            abuseipdb_report_budget::dispatch_flush_outcomes(
+                                outcomes,
+                                state.sqlite_store.as_deref(),
+                                |ip, categories, comment| async move {
+                                    client.report(&ip, &categories, &comment).await;
+                                },
+                            )
+                            .await;
                         }
                         state.abuseipdb_report_queue.retain(|(_, _, _, ts)| *ts >= report_cutoff);
                     }
@@ -2174,7 +2178,9 @@ mod tests {
             "tcp_stream.ssh",
         ];
         let mut events = Vec::new();
-        for i in 0..600 {
+        // 1000 events keeps the training slice above MIN_TRAIN_WINDOWS after
+        // the 20% holdout split introduced in the percentile-scoring fix.
+        for i in 0..1000 {
             let kind = kinds[i % kinds.len()];
             events.push(Event {
                 ts: Utc::now(),

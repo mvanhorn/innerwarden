@@ -2063,6 +2063,17 @@ pub struct AbuseIpDbConfig {
     /// This contributes to the global threat intelligence network.
     #[serde(default)]
     pub report_blocks: bool,
+
+    /// Maximum AbuseIPDB *report-endpoint* calls per 24h UTC. Free tier
+    /// grants 1,000 per day; the default of 800 reserves 20% headroom for
+    /// operator-triggered ad-hoc reports. A production incident on
+    /// 2026-04-18 (`correlation:CL-008` cascade) burned ~900 reports in
+    /// one day and tripped AbuseIPDB's quota email — the cap here is the
+    /// second line of defence behind `cloud_safelist`. Set to `0` to
+    /// pause outbound reporting entirely without disabling the rest of
+    /// the AbuseIPDB integration.
+    #[serde(default = "default_abuseipdb_report_daily_cap")]
+    pub report_daily_cap: u32,
 }
 
 impl Default for AbuseIpDbConfig {
@@ -2073,12 +2084,17 @@ impl Default for AbuseIpDbConfig {
             max_age_days: default_abuseipdb_max_age_days(),
             auto_block_threshold: 0,
             report_blocks: false,
+            report_daily_cap: default_abuseipdb_report_daily_cap(),
         }
     }
 }
 
 fn default_abuseipdb_max_age_days() -> u32 {
     30
+}
+
+fn default_abuseipdb_report_daily_cap() -> u32 {
+    800
 }
 
 // ---------------------------------------------------------------------------
