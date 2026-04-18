@@ -1471,11 +1471,15 @@ fn detect_crypto_miner(
         // linked back to the originating process via the evidence-array
         // ingestion path (ingestion.rs Phase 014-D). Without pid/uid the
         // incident ends up with no TriggeredBy edge, so the Threats tab
-        // cannot pivot to it.
-        let (pid, uid) = match graph.get_node(pid_id) {
-            Some(Node::Process { pid, uid, .. }) => (*pid, *uid),
-            _ => (0, 0),
+        // cannot pivot to it. The let-else is defensive: `pid_id` was
+        // produced from `nodes_of_type(NodeType::Process)` above, so the
+        // node is always Process — but if the graph was mutated between
+        // the two calls, skipping this iteration is safer than emitting
+        // a bogus incident with pid=0.
+        let Some(Node::Process { pid, uid, .. }) = graph.get_node(pid_id) else {
+            continue;
         };
+        let (pid, uid) = (*pid, *uid);
 
         incidents.push(Incident {
             ts: now,
