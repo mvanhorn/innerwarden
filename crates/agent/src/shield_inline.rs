@@ -501,7 +501,7 @@ mod tests {
     #[test]
     fn process_events_drop_path_blocks_ip_and_updates_drop_counters() {
         // Invariant: when both limiters fail, the packet is dropped and the IP is blocklisted.
-        let (_dir, mut shield) = make_shield_state(rl_config(1.0, 0.0, 10, 1));
+        let (_dir, mut shield) = make_shield_state(rl_config(1.0, 0.0, 10, 0));
         let ip = "198.51.100.14";
         let events = vec![
             network_event(ip, "network.tcp", 64),
