@@ -49,12 +49,6 @@ Inner Warden is a self-contained runtime defense stack: kernel-level telemetry, 
 
 40 eBPF kernel hooks. 49 detectors. 22 collectors. 47 cross-layer correlation rules. 65 MITRE ATT&CK techniques (40% validated via Caldera). 208 Sigma community rules. Autoencoder anomaly detection. Behavioral DNA attacker fingerprinting. JA3/JA4 TLS fingerprinting. YARA + Sigma rule engines. 20 automated playbooks. Monthly threat reports. Mesh collaborative defense. No cloud. No dependencies. Just two Rust daemons and a CLI.
 
-<p align="center">
-  <a href="https://innerwarden.com/live">
-    <img src="docs/images/innerwarden-demo.gif" alt="InnerWarden dashboard demo — sensors, threats, investigation, attacker intelligence" width="820">
-  </a>
-</p>
-
 <h3 align="center">
   <a href="https://innerwarden.com/live">See it responding to real attacks right now</a>
 </h3>
