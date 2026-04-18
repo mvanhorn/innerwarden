@@ -1160,6 +1160,18 @@ pub(crate) fn cmd_configure_digest(cli: &Cli, hour_str: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+    use tempfile::TempDir;
+
+    fn test_cli(temp: &TempDir) -> Cli {
+        let mut cli = Cli::parse_from(["innerwarden", "replay"]);
+        cli.sensor_config = temp.path().join("sensor.toml");
+        cli.agent_config = temp.path().join("agent.toml");
+        cli.data_dir = temp.path().join("data");
+        cli.dry_run = true;
+        std::fs::create_dir_all(&cli.data_dir).expect("test should create data dir");
+        cli
+    }
 
     #[test]
     fn is_valid_telegram_token_accepts_botfather_shape() {
@@ -1260,6 +1272,54 @@ mod tests {
         assert!(err.to_string().contains("hour must be 0-23"));
         let err = parse_digest_hour_config("1h").expect_err("1h must be rejected");
         assert!(err.to_string().contains("expected a number"));
+    }
+
+    #[test]
+    fn append_or_replace_env_creates_and_replaces_existing_key() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let env_path = temp.path().join("agent.env");
+
+        append_or_replace_env(&env_path, "FOO", "one").expect("first write should succeed");
+        append_or_replace_env(&env_path, "BAR", "two").expect("second write should succeed");
+        append_or_replace_env(&env_path, "FOO", "three").expect("replace should succeed");
+
+        let content = std::fs::read_to_string(&env_path).expect("env file should exist");
+        assert!(content.contains("BAR=\"two\""));
+        assert!(content.contains("FOO=\"three\""));
+        assert!(!content.contains("FOO=\"one\""));
+        assert_eq!(
+            content.lines().filter(|l| l.starts_with("FOO=")).count(),
+            1,
+            "FOO should be unique after replace"
+        );
+    }
+
+    #[test]
+    fn which_bin_returns_none_for_missing_binary() {
+        assert!(which_bin("innerwarden-definitely-missing-binary").is_none());
+    }
+
+    #[test]
+    fn generate_vapid_keys_ctl_returns_pem_and_public_key() {
+        let (private_pem, public_b64) = generate_vapid_keys_ctl().expect("keygen should succeed");
+        assert!(private_pem.contains("BEGIN PRIVATE KEY"));
+        assert!(!public_b64.is_empty());
+    }
+
+    #[test]
+    fn cmd_configure_digest_dry_run_covers_hour_and_disable_branches() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+
+        cmd_configure_digest(&cli, "off").expect("disable branch should succeed");
+        cmd_configure_digest(&cli, "7").expect("hour branch should succeed");
+    }
+
+    #[test]
+    fn cmd_configure_budget_dry_run_succeeds() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        cmd_configure_budget(&cli, 42).expect("dry-run budget config should succeed");
     }
 }
 

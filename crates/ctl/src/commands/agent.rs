@@ -487,3 +487,131 @@ pub(crate) fn cmd_agent(cli: &Cli, command: Option<&AgentCommand>) -> Result<()>
 // ---------------------------------------------------------------------------
 // ATT&CK Navigator layer generation
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use tempfile::TempDir;
+
+    fn test_cli(temp: &TempDir) -> Cli {
+        let mut cli = Cli::parse_from(["innerwarden", "replay"]);
+        cli.sensor_config = temp.path().join("sensor.toml");
+        cli.agent_config = temp.path().join("agent.toml");
+        cli.data_dir = temp.path().join("data");
+        cli.dry_run = true;
+        std::fs::create_dir_all(&cli.data_dir).expect("test should create data dir");
+        cli
+    }
+
+    #[test]
+    fn resolve_dashboard_url_defaults_when_config_is_missing() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        let url = resolve_dashboard_url(&cli);
+        assert_eq!(url, "http://127.0.0.1:8787");
+    }
+
+    #[test]
+    fn resolve_dashboard_url_reads_bind_from_config() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        std::fs::write(
+            &cli.agent_config,
+            r#"[dashboard]
+bind = "0.0.0.0:9999"
+"#,
+        )
+        .expect("test should write agent config");
+        let url = resolve_dashboard_url(&cli);
+        assert_eq!(url, "http://0.0.0.0:9999");
+    }
+
+    #[test]
+    fn parse_selection_indices_handles_all_dedup_and_invalid_cases() {
+        assert_eq!(parse_selection_indices("all", 3), Some(vec![1, 2, 3]));
+        assert_eq!(parse_selection_indices("1,2,2,3", 3), Some(vec![1, 2, 3]));
+        assert_eq!(parse_selection_indices("", 3), None);
+        assert_eq!(parse_selection_indices("0", 3), None);
+        assert_eq!(parse_selection_indices("4", 3), None);
+        assert_eq!(parse_selection_indices("x", 3), None);
+    }
+
+    #[test]
+    fn cmd_agent_menu_and_list_return_ok() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        assert!(cmd_agent(&cli, None).is_ok());
+        assert!(cmd_agent(&cli, Some(&AgentCommand::List)).is_ok());
+    }
+
+    #[test]
+    fn cmd_agent_add_without_name_and_unknown_name_return_ok() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        assert!(cmd_agent(&cli, Some(&AgentCommand::Add { name: None })).is_ok());
+        assert!(cmd_agent(
+            &cli,
+            Some(&AgentCommand::Add {
+                name: Some("definitely-unknown-agent".to_string()),
+            }),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn cmd_agent_scan_and_status_are_non_fatal_without_services() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        assert!(cmd_agent(&cli, Some(&AgentCommand::Scan)).is_ok());
+        assert!(cmd_agent(&cli, Some(&AgentCommand::Status)).is_ok());
+    }
+
+    #[test]
+    fn cmd_agent_connect_with_pid_falls_back_to_local_queue_when_dashboard_unreachable() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        std::fs::write(
+            &cli.agent_config,
+            r#"[dashboard]
+dashboard_bind = "127.0.0.1:1"
+"#,
+        )
+        .expect("test should write agent config");
+
+        assert!(cmd_agent(
+            &cli,
+            Some(&AgentCommand::Connect {
+                pid: Some(std::process::id()),
+                name: None,
+                label: Some("unit".to_string()),
+            }),
+        )
+        .is_ok());
+
+        let queue_path = cli.data_dir.join("agent-connections.jsonl");
+        let queued = std::fs::read_to_string(queue_path).expect("connect should queue fallback");
+        assert!(queued.contains("\"action\":\"connect\""));
+    }
+
+    #[test]
+    fn cmd_agent_disconnect_is_non_fatal_when_dashboard_unreachable() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        std::fs::write(
+            &cli.agent_config,
+            r#"[dashboard]
+dashboard_bind = "127.0.0.1:1"
+"#,
+        )
+        .expect("test should write agent config");
+
+        assert!(cmd_agent(
+            &cli,
+            Some(&AgentCommand::Disconnect {
+                id: "ag-0001".to_string(),
+            }),
+        )
+        .is_ok());
+    }
+}
