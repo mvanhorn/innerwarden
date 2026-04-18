@@ -1126,6 +1126,37 @@ pub(crate) fn cmd_module_update_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+    use tempfile::TempDir;
+
+    fn test_cli(temp: &TempDir) -> Cli {
+        let mut cli = Cli::parse_from(["innerwarden", "replay"]);
+        cli.sensor_config = temp.path().join("sensor.toml");
+        cli.agent_config = temp.path().join("agent.toml");
+        cli.data_dir = temp.path().join("data");
+        cli.dry_run = true;
+
+        std::fs::create_dir_all(&cli.data_dir).expect("test should create data dir");
+        std::fs::write(&cli.sensor_config, "").expect("test should create sensor config");
+        std::fs::write(&cli.agent_config, "").expect("test should create agent config");
+        cli
+    }
+
+    fn test_manifest() -> module_manifest::ModuleManifest {
+        module_manifest::ModuleManifest {
+            id: "test-module".to_string(),
+            name: "Test Module".to_string(),
+            builtin: false,
+            version: Some("1.0.0".to_string()),
+            update_url: None,
+            collectors: vec!["journald".to_string()],
+            detectors: vec!["sudo-abuse".to_string()],
+            skills: vec!["block-ip".to_string()],
+            notifiers: vec!["slack".to_string()],
+            allowed_commands: vec!["/usr/bin/true".to_string()],
+            preflights: vec![],
+        }
+    }
 
     // SEC-009: Unknown preflight kind fails closed.
     #[test]
@@ -1192,8 +1223,178 @@ mod tests {
 
     #[test]
     fn validate_module_source_allows_local_path() {
+        // Ensures local module installation remains available for offline/manual workflows.
         assert!(validate_module_source("/opt/modules/my-module.tar.gz").is_ok());
         assert!(validate_module_source("./my-module.tar.gz").is_ok());
         assert!(validate_module_source("my-module").is_ok());
+    }
+
+    #[test]
+    fn parse_registry_toml_parses_multiple_module_entries() {
+        // Covers registry parser happy path including arrays, booleans, and optional install_url.
+        let raw = r#"
+[[modules]]
+id = "ssh-protection"
+name = "SSH Protection"
+version = "1.2.3"
+description = "Detect brute force"
+tags = ["ssh", "auth"]
+tier = "open"
+builtin = true
+enables = ["ssh-protection"]
+
+[[modules]]
+id = "cloudflare-integration"
+name = "Cloudflare"
+version = "2.0.0"
+description = "Push indicators"
+tags = ["cloudflare"]
+tier = "premium"
+builtin = false
+install_url = "https://example.com/cloudflare.tar.gz"
+"#;
+
+        let parsed = parse_registry_toml(raw);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].id, "ssh-protection");
+        assert_eq!(parsed[0].tags, vec!["ssh".to_string(), "auth".to_string()]);
+        assert!(parsed[0].builtin);
+        assert_eq!(parsed[0].enables, vec!["ssh-protection".to_string()]);
+        assert_eq!(parsed[1].id, "cloudflare-integration");
+        assert_eq!(
+            parsed[1].install_url.as_deref(),
+            Some("https://example.com/cloudflare.tar.gz")
+        );
+    }
+
+    #[test]
+    fn parse_registry_toml_skips_blocks_without_id() {
+        // Guards parser behavior so malformed registry entries cannot create nameless modules.
+        let raw = r#"
+[[modules]]
+name = "Broken"
+version = "0.1.0"
+
+[[modules]]
+id = "valid"
+name = "Valid"
+version = "1.0.0"
+description = "ok"
+tier = "open"
+builtin = false
+"#;
+
+        let parsed = parse_registry_toml(raw);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "valid");
+    }
+
+    #[test]
+    fn preflight_directory_exists_detects_temp_dir() {
+        // Exercises directory_exists success branch without depending on host-specific paths.
+        let temp = TempDir::new().expect("test should create temp dir");
+        let pf = module_manifest::ModulePreflightSpec {
+            kind: "directory_exists".into(),
+            value: temp.path().display().to_string(),
+            reason: "temp dir".into(),
+        };
+        let (passed, _) = run_module_preflight(&pf);
+        assert!(passed);
+    }
+
+    #[test]
+    fn preflight_user_exists_checks_known_and_missing_users() {
+        // Covers user_exists branches to ensure account preflights fail closed for unknown users.
+        let existing = module_manifest::ModulePreflightSpec {
+            kind: "user_exists".into(),
+            value: "root".into(),
+            reason: "root should exist".into(),
+        };
+        let missing = module_manifest::ModulePreflightSpec {
+            kind: "user_exists".into(),
+            value: "innerwarden_nonexistent_test_user".into(),
+            reason: "missing should fail".into(),
+        };
+
+        let (existing_ok, _) = run_module_preflight(&existing);
+        let (missing_ok, missing_msg) = run_module_preflight(&missing);
+
+        assert!(existing_ok);
+        assert!(!missing_ok);
+        assert!(missing_msg.contains("does not exist"));
+    }
+
+    #[test]
+    fn apply_module_enable_sets_expected_config_state() {
+        // Verifies deterministic state transitions for collector/detector/skill/notifier toggles.
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        let manifest = test_manifest();
+
+        apply_module_enable(
+            &cli,
+            &manifest,
+            &module_manifest::generate_module_sudoers_rule,
+        )
+        .expect("enable should succeed in dry-run mode");
+
+        assert!(config_editor::read_bool(
+            &cli.sensor_config,
+            "collectors.journald",
+            "enabled"
+        ));
+        assert!(config_editor::read_bool(
+            &cli.sensor_config,
+            "detectors.sudo_abuse",
+            "enabled"
+        ));
+        assert!(config_editor::read_bool(
+            &cli.agent_config,
+            "responder",
+            "enabled"
+        ));
+        assert!(config_editor::read_bool(
+            &cli.agent_config,
+            "slack",
+            "enabled"
+        ));
+        let skills =
+            config_editor::read_str_array(&cli.agent_config, "responder", "allowed_skills");
+        assert!(skills.iter().any(|s| s == "block-ip"));
+    }
+
+    #[test]
+    fn apply_module_disable_reverts_expected_config_state() {
+        // Ensures disable path undoes enabled state and skill allowlist entries consistently.
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        let manifest = test_manifest();
+
+        apply_module_enable(
+            &cli,
+            &manifest,
+            &module_manifest::generate_module_sudoers_rule,
+        )
+        .expect("enable should succeed in dry-run mode");
+        apply_module_disable(&cli, &manifest).expect("disable should succeed in dry-run mode");
+
+        assert!(!config_editor::read_bool(
+            &cli.sensor_config,
+            "collectors.journald",
+            "enabled"
+        ));
+        assert!(!config_editor::read_bool(
+            &cli.sensor_config,
+            "detectors.sudo_abuse",
+            "enabled"
+        ));
+        assert!(!config_editor::read_bool(
+            &cli.agent_config,
+            "slack",
+            "enabled"
+        ));
+        let skills =
+            config_editor::read_str_array(&cli.agent_config, "responder", "allowed_skills");
+        assert!(!skills.iter().any(|s| s == "block-ip"));
     }
 }
