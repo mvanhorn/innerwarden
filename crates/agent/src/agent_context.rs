@@ -143,6 +143,40 @@ pub(crate) fn build_agent_context(
     )
 }
 
+/// Merge a persona string, the runtime snapshot, recent incidents, and recent
+/// decisions into one system prompt. Empty-string inputs are skipped so the
+/// prompt never carries dangling "RECENT INCIDENTS:" headers with no body.
+/// Centralised here so every chat surface (Telegram bot, dashboard briefing,
+/// dashboard explain) composes the same prompt shape.
+pub(crate) fn compose_system_prompt(
+    persona: &str,
+    runtime_snapshot: &str,
+    recent_incidents: &str,
+    recent_decisions: &str,
+) -> String {
+    let mut out = String::with_capacity(
+        persona.len()
+            + runtime_snapshot.len()
+            + recent_incidents.len()
+            + recent_decisions.len()
+            + 128,
+    );
+    out.push_str(persona.trim_end());
+    if !runtime_snapshot.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(runtime_snapshot.trim_end());
+    }
+    if !recent_incidents.is_empty() {
+        out.push_str("\n\nRECENT INCIDENTS:\n");
+        out.push_str(recent_incidents.trim_end());
+    }
+    if !recent_decisions.is_empty() {
+        out.push_str("\n\nRECENT DECISIONS:\n");
+        out.push_str(recent_decisions.trim_end());
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +276,47 @@ mod tests {
         assert!(context.contains("Telegram bot: ENABLED"));
         assert!(context.contains("Cloudflare edge blocking: ENABLED"));
         assert!(context.contains("Allowed skills: block-ip-ufw, honeypot"));
+    }
+
+    #[test]
+    fn compose_system_prompt_includes_persona_only_when_others_empty() {
+        let out = compose_system_prompt("persona-body", "", "", "");
+        assert_eq!(out, "persona-body");
+    }
+
+    #[test]
+    fn compose_system_prompt_appends_runtime_when_present() {
+        let out = compose_system_prompt("p", "SNAP", "", "");
+        assert!(out.starts_with("p"));
+        assert!(out.contains("SNAP"));
+        assert!(!out.contains("RECENT INCIDENTS"));
+        assert!(!out.contains("RECENT DECISIONS"));
+    }
+
+    #[test]
+    fn compose_system_prompt_labels_recent_sections() {
+        let out = compose_system_prompt(
+            "p",
+            "SNAP",
+            "[high] title - summary",
+            "- block_ip 1.2.3.4 (auto)",
+        );
+        assert!(out.contains("RECENT INCIDENTS:\n[high] title - summary"));
+        assert!(out.contains("RECENT DECISIONS:\n- block_ip 1.2.3.4 (auto)"));
+        // Sections must appear in the stable order persona -> snapshot -> incidents -> decisions.
+        let idx_snap = out.find("SNAP").unwrap();
+        let idx_inc = out.find("RECENT INCIDENTS").unwrap();
+        let idx_dec = out.find("RECENT DECISIONS").unwrap();
+        assert!(idx_snap < idx_inc && idx_inc < idx_dec);
+    }
+
+    #[test]
+    fn compose_system_prompt_omits_headers_for_empty_sections() {
+        // An empty decisions string should not leave a dangling "RECENT
+        // DECISIONS:" header in the prompt.
+        let out = compose_system_prompt("p", "", "[high] x - y", "");
+        assert!(out.contains("RECENT INCIDENTS"));
+        assert!(!out.contains("RECENT DECISIONS"));
     }
 
     #[test]

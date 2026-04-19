@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+mod banner;
 mod calibrate;
 mod capabilities;
 mod capability;
@@ -40,7 +41,7 @@ use innerwarden_core::audit::{append_admin_action, current_operator, AdminAction
 #[derive(Parser)]
 #[command(
     name = "innerwarden",
-    about = "InnerWarden — self-defending security for Linux and macOS",
+    about = "InnerWarden. self-defending security for Linux and macOS.",
     long_about = "8 commands to protect your server:\n\n\
                   \x20 get       Query status, incidents, decisions, reports\n\
                   \x20 stream    Monitor events in real-time\n\
@@ -70,7 +71,7 @@ struct Cli {
     dry_run: bool,
 
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -169,7 +170,7 @@ enum Command {
         command: ModuleCommand,
     },
 
-    /// AI agent management — install, scan, connect, monitor agents.
+    /// AI agent management. Install, scan, connect, monitor agents.
     ///
     /// Run without arguments for an interactive menu.
     ///
@@ -1696,6 +1697,59 @@ enum SystemCommand {
         #[arg(long)]
         json: bool,
     },
+
+    /// Show the block-rate circuit breaker state for the current UTC hour.
+    ///
+    /// When `responder.circuit_breaker_mode = "pause"` the agent refuses
+    /// every auto-block once the hourly cap is crossed, to stop cascade
+    /// incidents (see operator incident 2026-04-18). This command lets
+    /// you inspect the current hour's counter and trip marker.
+    ///
+    /// Examples:
+    ///   innerwarden system circuit-status
+    ///   innerwarden system circuit-status --json
+    #[clap(name = "circuit-status")]
+    CircuitStatus {
+        /// Output as JSON instead of human-readable format.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Clear the circuit breaker for the current UTC hour. Use this once
+    /// you have diagnosed the cascade source and want to resume autonomous
+    /// blocking without waiting for the next hour boundary.
+    ///
+    /// Examples:
+    ///   innerwarden system circuit-reset
+    ///   innerwarden system circuit-reset --json
+    #[clap(name = "circuit-reset")]
+    CircuitReset {
+        /// Output as JSON instead of human-readable format.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Cross-check firewall DENY rules against the cloud provider
+    /// safelist and release any that now fall inside a known safe range.
+    ///
+    /// Motivating case: the CL-008 cascade in April 2026 installed ufw
+    /// rules blocking Cloudflare and Oracle OCI peer ranges before the
+    /// safelist existed. New blocks are refused by the safelist, but the
+    /// old rules rot until their 7-day TTL expires. This command walks
+    /// the current firewall state and offers a cleanup plan.
+    ///
+    /// Dry-run by default; pass --apply to actually unblock.
+    ///
+    /// Examples:
+    ///   innerwarden system reconcile-blocks
+    ///   innerwarden system reconcile-blocks --apply
+    #[clap(name = "reconcile-blocks")]
+    ReconcileBlocks {
+        /// Release every matching rule. Without this flag the command is
+        /// a dry run and only prints what it would do.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1907,7 +1961,15 @@ fn main() -> Result<()> {
         }
     }
 
-    match cli.command {
+    let Some(command) = cli.command.take() else {
+        banner::render(env!("CARGO_PKG_VERSION"), &mut std::io::stdout()).ok();
+        use clap::CommandFactory;
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    };
+
+    match command {
         // ===================================================================
         // New grouped commands
         // ===================================================================
@@ -2092,6 +2154,15 @@ fn main() -> Result<()> {
                 }
             }
             SystemCommand::Hypervisor { json } => commands::firmware::cmd_hypervisor(*json),
+            SystemCommand::CircuitStatus { json } => {
+                commands::circuit::cmd_circuit_status(&cli.agent_config, &cli.data_dir, *json)
+            }
+            SystemCommand::CircuitReset { json } => {
+                commands::circuit::cmd_circuit_reset(&cli.agent_config, &cli.data_dir, *json)
+            }
+            SystemCommand::ReconcileBlocks { apply } => {
+                commands::reconcile::cmd_reconcile_blocks(&cli, &cli.data_dir.clone(), *apply)
+            }
         },
 
         // ===================================================================
@@ -2557,10 +2628,10 @@ mod tests {
             agent_config: data_dir.join("agent.toml"),
             data_dir: data_dir.to_path_buf(),
             dry_run: false,
-            command: Command::Decisions {
+            command: Some(Command::Decisions {
                 days: 1,
                 action: None,
-            },
+            }),
         }
     }
 

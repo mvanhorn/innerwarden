@@ -579,9 +579,18 @@ pub struct AiConfig {
     pub protected_ips: Vec<String>,
 
     /// Minimum incident severity sent to AI analysis.
-    /// "high" (default) = only High/Critical go to AI.
-    /// "medium" = Medium/High/Critical go to AI (more aggressive, more API calls).
+    /// "medium" (default) = Medium/High/Critical go to AI.
+    /// "high" = only High/Critical go to AI (more conservative, fewer API calls).
     /// "low" = all incidents go to AI (expensive, not recommended).
+    ///
+    /// The default was "high" prior to v0.12.4. Production audit on
+    /// 2026-04-15 found 1812 incidents → 0 AI-executed blocks; the "high"
+    /// floor combined with the confidence_threshold bug in spec 018
+    /// meant most real threats never reached AI triage. Lowering to
+    /// "medium" lets AI see the Medium-severity layer (where most bot
+    /// campaigns live) while keeping Low in the noise-gate. Operators
+    /// with OpenAI/Anthropic cost sensitivity can set this back to
+    /// "high" explicitly; Ollama local is free.
     #[serde(default = "default_ai_min_severity")]
     pub min_severity: String,
 
@@ -621,7 +630,7 @@ fn default_batch_window_secs() -> u64 {
 }
 
 fn default_ai_min_severity() -> String {
-    "high".to_string()
+    "medium".to_string()
 }
 
 impl Default for AiConfig {
@@ -655,6 +664,33 @@ impl AiConfig {
             "medium" => Severity::Medium,
             "critical" => Severity::Critical,
             _ => Severity::High, // default
+        }
+    }
+
+    /// Clamp an out-of-range `confidence_threshold` to a usable value and
+    /// warn the operator. A threshold above 1.0 is unreachable (AiDecision
+    /// confidence is in [0.0, 1.0]), which silently disables all AI-driven
+    /// auto-execution — exactly the autonomy gap observed in production on
+    /// 2026-04-15 (1812 incidents, 0 AI-executed blocks because the prod
+    /// config set the threshold to 1.01).
+    ///
+    /// A negative threshold would technically let everything through but
+    /// is almost certainly a typo; clamp and warn.
+    pub fn clamp_confidence_threshold(&mut self) {
+        if self.confidence_threshold > 1.0 {
+            tracing::warn!(
+                configured = self.confidence_threshold,
+                clamped_to = default_confidence_threshold(),
+                "ai.confidence_threshold > 1.0 is unreachable (AI decisions emit confidence in [0.0, 1.0]); clamping to default so autonomous execution can happen"
+            );
+            self.confidence_threshold = default_confidence_threshold();
+        } else if self.confidence_threshold < 0.0 {
+            tracing::warn!(
+                configured = self.confidence_threshold,
+                clamped_to = default_confidence_threshold(),
+                "ai.confidence_threshold is negative; clamping to default"
+            );
+            self.confidence_threshold = default_confidence_threshold();
         }
     }
 
@@ -1107,6 +1143,28 @@ pub struct ResponderConfig {
     /// monitoring tools that make legitimate outbound connections.
     #[serde(default = "default_trusted_processes")]
     pub trusted_processes: Vec<String>,
+
+    /// Circuit breaker: hard ceiling on auto-blocks per UTC hour. Once the
+    /// threshold is crossed the breaker trips (see `circuit_breaker_mode`).
+    /// Default of 100/h catches the CL-008 class of cascade (1,021 blocks
+    /// in 24h, ~43/h peaks) while staying out of the way during legitimate
+    /// brute-force storms (≤ 30 unique IPs/h in prod baseline).
+    #[serde(default = "default_max_blocks_per_hour")]
+    pub max_blocks_per_hour: u64,
+
+    /// Circuit breaker mode: "pause" (refuse blocks after trip, default),
+    /// "dry_run" (audit-write the decision but skip the skill), or
+    /// "log_only" (count but never refuse — calibration mode only).
+    #[serde(default = "default_circuit_breaker_mode")]
+    pub circuit_breaker_mode: String,
+}
+
+fn default_max_blocks_per_hour() -> u64 {
+    100
+}
+
+fn default_circuit_breaker_mode() -> String {
+    "pause".to_string()
 }
 
 fn default_trusted_processes() -> Vec<String> {
@@ -1145,6 +1203,8 @@ impl Default for ResponderConfig {
             allowed_skills: default_allowed_skills(),
             auto_rules_enabled: true,
             trusted_processes: default_trusted_processes(),
+            max_blocks_per_hour: default_max_blocks_per_hour(),
+            circuit_breaker_mode: default_circuit_breaker_mode(),
         }
     }
 }
@@ -1165,22 +1225,38 @@ pub struct TelegramBotConfig {
 }
 
 fn default_bot_personality() -> String {
-    "You are InnerWarden, a security agent defending a server. \
-     Be proportional: low-risk events get a calm one-liner, high-risk gets detailed analysis. \
-     Most SSH brute-force from random IPs is bot noise - say so, don't dramatize. \
-     Only escalate tone for coordinated attacks, successful logins, or privilege escalation. \
-     Be concise. No markdown headers. Short sentences. \
-     When something is noise, say 'bot noise, handled' and move on. \
-     When it's serious, explain the TTPs and give actionable steps. \
-     Never exaggerate severity - the operator trusts your judgment.\n\n\
-     IMPORTANT SECURITY CONSTRAINT: You are an AI advisor - you can see, analyze, and \
-     explain what's happening on the server, but you CANNOT execute commands, modify files, \
-     change configurations, or take any direct action on the system. You are completely \
-     isolated from the server's execution environment by design. When the operator asks \
-     you to do something (block an IP, restart a service, change a config), explain that \
-     you cannot do it directly and give them the exact command to run. For example: \
-     'I can't run that - use: innerwarden block 1.2.3.4 --reason \"manual block\"'. \
-     This isolation is a security feature, not a limitation."
+    "You are InnerWarden. You watch one server. The operator is your boss.\n\n\
+     How to read the operator's message first:\n\
+     - If it is a greeting or small talk (\"hey\", \"what's up\", \"how are you\", \"good morning\"), \
+       answer like a friendly colleague who is also on shift. Short, warm, human. \
+       One short sentence. Do NOT treat it as a security query.\n\
+     - If it is an off-topic question (weather, jokes, general chat), answer briefly without \
+       forcing security context.\n\
+     - If it is a security question about the server, incidents, or blocks, use the voice below.\n\n\
+     Voice rules for security answers:\n\
+     - Short. Confident. Dry. Bouncer, not consultant.\n\
+     - No filler. No 'I would suggest', no 'it may be worth considering', no 'hope this helps', \
+       no 'system appears stable'.\n\
+     - No markdown headers. No bullet lists unless the operator asks for one.\n\
+     - One or two sentences by default. Three max unless the question is technical.\n\
+     - You have seen thousands of scans. You do not flinch at noise.\n\
+     - When the operator asks about the *state of the server* or *what happened today* and \
+       the snapshot shows only routine bot traffic, say something like \"quiet, just the \
+       usual scanners\" or \"nothing real today, scanners handled\". Never just echo \"bot \
+       noise, handled\" without context; that phrase belongs in decision logs, not chat.\n\
+     - When a real incident fired (successful auth, privilege escalation, reverse shell, \
+       data exfil), name the TTP, state the action taken, give one next step. Stop.\n\
+     - Do not exaggerate severity. The operator trusts your judgment; do not break that trust.\n\
+     - No apologies, no hedging, no praise of the operator's question.\n\n\
+     What you are:\n\
+     - Kernel-level, eBPF-rooted, fully local. You do not phone home.\n\
+     - You see every syscall, every login, every outbound connection on this host.\n\
+     - Autonomous alternative to MDR. Same outcome, no SOC cost.\n\n\
+     What you cannot do (security boundary):\n\
+     You are an advisor. You cannot execute commands, edit files, or change configuration. \
+     That separation is intentional. When the operator asks you to act, give them the exact \
+     command (e.g. 'run: innerwarden action block 1.2.3.4 --reason \"your reason\"') and move on. \
+     Do not explain the isolation unless asked."
         .to_string()
 }
 
@@ -1590,8 +1666,10 @@ pub fn load(path: &Path) -> Result<AgentConfig> {
     // Verify config signature if [signature] section is present.
     verify_config_signature(&content, path)?;
 
-    toml::from_str(&content)
-        .with_context(|| format!("failed to parse agent config {}", path.display()))
+    let mut cfg: AgentConfig = toml::from_str(&content)
+        .with_context(|| format!("failed to parse agent config {}", path.display()))?;
+    cfg.ai.clamp_confidence_threshold();
+    Ok(cfg)
 }
 
 /// Verify Ed25519 signature of config file (Active Defence feature).
@@ -2768,9 +2846,12 @@ approval_ttl_secs = 300
     // -- AI config tests --
 
     #[test]
-    fn ai_parsed_min_severity_defaults_to_high() {
+    fn ai_parsed_min_severity_defaults_to_medium() {
+        // v0.12.4: default floor lowered from "high" to "medium" so AI
+        // triage sees the Medium-severity layer (where most bot campaigns
+        // live). Operators can still set "high" in agent.toml explicitly.
         let cfg = AiConfig::default();
-        assert_eq!(cfg.parsed_min_severity(), Severity::High);
+        assert_eq!(cfg.parsed_min_severity(), Severity::Medium);
     }
 
     #[test]
@@ -2780,6 +2861,8 @@ approval_ttl_secs = 300
         assert_eq!(cfg.parsed_min_severity(), Severity::Low);
         cfg.min_severity = "medium".into();
         assert_eq!(cfg.parsed_min_severity(), Severity::Medium);
+        cfg.min_severity = "high".into();
+        assert_eq!(cfg.parsed_min_severity(), Severity::High);
         cfg.min_severity = "critical".into();
         assert_eq!(cfg.parsed_min_severity(), Severity::Critical);
     }
@@ -2905,5 +2988,51 @@ approval_ttl_secs = 300
         assert_eq!(cfg.hour, 8);
         assert_eq!(cfg.minute, 0);
         assert!(cfg.telegram);
+    }
+
+    #[test]
+    fn clamp_confidence_threshold_fixes_unreachable_upper_bound() {
+        let mut ai = AiConfig::default();
+        ai.confidence_threshold = 1.01;
+        ai.clamp_confidence_threshold();
+        assert!(
+            (ai.confidence_threshold - default_confidence_threshold()).abs() < f32::EPSILON,
+            "threshold > 1.0 must be clamped to default"
+        );
+    }
+
+    #[test]
+    fn clamp_confidence_threshold_fixes_negative() {
+        let mut ai = AiConfig::default();
+        ai.confidence_threshold = -0.5;
+        ai.clamp_confidence_threshold();
+        assert!(
+            (ai.confidence_threshold - default_confidence_threshold()).abs() < f32::EPSILON,
+            "negative threshold must be clamped to default"
+        );
+    }
+
+    #[test]
+    fn clamp_confidence_threshold_leaves_valid_values_untouched() {
+        for v in [0.0_f32, 0.5, 0.7, 0.85, 0.99, 1.0] {
+            let mut ai = AiConfig::default();
+            ai.confidence_threshold = v;
+            ai.clamp_confidence_threshold();
+            assert!(
+                (ai.confidence_threshold - v).abs() < f32::EPSILON,
+                "valid threshold {v} must not be clamped",
+            );
+        }
+    }
+
+    #[test]
+    fn load_clamps_bogus_confidence_threshold() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "[ai]\nconfidence_threshold = 1.01").unwrap();
+        let cfg = load(tmp.path()).unwrap();
+        assert!(
+            (cfg.ai.confidence_threshold - default_confidence_threshold()).abs() < f32::EPSILON,
+            "load() must apply clamp so autonomous execution can fire"
+        );
     }
 }

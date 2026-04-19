@@ -32,7 +32,7 @@ pub fn format_daily_digest(
              \u{00a0}\u{00a0}{critical_count} critical threats\n\
              \u{00a0}\u{00a0}Health: {score}/100 {health_emoji}\n\
              \n\
-             Everything is under control."
+             All clear. Nothing needs you."
         )
     } else {
         let date = chrono::Local::now().format("%Y-%m-%d");
@@ -113,7 +113,7 @@ pub fn format_daily_digest_enriched(
                 pipeline.needs_review_groups
             ));
         } else {
-            msg.push_str("\n\n\u{2705} No action needed — everything is under control.");
+            msg.push_str("\n\n\u{2705} All clear. Nothing needs you.");
         }
 
         msg

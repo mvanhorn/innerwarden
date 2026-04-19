@@ -1072,6 +1072,8 @@ fn builtin_playbooks() -> Vec<Playbook> {
 mod tests {
     use super::*;
     use innerwarden_core::entities::EntityRef;
+    use std::collections::HashSet;
+    use tempfile::tempdir;
 
     fn make_incident(detector: &str, severity: Severity) -> Incident {
         Incident {
@@ -1085,6 +1087,28 @@ mod tests {
             recommended_checks: vec![],
             tags: vec![],
             entities: vec![EntityRef::ip("10.0.0.1")],
+        }
+    }
+
+    fn severity_at_or_above(min: &str) -> Severity {
+        match min {
+            "critical" => Severity::Critical,
+            "high" => Severity::High,
+            "medium" => Severity::Medium,
+            "low" => Severity::Low,
+            "info" => Severity::Info,
+            _ => Severity::Debug,
+        }
+    }
+
+    fn severity_just_below(min: &str) -> Option<Severity> {
+        match min {
+            "critical" => Some(Severity::High),
+            "high" => Some(Severity::Medium),
+            "medium" => Some(Severity::Low),
+            "low" => Some(Severity::Info),
+            "info" => Some(Severity::Debug),
+            _ => None,
         }
     }
 
@@ -1176,5 +1200,231 @@ mod tests {
         };
         assert!(matches_trigger(&trigger, "anything", &Severity::Critical));
         assert!(!matches_trigger(&trigger, "anything", &Severity::High));
+    }
+
+    #[test]
+    fn severity_rank_helpers_cover_all_inputs() {
+        assert_eq!(severity_rank(&Severity::Debug), 0);
+        assert_eq!(severity_rank(&Severity::Info), 1);
+        assert_eq!(severity_rank(&Severity::Low), 2);
+        assert_eq!(severity_rank(&Severity::Medium), 3);
+        assert_eq!(severity_rank(&Severity::High), 4);
+        assert_eq!(severity_rank(&Severity::Critical), 5);
+
+        assert_eq!(severity_rank_str("critical"), 5);
+        assert_eq!(severity_rank_str("high"), 4);
+        assert_eq!(severity_rank_str("medium"), 3);
+        assert_eq!(severity_rank_str("low"), 2);
+        assert_eq!(severity_rank_str("info"), 1);
+        assert_eq!(severity_rank_str("unknown"), 0);
+    }
+
+    #[test]
+    fn load_playbooks_missing_dir_returns_empty() {
+        let dir = tempdir().unwrap();
+        assert!(load_playbooks(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn load_playbooks_parses_valid_toml_and_applies_defaults() {
+        let dir = tempdir().unwrap();
+        let playbooks_dir = dir.path().join("playbooks");
+        std::fs::create_dir_all(&playbooks_dir).unwrap();
+        std::fs::write(
+            playbooks_dir.join("custom.toml"),
+            r#"
+[playbook.pb-default-min]
+trigger = { detector = "custom_detector" }
+steps = [
+  { action = "notify", params = { channels = "telegram" } },
+]
+run_in_dry_run = true
+"#,
+        )
+        .unwrap();
+
+        let playbooks = load_playbooks(dir.path());
+        assert_eq!(playbooks.len(), 1);
+        let pb = &playbooks[0];
+        assert_eq!(pb.id, "pb-default-min");
+        assert_eq!(pb.name, "pb-default-min");
+        assert_eq!(pb.trigger.detector, "custom_detector");
+        assert_eq!(pb.trigger.min_severity, "high");
+        assert!(pb.run_in_dry_run);
+        assert_eq!(pb.steps.len(), 1);
+        assert_eq!(pb.steps[0].action, "notify");
+        assert_eq!(
+            pb.steps[0].params.get("channels").map(String::as_str),
+            Some("telegram")
+        );
+    }
+
+    #[test]
+    fn load_playbooks_skips_non_toml_and_handles_invalid_and_unreadable_toml() {
+        let dir = tempdir().unwrap();
+        let playbooks_dir = dir.path().join("playbooks");
+        std::fs::create_dir_all(&playbooks_dir).unwrap();
+
+        std::fs::write(playbooks_dir.join("ignored.txt"), "not toml").unwrap();
+        std::fs::write(playbooks_dir.join("broken.toml"), "playbook = [").unwrap();
+        std::fs::create_dir_all(playbooks_dir.join("directory.toml")).unwrap();
+        std::fs::write(
+            playbooks_dir.join("valid.toml"),
+            r#"
+[playbook.pb-valid]
+name = "Valid"
+trigger = { detector = "ssh_bruteforce", min_severity = "high" }
+steps = [{ action = "notify" }]
+"#,
+        )
+        .unwrap();
+
+        let playbooks = load_playbooks(dir.path());
+        assert_eq!(playbooks.len(), 1);
+        assert_eq!(playbooks[0].id, "pb-valid");
+        assert_eq!(playbooks[0].name, "Valid");
+    }
+
+    #[test]
+    fn builtin_step_catalog_includes_expected_actions_and_dry_run_playbooks() {
+        let builtins = builtin_playbooks();
+        let actions: HashSet<&str> = builtins
+            .iter()
+            .flat_map(|pb| pb.steps.iter().map(|step| step.action.as_str()))
+            .collect();
+
+        for expected in [
+            "block_ip",
+            "kill_process",
+            "suspend_user_sudo",
+            "capture_forensics",
+            "quarantine_file",
+            "isolate_network",
+            "notify",
+            "escalate",
+            "block_container",
+        ] {
+            assert!(
+                actions.contains(expected),
+                "missing expected action in builtin catalog: {expected}"
+            );
+        }
+
+        let dry_run_ids: HashSet<&str> = builtins
+            .iter()
+            .filter(|pb| pb.run_in_dry_run)
+            .map(|pb| pb.id.as_str())
+            .collect();
+        assert!(dry_run_ids.contains("pb-chain-firmware-rootkit"));
+        assert!(dry_run_ids.contains("pb-kernel-module"));
+        assert!(dry_run_ids.contains("pb-discovery-burst"));
+        assert!(!dry_run_ids.contains("pb-ransomware"));
+    }
+
+    #[test]
+    fn builtin_detector_playbooks_match_and_enforce_min_severity() {
+        let detector_playbooks: Vec<Playbook> = builtin_playbooks()
+            .into_iter()
+            .filter(|pb| pb.trigger.chain_rule.is_empty())
+            .collect();
+
+        for pb in detector_playbooks {
+            let mut engine = PlaybookEngine::new(Path::new("/nonexistent"));
+            let severity = severity_at_or_above(&pb.trigger.min_severity);
+            let incident = make_incident(&pb.trigger.detector, severity);
+            let exec = engine.evaluate(&incident).unwrap_or_else(|| {
+                panic!(
+                    "expected detector playbook to match: {} ({})",
+                    pb.id, pb.trigger.detector
+                )
+            });
+            assert_eq!(exec.playbook_id, pb.id);
+
+            if let Some(lower) = severity_just_below(&pb.trigger.min_severity) {
+                let mut engine = PlaybookEngine::new(Path::new("/nonexistent"));
+                let incident = make_incident(&pb.trigger.detector, lower);
+                assert!(
+                    engine.evaluate(&incident).is_none(),
+                    "playbook should not match below threshold: {}",
+                    pb.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chain_playbooks_match_by_rule_and_respect_cooldown() {
+        let incident = make_incident("any_detector", Severity::Critical);
+
+        let mut engine = PlaybookEngine::new(Path::new("/nonexistent"));
+        let chain_exec = engine.evaluate_chain("CL-002", &incident).unwrap();
+        assert_eq!(chain_exec.playbook_id, "pb-chain-recon-exfil");
+        assert!(engine.evaluate_chain("CL-002", &incident).is_none());
+
+        let mut engine = PlaybookEngine::new(Path::new("/nonexistent"));
+        let chain_exec = engine.evaluate_chain("CL-001", &incident).unwrap();
+        assert_eq!(chain_exec.playbook_id, "pb-chain-firmware-rootkit");
+        assert!(engine.evaluate_chain("CL-999", &incident).is_none());
+    }
+
+    #[test]
+    fn custom_playbook_preserves_step_actions_and_pending_plan() {
+        let dir = tempdir().unwrap();
+        let playbooks_dir = dir.path().join("playbooks");
+        std::fs::create_dir_all(&playbooks_dir).unwrap();
+        std::fs::write(
+            playbooks_dir.join("step-catalog.toml"),
+            r#"
+[playbook.pb-step-catalog]
+name = "Step Catalog"
+trigger = { detector = "step_catalog_detector", min_severity = "high" }
+run_in_dry_run = true
+steps = [
+  { action = "block_ip" },
+  { action = "kill_process" },
+  { action = "suspend_user_sudo" },
+  { action = "capture_forensics" },
+  { action = "quarantine_file" },
+  { action = "isolate_network" },
+  { action = "notify", params = { channels = "telegram,slack" } },
+  { action = "escalate", params = { to = "critical" } },
+]
+"#,
+        )
+        .unwrap();
+
+        let loaded = load_playbooks(dir.path());
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "pb-step-catalog");
+        assert!(loaded[0].run_in_dry_run);
+
+        let mut engine = PlaybookEngine::new(dir.path());
+        let exec = engine
+            .evaluate(&make_incident("step_catalog_detector", Severity::High))
+            .unwrap();
+
+        let actions: Vec<&str> = exec.steps.iter().map(|step| step.action.as_str()).collect();
+        assert_eq!(
+            actions,
+            vec![
+                "block_ip",
+                "kill_process",
+                "suspend_user_sudo",
+                "capture_forensics",
+                "quarantine_file",
+                "isolate_network",
+                "notify",
+                "escalate"
+            ]
+        );
+        assert!(exec.steps.iter().all(|step| step.status == "pending"));
+        assert!(exec
+            .steps
+            .iter()
+            .any(|step| step.detail.contains("channels")));
+        assert!(exec
+            .steps
+            .iter()
+            .any(|step| step.detail.contains("critical")));
     }
 }

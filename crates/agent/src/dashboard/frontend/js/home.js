@@ -25,7 +25,6 @@ async function loadHome() {
     window._lastIncidentList = incidentList.items || [];
     window._lastEntityItems = entityData.items || [];
 
-    // Filtered base matches what Recent Activity will render.
     var items = incidentList.items || [];
     var base = state.hideAllowlisted
       ? items.filter(function(i) { return !isIncidentTrusted(i); })
@@ -61,7 +60,6 @@ async function loadHome() {
 
     updateHomeNow(overview, activeHighCriticalList.length, softStale, totalEventsScanned);
     updateHomeKpis(overview, totalEventsScanned);
-    buildHomeFeed(base);
     updateCollectorStrip(sensors);
     loadBriefing();
   } catch(e) { console.warn('loadHome error:', e); }
@@ -145,20 +143,15 @@ function computeHomeState(payload) {
 
   // Guard ON or no active threats: AI Protection Active.
   // The operator sees confidence, not alarm.
-  // Use entity items (same source as Threats tab) for consistent counts.
-  var entityItems = payload.entityItems || [];
-  var blocked = 0, observing = 0;
-  entityItems.forEach(function(item) {
-    var o = (item.outcome || 'open').toLowerCase();
-    if (o === 'blocked' || o === 'honeypot' || o === 'contained') blocked++;
-    else if (o === 'monitoring' || o === 'open' || o === 'active') observing++;
-  });
-  if (blocked === 0) blocked = overview.ai_responded || 0;
-  var subParts = [];
-  if (blocked > 0) subParts.push(blocked + ' blocked');
-  if (observing > 0) subParts.push(observing + ' observing');
-  var subText = subParts.length > 0
-    ? subParts.join(' \u00B7 ') + '. Everything handled automatically.'
+  //
+  // Single source: overview.safely_resolved = every decision today that was
+  // NOT "ignore" (block, monitor, honeypot, kill, suspend). The Home KPI
+  // tile and the briefing now quote the same field, so the operator no
+  // longer sees "9 blocked" in the hero while the KPI says 50 and the
+  // briefing says 48 for the same time window.
+  var handled = overview.safely_resolved || 0;
+  var subText = handled > 0
+    ? handled + ' handled today. AI is on shift.'
     : 'All systems monitoring. Nothing requires your attention.';
 
   return {
@@ -219,14 +212,11 @@ function updateHomeNow(overview, activeCount, softStale, totalEventsScanned) {
   var didEl  = document.getElementById('homeNowDid');
   if (!whatEl || !didEl) return;
 
-  var entityItems = window._lastEntityItems || [];
-  var contained = 0, observingNow = 0;
-  entityItems.forEach(function(item) {
-    var o = (item.outcome || 'open').toLowerCase();
-    if (o === 'blocked' || o === 'honeypot' || o === 'contained') contained++;
-    else if (o === 'monitoring' || o === 'open' || o === 'active') observingNow++;
-  });
-  if (contained === 0) contained = overview.ai_responded || 0;
+  // Same source as updateHomeKpis and computeHomeState: overview.safely_resolved.
+  // Counts every non-"ignore" decision today (block + monitor + honeypot +
+  // kill + suspend). Older code summed currently-active entities, which
+  // decay with TTL and so understated the number the briefing reported.
+  var handled = overview.safely_resolved || 0;
   var total = totalEventsScanned || overview.events_count || 0;
 
   // Line 1 — Trust signal: volume scanned
@@ -243,27 +233,24 @@ function updateHomeNow(overview, activeCount, softStale, totalEventsScanned) {
 
   // Line 2 — Outcome summary
   var line2;
-  if (contained === 0 && observingNow === 0) {
+  if (handled === 0) {
     line2 = 'Nothing suspicious found. All systems operating normally.';
-  } else if (contained > 0 && observingNow === 0) {
-    line2 = 'Blocked ' + contained + ' threat' + (contained > 1 ? 's' : '') + ' automatically. Nothing requires your attention.';
   } else {
-    line2 = 'Blocked ' + contained + ' automatically. Observing ' + observingNow + ' more. No action needed.';
+    line2 = 'Handled ' + handled + ' threat' + (handled === 1 ? '' : 's') + ' today. AI is on shift.';
   }
   didEl.textContent = line2;
 }
 
 // ── KPIs with fixed temporal sub-labels ──────────────────────────────
 function updateHomeKpis(overview, totalEventsScanned) {
-  // Count from entity items (same source as Threats tab) for consistency.
-  var entityItems = window._lastEntityItems || [];
-  var blockedCount = 0;
-  entityItems.forEach(function(item) {
-    var o = (item.outcome || 'open').toLowerCase();
-    if (o === 'blocked' || o === 'honeypot' || o === 'contained') blockedCount++;
-  });
+  // "Handled" = every decision today that was NOT "ignore" (block, monitor,
+  // honeypot, kill, suspend). Uses overview.safely_resolved — same field
+  // consumed by the hero sub (updateHomeNow) and computeHomeState, and
+  // produced by the same graph walk the briefing uses. Prior revision
+  // read ai_responded which excluded Monitor actions, so the KPI
+  // reported a smaller number than the briefing for the same window.
   var el = document.getElementById('homeKpiThreats');
-  if (el) el.textContent = blockedCount > 0 ? blockedCount : (overview.ai_responded || 0);
+  if (el) el.textContent = overview.safely_resolved || 0;
 
   el = document.getElementById('homeKpiResponded');
   if (el) el.textContent = overview.incidents_count || 0;
@@ -296,13 +283,19 @@ async function loadBriefing() {
     section.style.display = '';
     var content = document.getElementById('briefingContent');
     var btn = document.getElementById('briefingBtn');
+    // SSE can fire refresh while the Home view is hidden; children may
+    // briefly be null during markup rerender. Guard each write so the
+    // whole loadHome pipeline does not throw on null.textContent /
+    // null.innerHTML.
     if (data.available) {
       var age = data.generated_at ? new Date(data.generated_at).toLocaleTimeString() : '';
-      content.innerHTML = '<div style="margin-bottom:8px;font-size:0.65rem;color:var(--muted)">Generated ' + age + '</div>' +
-        '<div>' + esc(data.summary).replace(/\n/g, '<br>').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>') + '</div>';
-      btn.textContent = 'Regenerate';
-    } else {
-      // Spec 017 Change 7 — exact approved English copy.
+      if (content) {
+        content.innerHTML = '<div style="margin-bottom:8px;font-size:0.65rem;color:var(--muted)">Generated ' + age + '</div>' +
+          '<div>' + esc(data.summary).replace(/\n/g, '<br>').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>') + '</div>';
+      }
+      if (btn) btn.textContent = 'Regenerate';
+    } else if (content) {
+      // Spec 017 Change 7 exact approved English copy.
       content.innerHTML = '<div class="briefing-empty">' +
         esc("No briefing yet. You're protected, and we are still monitoring. Generate a briefing now for a quick summary.") +
         '</div>';
@@ -331,94 +324,6 @@ async function generateBriefing() {
     content.innerHTML = '<div style="color:var(--danger)">Error: ' + esc(e.message) + '</div>';
   }
   if (btn) { btn.textContent = 'Regenerate'; btn.disabled = false; }
-}
-
-// ── Recent Activity (severity × outcome hierarchy, never red) ──────
-function buildHomeFeed(incidents) {
-  var feedEl = document.getElementById('homeFeed');
-  if (!feedEl) return;
-
-  incidents = (incidents || []).slice();
-
-  if (incidents.length === 0) {
-    feedEl.innerHTML =
-      '<div class="home-feed-empty">' +
-      '<div class="home-feed-empty-icon">\u2705</div>' +
-      '<div class="home-feed-empty-title">No events in view.</div>' +
-      '<div class="home-feed-empty-sub">AI is monitoring.</div>' +
-      '</div>';
-    return;
-  }
-
-  // Sort: open first, then severity desc, then ts desc.
-  incidents.sort(function(a, b) {
-    var ao = (a.outcome || 'open') === 'open' ? 0 : 1;
-    var bo = (b.outcome || 'open') === 'open' ? 0 : 1;
-    if (ao !== bo) return ao - bo;
-    var as = severityRank(a.effective_severity || a.severity);
-    var bs = severityRank(b.effective_severity || b.severity);
-    if (as !== bs) return bs - as;
-    return (new Date(b.ts).getTime() || 0) - (new Date(a.ts).getTime() || 0);
-  });
-
-  var html = '<div class="activity-feed">';
-  incidents.slice(0, 15).forEach(function(inc) {
-    var slug = (inc.incident_id || '').split(':')[0] || '';
-    var label = humanLabel(slug);
-    var ago = timeAgo(inc.ts);
-    var outcome = inc.outcome || 'open';
-    var sev = (inc.effective_severity || inc.severity || '').toLowerCase();
-    var entities = inc.entities || [];
-    var ipEntity = entities.find(function(e) {
-      return (e.type || '').toLowerCase() === 'ip' || (typeof e === 'string' && e.startsWith('ip:'));
-    });
-    var ipVal = ipEntity ? (ipEntity.value || (typeof ipEntity === 'string' ? ipEntity.slice(3) : '')) : '';
-
-    // Row class: severity × outcome. Open + critical/high uses
-    // .alert-high / .alert-medium (orange/amber) — never .alert-critical.
-    var rowClass = 'feed-row';
-    if (outcome === 'blocked' || outcome === 'killed' || outcome === 'contained' || outcome === 'suspended') {
-      rowClass += ' feed-handled';
-    } else if (outcome === 'ignored') {
-      rowClass += ' feed-noise';
-    } else if (outcome === 'monitored') {
-      rowClass += ' feed-monitor';
-    } else if (outcome === 'honeypot') {
-      rowClass += ' feed-honeypot';
-    } else {
-      // open — scale by severity, but never red
-      if (sev === 'critical')    rowClass += ' alert-high';
-      else if (sev === 'high')   rowClass += ' alert-medium';
-      else if (sev === 'medium') rowClass += ' alert-low';
-      else                       rowClass += ' feed-muted';
-    }
-
-    var icon = '\u26A0';
-    if (outcome === 'blocked' || outcome === 'killed' || outcome === 'contained' || outcome === 'suspended') icon = '\uD83D\uDEE1';
-    else if (outcome === 'ignored') icon = '\u2796';
-    else if (sev === 'critical' || sev === 'high') icon = '\u26A1';
-
-    // Map raw outcome to AI-first model: open/active → OBSERVING with Guard ON
-    var mappedOutcome = outcome;
-    if ((outcome === 'open' || outcome === 'active') && (window._agentMode || status?.mode || 'guard') === 'guard') {
-      mappedOutcome = 'monitoring';
-    }
-    var badge = outcomeBadgeHtml(mappedOutcome);
-
-    html += '<div class="' + rowClass + '" onclick="viewActivity();handleCardClickByValue(\'ip\',\'' + ipVal + '\')">' +
-      '<span class="activity-icon">' + icon + '</span>' +
-      '<div style="flex:1;min-width:0">' +
-      '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
-      '<span style="font-size:0.8rem;font-weight:600;color:var(--text)">' + label + '</span>' +
-      badge +
-      '</div>' +
-      (ipVal ? '<div style="font-size:0.72rem;color:var(--muted);margin-top:2px;font-family:\'JetBrains Mono\',monospace">' + ipVal + '</div>' : '') +
-      '</div>' +
-      '<span class="activity-time">' + ago + '</span>' +
-      '</div>';
-  });
-  html += '</div>';
-  feedEl.innerHTML = html;
 }
 
 // ── Data Collection (summary + collapsed details) ───────────────────

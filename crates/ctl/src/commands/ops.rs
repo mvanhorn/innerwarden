@@ -2189,10 +2189,10 @@ mod tests {
             agent_config: data_dir.join("agent.toml"),
             data_dir: data_dir.to_path_buf(),
             dry_run,
-            command: crate::Command::Decisions {
+            command: Some(crate::Command::Decisions {
                 days: 1,
                 action: None,
-            },
+            }),
         }
     }
 

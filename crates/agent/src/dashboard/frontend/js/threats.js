@@ -260,7 +260,8 @@ async function downloadSnapshot(format) {
       body
     );
   } catch (e) {
-    document.getElementById('refreshStatus').textContent = 'export err: ' + e.message;
+    var s = document.getElementById('refreshStatus');
+    if (s) s.textContent = 'export err: ' + e.message;
   }
 }
 
@@ -439,6 +440,10 @@ async function refreshLeftLive() {
 
     const list = document.getElementById('attackerList');
     const newItems = items.filter(it => !state.knownItemValues.has(it.value));
+    // SSE refresh can fire while Threats view is hidden; the list node
+    // may be absent if the tab was not yet opened. Bail early in that
+    // case so the live path never throws on null.innerHTML.
+    if (!list) return;
     if (newItems.length > 0) {
       // Rebuild grouped list when new items arrive
       list.innerHTML = buildGroupedList(items);
@@ -512,36 +517,50 @@ async function refreshLeft(forceRefreshJourney = false) {
       else if (o === 'needs_attention') kpiAttention++;
       else if (o === 'monitoring') kpiObserving++;
     });
-    document.getElementById('kpi-confirmed').textContent = kpiBlocked;
-    document.getElementById('kpi-responded').textContent = kpiObserving;
-    document.getElementById('kpi-noise').textContent     = kpiAttention;
-    document.getElementById('kpi-events').textContent    = ov.events_count;
-    document.getElementById('kpi-incidents').textContent = ov.incidents_count;
-    const kpiAtt = document.getElementById('kpi-attackers');
-    if (kpiAtt) kpiAtt.textContent = items.length;
+    // #188 removed four elements from the Threats left panel that this
+    // handler still writes to: kpi-events, kpi-incidents, kpi-attackers
+    // (hidden spans), clusterList + topDetectors divs (dead UI). Without
+    // a null guard the first null.textContent throws and aborts the
+    // whole refreshLeft before attackerList.innerHTML runs — the list
+    // then sticks on "Loading..." forever. Guard every write.
+    var setText = function(id, value) {
+      var el = document.getElementById(id);
+      if (el) el.textContent = value;
+    };
+    var setHtml = function(id, value) {
+      var el = document.getElementById(id);
+      if (el) el.innerHTML = value;
+    };
+    setText('kpi-confirmed', kpiBlocked);
+    setText('kpi-responded', kpiObserving);
+    setText('kpi-noise', kpiAttention);
+    setText('kpi-events', ov.events_count);
+    setText('kpi-incidents', ov.incidents_count);
+    setText('kpi-attackers', items.length);
 
     const list = document.getElementById('attackerList');
-    if (items.length === 0) {
-      list.innerHTML = '<div class="empty">No records for the selected filters.</div>';
-      state.knownItemValues.clear();
-    } else {
-      list.innerHTML = buildGroupedList(items);
-      state.knownItemValues = new Set(items.map(it => it.value));
+    if (list) {
+      if (items.length === 0) {
+        list.innerHTML = '<div class="empty">No records for the selected filters.</div>';
+        state.knownItemValues.clear();
+      } else {
+        list.innerHTML = buildGroupedList(items);
+        state.knownItemValues = new Set(items.map(it => it.value));
+      }
     }
 
-    const clusterList = document.getElementById('clusterList');
     if (!state.clusters.length) {
-      clusterList.innerHTML = '<div class="empty">No clusters for current filters.</div>';
+      setHtml('clusterList', '<div class="empty">No clusters for current filters.</div>');
     } else {
-      clusterList.innerHTML = state.clusters.map(renderClusterCard).join('');
+      setHtml('clusterList', state.clusters.map(renderClusterCard).join(''));
     }
 
     if (ov.top_detectors && ov.top_detectors.length) {
-      document.getElementById('topDetectors').innerHTML = ov.top_detectors.map(d =>
+      setHtml('topDetectors', ov.top_detectors.map(d =>
         `<div class="det-row"><span>${esc(d.detector)}</span><span class="det-count">${d.count}</span></div>`
-      ).join('');
+      ).join(''));
     } else {
-      document.getElementById('topDetectors').innerHTML = '<div class="empty">No detectors fired.</div>';
+      setHtml('topDetectors', '<div class="empty">No detectors fired.</div>');
     }
 
     if (state.selected.value) {
@@ -558,9 +577,11 @@ async function refreshLeft(forceRefreshJourney = false) {
 
     applyEntitySearch();  // D9: re-apply filter after full reload
     syncUrl();
-    document.getElementById('refreshStatus').textContent = new Date().toLocaleTimeString();
+    var s = document.getElementById('refreshStatus');
+    if (s) s.textContent = new Date().toLocaleTimeString();
   } catch (e) {
-    document.getElementById('refreshStatus').textContent = 'err: ' + e.message;
+    var s = document.getElementById('refreshStatus');
+    if (s) s.textContent = 'err: ' + e.message;
   }
 }
 

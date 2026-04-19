@@ -198,13 +198,27 @@ function renderReport(r) {
     <div class="report-section-title">Operational Health</div>
     <table class="report-table"><thead><tr><th>File</th><th>Exists</th><th>Valid</th><th>Lines</th><th>Size</th></tr></thead><tbody>`;
   (oh.files || []).forEach(f => {
-    const valid = f.jsonl_valid == null ? '-' : (f.jsonl_valid ? '<span class="health-ok">✓</span>' : '<span class="health-fail">✗</span>');
+    // Spec 016 migrated events to SQLite. The events.jsonl file no
+    // longer exists on disk, so its "Exists: ✗" used to look like a
+    // health failure. Show "SQLite" for the events row instead; the
+    // rest still use jsonl backing.
+    const isSqliteOnly = (f.file === 'events' && !f.exists);
+    const existsCell = isSqliteOnly
+      ? '<span class="health-ok" title="stored in innerwarden.db (spec 016)">SQLite</span>'
+      : (f.exists ? '<span class="health-ok">✓</span>' : '<span class="health-fail">✗</span>');
+    const valid = isSqliteOnly
+      ? '<span class="health-ok">✓</span>'
+      : (f.jsonl_valid == null ? '-' : (f.jsonl_valid ? '<span class="health-ok">✓</span>' : '<span class="health-fail">✗</span>'));
+    const linesCell = isSqliteOnly ? '(in db)' : (f.lines ?? '-');
+    const sizeCell = isSqliteOnly
+      ? '-'
+      : (f.size_bytes > 0 ? (f.size_bytes > 1048576 ? (f.size_bytes/1048576).toFixed(1)+'MB' : (f.size_bytes/1024).toFixed(1)+'KB') : '0B');
     html += `<tr>
       <td>${esc(f.file)}</td>
-      <td>${f.exists ? '<span class="health-ok">✓</span>' : '<span class="health-fail">✗</span>'}</td>
+      <td>${existsCell}</td>
       <td>${valid}</td>
-      <td>${f.lines ?? '-'}</td>
-      <td>${f.size_bytes > 0 ? (f.size_bytes > 1048576 ? (f.size_bytes/1048576).toFixed(1)+'MB' : (f.size_bytes/1024).toFixed(1)+'KB') : '0B'}</td>
+      <td>${linesCell}</td>
+      <td>${sizeCell}</td>
     </tr>`;
   });
   html += `</tbody></table></div>`;

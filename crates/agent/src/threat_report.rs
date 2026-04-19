@@ -818,8 +818,46 @@ fn build_honeypot_intel(profiles: &[&AttackerProfile]) -> HoneypotIntel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::attacker_intel;
-    use std::collections::BTreeSet;
+    use crate::attacker_intel::{self, GeoIdentity};
+    use crate::decisions::DecisionEntry;
+
+    fn write_jsonl(path: &Path, lines: &[String]) {
+        let mut content = lines.join("\n");
+        content.push('\n');
+        std::fs::write(path, content).unwrap();
+    }
+
+    fn incident_line(incident_id: &str, ip: Option<&str>) -> String {
+        let entities = ip
+            .map(|addr| vec![serde_json::json!({"type": "ip", "value": addr})])
+            .unwrap_or_default();
+        serde_json::json!({
+            "incident_id": incident_id,
+            "entities": entities
+        })
+        .to_string()
+    }
+
+    fn decision_line(action_type: &str) -> String {
+        serde_json::to_string(&DecisionEntry {
+            ts: Utc::now(),
+            incident_id: "inc-1".to_string(),
+            host: "host-a".to_string(),
+            ai_provider: "stub".to_string(),
+            action_type: action_type.to_string(),
+            target_ip: Some("10.0.0.1".to_string()),
+            target_user: None,
+            skill_id: Some("skill.test".to_string()),
+            confidence: 0.95,
+            auto_executed: true,
+            dry_run: false,
+            reason: "test".to_string(),
+            estimated_threat: "high".to_string(),
+            execution_result: "ok".to_string(),
+            prev_hash: None,
+        })
+        .unwrap()
+    }
 
     fn make_profile(ip: &str, risk: u8, detectors: &[&str]) -> AttackerProfile {
         let mut p = attacker_intel::new_profile(ip, Utc::now());
@@ -829,6 +867,26 @@ mod tests {
             p.detectors_triggered.insert(d.to_string());
         }
         p.visit_dates.push("2026-03-15".to_string());
+        p
+    }
+
+    fn make_profile_with_geo(
+        ip: &str,
+        risk: u8,
+        detectors: &[&str],
+        country: &str,
+        country_code: &str,
+    ) -> AttackerProfile {
+        let mut p = make_profile(ip, risk, detectors);
+        p.geo = Some(GeoIdentity {
+            country: country.to_string(),
+            country_code: country_code.to_string(),
+            city: "City".to_string(),
+            isp: "ISP".to_string(),
+            asn: "AS123".to_string(),
+        });
+        p.mitre_techniques
+            .insert("T1110.001 (Brute Force: Password Guessing)".to_string());
         p
     }
 
@@ -905,5 +963,299 @@ mod tests {
         let (json_path, md_path) = write_report(&report, dir.path()).unwrap();
         assert!(json_path.exists());
         assert!(md_path.exists());
+    }
+
+    #[test]
+    fn month_validation_and_directory_sanitization_reject_bad_inputs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for bad_month in [
+            "2026-3",
+            "202603",
+            "2026/03",
+            "2026\\03",
+            "../2026-03",
+            "1999-12",
+            "2101-01",
+            "2026-13",
+        ] {
+            assert!(!report_exists(dir.path(), bad_month), "{bad_month}");
+        }
+
+        assert!(generate_monthly(dir.path(), "2026-13", &HashMap::new()).is_err());
+        assert!(available_months(Path::new("/definitely/missing/path")).is_empty());
+
+        let file_path = dir.path().join("not_a_dir.txt");
+        std::fs::write(&file_path, "x").unwrap();
+        assert!(available_months(&file_path).is_empty());
+    }
+
+    #[test]
+    fn available_months_detects_reports_and_incidents_and_sorts_desc() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("monthly-report-2026-01.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("monthly-report-2026-03.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("incidents-2026-02-15.jsonl"), "{}\n").unwrap();
+        std::fs::write(dir.path().join("incidents-graph-2026-03-01.jsonl"), "{}\n").unwrap();
+        std::fs::write(dir.path().join("incidents-2026-AA-01.jsonl"), "{}\n").unwrap();
+
+        let months = available_months(dir.path());
+        assert_eq!(months.first().map(String::as_str), Some("2026-03"));
+        assert!(months.contains(&"2026-02".to_string()));
+        assert!(months.contains(&"2026-01".to_string()));
+        assert!(!months.contains(&"2026-AA".to_string()));
+    }
+
+    #[test]
+    fn count_jsonl_lines_handles_existing_and_missing_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("sample.jsonl");
+        std::fs::write(&path, "a\nb\nc\n").unwrap();
+        assert_eq!(count_jsonl_lines(&path), 3);
+        assert_eq!(count_jsonl_lines(&dir.path().join("absent.jsonl")), 0);
+    }
+
+    #[test]
+    fn helper_aggregations_cover_mitre_geo_and_honeypot_paths() {
+        let mut by_detector = BTreeMap::new();
+        by_detector.insert("ssh_bruteforce".to_string(), 3);
+        by_detector.insert("unknown_detector".to_string(), 10);
+
+        let mut p1 = make_profile_with_geo(
+            "10.0.0.1",
+            80,
+            &["ssh_bruteforce", "credential_stuffing"],
+            "United States",
+            "US",
+        );
+        p1.honeypot_sessions = 3;
+        p1.credentials_attempted
+            .push(("root".to_string(), "toor".to_string()));
+        p1.commands_executed.push("wget http://evil".to_string());
+        p1.dna.tool_signatures.push("wget".to_string());
+
+        let mut p2 =
+            make_profile_with_geo("10.0.0.2", 60, &["ssh_bruteforce"], "United States", "US");
+        p2.honeypot_sessions = 1;
+        p2.credentials_attempted
+            .push(("admin".to_string(), "admin".to_string()));
+        p2.commands_executed.push("curl http://evil".to_string());
+        p2.dna.tool_signatures.push("curl".to_string());
+        p2.mitre_techniques
+            .insert("T1110 (Brute Force)".to_string());
+
+        let mut profiles_map = HashMap::new();
+        profiles_map.insert(p1.ip.clone(), p1.clone());
+        profiles_map.insert(p2.ip.clone(), p2.clone());
+
+        let mitre = build_mitre_coverage(&by_detector, &profiles_map);
+        assert!(mitre.total_unique_techniques >= 1);
+        assert!(!mitre.tactics_counts.is_empty());
+        assert!(mitre
+            .techniques_seen
+            .iter()
+            .any(|t| t.attacker_count >= 1 && t.incident_count >= 1));
+
+        let no_geo = make_profile("10.0.0.3", 40, &["web_scan"]);
+        let geo = build_geo_distribution(&[&p1, &p2, &no_geo]);
+        assert_eq!(geo.by_country.len(), 1);
+        assert_eq!(geo.by_country[0].country_code, "US");
+        assert_eq!(geo.by_country[0].attacker_count, 2);
+
+        let hp = build_honeypot_intel(&[&p1, &p2, &no_geo]);
+        assert_eq!(hp.total_sessions, 4);
+        assert_eq!(hp.unique_ips, 2);
+        assert!(!hp.top_credentials.is_empty());
+        assert!(!hp.top_commands.is_empty());
+        assert!(!hp.tool_signatures.is_empty());
+    }
+
+    #[test]
+    fn generate_monthly_parses_jsonl_skips_corrupt_and_aggregates_weekly_metrics() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let date = "2026-03-15";
+        write_jsonl(
+            &dir.path().join(format!("events-{date}.jsonl")),
+            &["e1".to_string(), "e2".to_string(), "e3".to_string()],
+        );
+        write_jsonl(
+            &dir.path().join(format!("incidents-{date}.jsonl")),
+            &[
+                incident_line("ssh_bruteforce:001", Some("10.10.10.1")),
+                "{bad-json".to_string(),
+                incident_line("ssh_bruteforce:002", Some("10.10.10.2")),
+            ],
+        );
+        write_jsonl(
+            &dir.path().join(format!("decisions-{date}.jsonl")),
+            &[
+                decision_line("block_ip"),
+                "not-json".to_string(),
+                decision_line("observe"),
+            ],
+        );
+
+        let profiles = HashMap::new();
+        let report = generate_monthly(dir.path(), "2026-03", &profiles).unwrap();
+
+        assert_eq!(report.executive_summary.total_events, 3);
+        assert_eq!(report.executive_summary.total_incidents, 2);
+        assert_eq!(report.executive_summary.total_decisions, 2);
+        assert_eq!(report.executive_summary.total_blocks, 1);
+        assert_eq!(report.executive_summary.unique_attackers, 2);
+        assert_eq!(report.executive_summary.days_with_data, 1);
+        assert_eq!(report.executive_summary.top_detector, "ssh_bruteforce");
+
+        let week = &report.weekly_trends[2]; // day 15 is week index 2
+        assert_eq!(week.events, 3);
+        assert_eq!(week.incidents, 2);
+        assert_eq!(week.decisions, 2);
+        assert_eq!(week.blocks, 1);
+        assert_eq!(week.unique_attackers, 2);
+    }
+
+    #[test]
+    fn generate_monthly_top20_json_markdown_and_private_field_contract() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let date = "2026-03-05";
+        write_jsonl(
+            &dir.path().join(format!("events-{date}.jsonl")),
+            &["ev".to_string()],
+        );
+        write_jsonl(
+            &dir.path().join(format!("incidents-{date}.jsonl")),
+            &[
+                incident_line("ssh_bruteforce:1", Some("20.0.0.1")),
+                incident_line("ransomware:2", Some("20.0.0.2")),
+            ],
+        );
+        write_jsonl(
+            &dir.path().join(format!("decisions-{date}.jsonl")),
+            &[decision_line("block_ip")],
+        );
+
+        let mut profiles = HashMap::new();
+        for i in 0..25u8 {
+            let ip = format!("20.0.0.{}", i + 1);
+            let mut p = make_profile_with_geo(
+                &ip,
+                100u8.saturating_sub(i),
+                &["ssh_bruteforce", "credential_stuffing", "port_scan"],
+                "United States",
+                "US",
+            );
+            p.visit_dates.push("2026-03-05".to_string());
+            p.total_incidents = (i as u32) + 1;
+            p.iocs.urls.push("http://evil.shared/payload".to_string());
+            p.honeypot_sessions = 1;
+            p.credentials_attempted
+                .push(("root".to_string(), "toor".to_string()));
+            p.commands_executed.push("cat /etc/passwd".to_string());
+            p.dna.tool_signatures.push("busybox".to_string());
+            p.mesh_peer_confirmations = 2;
+            p.mesh_signals_received = 3;
+
+            if i == 0 {
+                p.total_blocks = 3;
+            } else if i == 1 {
+                p.total_honeypot_diversions = 2;
+            } else if i == 2 {
+                p.total_monitors = 4;
+            }
+            profiles.insert(ip, p);
+        }
+
+        let report = generate_monthly(dir.path(), "2026-03", &profiles).unwrap();
+        assert_eq!(report.top_attackers.len(), 20);
+        assert!(report.top_attackers[0].risk_score >= report.top_attackers[1].risk_score);
+        let actions: std::collections::HashSet<&str> = report
+            .top_attackers
+            .iter()
+            .map(|a| a.action_taken.as_str())
+            .collect();
+        assert!(actions.contains("blocked"));
+        assert!(actions.contains("honeypot"));
+        assert!(actions.contains("monitoring"));
+        assert!(actions.contains("observed"));
+
+        assert!(!report.mitre_coverage.techniques_seen.is_empty());
+        assert!(!report.geographic_distribution.by_country.is_empty());
+        assert!(report.honeypot_intelligence.total_sessions > 0);
+        assert!(!report.honeypot_intelligence.top_credentials.is_empty());
+        assert!(!report.campaigns.is_empty());
+        assert!(!report.weekly_trends.is_empty());
+
+        let (json_path, md_path) = write_report(&report, dir.path()).unwrap();
+        let json_text = std::fs::read_to_string(json_path).unwrap();
+        let json_val: serde_json::Value = serde_json::from_str(&json_text).unwrap();
+        assert!(json_val.get("generated_at").is_some());
+        assert!(json_val.get("executive_summary").is_some());
+        assert!(json_val.get("top_attackers").is_some());
+        assert!(json_val.get("campaigns").is_some());
+        assert!(json_val.get("weekly_trends").is_some());
+        assert!(!json_text.contains("credentials_attempted"));
+        assert!(!json_text.contains("hour_distribution"));
+        assert!(!json_text.contains("mesh_peer_confirmations"));
+
+        let md = std::fs::read_to_string(md_path).unwrap();
+        assert!(md.contains("## Executive Summary"));
+        assert!(md.contains("## Top Attackers"));
+        assert!(md.contains("## MITRE ATT&CK Coverage"));
+        assert!(md.contains("## Geographic Distribution"));
+        assert!(md.contains("## Detected Campaigns"));
+        assert!(md.contains("## Honeypot Intelligence"));
+        assert!(md.contains("## Weekly Trends"));
+    }
+
+    #[test]
+    fn campaign_detection_ioc_overlap_and_no_overlap_cases() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let mut overlap_profiles = HashMap::new();
+        let mut a = make_profile("30.0.0.1", 80, &["port_scan"]);
+        a.iocs.urls.push("http://shared.c2/payload".to_string());
+        let mut b = make_profile("30.0.0.2", 70, &["ssh_bruteforce"]);
+        b.iocs.urls.push("http://shared.c2/payload".to_string());
+        overlap_profiles.insert(a.ip.clone(), a);
+        overlap_profiles.insert(b.ip.clone(), b);
+
+        let overlap_report = generate_monthly(dir.path(), "2026-03", &overlap_profiles).unwrap();
+        assert_eq!(overlap_report.campaigns.len(), 1);
+        assert!(overlap_report.campaigns[0].correlation_type.contains("ioc"));
+
+        let mut no_overlap_profiles = HashMap::new();
+        let p1 = make_profile("31.0.0.1", 60, &["ssh_bruteforce"]);
+        let p2 = make_profile("31.0.0.2", 55, &["web_scan"]);
+        no_overlap_profiles.insert(p1.ip.clone(), p1);
+        no_overlap_profiles.insert(p2.ip.clone(), p2);
+
+        let no_overlap_report =
+            generate_monthly(dir.path(), "2026-03", &no_overlap_profiles).unwrap();
+        assert!(no_overlap_report.campaigns.is_empty());
+    }
+
+    #[test]
+    fn incident_count_boundaries_one_and_thousand_are_handled() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        write_jsonl(
+            &dir.path().join("incidents-2026-03-02.jsonl"),
+            &[incident_line("ssh_bruteforce:1", Some("40.0.0.1"))],
+        );
+        let one = generate_monthly(dir.path(), "2026-03", &HashMap::new()).unwrap();
+        assert_eq!(one.executive_summary.total_incidents, 1);
+
+        let mut thousand_lines = Vec::with_capacity(1000);
+        for i in 0..1000 {
+            thousand_lines.push(incident_line(
+                &format!("ssh_bruteforce:{i}"),
+                Some("40.0.0.2"),
+            ));
+        }
+        write_jsonl(
+            &dir.path().join("incidents-2026-03-03.jsonl"),
+            &thousand_lines,
+        );
+        let thousand = generate_monthly(dir.path(), "2026-03", &HashMap::new()).unwrap();
+        assert_eq!(thousand.executive_summary.total_incidents, 1001);
     }
 }

@@ -1233,7 +1233,7 @@ mod tests {
         assert!(msg.contains("30 attacks blocked"));
         assert!(msg.contains("2 critical threats"));
         assert!(msg.contains("Health:"));
-        assert!(msg.contains("Everything is under control."));
+        assert!(msg.contains("All clear. Nothing needs you."));
         // Score = 100 - 2*20 - 5*5 = 35 → 🔴
         assert!(msg.contains("\u{1f534}"));
     }
@@ -1276,7 +1276,7 @@ mod tests {
         };
         let msg = format_daily_digest_enriched(42, 30, 0, 3, "ssh_bruteforce", 15, true, &stats);
         assert!(msg.contains("12 threat groups auto-resolved"));
-        assert!(msg.contains("under control"));
+        assert!(msg.contains("All clear"));
         assert!(!msg.contains("need your review"));
     }
 
@@ -1290,7 +1290,7 @@ mod tests {
         };
         let msg = format_daily_digest_enriched(42, 30, 2, 5, "ssh_bruteforce", 15, true, &stats);
         assert!(msg.contains("3 groups need your review"));
-        assert!(!msg.contains("under control"));
+        assert!(!msg.contains("All clear"));
     }
 
     #[test]

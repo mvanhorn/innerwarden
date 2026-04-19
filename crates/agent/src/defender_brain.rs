@@ -779,6 +779,92 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn make_history_entry(incident_id: &str, agreed: bool) -> BrainLogEntry {
+        BrainLogEntry {
+            ts: chrono::Utc::now(),
+            incident_id: incident_id.to_string(),
+            detector: "ssh_bruteforce".to_string(),
+            severity: "high".to_string(),
+            brain_action: "block_ip",
+            brain_confidence: 0.9,
+            brain_value: 0.2,
+            brain_top3: vec![
+                (1, "block_ip", 0.9),
+                (0, "observe", 0.05),
+                (9, "escalate", 0.05),
+            ],
+            ai_action: "BlockIp".to_string(),
+            ai_confidence: 0.8,
+            agreed,
+            feedback: None,
+            features: vec![0.0; 72],
+        }
+    }
+
+    fn tiny_trainable_brain() -> DefenderBrain {
+        let mut trunk_row0 = vec![0.0; 72];
+        trunk_row0[0] = 1.0;
+        trunk_row0[3] = 2.0;
+        trunk_row0[18] = -1.0;
+
+        let mut trunk_row1 = vec![0.0; 72];
+        trunk_row1[2] = 1.0;
+        trunk_row1[5] = 1.0;
+
+        let mut policy_out_weights = vec![vec![0.0, 0.0]; 30];
+        policy_out_weights[0] = vec![0.1, 0.1];
+        policy_out_weights[1] = vec![2.0, 0.0];
+        policy_out_weights[9] = vec![0.0, 2.0];
+
+        let mut policy_biases = vec![0.0; 30];
+        policy_biases[0] = 0.5;
+
+        DefenderBrain {
+            trunk: vec![Layer {
+                weights: vec![trunk_row0, trunk_row1],
+                biases: vec![0.0, 0.0],
+            }],
+            policy_head: vec![
+                Layer {
+                    weights: vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+                    biases: vec![0.0, 0.0],
+                },
+                Layer {
+                    weights: policy_out_weights,
+                    biases: policy_biases,
+                },
+            ],
+            value_head: vec![
+                Layer {
+                    weights: vec![vec![1.0, -1.0], vec![0.5, 0.5]],
+                    biases: vec![0.0, 0.0],
+                },
+                Layer {
+                    weights: vec![vec![0.2, 0.1]],
+                    biases: vec![0.0],
+                },
+            ],
+            loaded: true,
+        }
+    }
+
+    fn build_brain_log_entries(count: usize, action: &str) -> Vec<serde_json::Value> {
+        (0..count)
+            .map(|i| {
+                let mut features = vec![0.0f32; 72];
+                features[0] = (i % 3) as f32;
+                features[2] = (i % 2) as f32;
+                features[5] = (i as f32) / count.max(1) as f32;
+                json!({
+                    "features": features,
+                    "ai_action": action,
+                })
+            })
+            .collect()
+    }
 
     #[test]
     fn empty_brain_returns_none() {
@@ -923,5 +1009,353 @@ mod tests {
         assert_eq!(linear.len(), 2);
         assert!(linear[0] < 0.0);
         assert!(linear[1] < 0.0);
+    }
+
+    #[test]
+    fn brain_stats_load_save_and_rollover_cover_edge_cases() {
+        let dir = tempdir().unwrap();
+
+        let missing = BrainStats::load(dir.path());
+        assert_eq!(missing.total_since_retrain, 0);
+        assert_eq!(missing.today_date, "");
+
+        std::fs::write(dir.path().join("brain-stats.json"), "{invalid").unwrap();
+        let invalid = BrainStats::load(dir.path());
+        assert_eq!(invalid.total_since_retrain, 0);
+
+        let mut stats = BrainStats {
+            total_since_retrain: 10,
+            agreed_since_retrain: 6,
+            daily_agreement: (0..56)
+                .map(|i| (format!("2026-03-{i:02}"), i as f32))
+                .collect(),
+            today_date: "2026-04-01".to_string(),
+            today_agreed: 3,
+            today_total: 4,
+            ..Default::default()
+        };
+
+        stats.record(true, "2026-04-02");
+        assert_eq!(stats.today_date, "2026-04-02");
+        assert_eq!(stats.today_total, 1);
+        assert_eq!(stats.today_agreed, 1);
+        assert_eq!(stats.total_since_retrain, 11);
+        assert_eq!(stats.agreed_since_retrain, 7);
+        assert_eq!(stats.daily_agreement.len(), 56);
+
+        stats.save(dir.path());
+        let loaded = BrainStats::load(dir.path());
+        assert_eq!(loaded.today_date, "2026-04-02");
+        assert_eq!(loaded.today_total, 1);
+        assert_eq!(loaded.total_since_retrain, 11);
+        assert_eq!(loaded.agreed_since_retrain, 7);
+    }
+
+    #[test]
+    fn brain_stats_agreement_pct_and_weekly_trend_handle_boundaries() {
+        let mut stats = BrainStats::default();
+        assert_eq!(stats.agreement_pct(), 0.0);
+
+        stats.total_since_retrain = 4;
+        stats.agreed_since_retrain = 1;
+        assert!((stats.agreement_pct() - 25.0).abs() < 1e-6);
+
+        stats.daily_agreement = vec![
+            ("d1".to_string(), 10.0),
+            ("d2".to_string(), 20.0),
+            ("d3".to_string(), 30.0),
+            ("d4".to_string(), 40.0),
+            ("d5".to_string(), 50.0),
+            ("d6".to_string(), 60.0),
+            ("d7".to_string(), 70.0),
+            ("d8".to_string(), 80.0),
+        ]
+        .into_iter()
+        .collect();
+
+        let trend = stats.weekly_trend();
+        assert_eq!(trend.len(), 2);
+        assert!((trend[0] - 40.0).abs() < 1e-6);
+        assert!((trend[1] - 80.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn brain_history_tracks_ring_buffer_feedback_and_counts() {
+        let mut history = BrainHistory::new(2);
+        assert_eq!(history.agreement_rate(), 0.0);
+
+        history.record(make_history_entry("inc-1", false));
+        history.record(make_history_entry("inc-2", true));
+        history.record(make_history_entry("inc-3", false));
+
+        assert_eq!(history.total_suggestions, 3);
+        assert_eq!(history.total_agreed, 1);
+
+        let recent = history.recent(5);
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].incident_id, "inc-3");
+        assert_eq!(recent[1].incident_id, "inc-2");
+
+        assert!(history.mark_feedback("inc-2", true));
+        assert!(history.mark_feedback("inc-3", false));
+        assert!(!history.mark_feedback("missing", true));
+
+        assert!((history.agreement_rate() - (1.0 / 3.0)).abs() < 1e-6);
+        assert_eq!(history.tp_count(), 1);
+        assert_eq!(history.fp_count(), 1);
+        assert_eq!(history.unreviewed_count(), 0);
+    }
+
+    #[test]
+    fn load_and_param_count_cover_public_surface() {
+        let brain = DefenderBrain::load("ignored");
+        assert!(brain.is_loaded());
+        assert!(brain.param_count() > 0);
+    }
+
+    #[test]
+    fn load_json_parse_layers_and_missing_file_paths_are_covered() {
+        let dir = tempdir().unwrap();
+        let json_path = dir.path().join("model.json");
+
+        std::fs::write(
+            &json_path,
+            r#"{
+  "trunk": [{"weights": [[1.0, 0.0], [0.0, 1.0]], "biases": [0.1, -0.1]}],
+  "policy_head": [{"weights": [[0.2, 0.3], [0.4, 0.5]], "biases": [0.0, 0.0]}],
+  "value_head": [{"weights": [[0.9, -0.2]], "biases": [0.0]}]
+}"#,
+        )
+        .unwrap();
+
+        let loaded = DefenderBrain::load_json(json_path.to_str().unwrap()).unwrap();
+        assert!(loaded.is_loaded());
+        assert_eq!(loaded.param_count(), 15);
+
+        std::fs::write(&json_path, "{broken").unwrap();
+        assert!(DefenderBrain::load_json(json_path.to_str().unwrap()).is_none());
+        assert!(DefenderBrain::load_json("does-not-exist.json").is_none());
+
+        let weird_layers = json!([
+            {
+                "weights": [123, [2.0, 3.0]],
+                "biases": [5.0, "not-a-number"]
+            }
+        ]);
+        let parsed = DefenderBrain::parse_layers(&weird_layers).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].weights[0].len(), 0);
+        assert_eq!(parsed[0].weights[1].len(), 2);
+        assert_eq!(parsed[0].biases[1], 0.0);
+    }
+
+    #[test]
+    fn from_iwd1_and_read_section_reject_invalid_inputs() {
+        assert!(DefenderBrain::from_iwd1(b"BAD!").is_none());
+
+        let mut wrong_sections = Vec::new();
+        wrong_sections.extend_from_slice(b"IWD1");
+        wrong_sections.extend_from_slice(&2u32.to_le_bytes());
+        assert!(DefenderBrain::from_iwd1(&wrong_sections).is_none());
+
+        assert!(DefenderBrain::read_section(&[], 0).is_none());
+
+        let only_num_layers = 1u32.to_le_bytes().to_vec();
+        assert!(DefenderBrain::read_section(&only_num_layers, 0).is_none());
+
+        let mut missing_weight = Vec::new();
+        missing_weight.extend_from_slice(&1u32.to_le_bytes()); // num_layers
+        missing_weight.extend_from_slice(&1u32.to_le_bytes()); // rows
+        missing_weight.extend_from_slice(&1u32.to_le_bytes()); // cols
+        assert!(DefenderBrain::read_section(&missing_weight, 0).is_none());
+
+        let mut missing_bias = missing_weight.clone();
+        missing_bias.extend_from_slice(&1.5f32.to_le_bytes()); // one weight
+        assert!(DefenderBrain::read_section(&missing_bias, 0).is_none());
+    }
+
+    #[test]
+    fn export_iwd1_roundtrip_and_empty_layer_shape_are_supported() {
+        let unloaded = DefenderBrain::new();
+        assert!(unloaded.export_iwd1().is_none());
+
+        let roundtrip = tiny_trainable_brain();
+        let bytes = roundtrip.export_iwd1().unwrap();
+        let parsed = DefenderBrain::from_iwd1(&bytes).unwrap();
+        assert!(parsed.is_loaded());
+        assert_eq!(parsed.param_count(), roundtrip.param_count());
+
+        let empty_layer_brain = DefenderBrain {
+            trunk: vec![Layer {
+                weights: vec![],
+                biases: vec![],
+            }],
+            policy_head: vec![Layer {
+                weights: vec![],
+                biases: vec![],
+            }],
+            value_head: vec![Layer {
+                weights: vec![],
+                biases: vec![],
+            }],
+            loaded: true,
+        };
+        let empty_bytes = empty_layer_brain.export_iwd1().unwrap();
+        let empty_parsed = DefenderBrain::from_iwd1(&empty_bytes).unwrap();
+        assert!(empty_parsed.is_loaded());
+    }
+
+    #[test]
+    fn suggest_matrix_covers_main_feature_combinations() {
+        let brain = tiny_trainable_brain();
+
+        let mut quiet = [0.0f32; 72];
+
+        let mut ssh_pressure = [0.0f32; 72];
+        ssh_pressure[0] = 3.0;
+        ssh_pressure[12] = 1.0;
+
+        let mut ransomware_like = [0.0f32; 72];
+        ransomware_like[2] = 1.0;
+        ransomware_like[3] = 1.0;
+        ransomware_like[5] = 2.0;
+        ransomware_like[15] = 1.0;
+
+        let mut blocked_context = [0.0f32; 72];
+        blocked_context[0] = 2.0;
+        blocked_context[18] = 2.0;
+        blocked_context[12] = 1.0;
+
+        let cases = vec![
+            ("quiet", &mut quiet, 0usize),
+            ("ssh_pressure", &mut ssh_pressure, 1usize),
+            ("ransomware_like", &mut ransomware_like, 9usize),
+            ("blocked_context", &mut blocked_context, 0usize),
+        ];
+
+        for (name, features, expected_action) in cases {
+            let suggestion = brain.suggest(features).unwrap();
+            assert_eq!(suggestion.action, expected_action, "{name}");
+            assert_eq!(
+                suggestion.action_name, ACTION_NAMES[expected_action],
+                "{name}"
+            );
+            assert!(suggestion.confidence.is_finite(), "{name}");
+            assert!(
+                suggestion.confidence >= 0.0 && suggestion.confidence <= 1.0,
+                "{name}"
+            );
+            assert!(suggestion.value.is_finite(), "{name}");
+            assert!(
+                suggestion.value >= -1.0 && suggestion.value <= 1.0,
+                "{name}"
+            );
+            assert_eq!(suggestion.top_actions.len(), 3, "{name}");
+            assert!(
+                suggestion.top_actions.windows(2).all(|w| w[0].2 >= w[1].2),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn suggest_handles_numeric_boundaries_without_panicking() {
+        let brain = tiny_trainable_brain();
+
+        let mut ones = [1.0f32; 72];
+        ones[18] = 0.0;
+        let one_suggestion = brain.suggest(&ones).unwrap();
+        assert!(one_suggestion.action < 30);
+
+        let mut with_infinity = [0.0f32; 72];
+        with_infinity[5] = f32::INFINITY;
+        let inf_suggestion = brain.suggest(&with_infinity).unwrap();
+        assert!(inf_suggestion.action < 30);
+
+        let mut with_nan = [0.0f32; 72];
+        with_nan[6] = f32::NAN;
+        let nan_suggestion = brain.suggest(&with_nan).unwrap();
+        assert!(nan_suggestion.action < 30);
+    }
+
+    #[test]
+    fn softmax_empty_logits_returns_empty_output() {
+        let probs = softmax(&[]);
+        assert!(probs.is_empty());
+    }
+
+    #[test]
+    fn retrain_from_log_guard_paths_are_handled() {
+        let dir = tempdir().unwrap();
+
+        let mut unloaded = DefenderBrain::new();
+        assert!(unloaded.retrain_from_log(dir.path()).is_none());
+
+        let mut brain = tiny_trainable_brain();
+        assert!(brain.retrain_from_log(dir.path()).is_none());
+
+        std::fs::write(dir.path().join("brain-log.json"), "{broken").unwrap();
+        assert!(brain.retrain_from_log(dir.path()).is_none());
+
+        let short_entries = build_brain_log_entries(10, "BlockIp");
+        std::fs::write(
+            dir.path().join("brain-log.json"),
+            serde_json::to_string(&short_entries).unwrap(),
+        )
+        .unwrap();
+        assert!(brain.retrain_from_log(dir.path()).is_none());
+
+        let unknown_action_entries = build_brain_log_entries(25, "UnknownAction");
+        std::fs::write(
+            dir.path().join("brain-log.json"),
+            serde_json::to_string(&unknown_action_entries).unwrap(),
+        )
+        .unwrap();
+        assert!(brain.retrain_from_log(dir.path()).is_none());
+    }
+
+    #[test]
+    fn retrain_from_log_success_and_write_error_paths() {
+        let dir = tempdir().unwrap();
+        let mut brain = tiny_trainable_brain();
+
+        let entries: Vec<serde_json::Value> = (0..24)
+            .map(|i| {
+                let mut features = vec![0.0f32; 72];
+                features[0] = (i % 4) as f32;
+                features[2] = (i % 3) as f32;
+                features[5] = (i as f32) / 24.0;
+                let action = if i % 2 == 0 {
+                    "BlockIpDecision"
+                } else {
+                    "MonitorDecision"
+                };
+                json!({
+                    "features": features,
+                    "ai_action": action
+                })
+            })
+            .collect();
+
+        std::fs::write(
+            dir.path().join("brain-log.json"),
+            serde_json::to_string(&entries).unwrap(),
+        )
+        .unwrap();
+
+        let (used, accuracy) = brain.retrain_from_log(dir.path()).unwrap();
+        assert_eq!(used, 24);
+        assert!((0.0..=1.0).contains(&accuracy));
+
+        let retrained_path = dir.path().join("defender-brain-retrained.bin");
+        let retrained_bytes = std::fs::read(&retrained_path).unwrap();
+        let parsed = DefenderBrain::from_iwd1(&retrained_bytes).unwrap();
+        assert!(parsed.is_loaded());
+        assert!(parsed.param_count() > 0);
+
+        std::fs::remove_file(&retrained_path).unwrap();
+        std::fs::create_dir(&retrained_path).unwrap();
+        let second = brain.retrain_from_log(dir.path()).unwrap();
+        assert_eq!(second.0, 24);
     }
 }

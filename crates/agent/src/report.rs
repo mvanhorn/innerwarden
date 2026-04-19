@@ -2101,8 +2101,9 @@ mod tests {
     use super::*;
     use std::collections::{BTreeMap, HashSet};
 
+    use crate::knowledge_graph::types::{Edge, Node, Relation};
     use crate::telemetry::TelemetrySnapshot;
-    use chrono::Utc;
+    use chrono::{Local, Utc};
     use innerwarden_core::{
         entities::EntityRef,
         event::{Event, Severity},
@@ -2449,6 +2450,463 @@ mod tests {
         assert!(anomaly_codes.contains("confidence_drop"));
         assert!(anomaly_codes.contains("ignore_saturation"));
         assert!(anomaly_codes.contains("new_incident_type"));
+    }
+
+    #[test]
+    fn compute_for_date_happy_path_with_explicit_date() {
+        let dir = TempDir::new().unwrap();
+        let date = "2026-03-16";
+
+        let event = Event {
+            ts: Utc::now(),
+            host: "h".to_string(),
+            source: "auth.log".to_string(),
+            kind: "ssh.login_failed".to_string(),
+            severity: Severity::Info,
+            summary: "event".to_string(),
+            details: serde_json::json!({}),
+            tags: vec![],
+            entities: vec![EntityRef::ip("1.2.3.4"), EntityRef::user("root")],
+        };
+        fs::write(
+            dir.path().join(format!("events-{date}.jsonl")),
+            format!("{}\n", serde_json::to_string(&event).unwrap()),
+        )
+        .unwrap();
+
+        let incident = Incident {
+            ts: Utc::now(),
+            host: "h".to_string(),
+            incident_id: "ssh_bruteforce:1.2.3.4:test".to_string(),
+            severity: Severity::High,
+            title: "bruteforce".to_string(),
+            summary: "summary".to_string(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::ip("1.2.3.4")],
+        };
+        fs::write(
+            dir.path().join(format!("incidents-{date}.jsonl")),
+            format!("{}\n", serde_json::to_string(&incident).unwrap()),
+        )
+        .unwrap();
+
+        let decision = DecisionEntry {
+            ts: Utc::now(),
+            incident_id: incident.incident_id.clone(),
+            host: "h".to_string(),
+            ai_provider: "openai".to_string(),
+            action_type: "block_ip".to_string(),
+            target_ip: Some("1.2.3.4".to_string()),
+            target_user: None,
+            skill_id: Some("block-ip-ufw".to_string()),
+            confidence: 0.91,
+            auto_executed: true,
+            dry_run: false,
+            reason: "test".to_string(),
+            estimated_threat: "high".to_string(),
+            execution_result: "ok".to_string(),
+            prev_hash: None,
+        };
+        fs::write(
+            dir.path().join(format!("decisions-{date}.jsonl")),
+            format!("{}\n", serde_json::to_string(&decision).unwrap()),
+        )
+        .unwrap();
+
+        fs::write(dir.path().join(format!("summary-{date}.md")), "# summary\n").unwrap();
+        fs::write(dir.path().join("state.json"), "{}").unwrap();
+        fs::write(dir.path().join("agent-state.json"), "{}").unwrap();
+
+        let report = compute_for_date(dir.path(), Some(date));
+        assert_eq!(report.analyzed_date, date);
+        assert_eq!(report.detection_summary.total_events, 1);
+        assert_eq!(report.detection_summary.total_incidents, 1);
+        assert_eq!(report.agent_ai_summary.total_decisions, 1);
+        assert_eq!(
+            report
+                .agent_ai_summary
+                .decisions_by_action
+                .get("block_ip")
+                .copied(),
+            Some(1)
+        );
+        assert!(report.operational_health.expected_files_present);
+    }
+
+    #[test]
+    fn compute_for_date_none_with_no_data_defaults_to_today_and_zeroes() {
+        let dir = TempDir::new().unwrap();
+        let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
+
+        let report = compute_for_date(dir.path(), None);
+        assert_eq!(report.analyzed_date, today);
+        assert_eq!(report.detection_summary.total_events, 0);
+        assert_eq!(report.detection_summary.total_incidents, 0);
+        assert_eq!(report.agent_ai_summary.total_decisions, 0);
+        assert!(report
+            .operational_health
+            .files
+            .iter()
+            .filter(|file| file.file == "events"
+                || file.file == "incidents"
+                || file.file == "decisions")
+            .all(|file| !file.exists));
+        assert!(report.data_quality.empty_files.is_empty());
+    }
+
+    #[test]
+    fn list_available_dates_returns_descending_unique_dates() {
+        let dir = TempDir::new().unwrap();
+
+        fs::write(dir.path().join("events-2026-03-10.jsonl"), "{}\n").unwrap();
+        fs::write(dir.path().join("incidents-2026-03-12.jsonl"), "{}\n").unwrap();
+        fs::write(dir.path().join("decisions-2026-03-12.jsonl"), "{}\n").unwrap();
+        fs::write(dir.path().join("summary-2026-03-11.md"), "# summary\n").unwrap();
+        fs::write(dir.path().join("events-2026-03-xx.jsonl"), "{}\n").unwrap();
+        fs::write(dir.path().join("random-file.txt"), "x").unwrap();
+
+        let dates = list_available_dates(dir.path());
+        assert_eq!(
+            dates,
+            vec![
+                "2026-03-12".to_string(),
+                "2026-03-11".to_string(),
+                "2026-03-10".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn list_available_dates_edge_returns_empty_when_no_matching_files() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("state.json"), "{}").unwrap();
+
+        let dates = list_available_dates(dir.path());
+        assert!(dates.is_empty());
+    }
+
+    #[test]
+    fn safe_dated_file_sanitizes_date_component() {
+        let dir = TempDir::new().unwrap();
+        let path = safe_dated_file(dir.path(), "events", "../2026-03-16::malicious", "jsonl");
+
+        assert_eq!(
+            path.file_name().and_then(|v| v.to_str()),
+            Some("events-2026-03-16.jsonl")
+        );
+    }
+
+    #[test]
+    fn helper_formatters_handle_signs_and_empty_values() {
+        assert_eq!(yes_no(true), "yes");
+        assert_eq!(yes_no(false), "no");
+        assert_eq!(signed_i64(7), "+7");
+        assert_eq!(signed_i64(-7), "-7");
+        assert_eq!(signed_f64(1.236, 2), "+1.24");
+        assert_eq!(signed_f64(-1.236, 2), "-1.24");
+        assert_eq!(format_pct(Some(12.34)), "+12.3%");
+        assert_eq!(format_pct(None), "n/a");
+        assert_eq!(list_or_none(&[]), "none");
+        assert_eq!(list_or_none(&["alpha".to_string()]), "alpha");
+
+        let mut map = BTreeMap::new();
+        map.insert("x".to_string(), 2);
+        assert_eq!(map_or_none(&map), "x=2");
+    }
+
+    #[test]
+    fn build_suggestions_returns_default_when_report_is_healthy() {
+        let report = TrialReport {
+            generated_at: Utc::now(),
+            analyzed_date: "2026-03-16".to_string(),
+            data_dir: "/tmp".to_string(),
+            operational_health: OperationalHealth {
+                expected_files_present: true,
+                state_json_readable: true,
+                agent_state_json_readable: true,
+                files: vec![],
+            },
+            operational_telemetry: OperationalTelemetry {
+                available: true,
+                last_tick: Some("tick".to_string()),
+                events_by_collector: BTreeMap::new(),
+                incidents_by_detector: BTreeMap::new(),
+                gate_pass_count: 1,
+                ai_sent_count: 1,
+                ai_decision_count: 1,
+                avg_decision_latency_ms: 200.0,
+                errors_by_component: BTreeMap::new(),
+                decisions_by_action: BTreeMap::new(),
+                dry_run_execution_count: 1,
+                real_execution_count: 0,
+            },
+            detection_summary: DetectionSummary {
+                total_events: 10,
+                total_incidents: 2,
+                incidents_by_type: BTreeMap::new(),
+                top_ips: vec![],
+                top_entities: vec![],
+            },
+            agent_ai_summary: AgentAiSummary {
+                total_decisions: 2,
+                decisions_by_action: BTreeMap::new(),
+                average_confidence: 0.9,
+                ignore_count: 0,
+                block_ip_count: 1,
+                dry_run_count: 1,
+                skills_used: BTreeMap::new(),
+            },
+            recent_window: RecentWindow {
+                window_secs: 6 * 3600,
+                events: 0,
+                incidents: 0,
+                high_critical_incidents: 0,
+                decisions: 0,
+                decisions_by_action: BTreeMap::new(),
+                latest_event_ts: "none".to_string(),
+                latest_incident_ts: "none".to_string(),
+                latest_decision_ts: "none".to_string(),
+                latest_telemetry_ts: "none".to_string(),
+            },
+            trend_summary: TrendSummary {
+                previous_date: Some("2026-03-15".to_string()),
+                events: count_delta(10, 8),
+                incidents: count_delta(2, 2),
+                decisions: count_delta(2, 2),
+                incident_rate_per_1k_events: float_delta(200.0, 250.0),
+                decision_rate_per_incident: float_delta(1.0, 1.0),
+                average_confidence: float_delta(0.9, 0.9),
+            },
+            anomaly_hints: vec![],
+            data_quality: DataQuality {
+                empty_files: vec![],
+                malformed_jsonl: BTreeMap::new(),
+                incidents_without_entities: 0,
+                decisions_without_action: 0,
+                files_not_growing: vec![],
+            },
+            suggested_improvements: vec![],
+        };
+
+        assert_eq!(
+            build_suggestions(&report),
+            vec![
+                "Trial looks healthy; proceed to next phase by enabling responder in dry-run mode."
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn compute_for_date_from_graph_happy_path_counts_graph_data() {
+        let dir = TempDir::new().unwrap();
+        let date = "2026-03-16";
+
+        fs::write(dir.path().join(format!("events-{date}.jsonl")), "{}\n").unwrap();
+        fs::write(dir.path().join(format!("incidents-{date}.jsonl")), "{}\n").unwrap();
+        fs::write(dir.path().join(format!("decisions-{date}.jsonl")), "{}\n").unwrap();
+        fs::write(dir.path().join(format!("summary-{date}.md")), "# summary\n").unwrap();
+        fs::write(dir.path().join("state.json"), "{}").unwrap();
+        fs::write(dir.path().join("agent-state.json"), "{}").unwrap();
+
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+        let incident_id = graph.add_node(Node::Incident {
+            incident_id: "inc-1".to_string(),
+            detector: "ssh_bruteforce".to_string(),
+            severity: "high".to_string(),
+            title: "title".to_string(),
+            summary: "summary".to_string(),
+            ts: Utc::now(),
+            mitre_ids: vec![],
+            decision: Some("block_ip".to_string()),
+            confidence: Some(0.9),
+            decision_reason: Some("reason".to_string()),
+            decision_target: Some("1.2.3.4".to_string()),
+            auto_executed: true,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        let ip_id = graph.add_node(Node::Ip {
+            addr: "1.2.3.4".to_string(),
+            is_internal: false,
+            datasets: vec![],
+            risk_score: 0,
+            is_tor: false,
+            first_seen: Utc::now(),
+            last_seen: Utc::now(),
+            attempted_usernames: vec![],
+        });
+        let user_id = graph.add_node(Node::User {
+            name: "root".to_string(),
+            uid: Some(0),
+        });
+        graph.add_edge(Edge::new(
+            incident_id,
+            ip_id,
+            Relation::TriggeredBy,
+            Utc::now(),
+        ));
+        graph.add_edge(Edge::new(
+            incident_id,
+            user_id,
+            Relation::TriggeredBy,
+            Utc::now(),
+        ));
+
+        let report = compute_for_date_from_graph(dir.path(), Some(date), &graph);
+        assert_eq!(report.analyzed_date, date);
+        assert_eq!(report.detection_summary.total_events, 2);
+        assert_eq!(report.detection_summary.total_incidents, 1);
+        assert_eq!(
+            report
+                .detection_summary
+                .incidents_by_type
+                .get("ssh_bruteforce")
+                .copied(),
+            Some(1)
+        );
+        assert_eq!(report.agent_ai_summary.total_decisions, 1);
+        assert_eq!(
+            report
+                .agent_ai_summary
+                .decisions_by_action
+                .get("block_ip")
+                .copied(),
+            Some(1)
+        );
+        assert_eq!(report.data_quality.incidents_without_entities, 0);
+        assert!(report.operational_health.expected_files_present);
+    }
+
+    #[test]
+    fn compute_for_date_from_graph_none_defaults_to_today() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("state.json"), "{}").unwrap();
+        fs::write(dir.path().join("agent-state.json"), "{}").unwrap();
+
+        let graph = crate::knowledge_graph::KnowledgeGraph::new();
+        let report = compute_for_date_from_graph(dir.path(), None, &graph);
+        let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
+
+        assert_eq!(report.analyzed_date, today);
+    }
+
+    #[test]
+    fn compute_for_date_from_graph_edge_tracks_empty_historical_files() {
+        let dir = TempDir::new().unwrap();
+        let date = "2026-03-01";
+
+        fs::write(dir.path().join(format!("events-{date}.jsonl")), "").unwrap();
+        fs::write(dir.path().join(format!("incidents-{date}.jsonl")), "").unwrap();
+        fs::write(dir.path().join(format!("decisions-{date}.jsonl")), "").unwrap();
+        fs::write(dir.path().join(format!("summary-{date}.md")), "# summary\n").unwrap();
+        fs::write(dir.path().join("state.json"), "{}").unwrap();
+        fs::write(dir.path().join("agent-state.json"), "{}").unwrap();
+
+        let graph = crate::knowledge_graph::KnowledgeGraph::new();
+        let report = compute_for_date_from_graph(dir.path(), Some(date), &graph);
+
+        assert_eq!(report.detection_summary.total_events, 0);
+        assert_eq!(report.detection_summary.total_incidents, 0);
+        assert_eq!(report.agent_ai_summary.total_decisions, 0);
+        assert_eq!(report.data_quality.empty_files.len(), 3);
+        assert!(report
+            .data_quality
+            .empty_files
+            .contains(&"events".to_string()));
+        assert!(report
+            .data_quality
+            .empty_files
+            .contains(&"incidents".to_string()));
+        assert!(report
+            .data_quality
+            .empty_files
+            .contains(&"decisions".to_string()));
+        assert_eq!(report.data_quality.files_not_growing.len(), 3);
+        assert!(report
+            .data_quality
+            .files_not_growing
+            .contains(&"events".to_string()));
+        assert!(report
+            .data_quality
+            .files_not_growing
+            .contains(&"incidents".to_string()));
+        assert!(report
+            .data_quality
+            .files_not_growing
+            .contains(&"decisions".to_string()));
+    }
+
+    #[test]
+    fn generate_prefers_graph_snapshot_when_available() {
+        let dir = TempDir::new().unwrap();
+        let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
+
+        fs::write(dir.path().join(format!("events-{today}.jsonl")), "").unwrap();
+        fs::write(dir.path().join(format!("incidents-{today}.jsonl")), "").unwrap();
+        fs::write(dir.path().join(format!("decisions-{today}.jsonl")), "").unwrap();
+        fs::write(
+            dir.path().join(format!("summary-{today}.md")),
+            "# summary\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("state.json"), "{}").unwrap();
+        fs::write(dir.path().join("agent-state.json"), "{}").unwrap();
+
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+        let incident_id = graph.add_node(Node::Incident {
+            incident_id: "inc-generate".to_string(),
+            detector: "ssh_bruteforce".to_string(),
+            severity: "high".to_string(),
+            title: "title".to_string(),
+            summary: "summary".to_string(),
+            ts: Utc::now(),
+            mitre_ids: vec![],
+            decision: Some("ignore".to_string()),
+            confidence: Some(0.8),
+            decision_reason: Some("reason".to_string()),
+            decision_target: Some("1.2.3.4".to_string()),
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        let ip_id = graph.add_node(Node::Ip {
+            addr: "1.2.3.4".to_string(),
+            is_internal: false,
+            datasets: vec![],
+            risk_score: 0,
+            is_tor: false,
+            first_seen: Utc::now(),
+            last_seen: Utc::now(),
+            attempted_usernames: vec![],
+        });
+        graph.add_edge(Edge::new(
+            incident_id,
+            ip_id,
+            Relation::TriggeredBy,
+            Utc::now(),
+        ));
+        graph.save_dated_snapshot(dir.path()).unwrap();
+
+        let out = generate(dir.path(), dir.path()).unwrap();
+        assert_eq!(out.report.detection_summary.total_incidents, 1);
+        assert_eq!(out.report.agent_ai_summary.total_decisions, 1);
+        assert_eq!(
+            out.report
+                .agent_ai_summary
+                .decisions_by_action
+                .get("ignore")
+                .copied(),
+            Some(1)
+        );
     }
 
     #[test]

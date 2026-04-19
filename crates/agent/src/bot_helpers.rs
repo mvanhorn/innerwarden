@@ -220,6 +220,49 @@ pub(crate) fn graph_last_incidents_raw(
         .join("\n")
 }
 
+/// Plain-text format of the last N decisions, suitable for AI system-prompt
+/// context. No emojis, no HTML, short lines. Returns an empty string when
+/// the graph has no decisions yet so the caller can skip the whole section.
+pub(crate) fn graph_last_decisions_raw(
+    kg: &std::sync::Arc<std::sync::RwLock<knowledge_graph::KnowledgeGraph>>,
+    n: usize,
+) -> String {
+    use knowledge_graph::types::{Node, NodeType};
+    let graph = kg.read().unwrap();
+
+    let mut items: Vec<(chrono::DateTime<chrono::Utc>, String, String, bool)> = Vec::new();
+
+    for id in graph.nodes_of_type(NodeType::Incident) {
+        if let Some(Node::Incident {
+            ts,
+            decision: Some(action),
+            decision_target,
+            auto_executed,
+            ..
+        }) = graph.get_node(id)
+        {
+            let target = decision_target.as_deref().unwrap_or("?").to_string();
+            items.push((*ts, action.clone(), target, *auto_executed));
+        }
+    }
+
+    if items.is_empty() {
+        return String::new();
+    }
+
+    items.sort_by(|a, b| b.0.cmp(&a.0));
+    items.truncate(n);
+
+    items
+        .into_iter()
+        .map(|(_, action, target, auto)| {
+            let mode = if auto { "auto" } else { "proposed" };
+            format!("- {action} {target} ({mode})")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TelegramTriageAction<'a> {
     AllowProc(&'a str),

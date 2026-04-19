@@ -97,6 +97,13 @@ pub struct DashboardActionConfig {
     pub trusted_ips: Vec<String>,
     /// Allowlisted users.
     pub trusted_users: Vec<String>,
+    /// System prompt used for every AI-driven chat / briefing surface (Home
+    /// briefing, Threats drill-down explain, Telegram /ask, daily briefing
+    /// cron). Populated from `cfg.telegram.bot.personality` at dashboard
+    /// init so the three surfaces share one voice. Empty string falls back
+    /// to the previous hardcoded prompts (preserves old behaviour in tests
+    /// and when the operator explicitly blanks personality).
+    pub ai_personality: String,
 }
 
 impl Default for DashboardActionConfig {
@@ -132,6 +139,7 @@ impl Default for DashboardActionConfig {
             retention_reports_days: 30,
             trusted_ips: vec![],
             trusted_users: vec![],
+            ai_personality: String::new(),
         }
     }
 }

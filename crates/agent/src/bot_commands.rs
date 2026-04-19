@@ -626,14 +626,13 @@ pub(crate) async fn handle_telegram_bot_command(
             // Inject full system context so the AI knows exactly what's configured
             let agent_ctx = build_agent_context(cfg, data_dir, &state.knowledge_graph);
             let recent_incidents = bot_helpers::graph_last_incidents_raw(&state.knowledge_graph, 3);
-            let system_prompt = if recent_incidents.is_empty() {
-                format!("{}\n\n{agent_ctx}", cfg.telegram.bot.personality)
-            } else {
-                format!(
-                    "{}\n\n{agent_ctx}\n\nRECENT INCIDENTS (last 3):\n{recent_incidents}",
-                    cfg.telegram.bot.personality
-                )
-            };
+            let recent_decisions = bot_helpers::graph_last_decisions_raw(&state.knowledge_graph, 5);
+            let system_prompt = crate::agent_context::compose_system_prompt(
+                &cfg.telegram.bot.personality,
+                &agent_ctx,
+                &recent_incidents,
+                &recent_decisions,
+            );
 
             if let Some(ref ai) = state.ai_provider {
                 let ai = ai.clone();

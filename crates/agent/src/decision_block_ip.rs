@@ -24,6 +24,23 @@ pub(crate) async fn execute_block_ip_decision(
         .recent_blocks
         .retain(|ts| *ts > now_utc - chrono::Duration::seconds(60));
 
+    // Circuit breaker: hard ceiling on auto-blocks per UTC hour. Catches
+    // the CL-008 *class* of regression — any future correlation rule that
+    // starts cascading against unrelated IPs trips this pause regardless
+    // of signal source. Runs BEFORE per-minute rate limit and safelist so
+    // the counter reflects attempts, not just survivors.
+    if let Some(ref sq) = state.sqlite_store {
+        if let Some(reason) = consult_circuit_breaker(
+            sq.as_ref(),
+            chrono::Utc::now(),
+            ip,
+            cfg.responder.max_blocks_per_hour,
+            &cfg.responder.circuit_breaker_mode,
+        ) {
+            return (reason, false);
+        }
+    }
+
     // Safeguard: pure eligibility checks (empty IP, operator session, rate
     // limit) + cloud-provider / CDN safelist. Operator incident 2026-04-18:
     // `correlation:CL-008` + `repeat-offender` were auto-blocking Cloudflare
@@ -274,6 +291,66 @@ pub(crate) fn is_valid_block_target(s: &str) -> bool {
 /// eligibility rules without constructing a cloud-safelist closure. Prod
 /// code routes through `check_block_eligibility_with_safelist`.
 #[allow(dead_code)]
+/// Consult the block-rate circuit breaker. Returns `None` when the block
+/// may proceed, `Some(reason)` when it must be refused (breaker tripped,
+/// already tripped this hour, or log-only mode silently counting).
+///
+/// Pulled out of `execute_block_ip_decision` so the decision table + all
+/// four `Decision` branches are covered by plain sync unit tests below —
+/// the full `execute_block_ip_decision` is async + depends on shield,
+/// skills, firewall, mesh, Cloudflare, which makes direct testing of the
+/// wire-in impractical.
+pub(crate) fn consult_circuit_breaker(
+    store: &innerwarden_store::Store,
+    now: chrono::DateTime<chrono::Utc>,
+    ip: &str,
+    limit: u64,
+    mode_label: &str,
+) -> Option<String> {
+    let mode = crate::circuit_breaker::Mode::from_str_or_default(mode_label);
+    let decision = crate::circuit_breaker::check_and_record(store, now, limit, mode);
+    match &decision {
+        crate::circuit_breaker::Decision::TripAndRefuse { count, limit, hour } => {
+            warn!(
+                ip,
+                count,
+                limit,
+                hour = %hour,
+                mode = mode.as_label(),
+                "circuit breaker tripped. Block pipeline paused until next UTC hour (or run `innerwarden system circuit-reset`)."
+            );
+        }
+        crate::circuit_breaker::Decision::RefuseAfterTrip { count, limit, hour } => {
+            info!(
+                ip,
+                count,
+                limit,
+                hour = %hour,
+                "circuit breaker still tripped. Block refused silently."
+            );
+        }
+        crate::circuit_breaker::Decision::AutoRearm { count, limit, hour } => {
+            info!(
+                ip,
+                count,
+                limit,
+                hour = %hour,
+                "circuit breaker auto-rearmed. New UTC hour, counters reset."
+            );
+        }
+        crate::circuit_breaker::Decision::Allow { .. } => {}
+    }
+    if decision.should_block() {
+        None
+    } else {
+        Some(format!(
+            "skipped: circuit breaker tripped (blocks this hour exceed {limit})",
+            limit = limit
+        ))
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn check_block_eligibility(
     ip: &str,
     operator_ips: &std::collections::HashMap<String, std::time::Instant>,
@@ -335,6 +412,99 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::time::Instant;
+
+    fn mem_store() -> innerwarden_store::Store {
+        innerwarden_store::Store::open_memory().expect("memory store")
+    }
+
+    fn ts(iso: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(iso)
+            .expect("valid timestamp")
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn consult_circuit_breaker_allows_under_threshold() {
+        let store = mem_store();
+        let out =
+            consult_circuit_breaker(&store, ts("2026-04-19T12:00:00Z"), "1.2.3.4", 100, "pause");
+        assert!(out.is_none(), "fresh breaker must allow");
+    }
+
+    #[test]
+    fn consult_circuit_breaker_refuses_after_trip_with_reason() {
+        // Drive the breaker to trip then verify the next call refuses with
+        // a reason the audit trail can use verbatim.
+        let store = mem_store();
+        let now = ts("2026-04-19T12:00:00Z");
+        for _ in 0..100 {
+            let _ = consult_circuit_breaker(&store, now, "1.2.3.4", 100, "pause");
+        }
+        let tripped = consult_circuit_breaker(&store, now, "1.2.3.4", 100, "pause")
+            .expect("101st attempt must trip");
+        assert!(tripped.contains("circuit breaker tripped"));
+        assert!(tripped.contains("100"), "reason must carry the limit");
+
+        let silent = consult_circuit_breaker(&store, now, "5.6.7.8", 100, "pause")
+            .expect("subsequent attempts stay refused");
+        assert!(silent.contains("circuit breaker tripped"));
+    }
+
+    #[test]
+    fn consult_circuit_breaker_log_only_never_refuses() {
+        // Calibration mode: breaker counts but must NOT refuse even far
+        // above the nominal threshold.
+        let store = mem_store();
+        let now = ts("2026-04-19T12:00:00Z");
+        for _ in 0..1000 {
+            assert!(
+                consult_circuit_breaker(&store, now, "1.2.3.4", 100, "log_only").is_none(),
+                "log_only must always allow"
+            );
+        }
+    }
+
+    #[test]
+    fn consult_circuit_breaker_unknown_mode_falls_back_to_pause() {
+        // Garbage value in `responder.circuit_breaker_mode` must not disable
+        // the breaker — `Mode::from_str_or_default` treats unknown tokens
+        // as pause so the operator never ends up with a no-op breaker from
+        // a typo.
+        let store = mem_store();
+        let now = ts("2026-04-19T12:00:00Z");
+        for _ in 0..101 {
+            let _ = consult_circuit_breaker(&store, now, "1.2.3.4", 100, "garbage-token");
+        }
+        let refused = consult_circuit_breaker(&store, now, "1.2.3.4", 100, "garbage-token");
+        assert!(refused.is_some(), "unknown mode must still enforce pause");
+    }
+
+    #[test]
+    fn consult_circuit_breaker_auto_rearm_allows_on_hour_rollover() {
+        // Trip the breaker in hour A, confirm hour B's first call allows.
+        let store = mem_store();
+        let hour_a = ts("2026-04-19T12:00:00Z");
+        for _ in 0..101 {
+            let _ = consult_circuit_breaker(&store, hour_a, "1.2.3.4", 100, "pause");
+        }
+        let hour_b = ts("2026-04-19T13:05:00Z");
+        let after = consult_circuit_breaker(&store, hour_b, "9.9.9.9", 100, "pause");
+        assert!(after.is_none(), "new hour must rearm and allow the block");
+    }
+
+    #[test]
+    fn consult_circuit_breaker_dry_run_mode_refuses_after_trip() {
+        // Dry-run refuses at the executor layer same as pause; the
+        // audit trail (decision_writer) still runs upstream — this test
+        // verifies the executor-side signal.
+        let store = mem_store();
+        let now = ts("2026-04-19T12:00:00Z");
+        for _ in 0..100 {
+            let _ = consult_circuit_breaker(&store, now, "1.2.3.4", 100, "dry_run");
+        }
+        let refused = consult_circuit_breaker(&store, now, "1.2.3.4", 100, "dry_run");
+        assert!(refused.is_some());
+    }
 
     #[test]
     fn test_check_block_eligibility() {

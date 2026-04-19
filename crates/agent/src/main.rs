@@ -23,6 +23,7 @@ mod bot_actions;
 mod bot_commands;
 mod bot_helpers;
 mod briefing;
+mod circuit_breaker;
 mod cloud_safelist;
 mod cloudflare;
 mod config;
