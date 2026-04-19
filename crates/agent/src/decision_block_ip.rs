@@ -350,6 +350,7 @@ pub(crate) fn consult_circuit_breaker(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn check_block_eligibility(
     ip: &str,
     operator_ips: &std::collections::HashMap<String, std::time::Instant>,
