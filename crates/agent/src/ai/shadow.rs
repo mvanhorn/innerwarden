@@ -347,7 +347,9 @@ mod tests {
         // Primary OK, shadow errors -> primary returned, shadow_error logged
         let primary = Box::new(FakeProvider {
             name: "p",
-            action: AiAction::Ignore { reason: "ok".into() },
+            action: AiAction::Ignore {
+                reason: "ok".into(),
+            },
             calls: Arc::new(AtomicUsize::new(0)),
         });
         let shadow = Box::new(Erroring);
@@ -356,5 +358,84 @@ mod tests {
         assert!(matches!(d.action, AiAction::Ignore { .. }));
         let logged = std::fs::read_to_string(tmp.path()).unwrap();
         assert!(logged.contains("\"shadow_error\""));
+    }
+
+    #[tokio::test]
+    async fn chat_passes_through_to_primary_only() {
+        // Shadow.chat() must never invoke the shadow provider — only primary
+        // observation chat reaches production, shadow is decision-only.
+        let shadow_calls = Arc::new(AtomicUsize::new(0));
+        let primary = Box::new(FakeProvider {
+            name: "prim",
+            action: AiAction::Ignore { reason: "p".into() },
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let shadow = Box::new(FakeProvider {
+            name: "shad",
+            action: AiAction::Ignore { reason: "s".into() },
+            calls: Arc::clone(&shadow_calls),
+        });
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let sp = ShadowProvider::new(primary, shadow, tmp.path());
+
+        let reply = sp.chat("system", "user").await.unwrap();
+        assert_eq!(reply, "prim chat");
+        assert_eq!(
+            shadow_calls.load(Ordering::SeqCst),
+            0,
+            "chat must not hit shadow provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn name_delegates_to_primary() {
+        let primary = Box::new(FakeProvider {
+            name: "primary-name",
+            action: AiAction::Ignore { reason: "p".into() },
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let shadow = Box::new(FakeProvider {
+            name: "shadow-name",
+            action: AiAction::Ignore { reason: "s".into() },
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let sp = ShadowProvider::new(primary, shadow, tmp.path());
+        assert_eq!(sp.name(), "primary-name");
+    }
+
+    #[tokio::test]
+    async fn decide_returns_primary_when_log_write_fails() {
+        // Unwriteable log path must not break the primary decision. The open
+        // failure is logged via tracing and the primary decision still flows
+        // back to the caller.
+        let primary = Box::new(FakeProvider {
+            name: "prim",
+            action: AiAction::Ignore {
+                reason: "primary ok".into(),
+            },
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let shadow = Box::new(FakeProvider {
+            name: "shad",
+            action: AiAction::Ignore { reason: "s".into() },
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let sp = ShadowProvider::new(primary, shadow, "/nonexistent/dir/shadow.jsonl");
+
+        let inc = dummy_incident();
+        let ctx = DecisionContext {
+            incident: &inc,
+            recent_events: vec![],
+            related_incidents: vec![],
+            already_blocked: vec![],
+            available_skills: vec![],
+            ip_reputation: None,
+            ip_geo: None,
+            graph_context: None,
+            graph_subgraph: None,
+        };
+        let d = sp.decide(&ctx).await.unwrap();
+        assert!(matches!(d.action, AiAction::Ignore { .. }));
     }
 }

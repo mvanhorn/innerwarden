@@ -479,7 +479,11 @@ fn build_single(
             model.to_string(),
         ))),
         "ollama" => {
-            let api_key_opt = if api_key.is_empty() { None } else { Some(api_key) };
+            let api_key_opt = if api_key.is_empty() {
+                None
+            } else {
+                Some(api_key)
+            };
 
             let base_url = if !base_url.is_empty() {
                 validate_ai_base_url(base_url)?;
@@ -503,7 +507,9 @@ fn build_single(
                 model.to_string()
             };
             Ok(Box::new(ollama::OllamaProvider::new(
-                base_url, model, api_key_opt,
+                base_url,
+                model,
+                api_key_opt,
             )))
         }
         other => {
@@ -669,5 +675,144 @@ mod tests {
         };
         let provider = build_provider(&cfg).expect("stub provider must build offline");
         assert_eq!(provider.name(), "stub");
+    }
+
+    #[test]
+    fn build_provider_shadow_enabled_empty_provider_fails() {
+        let cfg = crate::config::AiConfig {
+            enabled: true,
+            provider: "stub".into(),
+            shadow: crate::config::ShadowConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = build_provider(&cfg).err().unwrap().to_string();
+        assert!(
+            err.contains("shadow") && err.contains("empty"),
+            "expected shadow-empty error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_provider_shadow_enabled_matching_primary_fails() {
+        // Same provider + same base_url + same model as primary must be
+        // rejected; otherwise shadow provides no signal.
+        let cfg = crate::config::AiConfig {
+            enabled: true,
+            provider: "ollama".into(),
+            base_url: "http://localhost:11434".into(),
+            model: "llama3.2".into(),
+            shadow: crate::config::ShadowConfig {
+                enabled: true,
+                provider: "ollama".into(),
+                base_url: "http://localhost:11434".into(),
+                model: "llama3.2".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = build_provider(&cfg).err().unwrap().to_string();
+        assert!(
+            err.contains("must differ"),
+            "expected 'must differ' error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_provider_shadow_enabled_with_distinct_config_succeeds() {
+        // Primary stub + shadow stub-with-different-model is allowed because
+        // the check compares (provider, base_url, model) tuple. Two stubs
+        // distinguish by model here.
+        let cfg = crate::config::AiConfig {
+            enabled: true,
+            provider: "stub".into(),
+            shadow: crate::config::ShadowConfig {
+                enabled: true,
+                provider: "stub".into(),
+                model: "different".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let provider = build_provider(&cfg).expect("shadow wrapper must build");
+        // ShadowProvider::name() delegates to primary so existing telemetry
+        // labels stay stable.
+        assert_eq!(provider.name(), "stub");
+    }
+
+    #[test]
+    fn build_provider_azure_succeeds_with_explicit_base_url() {
+        let cfg = crate::config::AiConfig {
+            enabled: true,
+            provider: "azure_openai".into(),
+            base_url: "https://example-resource.openai.azure.com".into(),
+            model: "gpt-5-4-mini".into(),
+            api_version: "2024-12-01-preview".into(),
+            api_key: "dummy".into(),
+            ..Default::default()
+        };
+        let provider = build_provider(&cfg).expect("azure provider must build");
+        assert_eq!(provider.name(), "azure_openai");
+    }
+
+    #[test]
+    fn build_provider_azure_requires_base_url() {
+        let cfg = crate::config::AiConfig {
+            enabled: true,
+            provider: "azure_openai".into(),
+            base_url: String::new(),
+            model: "gpt-5-4-mini".into(),
+            api_key: "dummy".into(),
+            ..Default::default()
+        };
+        let err = build_provider(&cfg).err().unwrap().to_string();
+        assert!(err.contains("base_url"), "got: {err}");
+    }
+
+    #[test]
+    fn build_provider_azure_requires_model() {
+        let cfg = crate::config::AiConfig {
+            enabled: true,
+            provider: "azure_openai".into(),
+            base_url: "https://example-resource.openai.azure.com".into(),
+            model: String::new(),
+            api_key: "dummy".into(),
+            ..Default::default()
+        };
+        let err = build_provider(&cfg).err().unwrap().to_string();
+        assert!(err.contains("model"), "got: {err}");
+    }
+
+    #[test]
+    fn build_provider_azure_defaults_api_version_when_empty() {
+        let cfg = crate::config::AiConfig {
+            enabled: true,
+            provider: "azure_openai".into(),
+            base_url: "https://example-resource.openai.azure.com".into(),
+            model: "gpt-5-4-mini".into(),
+            api_version: String::new(),
+            api_key: "dummy".into(),
+            ..Default::default()
+        };
+        // Empty api_version should fall back to default (not a bail)
+        assert!(build_provider(&cfg).is_ok());
+    }
+
+    #[cfg(not(feature = "local-classifier"))]
+    #[test]
+    fn build_provider_local_classifier_without_feature_fails() {
+        let cfg = crate::config::AiConfig {
+            enabled: true,
+            provider: "local_classifier".into(),
+            base_url: "/tmp/nonexistent-model-dir".into(),
+            ..Default::default()
+        };
+        let err = build_provider(&cfg).err().unwrap().to_string();
+        assert!(
+            err.contains("local-classifier"),
+            "expected build-feature guidance, got: {err}"
+        );
     }
 }

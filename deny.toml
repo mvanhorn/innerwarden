@@ -6,6 +6,9 @@ ignore = [
     "RUSTSEC-2024-0384",
     # rustls-pemfile unmaintained - transitive dep via axum-server, no upgrade path yet
     "RUSTSEC-2025-0134",
+    # paste unmaintained - transitive via tokenizers + tract-core behind optional
+    # local-classifier feature only. Macro crate with zero runtime surface.
+    "RUSTSEC-2024-0436",
 ]
 
 [licenses]

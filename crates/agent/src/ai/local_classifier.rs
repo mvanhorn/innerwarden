@@ -20,8 +20,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use innerwarden_core::entities::EntityType;
 use tokenizers::Tokenizer;
-use tract_onnx::prelude::*;
 use tracing::{debug, warn};
+use tract_onnx::prelude::*;
 
 use super::{AiAction, AiDecision, AiProvider, DecisionContext};
 
@@ -29,11 +29,7 @@ use super::{AiAction, AiDecision, AiProvider, DecisionContext};
 const LABELS: [&str; 4] = ["dismiss", "ignore", "block_ip", "monitor"];
 const MAX_LEN: usize = 256;
 
-type OnnxModel = SimplePlan<
-    TypedFact,
-    Box<dyn TypedOp>,
-    Graph<TypedFact, Box<dyn TypedOp>>,
->;
+type OnnxModel = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
 
 pub struct LocalClassifier {
     model: Arc<OnnxModel>,
@@ -47,7 +43,10 @@ impl LocalClassifier {
         let model_path = dir.join("model.onnx");
         let tokenizer_path = dir.join("tokenizer.json");
         if !model_path.exists() {
-            bail!("classifier model.onnx not found at {}", model_path.display());
+            bail!(
+                "classifier model.onnx not found at {}",
+                model_path.display()
+            );
         }
         if !tokenizer_path.exists() {
             bail!(
@@ -70,8 +69,8 @@ impl LocalClassifier {
             .into_optimized()?
             .into_runnable()?;
 
-        let tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| anyhow!("loading tokenizer: {e}"))?;
+        let tokenizer =
+            Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow!("loading tokenizer: {e}"))?;
 
         Ok(Self {
             model: Arc::new(model),
@@ -110,10 +109,8 @@ impl LocalClassifier {
         pad_or_truncate(&mut ids, MAX_LEN, 0);
         pad_or_truncate(&mut mask, MAX_LEN, 0);
 
-        let ids_tensor: Tensor =
-            tract_ndarray::Array2::from_shape_vec((1, MAX_LEN), ids)?.into();
-        let mask_tensor: Tensor =
-            tract_ndarray::Array2::from_shape_vec((1, MAX_LEN), mask)?.into();
+        let ids_tensor: Tensor = tract_ndarray::Array2::from_shape_vec((1, MAX_LEN), ids)?.into();
+        let mask_tensor: Tensor = tract_ndarray::Array2::from_shape_vec((1, MAX_LEN), mask)?.into();
 
         let outputs = self
             .model

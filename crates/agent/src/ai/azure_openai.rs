@@ -4,8 +4,8 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::debug;
 
-use super::{AiDecision, AiProvider, DecisionContext};
 use super::openai::{build_prompt_pub, parse_decision_pub, system_prompt};
+use super::{AiDecision, AiProvider, DecisionContext};
 
 // ---------------------------------------------------------------------------
 // Azure OpenAI provider
@@ -197,6 +197,8 @@ struct Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use innerwarden_core::{event::Severity, incident::Incident};
 
     #[test]
     fn chat_url_formats_correctly() {
@@ -213,10 +215,95 @@ mod tests {
     }
 
     #[test]
+    fn chat_url_strips_trailing_slash() {
+        let p = AzureOpenAiProvider::new(
+            "k".into(),
+            "d".into(),
+            "https://x.openai.azure.com///".into(),
+            "2024-12-01-preview".into(),
+        );
+        assert!(p
+            .chat_url()
+            .starts_with("https://x.openai.azure.com/openai/"));
+        assert!(!p.chat_url().contains("//openai"));
+    }
+
+    #[test]
     fn uses_max_completion_tokens_for_gpt5() {
         assert!(uses_new_token_param("gpt-5-4-mini"));
         assert!(uses_new_token_param("gpt-5.4"));
         assert!(!uses_new_token_param("gpt-4o-mini"));
         assert!(!uses_new_token_param("gpt-4.1-mini"));
+    }
+
+    #[test]
+    fn uses_new_token_param_covers_o_series() {
+        assert!(uses_new_token_param("o1-preview"));
+        assert!(uses_new_token_param("o3-mini"));
+        assert!(uses_new_token_param("o4"));
+        assert!(!uses_new_token_param("gpt-3.5-turbo"));
+    }
+
+    fn dummy_incident() -> Incident {
+        Incident {
+            ts: Utc::now(),
+            host: "h".into(),
+            incident_id: "t:1".into(),
+            severity: Severity::High,
+            title: "t".into(),
+            summary: "s".into(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn decide_fails_without_api_key() {
+        let p = AzureOpenAiProvider::new(
+            String::new(),
+            "gpt-5-4-mini".into(),
+            "https://example-resource.openai.azure.com".into(),
+            "2024-12-01-preview".into(),
+        );
+        let inc = dummy_incident();
+        let ctx = DecisionContext {
+            incident: &inc,
+            recent_events: vec![],
+            related_incidents: vec![],
+            already_blocked: vec![],
+            available_skills: vec![],
+            ip_reputation: None,
+            ip_geo: None,
+            graph_context: None,
+            graph_subgraph: None,
+        };
+        let err = p.decide(&ctx).await.unwrap_err().to_string();
+        assert!(
+            err.contains("Azure OpenAI API key not configured"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_fails_without_api_key() {
+        let p = AzureOpenAiProvider::new(
+            String::new(),
+            "gpt-5-4-mini".into(),
+            "https://example-resource.openai.azure.com".into(),
+            "2024-12-01-preview".into(),
+        );
+        let err = p.chat("sys", "user").await.unwrap_err().to_string();
+        assert!(
+            err.contains("Azure OpenAI API key not configured"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn name_is_stable() {
+        let p = AzureOpenAiProvider::new("k".into(), "d".into(), "https://x".into(), "v".into());
+        assert_eq!(p.name(), "azure_openai");
     }
 }
