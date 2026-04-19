@@ -658,6 +658,33 @@ impl AiConfig {
         }
     }
 
+    /// Clamp an out-of-range `confidence_threshold` to a usable value and
+    /// warn the operator. A threshold above 1.0 is unreachable (AiDecision
+    /// confidence is in [0.0, 1.0]), which silently disables all AI-driven
+    /// auto-execution — exactly the autonomy gap observed in production on
+    /// 2026-04-15 (1812 incidents, 0 AI-executed blocks because the prod
+    /// config set the threshold to 1.01).
+    ///
+    /// A negative threshold would technically let everything through but
+    /// is almost certainly a typo; clamp and warn.
+    pub fn clamp_confidence_threshold(&mut self) {
+        if self.confidence_threshold > 1.0 {
+            tracing::warn!(
+                configured = self.confidence_threshold,
+                clamped_to = default_confidence_threshold(),
+                "ai.confidence_threshold > 1.0 is unreachable (AI decisions emit confidence in [0.0, 1.0]); clamping to default so autonomous execution can happen"
+            );
+            self.confidence_threshold = default_confidence_threshold();
+        } else if self.confidence_threshold < 0.0 {
+            tracing::warn!(
+                configured = self.confidence_threshold,
+                clamped_to = default_confidence_threshold(),
+                "ai.confidence_threshold is negative; clamping to default"
+            );
+            self.confidence_threshold = default_confidence_threshold();
+        }
+    }
+
     /// Resolve the API key: config field takes precedence, then env var.
     pub fn resolved_api_key(&self) -> String {
         if !self.api_key.is_empty() {
@@ -1614,8 +1641,10 @@ pub fn load(path: &Path) -> Result<AgentConfig> {
     // Verify config signature if [signature] section is present.
     verify_config_signature(&content, path)?;
 
-    toml::from_str(&content)
-        .with_context(|| format!("failed to parse agent config {}", path.display()))
+    let mut cfg: AgentConfig = toml::from_str(&content)
+        .with_context(|| format!("failed to parse agent config {}", path.display()))?;
+    cfg.ai.clamp_confidence_threshold();
+    Ok(cfg)
 }
 
 /// Verify Ed25519 signature of config file (Active Defence feature).
@@ -2929,5 +2958,51 @@ approval_ttl_secs = 300
         assert_eq!(cfg.hour, 8);
         assert_eq!(cfg.minute, 0);
         assert!(cfg.telegram);
+    }
+
+    #[test]
+    fn clamp_confidence_threshold_fixes_unreachable_upper_bound() {
+        let mut ai = AiConfig::default();
+        ai.confidence_threshold = 1.01;
+        ai.clamp_confidence_threshold();
+        assert!(
+            (ai.confidence_threshold - default_confidence_threshold()).abs() < f32::EPSILON,
+            "threshold > 1.0 must be clamped to default"
+        );
+    }
+
+    #[test]
+    fn clamp_confidence_threshold_fixes_negative() {
+        let mut ai = AiConfig::default();
+        ai.confidence_threshold = -0.5;
+        ai.clamp_confidence_threshold();
+        assert!(
+            (ai.confidence_threshold - default_confidence_threshold()).abs() < f32::EPSILON,
+            "negative threshold must be clamped to default"
+        );
+    }
+
+    #[test]
+    fn clamp_confidence_threshold_leaves_valid_values_untouched() {
+        for v in [0.0_f32, 0.5, 0.7, 0.85, 0.99, 1.0] {
+            let mut ai = AiConfig::default();
+            ai.confidence_threshold = v;
+            ai.clamp_confidence_threshold();
+            assert!(
+                (ai.confidence_threshold - v).abs() < f32::EPSILON,
+                "valid threshold {v} must not be clamped",
+            );
+        }
+    }
+
+    #[test]
+    fn load_clamps_bogus_confidence_threshold() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(tmp, "[ai]\nconfidence_threshold = 1.01").unwrap();
+        let cfg = load(tmp.path()).unwrap();
+        assert!(
+            (cfg.ai.confidence_threshold - default_confidence_threshold()).abs() < f32::EPSILON,
+            "load() must apply clamp so autonomous execution can fire"
+        );
     }
 }

@@ -9,7 +9,17 @@ use crate::{
     LocalIpReputation,
 };
 
-/// Obvious incident gate: skip AI for high-confidence detectors + known attacker IP.
+/// Obvious incident gate: skip AI for high-confidence detectors.
+///
+/// Two policies:
+///
+/// - `RepeatOffender`: ssh_bruteforce / credential_stuffing / port_scan /
+///   packet_flood require `ip_seen_before` so one mistyped password or a
+///   single probe does not trigger a block.
+/// - `FirstHit`: reverse_shell / web_shell / c2_callback / process_injection /
+///   rootkit / crypto_miner / threat_intel auto-block on the first observation
+///   because the detector only fires when the compromise has already started.
+///
 /// Returns true when the incident was fully handled (auto-block path).
 pub(crate) async fn try_handle_obvious_incident(
     incident: &innerwarden_core::incident::Incident,
@@ -68,7 +78,15 @@ pub(crate) async fn try_handle_obvious_incident(
         },
         confidence: 0.95,
         auto_execute: true,
-        reason: format!("Auto-blocked: obvious {detector} from repeat offender {ip}"),
+        reason: match obvious_detector_policy(detector) {
+            ObviousPolicy::RepeatOffender => {
+                format!("Auto-blocked: obvious {detector} from repeat offender {ip}")
+            }
+            ObviousPolicy::FirstHit => {
+                format!("Auto-blocked: {detector} from {ip} (first hit is the attack)")
+            }
+            ObviousPolicy::None => format!("Auto-blocked: {detector} from {ip}"),
+        },
         alternatives: vec![],
         estimated_threat: "high".to_string(),
     };
@@ -170,15 +188,49 @@ pub(crate) fn is_obvious_attack(
     ip_seen_before: bool,
     responder_enabled: bool,
 ) -> bool {
-    let is_obvious_detector = matches!(
-        detector,
-        "ssh_bruteforce" | "credential_stuffing" | "packet_flood" | "port_scan" | "threat_intel"
-    );
+    if !responder_enabled {
+        return false;
+    }
     let is_high_or_critical = matches!(
         severity,
         innerwarden_core::event::Severity::High | innerwarden_core::event::Severity::Critical
     );
-    is_obvious_detector && is_high_or_critical && ip_seen_before && responder_enabled
+    if !is_high_or_critical {
+        return false;
+    }
+    match obvious_detector_policy(detector) {
+        ObviousPolicy::None => false,
+        ObviousPolicy::RepeatOffender => ip_seen_before,
+        ObviousPolicy::FirstHit => true,
+    }
+}
+
+/// Auto-block policy per detector. Split into two buckets because the
+/// "first hit is the attack" set (reverse_shell, web_shell, c2_callback,
+/// process_injection, rootkit, crypto_miner) should not wait for a
+/// repeat-offender signal; the first observation is, by construction,
+/// the compromise. The noisier set (ssh_bruteforce, credential_stuffing,
+/// port_scan, packet_flood) keeps the repeat-offender gate so we don't
+/// block legitimate users who mistype a password once.
+///
+/// `threat_intel` keeps `FirstHit` since external feeds have already
+/// done the repeat-offender calculus for us.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObviousPolicy {
+    None,
+    RepeatOffender,
+    FirstHit,
+}
+
+pub(crate) fn obvious_detector_policy(detector: &str) -> ObviousPolicy {
+    match detector {
+        "ssh_bruteforce" | "credential_stuffing" | "packet_flood" | "port_scan" => {
+            ObviousPolicy::RepeatOffender
+        }
+        "threat_intel" | "reverse_shell" | "web_shell" | "c2_callback" | "process_injection"
+        | "rootkit" | "crypto_miner" => ObviousPolicy::FirstHit,
+        _ => ObviousPolicy::None,
+    }
 }
 
 #[cfg(test)]
@@ -226,6 +278,85 @@ mod tests {
             &Severity::High,
             true,
             false
+        ));
+    }
+
+    #[test]
+    fn first_hit_detectors_block_on_first_observation() {
+        // First-hit detectors (reverse_shell, web_shell, c2_callback,
+        // process_injection, rootkit, crypto_miner) must auto-block even
+        // when ip_seen_before is false — by the time we see a reverse
+        // shell the compromise has already happened.
+        for detector in [
+            "reverse_shell",
+            "web_shell",
+            "c2_callback",
+            "process_injection",
+            "rootkit",
+            "crypto_miner",
+        ] {
+            assert!(
+                is_obvious_attack(detector, &Severity::High, false, true),
+                "{detector} should auto-block on first high-severity hit"
+            );
+            assert!(
+                is_obvious_attack(detector, &Severity::Critical, false, true),
+                "{detector} should auto-block on first critical hit"
+            );
+        }
+    }
+
+    #[test]
+    fn first_hit_detectors_still_require_high_severity() {
+        // Defence-in-depth: even for FirstHit detectors we only act on
+        // High/Critical. Low/Medium incidents route to AI or noise-gate.
+        assert!(!is_obvious_attack(
+            "reverse_shell",
+            &Severity::Medium,
+            false,
+            true
+        ));
+        assert!(!is_obvious_attack(
+            "reverse_shell",
+            &Severity::Low,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn repeat_offender_detectors_still_require_seen_before() {
+        // Noisier detectors keep the repeat-offender gate to avoid
+        // blocking legit users on a single mistyped password or
+        // single-shot port probe.
+        for detector in [
+            "ssh_bruteforce",
+            "credential_stuffing",
+            "port_scan",
+            "packet_flood",
+        ] {
+            assert!(
+                !is_obvious_attack(detector, &Severity::High, false, true),
+                "{detector} should require ip_seen_before"
+            );
+            assert!(
+                is_obvious_attack(detector, &Severity::High, true, true),
+                "{detector} should fire once ip_seen_before"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_detectors_never_auto_block() {
+        assert_eq!(
+            obvious_detector_policy("totally_unknown"),
+            ObviousPolicy::None
+        );
+        assert!(!is_obvious_attack(
+            "totally_unknown",
+            &Severity::Critical,
+            true,
+            true
         ));
     }
 }
