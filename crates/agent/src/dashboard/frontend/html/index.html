@@ -85,14 +85,14 @@
       </ul>
     </section>
     <div class="home-kpi-row">
-      <div class="home-kpi-big" onclick="showContained()">
+      <div class="home-kpi-big" onclick="viewActivity()">
         <div class="kpi-value" id="homeKpiThreats" style="color:var(--ok)">0</div>
-        <div class="kpi-label">Blocked</div>
+        <div class="kpi-label">Handled</div>
         <div class="kpi-window" id="homeKpiThreatsWindow">Today</div>
       </div>
       <div class="home-kpi-big" onclick="viewActivity()">
         <div class="kpi-value" id="homeKpiResponded" style="color:var(--accent)">0</div>
-        <div class="kpi-label">Incidents</div>
+        <div class="kpi-label">Detections</div>
         <div class="kpi-window" id="homeKpiRespondedWindow">Today</div>
       </div>
       <div class="home-kpi-big" onclick="showView('sensors')">
@@ -107,10 +107,6 @@
         <button id="briefingBtn" onclick="generateBriefing()" style="padding:5px 14px;border-radius:8px;border:1px solid var(--accent);background:transparent;color:var(--accent);font-size:0.7rem;font-weight:700;cursor:pointer">Generate Briefing</button>
       </div>
       <div id="briefingContent" style="font-size:0.78rem;color:var(--text);white-space:pre-wrap;line-height:1.6"></div>
-    </div>
-    <div class="home-section">
-      <div class="home-section-title"><span class="live-dot"></span> Recent Activity</div>
-      <div id="homeFeed"><div class="empty">Loading…</div></div>
     </div>
     <div class="home-section home-kpi-clickable" onclick="showView('sensors')">
       <div class="home-section-title">Data Collection</div>
@@ -154,7 +150,6 @@
         <div class="kpi-card"><div class="kpi-value" id="kpi-responded" style="color:var(--accent)">0</div><div class="kpi-label">Observing</div><div class="kpi-window">Now</div></div>
         <div class="kpi-card"><div class="kpi-value" id="kpi-noise" style="color:var(--muted)">0</div><div class="kpi-label">Needs attention</div><div class="kpi-window">Today</div></div>
       </div>
-      <div style="display:none"><span id="kpi-incidents">0</span><span id="kpi-attackers">0</span><span id="kpi-events">0</span></div>
       <div class="filters" style="grid-template-columns:1fr auto;margin-bottom:6px">
         <input id="flt-date" type="date" class="full" style="grid-column:1/-1" />
         <button id="flt-adv-toggle" type="button" class="full" style="background:transparent;border:none;color:var(--muted);font-size:0.68rem;cursor:pointer;text-align:left;padding:2px 0" onclick="toggleAdvFilters()">▸ Advanced filters</button>
@@ -183,8 +178,6 @@
         <button type="button" class="pivot-tab" data-pivot="user">User</button>
         <button type="button" class="pivot-tab" data-pivot="detector">Detector</button>
       </div>
-      <div id="clusterList" style="display:none"></div>
-      <div id="topDetectors" style="display:none"></div>
       <div class="search-wrap">
         <input id="entitySearch" type="search" placeholder="search threats…" autocomplete="off" spellcheck="false" />
       </div>

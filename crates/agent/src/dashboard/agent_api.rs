@@ -1020,6 +1020,32 @@ pub(super) async fn api_incident_groups(
         .into_response()
 }
 
+/// Empty-state payload for `/api/responses`. Both `state_counts` and
+/// `totals` must be populated: responses.js reads `r.state_counts.revert_pending`
+/// and `r.totals.registered` and would evaluate `undefined.field` on a
+/// clean install without the full shape. Kept as a standalone helper so
+/// tests can assert on the shape without standing up a `DashboardState`.
+pub(super) fn empty_responses_payload() -> serde_json::Value {
+    serde_json::json!({
+        "active": [],
+        "active_count": 0,
+        "history": [],
+        "state_counts": {
+            "pending": 0,
+            "active": 0,
+            "expired": 0,
+            "revert_pending": 0,
+            "revert_failed": 0,
+            "reverted": 0,
+        },
+        "totals": {
+            "registered": 0,
+            "expired": 0,
+            "reverted": 0,
+        },
+    })
+}
+
 /// GET /api/responses — active and historical response actions with TTL.
 pub(super) async fn api_responses(State(state): State<DashboardState>) -> axum::response::Response {
     // Try SQLite blob first, fall back to JSON file
@@ -1043,7 +1069,7 @@ pub(super) async fn api_responses(State(state): State<DashboardState>) -> axum::
             .unwrap()
             .into_response(),
         None => {
-            let empty = serde_json::json!({"active": [], "active_count": 0, "history": [], "totals": {"registered": 0, "expired": 0, "reverted": 0}});
+            let empty = empty_responses_payload();
             axum::response::Response::builder()
                 .header("content-type", "application/json")
                 .body(Body::from(serde_json::to_string(&empty).unwrap()))
@@ -1192,6 +1218,34 @@ pub(super) async fn api_mitre_coverage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_responses_payload_covers_every_field_responses_js_reads() {
+        // responses.js crashes with TypeError if any of these are missing;
+        // this test locks in the shape so a future edit to the handler
+        // cannot silently drop a key the renderer expects.
+        let payload = empty_responses_payload();
+        for k in ["active", "history"] {
+            assert!(payload[k].is_array(), "{k} must be an array");
+        }
+        assert_eq!(payload["active_count"], 0);
+        for k in [
+            "pending",
+            "active",
+            "expired",
+            "revert_pending",
+            "revert_failed",
+            "reverted",
+        ] {
+            assert!(
+                payload["state_counts"][k].is_u64(),
+                "state_counts.{k} missing"
+            );
+        }
+        for k in ["registered", "expired", "reverted"] {
+            assert!(payload["totals"][k].is_u64(), "totals.{k} missing");
+        }
+    }
 
     #[test]
     fn test_parse_disabled_detectors() {

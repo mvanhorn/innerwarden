@@ -25,7 +25,6 @@ async function loadHome() {
     window._lastIncidentList = incidentList.items || [];
     window._lastEntityItems = entityData.items || [];
 
-    // Filtered base matches what Recent Activity will render.
     var items = incidentList.items || [];
     var base = state.hideAllowlisted
       ? items.filter(function(i) { return !isIncidentTrusted(i); })
@@ -61,7 +60,6 @@ async function loadHome() {
 
     updateHomeNow(overview, activeHighCriticalList.length, softStale, totalEventsScanned);
     updateHomeKpis(overview, totalEventsScanned);
-    buildHomeFeed(base);
     updateCollectorStrip(sensors);
     loadBriefing();
   } catch(e) { console.warn('loadHome error:', e); }
@@ -255,15 +253,14 @@ function updateHomeNow(overview, activeCount, softStale, totalEventsScanned) {
 
 // ── KPIs with fixed temporal sub-labels ──────────────────────────────
 function updateHomeKpis(overview, totalEventsScanned) {
-  // Count from entity items (same source as Threats tab) for consistency.
-  var entityItems = window._lastEntityItems || [];
-  var blockedCount = 0;
-  entityItems.forEach(function(item) {
-    var o = (item.outcome || 'open').toLowerCase();
-    if (o === 'blocked' || o === 'honeypot' || o === 'contained') blockedCount++;
-  });
+  // "Handled" = every IP where the AI made a take-action decision today
+  // (block, contain, honeypot, monitor). Matches the number the AI briefing
+  // quotes, so the two surfaces never disagree. Previously this KPI silently
+  // fell back from "active blocks now" to ai_responded when the active set
+  // was empty, which mislabelled the number as "Blocked Today" while really
+  // meaning "still active". Now it's one source, one meaning.
   var el = document.getElementById('homeKpiThreats');
-  if (el) el.textContent = blockedCount > 0 ? blockedCount : (overview.ai_responded || 0);
+  if (el) el.textContent = overview.ai_responded || 0;
 
   el = document.getElementById('homeKpiResponded');
   if (el) el.textContent = overview.incidents_count || 0;
@@ -331,94 +328,6 @@ async function generateBriefing() {
     content.innerHTML = '<div style="color:var(--danger)">Error: ' + esc(e.message) + '</div>';
   }
   if (btn) { btn.textContent = 'Regenerate'; btn.disabled = false; }
-}
-
-// ── Recent Activity (severity × outcome hierarchy, never red) ──────
-function buildHomeFeed(incidents) {
-  var feedEl = document.getElementById('homeFeed');
-  if (!feedEl) return;
-
-  incidents = (incidents || []).slice();
-
-  if (incidents.length === 0) {
-    feedEl.innerHTML =
-      '<div class="home-feed-empty">' +
-      '<div class="home-feed-empty-icon">\u2705</div>' +
-      '<div class="home-feed-empty-title">No events in view.</div>' +
-      '<div class="home-feed-empty-sub">AI is monitoring.</div>' +
-      '</div>';
-    return;
-  }
-
-  // Sort: open first, then severity desc, then ts desc.
-  incidents.sort(function(a, b) {
-    var ao = (a.outcome || 'open') === 'open' ? 0 : 1;
-    var bo = (b.outcome || 'open') === 'open' ? 0 : 1;
-    if (ao !== bo) return ao - bo;
-    var as = severityRank(a.effective_severity || a.severity);
-    var bs = severityRank(b.effective_severity || b.severity);
-    if (as !== bs) return bs - as;
-    return (new Date(b.ts).getTime() || 0) - (new Date(a.ts).getTime() || 0);
-  });
-
-  var html = '<div class="activity-feed">';
-  incidents.slice(0, 15).forEach(function(inc) {
-    var slug = (inc.incident_id || '').split(':')[0] || '';
-    var label = humanLabel(slug);
-    var ago = timeAgo(inc.ts);
-    var outcome = inc.outcome || 'open';
-    var sev = (inc.effective_severity || inc.severity || '').toLowerCase();
-    var entities = inc.entities || [];
-    var ipEntity = entities.find(function(e) {
-      return (e.type || '').toLowerCase() === 'ip' || (typeof e === 'string' && e.startsWith('ip:'));
-    });
-    var ipVal = ipEntity ? (ipEntity.value || (typeof ipEntity === 'string' ? ipEntity.slice(3) : '')) : '';
-
-    // Row class: severity × outcome. Open + critical/high uses
-    // .alert-high / .alert-medium (orange/amber) — never .alert-critical.
-    var rowClass = 'feed-row';
-    if (outcome === 'blocked' || outcome === 'killed' || outcome === 'contained' || outcome === 'suspended') {
-      rowClass += ' feed-handled';
-    } else if (outcome === 'ignored') {
-      rowClass += ' feed-noise';
-    } else if (outcome === 'monitored') {
-      rowClass += ' feed-monitor';
-    } else if (outcome === 'honeypot') {
-      rowClass += ' feed-honeypot';
-    } else {
-      // open — scale by severity, but never red
-      if (sev === 'critical')    rowClass += ' alert-high';
-      else if (sev === 'high')   rowClass += ' alert-medium';
-      else if (sev === 'medium') rowClass += ' alert-low';
-      else                       rowClass += ' feed-muted';
-    }
-
-    var icon = '\u26A0';
-    if (outcome === 'blocked' || outcome === 'killed' || outcome === 'contained' || outcome === 'suspended') icon = '\uD83D\uDEE1';
-    else if (outcome === 'ignored') icon = '\u2796';
-    else if (sev === 'critical' || sev === 'high') icon = '\u26A1';
-
-    // Map raw outcome to AI-first model: open/active → OBSERVING with Guard ON
-    var mappedOutcome = outcome;
-    if ((outcome === 'open' || outcome === 'active') && (window._agentMode || status?.mode || 'guard') === 'guard') {
-      mappedOutcome = 'monitoring';
-    }
-    var badge = outcomeBadgeHtml(mappedOutcome);
-
-    html += '<div class="' + rowClass + '" onclick="viewActivity();handleCardClickByValue(\'ip\',\'' + ipVal + '\')">' +
-      '<span class="activity-icon">' + icon + '</span>' +
-      '<div style="flex:1;min-width:0">' +
-      '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">' +
-      '<span style="font-size:0.8rem;font-weight:600;color:var(--text)">' + label + '</span>' +
-      badge +
-      '</div>' +
-      (ipVal ? '<div style="font-size:0.72rem;color:var(--muted);margin-top:2px;font-family:\'JetBrains Mono\',monospace">' + ipVal + '</div>' : '') +
-      '</div>' +
-      '<span class="activity-time">' + ago + '</span>' +
-      '</div>';
-  });
-  html += '</div>';
-  feedEl.innerHTML = html;
 }
 
 // ── Data Collection (summary + collapsed details) ───────────────────

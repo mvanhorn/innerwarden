@@ -15,6 +15,42 @@ pub(super) fn is_dashboard_sleeping(last_activity: &std::sync::atomic::AtomicU64
         .as_secs();
     now.saturating_sub(last) > DASHBOARD_SLEEP_SECS
 }
+
+/// Build the AI briefing system prompt. When the operator has a bot
+/// personality configured, use it as the base so the Home briefing speaks
+/// in the same voice as Telegram `/ask`; otherwise fall back to a plain
+/// analyst prompt (preserves behaviour in test fixtures that build a bare
+/// `DashboardActionConfig::default()`).
+pub(super) fn briefing_system_prompt(personality: &str) -> String {
+    let guidance = "FORMAT: generate a concise intelligence briefing. \
+        Short sections. No fluff. No generic security advice. \
+        Name the TTP and state the action taken for any real incident; \
+        treat routine scanner noise as one summary line, not a section each.";
+    if personality.trim().is_empty() {
+        format!("You are a senior security analyst.\n\n{guidance}")
+    } else {
+        format!("{}\n\n{guidance}", personality.trim_end())
+    }
+}
+
+/// Build the AI explain-threat system prompt used by the Threats drill-down.
+/// Uses the same base personality as the briefing so all three AI surfaces
+/// (Home briefing, Threats explain, Telegram /ask) speak in one voice,
+/// layered with the plain-English simplification guidance.
+pub(super) fn explain_system_prompt(personality: &str) -> String {
+    let simplifier = "FORMAT: you are explaining one incident to the operator. \
+        Base your answer strictly on the incident data provided. \
+        2-3 sentences. No jargon. No generic advice. \
+        Only call it dangerous if the attacker got past initial contact \
+        (successful authentication, shell access, data exfil).";
+    if personality.trim().is_empty() {
+        format!(
+            "You are a security assistant explaining threats to a non-technical person.\n\n{simplifier}"
+        )
+    } else {
+        format!("{}\n\n{simplifier}", personality.trim_end())
+    }
+}
 pub(super) async fn api_overview(
     State(state): State<DashboardState>,
     Query(query): Query<ListQuery>,
@@ -366,9 +402,8 @@ pub(super) async fn api_briefing_generate(
             "error": "AI provider not configured. Enable AI in agent.toml to generate briefings.",
         }));
     };
-    let system =
-        "You are a senior security analyst. Generate a concise, actionable intelligence briefing.";
-    match ai.chat(system, &prompt).await {
+    let system = briefing_system_prompt(&state.action_cfg.ai_personality);
+    match ai.chat(&system, &prompt).await {
         Ok(response) => {
             let b = crate::briefing::parse_briefing(&response, threat_level);
             let result = serde_json::json!({
@@ -506,20 +541,14 @@ pub(super) async fn api_ai_explain(
         )
     };
 
-    let system = "You are a security assistant explaining threats to a non-technical person. \
-        This server is protected by InnerWarden (an AI security agent) and uses SSH key-only authentication (password login is disabled). \
-        Explain in plain English: what happened, whether it's actually dangerous, and whether any action is needed. \
-        Base your answer strictly on the incident data provided — the title and summary tell you exactly what happened. \
-        Most activity you'll see is routine internet noise (bots scanning every IP on the internet). Failed connection attempts from scanners are NOT dangerous. \
-        Only say it's dangerous if the attacker actually got past the initial connection (authentication success, shell access, data exfiltration). \
-        Keep your explanation to 2-3 sentences. No jargon. No generic security advice like 'update passwords'. Be specific to what happened.";
+    let system = explain_system_prompt(&state.action_cfg.ai_personality);
 
     let user_msg = format!(
         "Explain this activity to me in simple terms. Should I be worried?\n\n{}",
         context
     );
 
-    match ai.chat(system, &user_msg).await {
+    match ai.chat(&system, &user_msg).await {
         Ok(explanation) => Json(serde_json::json!({ "explanation": explanation })),
         Err(e) => Json(serde_json::json!({
             "error": format!("AI call failed: {}", e)
@@ -717,6 +746,44 @@ pub(super) fn effective_severity(outcome: &str, severity: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn briefing_system_prompt_falls_back_when_personality_blank() {
+        let out = briefing_system_prompt("");
+        assert!(out.starts_with("You are a senior security analyst."));
+        assert!(out.contains("FORMAT: generate a concise intelligence briefing."));
+    }
+
+    #[test]
+    fn briefing_system_prompt_uses_personality_when_set() {
+        let out = briefing_system_prompt("You are InnerWarden. Bouncer voice.");
+        assert!(out.starts_with("You are InnerWarden. Bouncer voice."));
+        assert!(!out.contains("senior security analyst"));
+        assert!(out.contains("FORMAT: generate a concise intelligence briefing."));
+    }
+
+    #[test]
+    fn briefing_system_prompt_trims_whitespace_personality() {
+        let out = briefing_system_prompt("   \n\t  ");
+        // Whitespace-only must fall back to the analyst baseline rather
+        // than produce a prompt that opens with blank lines.
+        assert!(out.starts_with("You are a senior security analyst."));
+    }
+
+    #[test]
+    fn explain_system_prompt_falls_back_when_personality_blank() {
+        let out = explain_system_prompt("");
+        assert!(out.starts_with("You are a security assistant explaining threats"));
+        assert!(out.contains("FORMAT: you are explaining one incident"));
+    }
+
+    #[test]
+    fn explain_system_prompt_uses_personality_when_set() {
+        let out = explain_system_prompt("You are InnerWarden. Bouncer voice.");
+        assert!(out.starts_with("You are InnerWarden. Bouncer voice."));
+        assert!(!out.contains("security assistant explaining threats"));
+        assert!(out.contains("Only call it dangerous"));
+    }
 
     #[test]
     fn test_effective_severity_downgrade() {
