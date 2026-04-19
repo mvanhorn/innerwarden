@@ -90,7 +90,7 @@ fn detector_from_incident_id(incident_id: &str) -> &str {
 
 fn autodismiss_reason(detector: &str, severity: &innerwarden_core::event::Severity) -> String {
     format!(
-        "Auto-dismissed: {detector} below AI severity threshold (severity {:?})",
+        "Low-priority {detector} ({:?}). Filed, not firing.",
         severity,
     )
 }

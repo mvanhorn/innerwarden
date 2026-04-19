@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+mod banner;
 mod calibrate;
 mod capabilities;
 mod capability;
@@ -40,7 +41,7 @@ use innerwarden_core::audit::{append_admin_action, current_operator, AdminAction
 #[derive(Parser)]
 #[command(
     name = "innerwarden",
-    about = "InnerWarden — self-defending security for Linux and macOS",
+    about = "InnerWarden. self-defending security for Linux and macOS.",
     long_about = "8 commands to protect your server:\n\n\
                   \x20 get       Query status, incidents, decisions, reports\n\
                   \x20 stream    Monitor events in real-time\n\
@@ -70,7 +71,7 @@ struct Cli {
     dry_run: bool,
 
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -169,7 +170,7 @@ enum Command {
         command: ModuleCommand,
     },
 
-    /// AI agent management — install, scan, connect, monitor agents.
+    /// AI agent management. Install, scan, connect, monitor agents.
     ///
     /// Run without arguments for an interactive menu.
     ///
@@ -1938,7 +1939,15 @@ fn main() -> Result<()> {
         }
     }
 
-    match cli.command {
+    let Some(command) = cli.command.take() else {
+        banner::render(env!("CARGO_PKG_VERSION"), &mut std::io::stdout()).ok();
+        use clap::CommandFactory;
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    };
+
+    match command {
         // ===================================================================
         // New grouped commands
         // ===================================================================
@@ -2594,10 +2603,10 @@ mod tests {
             agent_config: data_dir.join("agent.toml"),
             data_dir: data_dir.to_path_buf(),
             dry_run: false,
-            command: Command::Decisions {
+            command: Some(Command::Decisions {
                 days: 1,
                 action: None,
-            },
+            }),
         }
     }
 

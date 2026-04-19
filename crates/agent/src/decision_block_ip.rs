@@ -317,7 +317,7 @@ pub(crate) fn consult_circuit_breaker(
                 limit,
                 hour = %hour,
                 mode = mode.as_label(),
-                "circuit breaker TRIPPED — pausing block pipeline until UTC hour rolls over (or run `innerwarden system circuit-reset`)"
+                "circuit breaker tripped. Block pipeline paused until next UTC hour (or run `innerwarden system circuit-reset`)."
             );
         }
         crate::circuit_breaker::Decision::RefuseAfterTrip { count, limit, hour } => {
@@ -326,7 +326,7 @@ pub(crate) fn consult_circuit_breaker(
                 count,
                 limit,
                 hour = %hour,
-                "circuit breaker still tripped — block refused silently"
+                "circuit breaker still tripped. Block refused silently."
             );
         }
         crate::circuit_breaker::Decision::AutoRearm { count, limit, hour } => {
@@ -335,7 +335,7 @@ pub(crate) fn consult_circuit_breaker(
                 count,
                 limit,
                 hour = %hour,
-                "circuit breaker auto-rearmed — new UTC hour, counters reset"
+                "circuit breaker auto-rearmed. New UTC hour, counters reset."
             );
         }
         crate::circuit_breaker::Decision::Allow { .. } => {}

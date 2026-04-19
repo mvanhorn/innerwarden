@@ -80,12 +80,14 @@ pub(crate) async fn try_handle_obvious_incident(
         auto_execute: true,
         reason: match obvious_detector_policy(detector) {
             ObviousPolicy::RepeatOffender => {
-                format!("Auto-blocked: obvious {detector} from repeat offender {ip}")
+                format!("Shut the door on {ip}. {detector}, seen before. No more guesses.")
             }
             ObviousPolicy::FirstHit => {
-                format!("Auto-blocked: {detector} from {ip} (first hit is the attack)")
+                format!(
+                    "Shut the door on {ip}. {detector} caught on first try. Compromise averted."
+                )
             }
-            ObviousPolicy::None => format!("Auto-blocked: {detector} from {ip}"),
+            ObviousPolicy::None => format!("Shut the door on {ip}. {detector}."),
         },
         alternatives: vec![],
         estimated_threat: "high".to_string(),
