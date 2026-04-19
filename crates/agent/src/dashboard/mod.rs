@@ -1464,6 +1464,76 @@ mod tests {
         assert_eq!(determine_outcome(&[], "1.2.3.4", false), "unknown");
     }
 
+    // Spec 028-c: escalate decisions route the IP to the "escalated" outcome,
+    // which status_determination maps to "needs_attention" on the dashboard.
+    #[test]
+    fn outcome_escalated_surfaces_needs_attention() {
+        let escalated = DecisionEntry {
+            ts: Utc::now(),
+            incident_id: "x".to_string(),
+            host: "h".to_string(),
+            ai_provider: "observation-verify".to_string(),
+            action_type: "escalate".to_string(),
+            target_ip: Some("1.2.3.4".to_string()),
+            target_user: None,
+            skill_id: None,
+            confidence: 0.8,
+            auto_executed: true,
+            dry_run: false,
+            reason: "obs-verify score 55/100".to_string(),
+            estimated_threat: "medium".to_string(),
+            execution_result: "pending-fase4".to_string(),
+            prev_hash: None,
+        };
+        assert_eq!(
+            determine_outcome(&[escalated], "1.2.3.4", true),
+            "escalated"
+        );
+    }
+
+    // Spec 028-c: a later block_ip supersedes an earlier escalate.
+    #[test]
+    fn outcome_block_wins_over_escalate() {
+        let escalated = DecisionEntry {
+            ts: Utc::now(),
+            incident_id: "x".to_string(),
+            host: "h".to_string(),
+            ai_provider: "observation-verify".to_string(),
+            action_type: "escalate".to_string(),
+            target_ip: Some("1.2.3.4".to_string()),
+            target_user: None,
+            skill_id: None,
+            confidence: 0.8,
+            auto_executed: true,
+            dry_run: false,
+            reason: "obs-verify".to_string(),
+            estimated_threat: "medium".to_string(),
+            execution_result: "pending-fase4".to_string(),
+            prev_hash: None,
+        };
+        let block = DecisionEntry {
+            ts: Utc::now(),
+            incident_id: "x".to_string(),
+            host: "h".to_string(),
+            ai_provider: "mock".to_string(),
+            action_type: "block_ip".to_string(),
+            target_ip: Some("1.2.3.4".to_string()),
+            target_user: None,
+            skill_id: None,
+            confidence: 0.95,
+            auto_executed: true,
+            dry_run: false,
+            reason: "r".to_string(),
+            estimated_threat: "high".to_string(),
+            execution_result: "ok".to_string(),
+            prev_hash: None,
+        };
+        assert_eq!(
+            determine_outcome(&[escalated, block], "1.2.3.4", true),
+            "blocked"
+        );
+    }
+
     // ── D3 tests ────────────────────────────────────────────────────────
 
     #[test]

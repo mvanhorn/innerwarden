@@ -65,7 +65,7 @@ pub(crate) fn verify_observing_incidents(
     );
 
     // Collect undecided incident data from the graph (read lock)
-    let undecided: Vec<(String, String, String, serde_json::Value)> = {
+    let undecided: Vec<(String, String, String, serde_json::Value, Option<String>)> = {
         let graph = state.knowledge_graph.read().unwrap();
         collect_undecided_incidents(&graph)
     };
@@ -78,7 +78,7 @@ pub(crate) fn verify_observing_incidents(
     let mut escalated = 0u32;
     let mut ambiguous_items = Vec::new();
 
-    for (incident_id, detector, title, evidence) in undecided {
+    for (incident_id, detector, title, evidence, primary_ip) in undecided {
         let (result, breakdown) = observation_verify::behaviour_score(
             &evidence,
             operator_active,
@@ -108,16 +108,65 @@ pub(crate) fn verify_observing_incidents(
                 );
             }
             VerificationResult::Escalate { score, reason } => {
-                let mut graph = state.knowledge_graph.write().unwrap();
-                graph.ingest_decision(
-                    &incident_id,
-                    "escalate",
-                    None,
-                    0.8,
-                    &format!("obs-verify score {score}/100: {reason}"),
-                    true,
-                    chrono::Utc::now(),
-                );
+                // Spec 028-c: also record the escalate decision in the decisions
+                // JSONL via state.decision_writer so dashboard bucketing (which
+                // reads decisions, not the graph) can classify the IP as "needs
+                // attention" instead of leaving it in "observing".
+                //
+                // The graph write and the JSONL write are kept separate scopes
+                // so the graph write lock is released before we grab the
+                // decision_writer (separate fields, but easier reasoning).
+                {
+                    let mut graph = state.knowledge_graph.write().unwrap();
+                    graph.ingest_decision(
+                        &incident_id,
+                        "escalate",
+                        primary_ip.as_deref(),
+                        0.8,
+                        &format!("obs-verify score {score}/100: {reason}"),
+                        true,
+                        chrono::Utc::now(),
+                    );
+                }
+                if let Some(writer) = state.decision_writer.as_mut() {
+                    let entry = crate::decisions::DecisionEntry {
+                        ts: chrono::Utc::now(),
+                        incident_id: incident_id.clone(),
+                        host: String::new(),
+                        ai_provider: "observation-verify".to_string(),
+                        action_type: "escalate".to_string(),
+                        target_ip: primary_ip.clone(),
+                        target_user: None,
+                        skill_id: None,
+                        confidence: 0.8,
+                        auto_executed: true,
+                        dry_run: false,
+                        reason: format!("obs-verify score {score}/100: {reason}"),
+                        estimated_threat: "medium".to_string(),
+                        execution_result: "pending-fase4".to_string(),
+                        prev_hash: None,
+                    };
+                    if let Err(e) = writer.write(&entry) {
+                        // Don't propagate; the graph already has the decision.
+                        tracing::warn!(
+                            incident_id = %incident_id,
+                            error = %e,
+                            "observation-verify: failed to write escalate decision to JSONL"
+                        );
+                    }
+                }
+                // Spec 028-b stub: the flag is read here so operators can
+                // already toggle it in agent.toml, but the actual forwarding
+                // into Fase 4 is a follow-up PR. Once the provider + skill
+                // executor are threaded through this function (async
+                // conversion required), replace this log with the real call.
+                if cfg.incident_flow.escalate_to_decide {
+                    tracing::info!(
+                        incident_id = %incident_id,
+                        target_ip = ?primary_ip,
+                        "observation-verify: spec 028-b flag on - decide() call pending (follow-up PR threading)"
+                    );
+                }
                 escalated += 1;
                 debug!(
                     incident_id,
@@ -152,9 +201,14 @@ pub(crate) fn verify_observing_incidents(
 }
 
 /// Collect undecided incident data from the knowledge graph.
+///
+/// The last tuple element is the primary IP entity connected to the incident,
+/// if any. Spec 028-c uses this so the escalate decision written below can
+/// link back to a target IP and the dashboard can bucket the IP as "needs
+/// attention" instead of "observing".
 fn collect_undecided_incidents(
     graph: &KnowledgeGraph,
-) -> Vec<(String, String, String, serde_json::Value)> {
+) -> Vec<(String, String, String, serde_json::Value, Option<String>)> {
     graph
         .nodes_of_type(NodeType::Incident)
         .iter()
@@ -181,13 +235,20 @@ fn collect_undecided_incidents(
                     "summary": summary,
                 });
 
-                // Enrich evidence from connected graph nodes
+                // Enrich evidence from connected graph nodes.
+                // Track the first IP entity we see as the primary attacker IP.
+                let mut primary_ip: Option<String> = None;
                 for edge in graph.edges_slice() {
                     if edge.from != id && edge.to != id {
                         continue;
                     }
                     let other_id = if edge.from == id { edge.to } else { edge.from };
                     if let Some(node) = graph.get_node(other_id) {
+                        if primary_ip.is_none() {
+                            if let Node::Ip { addr, .. } = node {
+                                primary_ip = Some(addr.clone());
+                            }
+                        }
                         enrich_evidence_from_node(&mut evidence, node, graph);
                     }
                 }
@@ -197,6 +258,7 @@ fn collect_undecided_incidents(
                     detector.clone(),
                     title.clone(),
                     evidence,
+                    primary_ip,
                 ))
             } else {
                 None
