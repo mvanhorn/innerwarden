@@ -1107,6 +1107,28 @@ pub struct ResponderConfig {
     /// monitoring tools that make legitimate outbound connections.
     #[serde(default = "default_trusted_processes")]
     pub trusted_processes: Vec<String>,
+
+    /// Circuit breaker: hard ceiling on auto-blocks per UTC hour. Once the
+    /// threshold is crossed the breaker trips (see `circuit_breaker_mode`).
+    /// Default of 100/h catches the CL-008 class of cascade (1,021 blocks
+    /// in 24h, ~43/h peaks) while staying out of the way during legitimate
+    /// brute-force storms (≤ 30 unique IPs/h in prod baseline).
+    #[serde(default = "default_max_blocks_per_hour")]
+    pub max_blocks_per_hour: u64,
+
+    /// Circuit breaker mode: "pause" (refuse blocks after trip, default),
+    /// "dry_run" (audit-write the decision but skip the skill), or
+    /// "log_only" (count but never refuse — calibration mode only).
+    #[serde(default = "default_circuit_breaker_mode")]
+    pub circuit_breaker_mode: String,
+}
+
+fn default_max_blocks_per_hour() -> u64 {
+    100
+}
+
+fn default_circuit_breaker_mode() -> String {
+    "pause".to_string()
 }
 
 fn default_trusted_processes() -> Vec<String> {
@@ -1145,6 +1167,8 @@ impl Default for ResponderConfig {
             allowed_skills: default_allowed_skills(),
             auto_rules_enabled: true,
             trusted_processes: default_trusted_processes(),
+            max_blocks_per_hour: default_max_blocks_per_hour(),
+            circuit_breaker_mode: default_circuit_breaker_mode(),
         }
     }
 }
