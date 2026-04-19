@@ -295,7 +295,21 @@ impl ProtoAnomalyDetector {
         now: DateTime<Utc>,
         severity: Severity,
     ) -> Option<Incident> {
-        let key = format!("{:?}:{}:{}", anomaly_type, src_ip, dst_port);
+        // Spec 028-a: reject loopback + RFC1918 as source. Internal addresses
+        // cannot be remote attackers; firing on them produces noise. The helper
+        // covers 127/8, 10/8, 172.16/12, 192.168/16, link-local, and broadcast.
+        if super::is_internal_ip(src_ip) {
+            return None;
+        }
+
+        // Spec 028-a: throttle per (source_ip, detector_kind) with the
+        // configured cooldown (default 600s). Previously the key also included
+        // dst_port, which defeats the throttle whenever attackers scan a range
+        // of ports — each port gets its own fire. SshVersionAnomaly and the
+        // other SSH-bound anomalies all target dst_port 22, so dropping the
+        // port from the key is safe for those and correct for the port-scan
+        // cases too.
+        let key = format!("{:?}:{}", anomaly_type, src_ip);
 
         if let Some(&last) = self.alerted.get(&key) {
             if now - last < self.cooldown {
@@ -426,6 +440,11 @@ mod tests {
             .any(|i| i.title.contains("double encoding")));
     }
 
+    // Spec 028-a enforces public-source filtering, so this test uses a public
+    // src_ip. 8.8.8.8 is chosen because it falls outside every std::Ipv4Addr
+    // predicate (not loopback, private, link-local, broadcast, documentation,
+    // or unspecified). Note: 203.0.113.0/24 IS documentation range and would
+    // be filtered out.
     #[test]
     fn test_smb_non_standard_port() {
         let mut det = ProtoAnomalyDetector::new("host1", 300);
@@ -433,7 +452,7 @@ mod tests {
             "tcp_stream.smb",
             serde_json::json!({
                 "app_proto": "smb",
-                "src_ip": "10.0.0.5",
+                "src_ip": "8.8.8.8",
                 "dst_ip": "10.0.0.10",
                 "dst_port": 8445,
                 "signals": [],
@@ -493,5 +512,79 @@ mod tests {
             entities: Vec::new(),
         };
         assert!(det.process(&ev).is_empty());
+    }
+
+    // Spec 028-a: rejects loopback as source (cannot be a remote attacker).
+    #[test]
+    fn test_rejects_loopback_source() {
+        let mut det = ProtoAnomalyDetector::new("host1", 300);
+        let ev = make_stream_event(
+            "tcp_stream.ssh",
+            serde_json::json!({
+                "app_proto": "ssh",
+                "src_ip": "127.0.0.1",
+                "dst_ip": "10.0.0.1",
+                "dst_port": 22,
+                "client_version": "EXPLOIT-TOOL-v1",
+                "signals": [],
+            }),
+        );
+        assert!(
+            det.process(&ev).is_empty(),
+            "loopback source must not produce an incident"
+        );
+    }
+
+    // Spec 028-a: rejects RFC1918 as source.
+    #[test]
+    fn test_rejects_rfc1918_source() {
+        let mut det = ProtoAnomalyDetector::new("host1", 300);
+        for src in ["10.0.0.5", "172.16.1.2", "192.168.1.50"] {
+            let ev = make_stream_event(
+                "tcp_stream.ssh",
+                serde_json::json!({
+                    "app_proto": "ssh",
+                    "src_ip": src,
+                    "dst_ip": "8.8.8.8",
+                    "dst_port": 22,
+                    "client_version": "EXPLOIT-TOOL-v1",
+                    "signals": [],
+                }),
+            );
+            assert!(
+                det.process(&ev).is_empty(),
+                "RFC1918 src {src} must not produce an incident"
+            );
+        }
+    }
+
+    // Spec 028-a: single IP hitting multiple dst_ports in the cooldown window
+    // produces one incident, not one per port. Previously the key included
+    // dst_port, so a scanner probing ports 22,2222,22022 emitted three times
+    // even for the same SshNonStandardPort anomaly.
+    #[test]
+    fn test_cooldown_across_ports_from_same_source() {
+        let mut det = ProtoAnomalyDetector::new("host1", 300);
+        let mk = |port: u16| {
+            make_stream_event(
+                "tcp_stream.ssh",
+                serde_json::json!({
+                    "app_proto": "ssh",
+                    "src_ip": "1.2.3.4",
+                    "dst_ip": "8.8.8.8",
+                    "dst_port": port,
+                    "client_version": "SSH-2.0-Foo",
+                    "signals": [],
+                }),
+            )
+        };
+        let first = det.process(&mk(2222));
+        let second = det.process(&mk(22022));
+        let third = det.process(&mk(42424));
+        let total = first.len() + second.len() + third.len();
+        assert_eq!(
+            total, 1,
+            "same src across different dst_ports should be throttled"
+        );
     }
 }
