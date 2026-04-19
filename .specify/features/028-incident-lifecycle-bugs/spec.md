@@ -1,4 +1,4 @@
-# Feature Specification: Incident Lifecycle Bugs — Autonomy Gap 2.0
+# Feature Specification: Incident Lifecycle Bugs - Autonomy Gap 2.0
 
 **Feature Branch**: `028-incident-lifecycle-bugs`
 **Created**: 2026-04-19
@@ -79,17 +79,17 @@ P2 = UI only.
 
 Three IPs that expose bugs #1, #2, #3, #4 in isolation:
 
-- **51.158.205.47 (masscan)**: 32 incidents in 5h, each triggered an AI chat() call that returned "escalate — SUSPICIOUS". Zero blocks. Still Observing.
-- **64.89.163.156 (Distributed SSH botnet)**: HIGH severity, AI said "SUSPICIOUS — botnet scan activity" at 85% confidence. Status "Needs review — no automated response taken". 3 hours later still not blocked.
+- **51.158.205.47 (masscan)**: 32 incidents in 5h, each triggered an AI chat() call that returned "escalate - SUSPICIOUS". Zero blocks. Still Observing.
+- **64.89.163.156 (Distributed SSH botnet)**: HIGH severity, AI said "SUSPICIOUS - botnet scan activity" at 85% confidence. Status "Needs review - no automated response taken". 3 hours later still not blocked.
 - **103.41.247.76 (rule-blocked but shown Observing)**: ssh_bruteforce rule fired a block at 17:00:41 (recorded in decisions). Dashboard still shows this IP under "Observing" rather than "Blocked".
 
 ### Reference files and lines
 
-- `crates/agent/src/narrative_observation_verify.rs:110-126` — escalate branch that only writes to the graph.
-- `crates/agent/src/observation_verify.rs` — the Fase 3 scorer; thresholds in `DEFAULT_ESCALATE_THRESHOLD` = 40.
-- `crates/sensor/src/detectors/user_agent_scanner.rs` — fires `graph_scanner_ua`, no throttle.
-- `crates/sensor/src/detectors/` — most `proto_anomaly:*` detectors; should reject loopback and RFC1918 sources.
-- `crates/agent/src/dashboard.rs` — aggregation of threats into Blocked / Observing / Needs attention buckets.
+- `crates/agent/src/narrative_observation_verify.rs:110-126` - escalate branch that only writes to the graph.
+- `crates/agent/src/observation_verify.rs` - the Fase 3 scorer; thresholds in `DEFAULT_ESCALATE_THRESHOLD` = 40.
+- `crates/sensor/src/detectors/user_agent_scanner.rs` - fires `graph_scanner_ua`, no throttle.
+- `crates/sensor/src/detectors/` - most `proto_anomaly:*` detectors; should reject loopback and RFC1918 sources.
+- `crates/agent/src/dashboard.rs` - aggregation of threats into Blocked / Observing / Needs attention buckets.
 
 ---
 
@@ -97,7 +97,7 @@ Three IPs that expose bugs #1, #2, #3, #4 in isolation:
 
 Organised as four PRs, sequenced by risk vs impact. All PRs sit behind the shadow-mode mechanism introduced in PR #196 (see `crates/agent/src/ai/shadow.rs`) so comparisons against the current behaviour are first-class.
 
-### 028-a — Detector cooldowns and source filters (P1)
+### 028-a - Detector cooldowns and source filters (P1)
 **Fixes**: #1, #5, #9 (partially), #10.
 
 - Add a per-detector `(pivot, window_secs)` throttle in the sensor. `graph_scanner_ua`, `proto_anomaly:SshVersionAnomaly`, `proto_anomaly:SlowConnection`, `proto_anomaly:SshNonStandardPort`, `proto_anomaly:ProtocolMismatch`: one fire per `(source_ip, detector)` per 600s.
@@ -107,7 +107,7 @@ Organised as four PRs, sequenced by risk vs impact. All PRs sit behind the shado
 Risk: low. Only reduces emission volume; does not change decisions.
 Test plan: unit tests on the throttle, replay harness, one week of shadow-mode observation confirming no previously-blocked IPs go un-blocked because the second detector fire was suppressed.
 
-### 028-b — Escalate -> decide() wiring (P0)
+### 028-b - Escalate -> decide() wiring (P0)
 **Fixes**: #2, #6, #7, #8.
 
 - `narrative_observation_verify.rs` escalate branch enqueues the incident into the same queue the main Fase 4 pipeline consumes (whatever the current incident_flow pre-AI queue is).
@@ -117,7 +117,7 @@ Test plan: unit tests on the throttle, replay harness, one week of shadow-mode o
 Risk: medium. Changes what gets blocked autonomously. MUST shadow-mode validate first: with shadow enabled, the local classifier decides on the escalated stream alongside Azure, and we compare the agreement rate for at least 7 days before flipping.
 Test plan: integration test that replays the three UI cases; shadow-mode agreement >= 90% for block_ip on escalated incidents before promoting.
 
-### 028-c — Dashboard bucket fix (P2)
+### 028-c - Dashboard bucket fix (P2)
 **Fixes**: #3, #4.
 
 - Change the Observing/Blocked/Needs-attention classification to look at the latest *effective* state of the IP, not the most recent incident row.
@@ -127,7 +127,7 @@ Test plan: integration test that replays the three UI cases; shadow-mode agreeme
 Risk: low. UI only, no state mutation.
 Test plan: snapshot tests on the classification function with fixtures covering all four transitions.
 
-### 028-d — /24 subnet correlation (P1, optional)
+### 028-d - /24 subnet correlation (P1, optional)
 **Fixes**: #9.
 
 - New correlation rule: if >=3 distinct IPs from the same `/24` trigger any `proto_anomaly:*` or `ssh_bruteforce` detector within 30 min, emit a `subnet_scan_correlation` incident severity High with the /24 as the pivot.
@@ -144,7 +144,7 @@ Risk: medium. A noisy /24 false-positive could accidentally block a whole shared
 3. **028-b (escalate to action)**: ship third. Highest value but also highest risk; requires the shadow-mode agreement window.
 4. **028-d (/24 correlation)**: optional, ship last once the other three are stable.
 
-## Addendum 2026-04-19 — shadow-mode depends on 028-b
+## Addendum 2026-04-19 - shadow-mode depends on 028-b
 
 After enabling shadow-mode in production at 19:43 UTC (`[ai.shadow]` in `/etc/innerwarden/agent.toml` with `provider = "local_classifier"`), the log file `/var/lib/innerwarden/shadow-decisions.jsonl` stayed at 0 bytes for over an hour with zero entries.
 
