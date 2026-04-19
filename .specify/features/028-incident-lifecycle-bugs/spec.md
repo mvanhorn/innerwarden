@@ -144,6 +144,29 @@ Risk: medium. A noisy /24 false-positive could accidentally block a whole shared
 3. **028-b (escalate to action)**: ship third. Highest value but also highest risk; requires the shadow-mode agreement window.
 4. **028-d (/24 correlation)**: optional, ship last once the other three are stable.
 
+## Addendum 2026-04-19 — shadow-mode depends on 028-b
+
+After enabling shadow-mode in production at 19:43 UTC (`[ai.shadow]` in `/etc/innerwarden/agent.toml` with `provider = "local_classifier"`), the log file `/var/lib/innerwarden/shadow-decisions.jsonl` stayed at 0 bytes for over an hour with zero entries.
+
+Root cause: the shadow wrapper in `crates/agent/src/ai/shadow.rs` only intercepts the `AiProvider::decide()` path. It deliberately does not wrap `AiProvider::chat()` because chat returns free-form text that has no `action` label to compare.
+
+In the current production pipeline, the main `decide()` path is almost never invoked. Most traffic goes through `observation-verify` which uses `chat()` to ask "is this suspicious, dismiss or escalate?", and the `escalate` result dead-ends into a graph label (bug #2 in this spec). Concretely: from 19:43 to 20:50 UTC there were 5 `chat()` calls via observation-verify and zero `decide()` calls through the main pipeline.
+
+This exposes a real dependency:
+
+- **Shadow-mode cannot produce useful parity data until 028-b ships.**
+- Before 028-b, the shadow log is empty by construction because the code path the shadow observes is rarely exercised.
+- Once 028-b is in place, every incident that `observation-verify` escalates will flow into `decide()`, which is what shadow-mode wraps. At that point the shadow log starts populating at the rate that 028-a does not throttle away.
+
+Implication for this spec: the 7-day shadow-agreement window required before promoting the local classifier to primary (referenced in 028-b test plan and in PR #196) cannot start counting down from today. It starts when 028-b lands in production, not when shadow mode is first enabled.
+
+Two workarounds are possible if we want earlier parity data:
+
+- **028-e (optional, not currently scoped)**: wrap `chat()` inside `ShadowProvider` too. The wrapper would send the same message to the shadow provider and log the raw text response. Parity would then be measured as "does the classifier's top action match the action keyword in the chat response text?". Noisier signal but would let us observe earlier. Adds ~50 lines to `shadow.rs`.
+- **Force high-severity traffic**: in a staging environment, replay historical high-severity incidents so they hit the main `decide()` path. Good for ad-hoc testing but does not constitute production validation.
+
+Recommendation: accept the dependency, do not add 028-e, and keep the shadow-mode validation gate on 028-b as specified.
+
 ## Success criteria
 
 - `proto_anomaly:SshVersionAnomaly` volume drops below 100 incidents / 24h (currently 646).
