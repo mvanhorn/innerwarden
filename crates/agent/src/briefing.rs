@@ -290,30 +290,30 @@ pub fn build_briefing_context(kg: &Arc<RwLock<KnowledgeGraph>>) -> String {
 }
 
 /// The LLM prompt for generating the briefing.
+///
+/// Format-only instructions. Tone is owned by the system prompt (the bot
+/// personality, plumbed via `briefing_system_prompt`). Prior revision
+/// carried a second "You are the AI security agent..." framing plus a
+/// "Be reassuring" / "Write for someone who is NOT a security professional"
+/// line here, which fought the persona and produced consultant-speak like
+/// "everything is under control" and "no further action needed".
 pub fn briefing_prompt(context: &str) -> String {
     format!(
-        "You are the AI security agent writing a daily briefing for a non-technical server operator.\n\
+        "Write a daily briefing from the state snapshot below.\n\
          \n\
-         This server is protected by InnerWarden — an autonomous AI security agent that blocks \
-         threats automatically. The operator does NOT need to take action on most items. \
-         SSH uses key-only authentication (password login disabled). Most activity from \
-         external IPs is routine internet scanning that fails at the protocol level.\n\
+         Counting rules:\n\
+         - CONTAINED/BLOCKED items are resolved. Count them, do not dramatise them.\n\
+         - IGNORED items are confirmed noise. Do not mention them.\n\
+         - UNRESOLVED items are being OBSERVED by the AI. Only flag the ones that \
+           genuinely need a human decision.\n\
+         - Quote numbers only from the snapshot below. Do not invent counts.\n\
          \n\
-         CRITICAL RULES:\n\
-         - CONTAINED/BLOCKED items are RESOLVED — present them as success, not active threats\n\
-         - IGNORED items are confirmed noise — do not mention them\n\
-         - UNRESOLVED items are being OBSERVED by the AI — only flag if genuinely dangerous\n\
-         - Routine scanners (SSH malformed strings, port probes) are NOT dangerous and NOT urgent\n\
-         - Do NOT recommend 'updating passwords' or generic security advice\n\
-         - Be reassuring when the server is safe. Be direct only when something is genuinely dangerous.\n\
-         - Write for someone who is NOT a security professional\n\
-         \n\
-         Write a SHORT briefing (under 150 words) with:\n\
-         1. **STATUS** — one sentence: is the server safe right now?\n\
-         2. **WHAT THE AI DID** — 2-3 bullets of actions taken (blocks, monitoring)\n\
-         3. **NEEDS ATTENTION** — only if something genuinely requires human decision (rare)\n\
-         \n\
-         Tone: calm, confident, specific. Like a trusted security guard giving a morning report.\n\
+         Structure (under 150 words total):\n\
+         1. STATUS: one line. Is the server safe right now?\n\
+         2. WHAT THE AI DID: 2-3 short lines. Name the actions (blocks, monitoring, \
+            honeypot redirects). Quote the totals from the snapshot.\n\
+         3. NEEDS ATTENTION: omit this section entirely unless something genuinely \
+            requires a human decision.\n\
          \n\
          ---\n\
          \n\
@@ -353,23 +353,44 @@ mod tests {
         assert!(briefing.summary.contains("unresolved"));
     }
 
-    // briefing_prompt injects context into system prompt
     #[test]
     fn briefing_prompt_contains_context() {
         let ctx = "SITUATION STATUS:\n- Operator-relevant incidents today: 5\n";
         let prompt = briefing_prompt(ctx);
         assert!(prompt.contains("SITUATION STATUS"));
-        assert!(prompt.contains("InnerWarden"));
         assert!(prompt.contains("150 words"));
     }
 
-    // briefing_prompt contains key instructions
     #[test]
-    fn briefing_prompt_has_critical_rules() {
+    fn briefing_prompt_keeps_format_structure() {
         let prompt = briefing_prompt("test context");
-        assert!(prompt.contains("CRITICAL RULES"));
-        assert!(prompt.contains("CONTAINED"));
+        assert!(prompt.contains("STATUS"));
+        assert!(prompt.contains("WHAT THE AI DID"));
         assert!(prompt.contains("NEEDS ATTENTION"));
+        // Counting rules still present so the model doesn't dramatise noise.
+        assert!(prompt.contains("CONTAINED"));
+        assert!(prompt.contains("IGNORED"));
+    }
+
+    #[test]
+    fn briefing_prompt_does_not_carry_tone_instructions() {
+        // Tone is owned by the system prompt (bot personality). The user
+        // message must not re-assert "Be reassuring" / "non-technical" /
+        // "trusted security guard", which previously fought the persona
+        // and produced consultant-speak in the output.
+        let prompt = briefing_prompt("x");
+        for banned in [
+            "Be reassuring",
+            "non-technical",
+            "trusted security guard",
+            "You are the AI security agent",
+            "under control",
+        ] {
+            assert!(
+                !prompt.contains(banned),
+                "prompt must not include tone instruction {banned:?}",
+            );
+        }
     }
 
     fn add_incident(

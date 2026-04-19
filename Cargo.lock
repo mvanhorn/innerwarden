@@ -2024,6 +2024,7 @@ dependencies = [
  "innerwarden-smm",
  "innerwarden-store",
  "innerwarden_core",
+ "ipnet",
  "p256 0.13.2",
  "qrcode",
  "rand_core 0.6.4",

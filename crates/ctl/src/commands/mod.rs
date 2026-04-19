@@ -10,6 +10,7 @@ pub(crate) mod mesh;
 pub(crate) mod module;
 pub(crate) mod notify;
 pub(crate) mod ops;
+pub(crate) mod reconcile;
 pub(crate) mod replay;
 pub(crate) mod responder;
 pub(crate) mod response;

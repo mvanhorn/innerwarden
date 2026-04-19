@@ -143,20 +143,15 @@ function computeHomeState(payload) {
 
   // Guard ON or no active threats: AI Protection Active.
   // The operator sees confidence, not alarm.
-  // Use entity items (same source as Threats tab) for consistent counts.
-  var entityItems = payload.entityItems || [];
-  var blocked = 0, observing = 0;
-  entityItems.forEach(function(item) {
-    var o = (item.outcome || 'open').toLowerCase();
-    if (o === 'blocked' || o === 'honeypot' || o === 'contained') blocked++;
-    else if (o === 'monitoring' || o === 'open' || o === 'active') observing++;
-  });
-  if (blocked === 0) blocked = overview.ai_responded || 0;
-  var subParts = [];
-  if (blocked > 0) subParts.push(blocked + ' blocked');
-  if (observing > 0) subParts.push(observing + ' observing');
-  var subText = subParts.length > 0
-    ? subParts.join(' \u00B7 ') + '. Everything handled automatically.'
+  //
+  // Single source: overview.safely_resolved = every decision today that was
+  // NOT "ignore" (block, monitor, honeypot, kill, suspend). The Home KPI
+  // tile and the briefing now quote the same field, so the operator no
+  // longer sees "9 blocked" in the hero while the KPI says 50 and the
+  // briefing says 48 for the same time window.
+  var handled = overview.safely_resolved || 0;
+  var subText = handled > 0
+    ? handled + ' handled today. AI is on shift.'
     : 'All systems monitoring. Nothing requires your attention.';
 
   return {
@@ -217,14 +212,11 @@ function updateHomeNow(overview, activeCount, softStale, totalEventsScanned) {
   var didEl  = document.getElementById('homeNowDid');
   if (!whatEl || !didEl) return;
 
-  var entityItems = window._lastEntityItems || [];
-  var contained = 0, observingNow = 0;
-  entityItems.forEach(function(item) {
-    var o = (item.outcome || 'open').toLowerCase();
-    if (o === 'blocked' || o === 'honeypot' || o === 'contained') contained++;
-    else if (o === 'monitoring' || o === 'open' || o === 'active') observingNow++;
-  });
-  if (contained === 0) contained = overview.ai_responded || 0;
+  // Same source as updateHomeKpis and computeHomeState: overview.safely_resolved.
+  // Counts every non-"ignore" decision today (block + monitor + honeypot +
+  // kill + suspend). Older code summed currently-active entities, which
+  // decay with TTL and so understated the number the briefing reported.
+  var handled = overview.safely_resolved || 0;
   var total = totalEventsScanned || overview.events_count || 0;
 
   // Line 1 — Trust signal: volume scanned
@@ -241,26 +233,24 @@ function updateHomeNow(overview, activeCount, softStale, totalEventsScanned) {
 
   // Line 2 — Outcome summary
   var line2;
-  if (contained === 0 && observingNow === 0) {
+  if (handled === 0) {
     line2 = 'Nothing suspicious found. All systems operating normally.';
-  } else if (contained > 0 && observingNow === 0) {
-    line2 = 'Blocked ' + contained + ' threat' + (contained > 1 ? 's' : '') + ' automatically. Nothing requires your attention.';
   } else {
-    line2 = 'Blocked ' + contained + ' automatically. Observing ' + observingNow + ' more. No action needed.';
+    line2 = 'Handled ' + handled + ' threat' + (handled === 1 ? '' : 's') + ' today. AI is on shift.';
   }
   didEl.textContent = line2;
 }
 
 // ── KPIs with fixed temporal sub-labels ──────────────────────────────
 function updateHomeKpis(overview, totalEventsScanned) {
-  // "Handled" = every IP where the AI made a take-action decision today
-  // (block, contain, honeypot, monitor). Matches the number the AI briefing
-  // quotes, so the two surfaces never disagree. Previously this KPI silently
-  // fell back from "active blocks now" to ai_responded when the active set
-  // was empty, which mislabelled the number as "Blocked Today" while really
-  // meaning "still active". Now it's one source, one meaning.
+  // "Handled" = every decision today that was NOT "ignore" (block, monitor,
+  // honeypot, kill, suspend). Uses overview.safely_resolved — same field
+  // consumed by the hero sub (updateHomeNow) and computeHomeState, and
+  // produced by the same graph walk the briefing uses. Prior revision
+  // read ai_responded which excluded Monitor actions, so the KPI
+  // reported a smaller number than the briefing for the same window.
   var el = document.getElementById('homeKpiThreats');
-  if (el) el.textContent = overview.ai_responded || 0;
+  if (el) el.textContent = overview.safely_resolved || 0;
 
   el = document.getElementById('homeKpiResponded');
   if (el) el.textContent = overview.incidents_count || 0;

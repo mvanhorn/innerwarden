@@ -1728,6 +1728,28 @@ enum SystemCommand {
         #[arg(long)]
         json: bool,
     },
+
+    /// Cross-check firewall DENY rules against the cloud provider
+    /// safelist and release any that now fall inside a known safe range.
+    ///
+    /// Motivating case: the CL-008 cascade in April 2026 installed ufw
+    /// rules blocking Cloudflare and Oracle OCI peer ranges before the
+    /// safelist existed. New blocks are refused by the safelist, but the
+    /// old rules rot until their 7-day TTL expires. This command walks
+    /// the current firewall state and offers a cleanup plan.
+    ///
+    /// Dry-run by default; pass --apply to actually unblock.
+    ///
+    /// Examples:
+    ///   innerwarden system reconcile-blocks
+    ///   innerwarden system reconcile-blocks --apply
+    #[clap(name = "reconcile-blocks")]
+    ReconcileBlocks {
+        /// Release every matching rule. Without this flag the command is
+        /// a dry run and only prints what it would do.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -2137,6 +2159,9 @@ fn main() -> Result<()> {
             }
             SystemCommand::CircuitReset { json } => {
                 commands::circuit::cmd_circuit_reset(&cli.agent_config, &cli.data_dir, *json)
+            }
+            SystemCommand::ReconcileBlocks { apply } => {
+                commands::reconcile::cmd_reconcile_blocks(&cli, &cli.data_dir.clone(), *apply)
             }
         },
 

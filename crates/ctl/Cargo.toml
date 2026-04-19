@@ -19,6 +19,7 @@ innerwarden-agent-guard = { path = "../agent-guard" }
 innerwarden-smm = { path = "../smm" }
 innerwarden-hypervisor = { path = "../hypervisor" }
 innerwarden-store = { path = "../store" }
+ipnet = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
