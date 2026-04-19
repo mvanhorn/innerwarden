@@ -659,6 +659,53 @@ mod tests {
         assert_eq!(determine_outcome_for_ips(&decisions, &ips, true), "active");
     }
 
+    // Spec 028-c: aggregating across multiple IPs, escalated wins over
+    // monitoring/honeypot/dismissed as long as no blocked IP is present.
+    #[test]
+    fn test_determine_outcome_for_ips_escalated_wins_over_monitoring() {
+        let escalated = DecisionEntry {
+            ts: chrono::Utc::now(),
+            incident_id: "x".into(),
+            host: "h".into(),
+            ai_provider: "observation-verify".into(),
+            action_type: "escalate".into(),
+            target_ip: Some("1.2.3.4".into()),
+            target_user: None,
+            skill_id: None,
+            confidence: 0.8,
+            auto_executed: true,
+            dry_run: false,
+            reason: "r".into(),
+            estimated_threat: "medium".into(),
+            execution_result: "pending-fase4".into(),
+            prev_hash: None,
+        };
+        let monitor = DecisionEntry {
+            ts: chrono::Utc::now(),
+            incident_id: "y".into(),
+            host: "h".into(),
+            ai_provider: "mock".into(),
+            action_type: "monitor".into(),
+            target_ip: Some("5.6.7.8".into()),
+            target_user: None,
+            skill_id: None,
+            confidence: 0.7,
+            auto_executed: true,
+            dry_run: false,
+            reason: "r".into(),
+            estimated_threat: "low".into(),
+            execution_result: "ok".into(),
+            prev_hash: None,
+        };
+        let mut ips = BTreeSet::new();
+        ips.insert("1.2.3.4".into());
+        ips.insert("5.6.7.8".into());
+        assert_eq!(
+            determine_outcome_for_ips(&[escalated, monitor], &ips, true),
+            "escalated"
+        );
+    }
+
     #[test]
     fn test_format_duration_scale() {
         assert_eq!(format_duration(0), "0s");
