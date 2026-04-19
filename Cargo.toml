@@ -13,12 +13,15 @@ members = [
   "crates/shield",
   "crates/store",
 ]
-exclude = ["crates/sensor-ebpf"]
-# crates/sensor-ebpf compiles to bpfel-unknown-none target (separate build)
+exclude = ["crates/sensor-ebpf", "fuzz"]
+# crates/sensor-ebpf compiles to bpfel-unknown-none target (separate build).
+# fuzz/ is a cargo-fuzz harness that depends on libfuzzer-sys (nightly-only
+# when using `cargo fuzz`); keeping it out of the workspace avoids polluting
+# stable CI with nightly requirements.
 resolver = "2"
 
 [workspace.package]
-version = "0.12.2"
+version = "0.12.4"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/InnerWarden/innerwarden"

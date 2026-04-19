@@ -1,0 +1,40 @@
+[package]
+name = "innerwarden-fuzz"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Fuzz harnesses for InnerWarden parsers that consume attacker-controlled input (TLS ClientHello, JSONL event stream, core incident deserialisation). Run with `cargo +nightly fuzz run <target>`."
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+innerwarden-sensor = { path = "../crates/sensor" }
+innerwarden_core = { path = "../crates/core" }
+
+# Targets are compiled individually; each gets its own [[bin]] entry so
+# `cargo fuzz list` discovers them without a wrapper module.
+
+[[bin]]
+name = "tls_client_hello"
+path = "fuzz_targets/tls_client_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "core_event_json"
+path = "fuzz_targets/core_event_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "core_incident_json"
+path = "fuzz_targets/core_incident_json.rs"
+test = false
+doc = false
+bench = false

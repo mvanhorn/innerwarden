@@ -60,6 +60,19 @@ scenario-qa:
 ops-check:
 	./scripts/ops-check.sh $(DATA_DIR)
 
+# Requires nightly Rust + cargo-fuzz (`cargo install cargo-fuzz`).
+# `fuzz-quick` runs each harness for 60s, enough to catch regressions
+# on a developer machine without burning a build slot. For real
+# coverage, point OSS-Fuzz or a dedicated runner at the targets.
+FUZZ_DURATION ?= 60
+.PHONY: fuzz-quick
+fuzz-quick:
+	@command -v cargo-fuzz >/dev/null 2>&1 || { echo "cargo-fuzz not installed; run: cargo install cargo-fuzz"; exit 1; }
+	@for target in tls_client_hello core_event_json core_incident_json; do \
+		echo "[fuzz] $$target — $(FUZZ_DURATION)s"; \
+		(cd fuzz && cargo +nightly fuzz run $$target -- -max_total_time=$(FUZZ_DURATION)) || exit 1; \
+	done
+
 # ─── Cross-compile for Linux arm64 ───────────────────────────────────────────
 
 .PHONY: build-linux

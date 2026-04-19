@@ -552,8 +552,15 @@ pub struct AiConfig {
     /// - anthropic: defaults to https://api.anthropic.com (leave empty)
     /// - ollama: defaults to http://localhost:11434 (override for remote Ollama)
     ///   Can also be set via OLLAMA_BASE_URL env var for Ollama.
+    /// - azure_openai: required - https://<resource>.openai.azure.com
     #[serde(default)]
     pub base_url: String,
+
+    /// Azure OpenAI API version (only used when provider = "azure_openai").
+    /// Defaults to "2024-12-01-preview" when empty. See Azure docs for the
+    /// current stable/preview versions.
+    #[serde(default)]
+    pub api_version: String,
 
     /// Maximum number of AI calls per incident tick (default: 5).
     /// When more incidents arrive in a single tick than this limit, the excess
@@ -619,6 +626,84 @@ pub struct AiConfig {
     /// prod drift is verified flat.
     #[serde(default = "default_use_structured_subgraph")]
     pub use_structured_subgraph: bool,
+
+    /// Optional shadow provider: runs in parallel with the primary provider
+    /// and logs each decision for operator audit. Primary drives production;
+    /// shadow is purely observational. Use to validate a new provider (e.g.
+    /// a local classifier) against a known-good one (e.g. Azure OpenAI)
+    /// before promoting the shadow to primary.
+    #[serde(default)]
+    pub shadow: ShadowConfig,
+}
+
+/// Shadow provider configuration (subset of AiConfig applied to a second
+/// provider that runs in parallel with the primary for auditing).
+#[derive(Debug, Deserialize)]
+pub struct ShadowConfig {
+    /// If false (default), no shadow provider is created.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Provider name. Same set of valid values as `[ai].provider`.
+    #[serde(default)]
+    pub provider: String,
+
+    /// Same semantics as `[ai].api_key`. Can be empty if the env var
+    /// (e.g. OPENAI_API_KEY) provides the key.
+    #[serde(default)]
+    pub api_key: String,
+
+    /// Same semantics as `[ai].model`.
+    #[serde(default)]
+    pub model: String,
+
+    /// Same semantics as `[ai].base_url`.
+    #[serde(default)]
+    pub base_url: String,
+
+    /// Same semantics as `[ai].api_version` (used by `azure_openai`).
+    #[serde(default)]
+    pub api_version: String,
+
+    /// Where to append per-incident comparison lines. Default:
+    /// `/var/lib/innerwarden/shadow-decisions.jsonl`.
+    #[serde(default = "default_shadow_log_path")]
+    pub log_path: String,
+}
+
+impl Default for ShadowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            base_url: String::new(),
+            api_version: String::new(),
+            log_path: default_shadow_log_path(),
+        }
+    }
+}
+
+fn default_shadow_log_path() -> String {
+    "/var/lib/innerwarden/shadow-decisions.jsonl".to_string()
+}
+
+impl ShadowConfig {
+    /// Resolve API key: config field first, then provider-specific env var.
+    pub fn resolved_api_key(&self) -> String {
+        if !self.api_key.is_empty() {
+            return self.api_key.clone();
+        }
+        let env_var = match self.provider.as_str() {
+            "openai" => "OPENAI_API_KEY",
+            "anthropic" => "ANTHROPIC_API_KEY",
+            "ollama" => "OLLAMA_API_KEY",
+            "azure_openai" => "AZURE_OPENAI_API_KEY",
+            _ => "AI_API_KEY",
+        };
+        std::env::var(env_var).unwrap_or_default()
+    }
 }
 
 fn default_use_structured_subgraph() -> bool {
@@ -644,6 +729,7 @@ impl Default for AiConfig {
             confidence_threshold: default_confidence_threshold(),
             incident_poll_secs: default_incident_poll_secs(),
             base_url: String::new(),
+            api_version: String::new(),
             max_ai_calls_per_tick: default_max_ai_calls_per_tick(),
             circuit_breaker_threshold: 0,
             circuit_breaker_cooldown_secs: default_circuit_breaker_cooldown_secs(),
@@ -652,6 +738,7 @@ impl Default for AiConfig {
             batch_triage: false,
             batch_window_secs: default_batch_window_secs(),
             use_structured_subgraph: default_use_structured_subgraph(),
+            shadow: ShadowConfig::default(),
         }
     }
 }
@@ -704,6 +791,7 @@ impl AiConfig {
             "openai" => "OPENAI_API_KEY",
             "anthropic" => "ANTHROPIC_API_KEY",
             "ollama" => "OLLAMA_API_KEY",
+            "azure_openai" => "AZURE_OPENAI_API_KEY",
             _ => "AI_API_KEY",
         };
         std::env::var(env_var).unwrap_or_default()
@@ -3034,5 +3122,89 @@ approval_ttl_secs = 300
             (cfg.ai.confidence_threshold - default_confidence_threshold()).abs() < f32::EPSILON,
             "load() must apply clamp so autonomous execution can fire"
         );
+    }
+
+    #[test]
+    fn shadow_config_default_is_disabled() {
+        let s = ShadowConfig::default();
+        assert!(!s.enabled);
+        assert!(s.provider.is_empty());
+        assert!(s.api_key.is_empty());
+        assert!(s.model.is_empty());
+        assert!(s.base_url.is_empty());
+        assert!(s.api_version.is_empty());
+        assert_eq!(s.log_path, "/var/lib/innerwarden/shadow-decisions.jsonl");
+    }
+
+    #[test]
+    fn shadow_config_default_log_path_constant() {
+        assert_eq!(
+            default_shadow_log_path(),
+            "/var/lib/innerwarden/shadow-decisions.jsonl"
+        );
+    }
+
+    #[test]
+    fn shadow_resolved_api_key_field_wins() {
+        let mut s = ShadowConfig::default();
+        s.api_key = "explicit-key".into();
+        s.provider = "openai".into();
+        assert_eq!(s.resolved_api_key(), "explicit-key");
+    }
+
+    #[test]
+    fn shadow_resolved_api_key_matches_each_provider_branch() {
+        // Each provider branch must compile + run without panic regardless of
+        // the host's env. Function returns String (never errors).
+        for provider in ["openai", "anthropic", "ollama", "azure_openai", "unknown"] {
+            let mut s = ShadowConfig::default();
+            s.provider = provider.into();
+            // field empty -> goes into match
+            let _ = s.resolved_api_key();
+        }
+    }
+
+    #[test]
+    fn ai_config_default_has_disabled_shadow() {
+        let cfg = AiConfig::default();
+        assert!(!cfg.shadow.enabled);
+        assert!(cfg.api_version.is_empty());
+    }
+
+    #[test]
+    fn load_parses_shadow_config_block() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(
+            tmp,
+            r#"[ai]
+provider = "azure_openai"
+model = "gpt-5-4-mini"
+base_url = "https://example-resource.openai.azure.com"
+api_version = "2024-12-01-preview"
+
+[ai.shadow]
+enabled = true
+provider = "stub"
+log_path = "/tmp/shadow.jsonl"
+"#
+        )
+        .unwrap();
+        let cfg = load(tmp.path()).unwrap();
+        assert_eq!(cfg.ai.provider, "azure_openai");
+        assert_eq!(cfg.ai.api_version, "2024-12-01-preview");
+        assert!(cfg.ai.shadow.enabled);
+        assert_eq!(cfg.ai.shadow.provider, "stub");
+        assert_eq!(cfg.ai.shadow.log_path, "/tmp/shadow.jsonl");
+    }
+
+    #[test]
+    fn ai_resolved_api_key_recognises_azure_env() {
+        // The AiConfig::resolved_api_key match added "azure_openai" arm.
+        // Same coverage guarantee as shadow: hit each branch without panic.
+        for provider in ["openai", "anthropic", "ollama", "azure_openai", "unknown"] {
+            let mut ai = AiConfig::default();
+            ai.provider = provider.into();
+            let _ = ai.resolved_api_key();
+        }
     }
 }

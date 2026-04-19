@@ -1,6 +1,10 @@
 mod anthropic;
+mod azure_openai;
+#[cfg(feature = "local-classifier")]
+mod local_classifier;
 mod ollama;
 mod openai;
+mod shadow;
 mod stub;
 
 use std::collections::HashSet;
@@ -336,55 +340,155 @@ fn validate_ai_base_url(url: &str) -> Result<()> {
 }
 
 pub fn build_provider(cfg: &AiConfig) -> Result<Box<dyn AiProvider>> {
+    let primary = build_single(
+        &cfg.provider,
+        cfg.resolved_api_key(),
+        &cfg.model,
+        &cfg.base_url,
+        &cfg.api_version,
+        cfg.confidence_threshold,
+    )?;
+
+    if cfg.shadow.enabled {
+        if cfg.shadow.provider.is_empty() {
+            anyhow::bail!("[ai.shadow].enabled is true but provider is empty");
+        }
+        if cfg.shadow.provider == cfg.provider
+            && cfg.shadow.base_url == cfg.base_url
+            && cfg.shadow.model == cfg.model
+        {
+            anyhow::bail!(
+                "[ai.shadow] must differ from [ai] primary (same provider+base_url+model configured)"
+            );
+        }
+        let shadow = build_single(
+            &cfg.shadow.provider,
+            cfg.shadow.resolved_api_key(),
+            &cfg.shadow.model,
+            &cfg.shadow.base_url,
+            &cfg.shadow.api_version,
+            cfg.confidence_threshold,
+        )?;
+        tracing::info!(
+            primary = %cfg.provider,
+            shadow = %cfg.shadow.provider,
+            log_path = %cfg.shadow.log_path,
+            "shadow mode enabled"
+        );
+        return Ok(Box::new(shadow::ShadowProvider::new(
+            primary,
+            shadow,
+            &cfg.shadow.log_path,
+        )));
+    }
+
+    Ok(primary)
+}
+
+/// Build a single provider from flat parameters. Extracted so the same logic
+/// can be reused by the shadow-mode path.
+fn build_single(
+    provider: &str,
+    api_key: String,
+    model: &str,
+    base_url: &str,
+    api_version: &str,
+    #[allow(unused_variables)] confidence_threshold: f32,
+) -> Result<Box<dyn AiProvider>> {
+    // Suppress unused warning when local-classifier feature is off
+    let _ = confidence_threshold;
     // Spec 024 — deterministic stub used by the scenario-qa harness. Returns
     // fixed decisions per detector kind so scenario envelopes stay stable
     // across runs. Opt-in only (provider = "stub"); has no effect on
     // production configs.
-    if cfg.provider == "stub" {
+    if provider == "stub" {
         return Ok(Box::new(stub::StubAiProvider::new()));
     }
 
     // Check if provider is OpenAI-compatible (including "openai" itself)
     if let Some(&(_, default_url, default_model)) = OPENAI_COMPATIBLE
         .iter()
-        .find(|&&(name, _, _)| name == cfg.provider)
+        .find(|&&(name, _, _)| name == provider)
     {
-        let base_url = if cfg.base_url.is_empty() {
+        let base_url = if base_url.is_empty() {
             default_url.to_string()
         } else {
-            validate_ai_base_url(&cfg.base_url)?;
-            cfg.base_url.clone()
+            validate_ai_base_url(base_url)?;
+            base_url.to_string()
         };
-        let model = if cfg.model.is_empty() {
+        let model = if model.is_empty() {
             default_model.to_string()
         } else {
-            cfg.model.clone()
+            model.to_string()
         };
         return Ok(Box::new(openai::OpenAiProvider::with_base_url(
-            cfg.resolved_api_key(),
-            model,
-            base_url,
+            api_key, model, base_url,
         )));
     }
 
-    match cfg.provider.as_str() {
+    match provider {
+        #[cfg(feature = "local-classifier")]
+        "local_classifier" => {
+            if base_url.is_empty() {
+                anyhow::bail!(
+                    "local_classifier requires base_url = <dir with model.onnx + tokenizer.json>"
+                );
+            }
+            let dir = std::path::Path::new(base_url);
+            let threshold = if confidence_threshold > 0.0 {
+                confidence_threshold
+            } else {
+                0.85
+            };
+            Ok(Box::new(local_classifier::LocalClassifier::from_dir(
+                dir, threshold,
+            )?))
+        }
+        #[cfg(not(feature = "local-classifier"))]
+        "local_classifier" => {
+            anyhow::bail!(
+                "local_classifier provider requires building innerwarden-agent with --features local-classifier"
+            )
+        }
+        "azure_openai" => {
+            if base_url.is_empty() {
+                anyhow::bail!(
+                    "azure_openai requires base_url (e.g. https://<resource>.openai.azure.com)"
+                );
+            }
+            validate_ai_base_url(base_url)?;
+            if model.is_empty() {
+                anyhow::bail!(
+                    "azure_openai requires model = <deployment-name> (as configured in Azure AI Foundry)"
+                );
+            }
+            let api_version = if api_version.is_empty() {
+                "2024-12-01-preview".to_string()
+            } else {
+                api_version.to_string()
+            };
+            Ok(Box::new(azure_openai::AzureOpenAiProvider::new(
+                api_key,
+                model.to_string(),
+                base_url.to_string(),
+                api_version,
+            )))
+        }
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(
-            cfg.resolved_api_key(),
-            cfg.model.clone(),
+            api_key,
+            model.to_string(),
         ))),
         "ollama" => {
-            let api_key = cfg.resolved_api_key();
-            let api_key = if api_key.is_empty() {
+            let api_key_opt = if api_key.is_empty() {
                 None
             } else {
                 Some(api_key)
             };
 
-            let base_url = if !cfg.base_url.is_empty() {
-                validate_ai_base_url(&cfg.base_url)?;
-                cfg.base_url.clone()
-            } else if api_key.is_some() {
-                // Cloud mode: default to Ollama's hosted API
+            let base_url = if !base_url.is_empty() {
+                validate_ai_base_url(base_url)?;
+                base_url.to_string()
+            } else if api_key_opt.is_some() {
                 "https://api.ollama.com".to_string()
             } else {
                 let env_url = std::env::var("OLLAMA_BASE_URL")
@@ -393,35 +497,36 @@ pub fn build_provider(cfg: &AiConfig) -> Result<Box<dyn AiProvider>> {
                 env_url
             };
 
-            // Default model: cloud → qwen3-coder:480b, local → llama3.2
-            let model = if cfg.model.is_empty() || cfg.model == "gpt-4o-mini" {
-                if api_key.is_some() {
+            let model = if model.is_empty() || model == "gpt-4o-mini" {
+                if api_key_opt.is_some() {
                     "qwen3-coder:480b".to_string()
                 } else {
                     "llama3.2".to_string()
                 }
             } else {
-                cfg.model.clone()
+                model.to_string()
             };
             Ok(Box::new(ollama::OllamaProvider::new(
-                base_url, model, api_key,
+                base_url,
+                model,
+                api_key_opt,
             )))
         }
         other => {
             // SEC-017: Unknown provider name — require explicit base_url.
             // If base_url is set, treat as OpenAI-compatible endpoint.
             // Without base_url, fail closed to prevent accidental data egress.
-            if !cfg.base_url.is_empty() {
-                validate_ai_base_url(&cfg.base_url)?;
+            if !base_url.is_empty() {
+                validate_ai_base_url(base_url)?;
                 tracing::info!(
                     provider = other,
-                    base_url = %cfg.base_url,
+                    base_url = %base_url,
                     "treating unknown provider as OpenAI-compatible via base_url"
                 );
                 Ok(Box::new(openai::OpenAiProvider::with_base_url(
-                    cfg.resolved_api_key(),
-                    cfg.model.clone(),
-                    cfg.base_url.clone(),
+                    api_key,
+                    model.to_string(),
+                    base_url.to_string(),
                 )))
             } else {
                 anyhow::bail!(
@@ -570,5 +675,144 @@ mod tests {
         };
         let provider = build_provider(&cfg).expect("stub provider must build offline");
         assert_eq!(provider.name(), "stub");
+    }
+
+    #[test]
+    fn build_provider_shadow_enabled_empty_provider_fails() {
+        let cfg = crate::config::AiConfig {
+            enabled: true,
+            provider: "stub".into(),
+            shadow: crate::config::ShadowConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = build_provider(&cfg).err().unwrap().to_string();
+        assert!(
+            err.contains("shadow") && err.contains("empty"),
+            "expected shadow-empty error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_provider_shadow_enabled_matching_primary_fails() {
+        // Same provider + same base_url + same model as primary must be
+        // rejected; otherwise shadow provides no signal.
+        let cfg = crate::config::AiConfig {
+            enabled: true,
+            provider: "ollama".into(),
+            base_url: "http://localhost:11434".into(),
+            model: "llama3.2".into(),
+            shadow: crate::config::ShadowConfig {
+                enabled: true,
+                provider: "ollama".into(),
+                base_url: "http://localhost:11434".into(),
+                model: "llama3.2".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = build_provider(&cfg).err().unwrap().to_string();
+        assert!(
+            err.contains("must differ"),
+            "expected 'must differ' error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_provider_shadow_enabled_with_distinct_config_succeeds() {
+        // Primary stub + shadow stub-with-different-model is allowed because
+        // the check compares (provider, base_url, model) tuple. Two stubs
+        // distinguish by model here.
+        let cfg = crate::config::AiConfig {
+            enabled: true,
+            provider: "stub".into(),
+            shadow: crate::config::ShadowConfig {
+                enabled: true,
+                provider: "stub".into(),
+                model: "different".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let provider = build_provider(&cfg).expect("shadow wrapper must build");
+        // ShadowProvider::name() delegates to primary so existing telemetry
+        // labels stay stable.
+        assert_eq!(provider.name(), "stub");
+    }
+
+    #[test]
+    fn build_provider_azure_succeeds_with_explicit_base_url() {
+        let cfg = crate::config::AiConfig {
+            enabled: true,
+            provider: "azure_openai".into(),
+            base_url: "https://example-resource.openai.azure.com".into(),
+            model: "gpt-5-4-mini".into(),
+            api_version: "2024-12-01-preview".into(),
+            api_key: "dummy".into(),
+            ..Default::default()
+        };
+        let provider = build_provider(&cfg).expect("azure provider must build");
+        assert_eq!(provider.name(), "azure_openai");
+    }
+
+    #[test]
+    fn build_provider_azure_requires_base_url() {
+        let cfg = crate::config::AiConfig {
+            enabled: true,
+            provider: "azure_openai".into(),
+            base_url: String::new(),
+            model: "gpt-5-4-mini".into(),
+            api_key: "dummy".into(),
+            ..Default::default()
+        };
+        let err = build_provider(&cfg).err().unwrap().to_string();
+        assert!(err.contains("base_url"), "got: {err}");
+    }
+
+    #[test]
+    fn build_provider_azure_requires_model() {
+        let cfg = crate::config::AiConfig {
+            enabled: true,
+            provider: "azure_openai".into(),
+            base_url: "https://example-resource.openai.azure.com".into(),
+            model: String::new(),
+            api_key: "dummy".into(),
+            ..Default::default()
+        };
+        let err = build_provider(&cfg).err().unwrap().to_string();
+        assert!(err.contains("model"), "got: {err}");
+    }
+
+    #[test]
+    fn build_provider_azure_defaults_api_version_when_empty() {
+        let cfg = crate::config::AiConfig {
+            enabled: true,
+            provider: "azure_openai".into(),
+            base_url: "https://example-resource.openai.azure.com".into(),
+            model: "gpt-5-4-mini".into(),
+            api_version: String::new(),
+            api_key: "dummy".into(),
+            ..Default::default()
+        };
+        // Empty api_version should fall back to default (not a bail)
+        assert!(build_provider(&cfg).is_ok());
+    }
+
+    #[cfg(not(feature = "local-classifier"))]
+    #[test]
+    fn build_provider_local_classifier_without_feature_fails() {
+        let cfg = crate::config::AiConfig {
+            enabled: true,
+            provider: "local_classifier".into(),
+            base_url: "/tmp/nonexistent-model-dir".into(),
+            ..Default::default()
+        };
+        let err = build_provider(&cfg).err().unwrap().to_string();
+        assert!(
+            err.contains("local-classifier"),
+            "expected build-feature guidance, got: {err}"
+        );
     }
 }
