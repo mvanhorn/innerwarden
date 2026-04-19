@@ -146,6 +146,7 @@ pub(super) fn determine_outcome_for_ips(
     ips: &BTreeSet<String>,
     has_incident: bool,
 ) -> String {
+    let mut has_escalated = false;
     let mut has_monitoring = false;
     let mut has_honeypot = false;
     let mut has_dismissed = false;
@@ -154,6 +155,7 @@ pub(super) fn determine_outcome_for_ips(
     for ip in ips {
         match determine_outcome(decisions, ip, has_incident).as_str() {
             "blocked" => return "blocked".to_string(),
+            "escalated" => has_escalated = true,
             "honeypot" => has_honeypot = true,
             "monitoring" => has_monitoring = true,
             "dismissed" => has_dismissed = true,
@@ -162,6 +164,12 @@ pub(super) fn determine_outcome_for_ips(
         }
     }
 
+    // Spec 028-c: escalated wins over monitoring/honeypot/dismissed when
+    // aggregating across multiple IPs because escalate-without-resolution is
+    // the strongest "still needs action" signal short of a permanent block.
+    if has_escalated {
+        return "escalated".to_string();
+    }
     if has_honeypot {
         return "honeypot".to_string();
     }
@@ -182,6 +190,15 @@ pub(super) fn determine_outcome_for_ips(
 
 /// Determine the outcome for an IP given the full decisions list and whether
 /// it has at least one incident.
+///
+/// Precedence: blocked (permanent) > escalated (needs attention) > monitoring >
+/// honeypot > dismissed > active > unknown.
+///
+/// Spec 028-c added `escalated`: IPs whose most impactful decision is an
+/// "escalate" label (written by observation-verify when the Fase 3 scorer
+/// returns VerificationResult::Escalate) surface as their own outcome rather
+/// than sitting under `active`, so the dashboard can route them to the "needs
+/// attention" bucket.
 pub(super) fn determine_outcome(
     decisions: &[DecisionEntry],
     ip: &str,
@@ -199,6 +216,14 @@ pub(super) fn determine_outcome(
             && (d.execution_result.contains("ok") || d.execution_result.starts_with("Blocked"))
         {
             return "blocked".to_string();
+        }
+    }
+    // Spec 028-c: escalate wins over monitor/honeypot/dismiss because an
+    // escalated incident without a resolving decision is explicitly the
+    // "needs your attention" state. Only a real block (above) supersedes.
+    for d in &ip_decisions {
+        if d.action_type == "escalate" {
+            return "escalated".to_string();
         }
     }
     for d in &ip_decisions {
@@ -632,6 +657,53 @@ mod tests {
         );
         // No decisions, has incident => active
         assert_eq!(determine_outcome_for_ips(&decisions, &ips, true), "active");
+    }
+
+    // Spec 028-c: aggregating across multiple IPs, escalated wins over
+    // monitoring/honeypot/dismissed as long as no blocked IP is present.
+    #[test]
+    fn test_determine_outcome_for_ips_escalated_wins_over_monitoring() {
+        let escalated = DecisionEntry {
+            ts: chrono::Utc::now(),
+            incident_id: "x".into(),
+            host: "h".into(),
+            ai_provider: "observation-verify".into(),
+            action_type: "escalate".into(),
+            target_ip: Some("1.2.3.4".into()),
+            target_user: None,
+            skill_id: None,
+            confidence: 0.8,
+            auto_executed: true,
+            dry_run: false,
+            reason: "r".into(),
+            estimated_threat: "medium".into(),
+            execution_result: "pending-fase4".into(),
+            prev_hash: None,
+        };
+        let monitor = DecisionEntry {
+            ts: chrono::Utc::now(),
+            incident_id: "y".into(),
+            host: "h".into(),
+            ai_provider: "mock".into(),
+            action_type: "monitor".into(),
+            target_ip: Some("5.6.7.8".into()),
+            target_user: None,
+            skill_id: None,
+            confidence: 0.7,
+            auto_executed: true,
+            dry_run: false,
+            reason: "r".into(),
+            estimated_threat: "low".into(),
+            execution_result: "ok".into(),
+            prev_hash: None,
+        };
+        let mut ips = BTreeSet::new();
+        ips.insert("1.2.3.4".into());
+        ips.insert("5.6.7.8".into());
+        assert_eq!(
+            determine_outcome_for_ips(&[escalated, monitor], &ips, true),
+            "escalated"
+        );
     }
 
     #[test]

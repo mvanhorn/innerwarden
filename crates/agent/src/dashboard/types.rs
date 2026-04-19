@@ -497,7 +497,10 @@ pub(crate) fn status_determination(outcome: &str) -> &'static str {
         "blocked" | "killed" => "contained",
         "monitoring" | "monitored" => "observing",
         "honeypot" | "diverted" => "contained",
-        "active" | "open" => "needs_attention",
+        // Spec 028-c: "escalated" routes to the "needs your attention" bucket
+        // explicitly so operators can see obs-verify escalates that have no
+        // resolving decision yet.
+        "escalated" | "active" | "open" => "needs_attention",
         "dismissed" | "ignored" => "observing",
         _ => "needs_attention",
     }
@@ -548,6 +551,10 @@ mod tests {
         assert_eq!(status_determination("monitoring"), "observing");
         assert_eq!(status_determination("dismissed"), "observing");
         assert_eq!(status_determination("active"), "needs_attention");
+        // Spec 028-c: escalated items need operator attention, same bucket
+        // as active/open.
+        assert_eq!(status_determination("escalated"), "needs_attention");
+        assert_eq!(status_determination("ESCALATED"), "needs_attention");
         assert_eq!(status_determination("unknown"), "needs_attention");
     }
 

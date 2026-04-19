@@ -112,6 +112,40 @@ pub struct AgentConfig {
     /// Example: ["threat_intel", "lateral_movement", "persistence"]
     #[serde(default)]
     pub graph_only_detectors: Vec<String>,
+    /// Incident lifecycle flow configuration (spec 028).
+    #[serde(default)]
+    pub incident_flow: IncidentFlowConfig,
+}
+
+/// Incident lifecycle routing knobs (spec 028).
+///
+/// The only knob currently live is the `escalate_to_decide` feature flag. When
+/// true, observation-verify's Escalate branch is expected to forward incidents
+/// into the Fase 4 `ai_provider.decide()` pipeline so attackers that score
+/// above the escalate threshold actually get actioned instead of sitting under
+/// the OBSERVING bucket forever.
+///
+/// Default is `false` because the full wiring (threading the provider + skill
+/// executor + state into narrative_observation_verify) is intentionally
+/// staged: this PR lands the flag + config, the follow-up PR lands the decide
+/// call. See spec 028 section 028-b.
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct IncidentFlowConfig {
+    /// When true, Escalate from observation-verify should trigger a Fase 4
+    /// decide() call. The wiring itself is a follow-up PR; today the flag
+    /// is read but the code path only logs an intent line. Flip to true in
+    /// /etc/innerwarden/agent.toml after the wiring PR lands.
+    #[serde(default)]
+    pub escalate_to_decide: bool,
+    /// Detector prefixes whose incidents should skip the Fase 3 observation
+    /// verifier entirely and go direct to Fase 4. The spec lists
+    /// `threat_intel:*`, `sudo_abuse:*`, and `suspicious_execution:*` as
+    /// candidates because they are inherently high-signal. Matched via
+    /// prefix (case-sensitive). Empty by default; the skip path is also
+    /// part of the follow-up PR.
+    #[serde(default)]
+    #[allow(dead_code)] // wiring lands in the 028-b follow-up PR
+    pub detectors_skip_fase3: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -3206,5 +3240,36 @@ log_path = "/tmp/shadow.jsonl"
             ai.provider = provider.into();
             let _ = ai.resolved_api_key();
         }
+    }
+
+    // Spec 028-b: incident_flow config defaults keep the flag off and the
+    // skip-fase3 list empty so bundled deploy changes nothing about decision
+    // behaviour until operator flips the flag explicitly.
+    #[test]
+    fn incident_flow_defaults_are_conservative() {
+        let cfg = IncidentFlowConfig::default();
+        assert!(!cfg.escalate_to_decide);
+        assert!(cfg.detectors_skip_fase3.is_empty());
+    }
+
+    #[test]
+    fn load_parses_incident_flow_section() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(
+            tmp,
+            r#"[incident_flow]
+escalate_to_decide = true
+detectors_skip_fase3 = ["threat_intel", "sudo_abuse", "suspicious_execution"]
+"#
+        )
+        .unwrap();
+        let cfg = load(tmp.path()).unwrap();
+        assert!(cfg.incident_flow.escalate_to_decide);
+        assert_eq!(cfg.incident_flow.detectors_skip_fase3.len(), 3);
+        assert!(cfg
+            .incident_flow
+            .detectors_skip_fase3
+            .iter()
+            .any(|d| d == "threat_intel"));
     }
 }

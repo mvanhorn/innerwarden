@@ -65,7 +65,7 @@ pub(crate) fn verify_observing_incidents(
     );
 
     // Collect undecided incident data from the graph (read lock)
-    let undecided: Vec<(String, String, String, serde_json::Value)> = {
+    let undecided: Vec<(String, String, String, serde_json::Value, Option<String>)> = {
         let graph = state.knowledge_graph.read().unwrap();
         collect_undecided_incidents(&graph)
     };
@@ -78,7 +78,7 @@ pub(crate) fn verify_observing_incidents(
     let mut escalated = 0u32;
     let mut ambiguous_items = Vec::new();
 
-    for (incident_id, detector, title, evidence) in undecided {
+    for (incident_id, detector, title, evidence, primary_ip) in undecided {
         let (result, breakdown) = observation_verify::behaviour_score(
             &evidence,
             operator_active,
@@ -108,15 +108,14 @@ pub(crate) fn verify_observing_incidents(
                 );
             }
             VerificationResult::Escalate { score, reason } => {
-                let mut graph = state.knowledge_graph.write().unwrap();
-                graph.ingest_decision(
+                apply_escalate(
+                    &state.knowledge_graph,
+                    state.decision_writer.as_mut(),
+                    cfg.incident_flow.escalate_to_decide,
                     &incident_id,
-                    "escalate",
-                    None,
-                    0.8,
-                    &format!("obs-verify score {score}/100: {reason}"),
-                    true,
-                    chrono::Utc::now(),
+                    primary_ip.as_deref(),
+                    score,
+                    &reason,
                 );
                 escalated += 1;
                 debug!(
@@ -152,9 +151,14 @@ pub(crate) fn verify_observing_incidents(
 }
 
 /// Collect undecided incident data from the knowledge graph.
+///
+/// The last tuple element is the primary IP entity connected to the incident,
+/// if any. Spec 028-c uses this so the escalate decision written below can
+/// link back to a target IP and the dashboard can bucket the IP as "needs
+/// attention" instead of "observing".
 fn collect_undecided_incidents(
     graph: &KnowledgeGraph,
-) -> Vec<(String, String, String, serde_json::Value)> {
+) -> Vec<(String, String, String, serde_json::Value, Option<String>)> {
     graph
         .nodes_of_type(NodeType::Incident)
         .iter()
@@ -181,13 +185,20 @@ fn collect_undecided_incidents(
                     "summary": summary,
                 });
 
-                // Enrich evidence from connected graph nodes
+                // Enrich evidence from connected graph nodes.
+                // Track the first IP entity we see as the primary attacker IP.
+                let mut primary_ip: Option<String> = None;
                 for edge in graph.edges_slice() {
                     if edge.from != id && edge.to != id {
                         continue;
                     }
                     let other_id = if edge.from == id { edge.to } else { edge.from };
                     if let Some(node) = graph.get_node(other_id) {
+                        if primary_ip.is_none() {
+                            if let Node::Ip { addr, .. } = node {
+                                primary_ip = Some(addr.clone());
+                            }
+                        }
                         enrich_evidence_from_node(&mut evidence, node, graph);
                     }
                 }
@@ -197,6 +208,7 @@ fn collect_undecided_incidents(
                     detector.clone(),
                     title.clone(),
                     evidence,
+                    primary_ip,
                 ))
             } else {
                 None
@@ -258,6 +270,105 @@ fn find_process_comm_by_pid(graph: &KnowledgeGraph, pid: u32) -> Option<String> 
         }
     }
     None
+}
+
+/// Apply the Escalate branch of observation-verify (spec 028-b/c).
+///
+/// Writes the escalate label to the knowledge graph, writes the escalate
+/// decision to the decisions JSONL (if a writer is configured), and reads
+/// the 028-b feature flag to log intent for the future decide() call. The
+/// extraction keeps the verify_observing_incidents match arm short and
+/// makes the whole Escalate side effect unit-testable without constructing
+/// a full AgentState.
+fn apply_escalate(
+    graph: &std::sync::Arc<std::sync::RwLock<KnowledgeGraph>>,
+    decision_writer: Option<&mut crate::decisions::DecisionWriter>,
+    escalate_to_decide: bool,
+    incident_id: &str,
+    primary_ip: Option<&str>,
+    score: u8,
+    reason: &str,
+) {
+    {
+        let mut g = graph.write().unwrap();
+        g.ingest_decision(
+            incident_id,
+            "escalate",
+            primary_ip,
+            0.8,
+            &format!("obs-verify score {score}/100: {reason}"),
+            true,
+            chrono::Utc::now(),
+        );
+    }
+    if let Some(writer) = decision_writer {
+        write_escalate_decision(writer, incident_id, primary_ip, score, reason);
+    }
+    // Spec 028-b stub: the flag is read here so operators can already
+    // toggle it in agent.toml, but the actual forwarding into Fase 4 is a
+    // follow-up PR (needs provider + skill_executor threading + async
+    // conversion).
+    log_escalate_to_decide_intent(escalate_to_decide, incident_id, primary_ip);
+}
+
+/// Write an escalate decision to the decisions JSONL (spec 028-c).
+///
+/// Extracted so the Escalate match arm stays short and so the JSONL-write
+/// path can be unit tested without spinning up a full AgentState. Failures
+/// are logged at warn! level but never propagated; the knowledge graph
+/// already carries the decision, so a JSONL write failure is a visibility
+/// regression, not a correctness one.
+fn write_escalate_decision(
+    writer: &mut crate::decisions::DecisionWriter,
+    incident_id: &str,
+    primary_ip: Option<&str>,
+    score: u8,
+    reason: &str,
+) {
+    let entry = crate::decisions::DecisionEntry {
+        ts: chrono::Utc::now(),
+        incident_id: incident_id.to_string(),
+        host: String::new(),
+        ai_provider: "observation-verify".to_string(),
+        action_type: "escalate".to_string(),
+        target_ip: primary_ip.map(|s| s.to_string()),
+        target_user: None,
+        skill_id: None,
+        confidence: 0.8,
+        auto_executed: true,
+        dry_run: false,
+        reason: format!("obs-verify score {score}/100: {reason}"),
+        estimated_threat: "medium".to_string(),
+        execution_result: "pending-fase4".to_string(),
+        prev_hash: None,
+    };
+    if let Err(e) = writer.write(&entry) {
+        tracing::warn!(
+            incident_id = %incident_id,
+            error = %e,
+            "observation-verify: failed to write escalate decision to JSONL"
+        );
+    }
+}
+
+/// Log intent when the 028-b feature flag is on (spec 028-b stub).
+///
+/// Extracted from the Escalate match arm both for readability and so the
+/// flag-read branch is trivially exercisable by a unit test. The flag
+/// default is false, so in production this is a no-op until an operator
+/// explicitly flips it in agent.toml.
+fn log_escalate_to_decide_intent(
+    escalate_to_decide: bool,
+    incident_id: &str,
+    primary_ip: Option<&str>,
+) {
+    if escalate_to_decide {
+        tracing::info!(
+            incident_id = %incident_id,
+            target_ip = ?primary_ip,
+            "observation-verify: spec 028-b flag on - decide() call pending (follow-up PR threading)"
+        );
+    }
 }
 
 /// AI batch verification for ambiguous items (spec 021 Phase C).
@@ -455,6 +566,234 @@ mod tests {
         let graph = KnowledgeGraph::new();
         let result = collect_undecided_incidents(&graph);
         assert!(result.is_empty());
+    }
+
+    // Spec 028-c: write_escalate_decision must land a line in the decisions
+    // JSONL shaped so the dashboard's determine_outcome can bucket the IP
+    // into "escalated" → "needs_attention".
+    #[test]
+    fn write_escalate_decision_emits_jsonl_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut writer = crate::decisions::DecisionWriter::new(tmp.path()).unwrap();
+
+        write_escalate_decision(
+            &mut writer,
+            "test-incident-1",
+            Some("203.0.113.42"),
+            55,
+            "masscan fingerprint",
+        );
+        drop(writer); // flush buffer
+
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut found = false;
+        for entry in std::fs::read_dir(tmp.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains(&today))
+            {
+                let content = std::fs::read_to_string(&path).unwrap();
+                assert!(content.contains("\"action_type\":\"escalate\""));
+                assert!(content.contains("\"target_ip\":\"203.0.113.42\""));
+                assert!(content.contains("\"ai_provider\":\"observation-verify\""));
+                assert!(content.contains("\"execution_result\":\"pending-fase4\""));
+                assert!(content.contains("masscan fingerprint"));
+                assert!(content.contains("55/100"));
+                found = true;
+            }
+        }
+        assert!(found, "decisions JSONL file must exist for today");
+    }
+
+    // Spec 028-c: target_ip is optional (incident may lack an IP entity).
+    // The writer still produces a valid line with target_ip = null.
+    #[test]
+    fn write_escalate_decision_handles_missing_ip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut writer = crate::decisions::DecisionWriter::new(tmp.path()).unwrap();
+
+        write_escalate_decision(&mut writer, "test-incident-2", None, 45, "no ip");
+        drop(writer);
+
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        for entry in std::fs::read_dir(tmp.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains(&today))
+            {
+                let content = std::fs::read_to_string(&path).unwrap();
+                assert!(content.contains("\"target_ip\":null"));
+                return;
+            }
+        }
+        panic!("decisions JSONL file must exist for today");
+    }
+
+    // Spec 028-b stub: the intent-log branch reads the flag without side
+    // effects. Flag-off and flag-on are both tested here for coverage; the
+    // real assertion is that the helper does not panic and compiles in both
+    // shapes.
+    #[test]
+    fn log_escalate_to_decide_intent_is_side_effect_free() {
+        log_escalate_to_decide_intent(false, "id-off", None);
+        log_escalate_to_decide_intent(true, "id-on", Some("198.51.100.1"));
+        log_escalate_to_decide_intent(true, "id-on-no-ip", None);
+    }
+
+    // Spec 028-c: apply_escalate writes to graph + JSONL in one call. The
+    // graph must be seeded with the incident node first because
+    // ingest_decision silently no-ops when find_by_incident returns None.
+    // This test exercises the whole Escalate side effect directly with a
+    // seeded graph and DecisionWriter, bypassing the behaviour_score layer
+    // that is tested elsewhere.
+    #[test]
+    fn apply_escalate_writes_graph_and_jsonl() {
+        use innerwarden_core::entities::EntityRef;
+        use innerwarden_core::event::Severity;
+        use innerwarden_core::incident::Incident;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let graph = std::sync::Arc::new(std::sync::RwLock::new(KnowledgeGraph::new()));
+        let incident = Incident {
+            ts: chrono::Utc::now(),
+            host: "h".into(),
+            incident_id: "proto_anomaly:SshVersionAnomaly:198.51.100.77:apply-escalate-test".into(),
+            severity: Severity::Medium,
+            title: "t".into(),
+            summary: "s".into(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::ip("198.51.100.77".to_string())],
+        };
+        {
+            let mut g = graph.write().unwrap();
+            g.ingest_incident(&incident);
+        }
+        let mut writer = crate::decisions::DecisionWriter::new(tmp.path()).unwrap();
+
+        apply_escalate(
+            &graph,
+            Some(&mut writer),
+            false,
+            &incident.incident_id,
+            Some("198.51.100.77"),
+            35,
+            "low confidence signal",
+        );
+        drop(writer);
+
+        // Graph side: the incident node now carries decision="escalate".
+        {
+            let g = graph.read().unwrap();
+            let mut saw_escalate = false;
+            for &id in &g.nodes_of_type(NodeType::Incident) {
+                if let Some(Node::Incident {
+                    decision: Some(d), ..
+                }) = g.get_node(id)
+                {
+                    if d == "escalate" {
+                        saw_escalate = true;
+                    }
+                }
+            }
+            assert!(saw_escalate, "incident node must carry decision=escalate");
+        }
+
+        // JSONL side: one line shaped like a dashboard-consumable entry.
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut saw = false;
+        for entry in std::fs::read_dir(tmp.path()).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.contains(&today) && name.ends_with(".jsonl") {
+                let content = std::fs::read_to_string(&path).unwrap();
+                if content.contains("\"action_type\":\"escalate\"")
+                    && content.contains("\"target_ip\":\"198.51.100.77\"")
+                    && content.contains("\"ai_provider\":\"observation-verify\"")
+                    && content.contains("low confidence signal")
+                {
+                    saw = true;
+                    break;
+                }
+            }
+        }
+        assert!(saw, "apply_escalate must write the escalate line to JSONL");
+    }
+
+    // Spec 028-c: apply_escalate tolerates a missing writer and a missing
+    // incident in the graph (ingest_decision no-ops). Assertion: no panic.
+    #[test]
+    fn apply_escalate_tolerates_missing_writer_and_node() {
+        let graph = std::sync::Arc::new(std::sync::RwLock::new(KnowledgeGraph::new()));
+        apply_escalate(&graph, None, false, "id-no-writer", None, 20, "r");
+    }
+
+    // Spec 028-b stub: flag on/off must produce the same persistent side
+    // effects. Running apply_escalate twice with identical inputs apart
+    // from the flag must yield identical JSONL output and graph state.
+    #[test]
+    fn apply_escalate_flag_toggle_is_observational() {
+        let tmp = tempfile::tempdir().unwrap();
+        let graph = std::sync::Arc::new(std::sync::RwLock::new(KnowledgeGraph::new()));
+        let mut writer = crate::decisions::DecisionWriter::new(tmp.path()).unwrap();
+
+        apply_escalate(
+            &graph,
+            Some(&mut writer),
+            false,
+            "flag-test-off",
+            Some("198.51.100.88"),
+            30,
+            "reason",
+        );
+        apply_escalate(
+            &graph,
+            Some(&mut writer),
+            true,
+            "flag-test-on",
+            Some("198.51.100.88"),
+            30,
+            "reason",
+        );
+        drop(writer);
+
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let mut lines_off = 0;
+        let mut lines_on = 0;
+        for entry in std::fs::read_dir(tmp.path()).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.contains(&today) && name.ends_with(".jsonl") {
+                let content = std::fs::read_to_string(&path).unwrap();
+                for line in content.lines() {
+                    if line.contains("flag-test-off") {
+                        lines_off += 1;
+                    }
+                    if line.contains("flag-test-on") {
+                        lines_on += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(lines_off, 1, "flag=false path must emit exactly one line");
+        assert_eq!(lines_on, 1, "flag=true path must emit exactly one line");
     }
 
     #[test]

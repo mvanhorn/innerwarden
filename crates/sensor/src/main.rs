@@ -688,7 +688,10 @@ async fn main() -> Result<()> {
         }),
         proto_anomaly: Some({
             info!("proto_anomaly detector enabled (protocol violation detection)");
-            detectors::proto_anomaly::ProtoAnomalyDetector::new(&cfg.agent.host_id, 300)
+            // Spec 028-a: bumped 300 → 600 so the per-(src_ip, anomaly_type)
+            // throttle covers the 10-minute window the spec targets (cuts
+            // SshVersionAnomaly volume).
+            detectors::proto_anomaly::ProtoAnomalyDetector::new(&cfg.agent.host_id, 600)
         }),
     };
 
