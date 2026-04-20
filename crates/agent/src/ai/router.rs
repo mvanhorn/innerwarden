@@ -206,6 +206,76 @@ impl AiRouter {
     }
 }
 
+/// Spec 029 PR-C.1: build an `AiRouter` from the primary provider
+/// plus optional per-role config sections. Extracted from
+/// `loops/boot.rs` so the branch logic (per-role build failure
+/// fallback, legacy-only back-compat path, Falco-mode empty config)
+/// is unit-testable without spinning up the whole agent.
+///
+/// Contract:
+/// - If `role_cfg.enabled` is true, build a fresh provider from that
+///   config and put it in the slot. If the build fails, fall back to
+///   `primary` and call `on_slot_fallback` so the caller can log.
+/// - If `role_cfg.enabled` is false, use `primary` for the slot
+///   (back-compat with pre-029 configs).
+/// - Same logic for both classifier and llm roles.
+/// - If both resulting slots are empty, return `AiRouter::disabled()`
+///   instead of the `EmptyRouter` error so the agent can run in
+///   Falco-mode (rules-only detection, no LLM cost).
+///
+/// Side-effect callbacks keep tracing concerns in the caller; this
+/// helper stays pure enough to unit-test without mocking a logger.
+pub fn build_from_config(
+    primary: Option<Arc<dyn AiProvider>>,
+    classifier_cfg: &crate::config::RoleProviderConfig,
+    llm_cfg: &crate::config::RoleProviderConfig,
+    mut on_slot_configured: impl FnMut(&'static str, &str),
+    mut on_slot_fallback: impl FnMut(&'static str, &str, &anyhow::Error),
+) -> AiRouter {
+    let classifier_slot = resolve_slot(
+        "classifier",
+        &primary,
+        classifier_cfg,
+        &mut on_slot_configured,
+        &mut on_slot_fallback,
+    );
+    let llm_slot = resolve_slot(
+        "llm",
+        &primary,
+        llm_cfg,
+        &mut on_slot_configured,
+        &mut on_slot_fallback,
+    );
+
+    match AiRouter::new(classifier_slot, llm_slot) {
+        Ok(r) => r,
+        Err(_) => AiRouter::disabled(),
+    }
+}
+
+fn resolve_slot(
+    slot_name: &'static str,
+    primary: &Option<Arc<dyn AiProvider>>,
+    role_cfg: &crate::config::RoleProviderConfig,
+    on_configured: &mut impl FnMut(&'static str, &str),
+    on_fallback: &mut impl FnMut(&'static str, &str, &anyhow::Error),
+) -> Option<Arc<dyn AiProvider>> {
+    if !role_cfg.enabled {
+        return primary.as_ref().map(Arc::clone);
+    }
+    let ai_cfg = role_cfg.to_ai_config();
+    match crate::ai::build_provider(&ai_cfg) {
+        Ok(p) => {
+            on_configured(slot_name, &ai_cfg.provider);
+            Some(Arc::from(p))
+        }
+        Err(e) => {
+            on_fallback(slot_name, &ai_cfg.provider, &e);
+            primary.as_ref().map(Arc::clone)
+        }
+    }
+}
+
 /// Merge two capability sets. Small helper kept module-local because
 /// it is only used by the router; `AiCapabilities` itself does not
 /// need a public `|` impl yet.
@@ -473,5 +543,310 @@ mod tests {
         assert!(r.provider_for(Capability::Generate).is_none());
         assert!(r.provider_for(Capability::Explain).is_none());
         assert!(r.provider_for(Capability::SimulateShell).is_none());
+    }
+
+    // ── build_from_config ───────────────────────────────────────────
+
+    use crate::config::RoleProviderConfig;
+
+    fn record_callbacks() -> (
+        std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
+    ) {
+        (
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        )
+    }
+
+    // Spec 029 PR-C.1: legacy config (per-role blocks both disabled).
+    // Primary provider fills both slots; no callback fires because no
+    // per-role provider was constructed.
+    #[test]
+    fn build_from_config_legacy_primary_fills_both_slots() {
+        let primary = arc("legacy", AiCapabilities::ALL);
+        let (configured, fallbacks) = record_callbacks();
+        let cfg_configured = configured.clone();
+        let cfg_fallbacks = fallbacks.clone();
+
+        let r = build_from_config(
+            Some(Arc::clone(&primary)),
+            &RoleProviderConfig::default(),
+            &RoleProviderConfig::default(),
+            move |slot, p| {
+                cfg_configured
+                    .lock()
+                    .unwrap()
+                    .push((slot.to_string(), p.to_string()))
+            },
+            move |slot, p, e| {
+                cfg_fallbacks
+                    .lock()
+                    .unwrap()
+                    .push((slot.to_string(), p.to_string(), e.to_string()))
+            },
+        );
+
+        assert_eq!(r.decider().unwrap().name(), "legacy");
+        assert_eq!(r.any_llm().unwrap().name(), "legacy");
+        assert!(configured.lock().unwrap().is_empty());
+        assert!(fallbacks.lock().unwrap().is_empty());
+    }
+
+    // Spec 029 PR-C.1: classifier enabled + successful build. A
+    // dedicated provider goes in the classifier slot; llm slot still
+    // uses primary because its role_cfg is disabled.
+    #[test]
+    fn build_from_config_classifier_enabled_builds_dedicated_provider() {
+        let primary = arc("primary-llm", AiCapabilities::ALL);
+        let classifier_cfg = RoleProviderConfig {
+            enabled: true,
+            provider: "stub".into(),
+            ..Default::default()
+        };
+        let llm_cfg = RoleProviderConfig::default();
+        let (configured, fallbacks) = record_callbacks();
+        let cfg_configured = configured.clone();
+        let cfg_fallbacks = fallbacks.clone();
+
+        let r = build_from_config(
+            Some(Arc::clone(&primary)),
+            &classifier_cfg,
+            &llm_cfg,
+            move |slot, p| {
+                cfg_configured
+                    .lock()
+                    .unwrap()
+                    .push((slot.to_string(), p.to_string()))
+            },
+            move |slot, p, e| {
+                cfg_fallbacks
+                    .lock()
+                    .unwrap()
+                    .push((slot.to_string(), p.to_string(), e.to_string()))
+            },
+        );
+
+        // Classifier slot now the stub; llm slot still primary.
+        assert_eq!(r.decider().unwrap().name(), "stub");
+        assert_eq!(r.any_llm().unwrap().name(), "primary-llm");
+
+        let configured = configured.lock().unwrap().clone();
+        assert_eq!(configured.len(), 1);
+        assert_eq!(configured[0].0, "classifier");
+        assert_eq!(configured[0].1, "stub");
+        assert!(fallbacks.lock().unwrap().is_empty());
+    }
+
+    // Spec 029 PR-C.1: llm enabled + successful build. Dedicated
+    // provider in the llm slot; classifier slot still primary.
+    #[test]
+    fn build_from_config_llm_enabled_builds_dedicated_provider() {
+        let primary = arc("primary-classifier", AiCapabilities::ALL);
+        let classifier_cfg = RoleProviderConfig::default();
+        let llm_cfg = RoleProviderConfig {
+            enabled: true,
+            provider: "stub".into(),
+            ..Default::default()
+        };
+        let (configured, fallbacks) = record_callbacks();
+        let cfg_configured = configured.clone();
+        let cfg_fallbacks = fallbacks.clone();
+
+        let r = build_from_config(
+            Some(Arc::clone(&primary)),
+            &classifier_cfg,
+            &llm_cfg,
+            move |slot, p| {
+                cfg_configured
+                    .lock()
+                    .unwrap()
+                    .push((slot.to_string(), p.to_string()))
+            },
+            move |slot, p, e| {
+                cfg_fallbacks
+                    .lock()
+                    .unwrap()
+                    .push((slot.to_string(), p.to_string(), e.to_string()))
+            },
+        );
+
+        assert_eq!(r.decider().unwrap().name(), "primary-classifier");
+        assert_eq!(r.any_llm().unwrap().name(), "stub");
+
+        let configured = configured.lock().unwrap().clone();
+        assert_eq!(configured.len(), 1);
+        assert_eq!(configured[0].0, "llm");
+        assert_eq!(configured[0].1, "stub");
+    }
+
+    // Spec 029 PR-C.1: both roles enabled + successful build. Two
+    // distinct providers populate the router.
+    #[test]
+    fn build_from_config_both_roles_enabled() {
+        let primary = arc("primary", AiCapabilities::ALL);
+        let classifier_cfg = RoleProviderConfig {
+            enabled: true,
+            provider: "stub".into(),
+            model: "classifier-model".into(),
+            ..Default::default()
+        };
+        let llm_cfg = RoleProviderConfig {
+            enabled: true,
+            provider: "stub".into(),
+            model: "llm-model".into(),
+            ..Default::default()
+        };
+        let (configured, fallbacks) = record_callbacks();
+        let cfg_configured = configured.clone();
+        let cfg_fallbacks = fallbacks.clone();
+
+        let r = build_from_config(
+            Some(Arc::clone(&primary)),
+            &classifier_cfg,
+            &llm_cfg,
+            move |slot, p| {
+                cfg_configured
+                    .lock()
+                    .unwrap()
+                    .push((slot.to_string(), p.to_string()))
+            },
+            move |slot, p, e| {
+                cfg_fallbacks
+                    .lock()
+                    .unwrap()
+                    .push((slot.to_string(), p.to_string(), e.to_string()))
+            },
+        );
+
+        assert_eq!(r.decider().unwrap().name(), "stub");
+        assert_eq!(r.any_llm().unwrap().name(), "stub");
+        let configured = configured.lock().unwrap().clone();
+        assert_eq!(configured.len(), 2);
+        let slots: std::collections::HashSet<_> =
+            configured.iter().map(|(s, _)| s.clone()).collect();
+        assert!(slots.contains("classifier"));
+        assert!(slots.contains("llm"));
+        assert!(fallbacks.lock().unwrap().is_empty());
+    }
+
+    // Spec 029 PR-C.1: per-role enabled but build fails (unknown
+    // provider + no base_url, which build_provider rejects per SEC-017).
+    // The slot falls back to the primary and on_fallback fires so
+    // operators see a warn line.
+    #[test]
+    fn build_from_config_per_role_build_failure_falls_back() {
+        let primary = arc("primary", AiCapabilities::ALL);
+        let classifier_cfg = RoleProviderConfig {
+            enabled: true,
+            provider: "nonexistent-provider".into(),
+            // base_url empty — unknown providers without base_url fail
+            // per SEC-017.
+            ..Default::default()
+        };
+        let (configured, fallbacks) = record_callbacks();
+        let cfg_configured = configured.clone();
+        let cfg_fallbacks = fallbacks.clone();
+
+        let r = build_from_config(
+            Some(Arc::clone(&primary)),
+            &classifier_cfg,
+            &RoleProviderConfig::default(),
+            move |slot, p| {
+                cfg_configured
+                    .lock()
+                    .unwrap()
+                    .push((slot.to_string(), p.to_string()))
+            },
+            move |slot, p, e| {
+                cfg_fallbacks
+                    .lock()
+                    .unwrap()
+                    .push((slot.to_string(), p.to_string(), e.to_string()))
+            },
+        );
+
+        // Fallback: both slots end up with primary.
+        assert_eq!(r.decider().unwrap().name(), "primary");
+        assert_eq!(r.any_llm().unwrap().name(), "primary");
+        // on_configured never fired because no per-role build succeeded.
+        assert!(configured.lock().unwrap().is_empty());
+        // on_fallback fired for the classifier slot.
+        let fallbacks = fallbacks.lock().unwrap().clone();
+        assert_eq!(fallbacks.len(), 1);
+        assert_eq!(fallbacks[0].0, "classifier");
+        assert_eq!(fallbacks[0].1, "nonexistent-provider");
+        assert!(fallbacks[0].2.contains("unknown AI provider"));
+    }
+
+    // Spec 029 PR-C.1: no primary provider + both per-role blocks
+    // disabled. Router goes into Falco-mode (disabled) instead of
+    // erroring. The agent is explicitly allowed to run without AI.
+    #[test]
+    fn build_from_config_no_primary_and_no_per_role_is_falco_mode() {
+        let (configured, fallbacks) = record_callbacks();
+        let cfg_configured = configured.clone();
+        let cfg_fallbacks = fallbacks.clone();
+
+        let r = build_from_config(
+            None,
+            &RoleProviderConfig::default(),
+            &RoleProviderConfig::default(),
+            move |slot, p| {
+                cfg_configured
+                    .lock()
+                    .unwrap()
+                    .push((slot.to_string(), p.to_string()))
+            },
+            move |slot, p, e| {
+                cfg_fallbacks
+                    .lock()
+                    .unwrap()
+                    .push((slot.to_string(), p.to_string(), e.to_string()))
+            },
+        );
+
+        assert!(r.is_disabled());
+        for c in Capability::all() {
+            assert!(r.provider_for(*c).is_none());
+        }
+    }
+
+    // Spec 029 PR-C.1: per-role build fails AND no primary. The
+    // fallback path returns None for the slot; router has only the
+    // other slot (or disabled).
+    #[test]
+    fn build_from_config_failure_with_no_primary_leaves_slot_empty() {
+        let classifier_cfg = RoleProviderConfig {
+            enabled: true,
+            provider: "nonexistent-provider".into(),
+            ..Default::default()
+        };
+        let (configured, fallbacks) = record_callbacks();
+        let cfg_configured = configured.clone();
+        let cfg_fallbacks = fallbacks.clone();
+
+        let r = build_from_config(
+            None, // no primary
+            &classifier_cfg,
+            &RoleProviderConfig::default(),
+            move |slot, p| {
+                cfg_configured
+                    .lock()
+                    .unwrap()
+                    .push((slot.to_string(), p.to_string()))
+            },
+            move |slot, p, e| {
+                cfg_fallbacks
+                    .lock()
+                    .unwrap()
+                    .push((slot.to_string(), p.to_string(), e.to_string()))
+            },
+        );
+
+        assert!(r.is_disabled());
+        // Fallback callback fired even though the fallback itself
+        // yielded None — operators still see "we tried and failed".
+        assert_eq!(fallbacks.lock().unwrap().len(), 1);
     }
 }

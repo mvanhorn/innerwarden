@@ -5,7 +5,7 @@ pub mod capability;
 mod local_classifier;
 mod ollama;
 mod openai;
-mod router;
+pub mod router;
 mod shadow;
 mod stub;
 

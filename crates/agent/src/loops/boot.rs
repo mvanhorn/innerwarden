@@ -653,65 +653,31 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         None
     };
 
-    // Spec 029 PR-C: per-role providers. When `[ai.classifier].enabled`
+    // Spec 029 PR-C.1: per-role providers. When `[ai.classifier].enabled`
     // is true, build a separate provider for the classifier slot;
     // otherwise the primary `[ai]` provider fills that slot (PR-B
-    // back-compat behaviour). Same for `[ai.llm]`. This is where an
-    // operator can run a local ONNX classifier for triage and keep
-    // Azure for briefings without touching any call site.
-    let classifier_slot: Option<Arc<dyn ai::AiProvider>> = if cfg.ai.classifier.enabled {
-        let role_cfg = cfg.ai.classifier.to_ai_config();
-        match ai::build_provider(&role_cfg) {
-            Ok(p) => {
-                info!(
-                    provider = role_cfg.provider.as_str(),
-                    "AI router: classifier slot configured"
-                );
-                Some(Arc::from(p))
-            }
-            Err(e) => {
-                warn!(
-                    provider = role_cfg.provider.as_str(),
-                    "failed to build [ai.classifier] provider, falling back to primary: {e:#}"
-                );
-                ai_provider.as_ref().map(Arc::clone)
-            }
-        }
-    } else {
-        ai_provider.as_ref().map(Arc::clone)
-    };
-
-    let llm_slot: Option<Arc<dyn ai::AiProvider>> = if cfg.ai.llm.enabled {
-        let role_cfg = cfg.ai.llm.to_ai_config();
-        match ai::build_provider(&role_cfg) {
-            Ok(p) => {
-                info!(
-                    provider = role_cfg.provider.as_str(),
-                    "AI router: llm slot configured"
-                );
-                Some(Arc::from(p))
-            }
-            Err(e) => {
-                warn!(
-                    provider = role_cfg.provider.as_str(),
-                    "failed to build [ai.llm] provider, falling back to primary: {e:#}"
-                );
-                ai_provider.as_ref().map(Arc::clone)
-            }
-        }
-    } else {
-        ai_provider.as_ref().map(Arc::clone)
-    };
-
-    let ai_router = match ai::AiRouter::new(classifier_slot, llm_slot) {
-        Ok(r) => r,
-        Err(_) => {
-            // Both slots empty. Happens when [ai] is disabled and
-            // neither per-role block was enabled. The agent runs in
-            // Falco-mode: rules-only detection, zero LLM cost.
-            ai::AiRouter::disabled()
-        }
-    };
+    // back-compat). Same for `[ai.llm]`. Branch logic lives in the
+    // unit-testable `ai::router::build_from_config`; this block just
+    // wires tracing callbacks.
+    let ai_router = ai::router::build_from_config(
+        ai_provider.as_ref().map(Arc::clone),
+        &cfg.ai.classifier,
+        &cfg.ai.llm,
+        |slot, provider_name| {
+            info!(
+                slot,
+                provider = provider_name,
+                "AI router: per-role slot configured"
+            );
+        },
+        |slot, provider_name, err| {
+            warn!(
+                slot,
+                provider = provider_name,
+                "failed to build per-role provider, falling back to primary: {err:#}"
+            );
+        },
+    );
     info!(router = %ai_router.describe(), "AI router ready");
 
     let mut state = AgentState {
