@@ -672,6 +672,90 @@ pub struct AiConfig {
     /// before promoting the shadow to primary.
     #[serde(default)]
     pub shadow: ShadowConfig,
+
+    /// Spec 029 PR-C: dedicated provider for the classifier role
+    /// (triage decisions + structured classification). When
+    /// `enabled = false` (default), the primary `[ai]` block fills
+    /// the classifier slot of the router — identical to the pre-029
+    /// behaviour. When `enabled = true`, the router uses this block
+    /// for `Capability::Decide` and `Capability::Classify`. Typical
+    /// production config points this at the local ONNX classifier
+    /// so triage runs without LLM cost.
+    #[serde(default)]
+    pub classifier: RoleProviderConfig,
+
+    /// Spec 029 PR-C: dedicated provider for the LLM role
+    /// (free-form generation, explanation, honeypot shell
+    /// simulation). When `enabled = false` (default), the primary
+    /// `[ai]` block fills the llm slot. When enabled, the router
+    /// uses this block for `Capability::Generate`,
+    /// `Capability::Explain`, and `Capability::SimulateShell`.
+    /// Typical production config points this at a full LLM (Azure
+    /// OpenAI GPT-5.4-mini, Claude, etc.) so operator-facing chat
+    /// and briefings keep working when the classifier role is
+    /// served by a narrow local model.
+    #[serde(default)]
+    pub llm: RoleProviderConfig,
+}
+
+/// Slim per-role provider configuration introduced in spec 029 PR-C.
+/// Shared by `[ai.classifier]` and `[ai.llm]`. Fields are a subset of
+/// `AiConfig` (only what a single provider needs to be constructed);
+/// shared knobs like `confidence_threshold`, `min_severity`, and the
+/// shadow wrapper continue to live on the top-level `[ai]` block.
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct RoleProviderConfig {
+    /// If false (default), this role is not configured separately
+    /// and the boot path falls back to the primary `[ai]` block.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Provider name. Same set of valid values as `[ai].provider`
+    /// (openai, anthropic, ollama, azure_openai, local_classifier,
+    /// stub, or any OpenAI-compatible registered name).
+    #[serde(default)]
+    pub provider: String,
+
+    /// Same semantics as `[ai].api_key`. Empty string means the
+    /// agent reads the provider-specific env var at startup
+    /// (OPENAI_API_KEY, AZURE_OPENAI_API_KEY, etc.).
+    #[serde(default)]
+    pub api_key: String,
+
+    /// Same semantics as `[ai].model`.
+    #[serde(default)]
+    pub model: String,
+
+    /// Same semantics as `[ai].base_url`.
+    #[serde(default)]
+    pub base_url: String,
+
+    /// Same semantics as `[ai].api_version` (used by `azure_openai`).
+    #[serde(default)]
+    pub api_version: String,
+}
+
+impl RoleProviderConfig {
+    /// Project this role config into a full `AiConfig` shell suitable
+    /// for handing to `ai::build_provider`. Reuses the defaults from
+    /// `AiConfig::default()` for all knobs that are not per-role
+    /// (confidence threshold, max calls per tick, etc.). Leaves
+    /// `api_key` as-is on the returned config so the downstream
+    /// `AiConfig::resolved_api_key` env-var fallback fires exactly
+    /// like it does for the primary `[ai]` block — operators set
+    /// `AZURE_OPENAI_API_KEY` once and both the primary and the LLM
+    /// slot pick it up.
+    pub fn to_ai_config(&self) -> AiConfig {
+        AiConfig {
+            enabled: self.enabled,
+            provider: self.provider.clone(),
+            api_key: self.api_key.clone(),
+            model: self.model.clone(),
+            base_url: self.base_url.clone(),
+            api_version: self.api_version.clone(),
+            ..AiConfig::default()
+        }
+    }
 }
 
 /// Shadow provider configuration (subset of AiConfig applied to a second
@@ -777,6 +861,8 @@ impl Default for AiConfig {
             batch_window_secs: default_batch_window_secs(),
             use_structured_subgraph: default_use_structured_subgraph(),
             shadow: ShadowConfig::default(),
+            classifier: RoleProviderConfig::default(),
+            llm: RoleProviderConfig::default(),
         }
     }
 }
@@ -3275,5 +3361,132 @@ detectors_skip_fase3 = ["threat_intel", "sudo_abuse", "suspicious_execution"]
             .detectors_skip_fase3
             .iter()
             .any(|d| d == "threat_intel"));
+    }
+
+    // Spec 029 PR-C: RoleProviderConfig default is disabled + empty.
+    // When both per-role blocks are absent from agent.toml the router
+    // falls back to the primary [ai] provider (PR-B back-compat).
+    #[test]
+    fn role_provider_config_default_is_disabled() {
+        let r = RoleProviderConfig::default();
+        assert!(!r.enabled);
+        assert!(r.provider.is_empty());
+        assert!(r.api_key.is_empty());
+        assert!(r.model.is_empty());
+        assert!(r.base_url.is_empty());
+        assert!(r.api_version.is_empty());
+    }
+
+    // Spec 029 PR-C: ai_config defaults keep both per-role blocks
+    // disabled so pre-029 configs auto-use the primary [ai] block.
+    #[test]
+    fn ai_config_default_has_disabled_per_role_blocks() {
+        let cfg = AiConfig::default();
+        assert!(!cfg.classifier.enabled);
+        assert!(!cfg.llm.enabled);
+    }
+
+    // Spec 029 PR-C: to_ai_config maps the per-role fields into a
+    // full AiConfig shell suitable for ai::build_provider. Shared
+    // knobs (confidence_threshold, min_severity, etc.) default.
+    #[test]
+    fn role_provider_to_ai_config_maps_fields() {
+        let role = RoleProviderConfig {
+            enabled: true,
+            provider: "azure_openai".into(),
+            api_key: "explicit".into(),
+            model: "gpt-5.4-mini".into(),
+            base_url: "https://example.openai.azure.com".into(),
+            api_version: "2024-12-01-preview".into(),
+        };
+        let cfg = role.to_ai_config();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.provider, "azure_openai");
+        assert_eq!(cfg.api_key, "explicit");
+        assert_eq!(cfg.model, "gpt-5.4-mini");
+        assert_eq!(cfg.base_url, "https://example.openai.azure.com");
+        assert_eq!(cfg.api_version, "2024-12-01-preview");
+        // Shared knobs come from AiConfig::default().
+        assert!(!cfg.shadow.enabled);
+        assert_eq!(cfg.min_severity, "medium");
+    }
+
+    // Spec 029 PR-C: empty api_key on to_ai_config stays empty so
+    // the downstream AiConfig::resolved_api_key env-var fallback
+    // (OPENAI_API_KEY, AZURE_OPENAI_API_KEY, etc.) fires normally.
+    #[test]
+    fn role_provider_to_ai_config_preserves_empty_api_key() {
+        let role = RoleProviderConfig {
+            enabled: true,
+            provider: "openai".into(),
+            api_key: String::new(),
+            ..Default::default()
+        };
+        let cfg = role.to_ai_config();
+        assert!(cfg.api_key.is_empty());
+    }
+
+    // Spec 029 PR-C: parses the classifier + llm TOML sections.
+    #[test]
+    fn load_parses_classifier_and_llm_sections() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(
+            tmp,
+            r#"[ai]
+enabled = true
+provider = "stub"
+
+[ai.classifier]
+enabled = true
+provider = "local_classifier"
+base_url = "/var/lib/innerwarden/models/classifier"
+
+[ai.llm]
+enabled = true
+provider = "azure_openai"
+model = "gpt-5.4-mini"
+base_url = "https://example.openai.azure.com"
+api_version = "2024-12-01-preview"
+"#
+        )
+        .unwrap();
+        let cfg = load(tmp.path()).unwrap();
+
+        assert!(cfg.ai.enabled);
+        assert_eq!(cfg.ai.provider, "stub");
+
+        assert!(cfg.ai.classifier.enabled);
+        assert_eq!(cfg.ai.classifier.provider, "local_classifier");
+        assert_eq!(
+            cfg.ai.classifier.base_url,
+            "/var/lib/innerwarden/models/classifier"
+        );
+
+        assert!(cfg.ai.llm.enabled);
+        assert_eq!(cfg.ai.llm.provider, "azure_openai");
+        assert_eq!(cfg.ai.llm.model, "gpt-5.4-mini");
+        assert_eq!(cfg.ai.llm.api_version, "2024-12-01-preview");
+    }
+
+    // Spec 029 PR-C: legacy `[ai]` only config is still parsed with
+    // classifier/llm blocks defaulting to disabled. Back-compat gate.
+    #[test]
+    fn load_without_per_role_sections_leaves_slots_disabled() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(
+            tmp,
+            r#"[ai]
+enabled = true
+provider = "stub"
+model = "legacy"
+"#
+        )
+        .unwrap();
+        let cfg = load(tmp.path()).unwrap();
+        assert_eq!(cfg.ai.provider, "stub");
+        // Per-role blocks default to disabled so the boot path falls
+        // back to the primary [ai] provider for both slots.
+        assert!(!cfg.ai.classifier.enabled);
+        assert!(!cfg.ai.llm.enabled);
     }
 }

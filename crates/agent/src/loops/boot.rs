@@ -652,23 +652,65 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
     } else {
         None
     };
-    let ai_router = match &ai_provider {
-        Some(p) => {
-            // Same provider in both slots: router resolves every
-            // capability the provider declares. General-purpose LLMs
-            // default to ALL, narrow providers (LocalClassifier) cover
-            // Decide + Classify only — the router still routes
-            // correctly because `provider_for` consults `capabilities()`.
-            let shared = Arc::clone(p);
-            match ai::AiRouter::new(Some(Arc::clone(&shared)), Some(shared)) {
-                Ok(r) => r,
-                Err(_) => {
-                    warn!("AI router refused both-none config; falling back to disabled");
-                    ai::AiRouter::disabled()
-                }
+
+    // Spec 029 PR-C: per-role providers. When `[ai.classifier].enabled`
+    // is true, build a separate provider for the classifier slot;
+    // otherwise the primary `[ai]` provider fills that slot (PR-B
+    // back-compat behaviour). Same for `[ai.llm]`. This is where an
+    // operator can run a local ONNX classifier for triage and keep
+    // Azure for briefings without touching any call site.
+    let classifier_slot: Option<Arc<dyn ai::AiProvider>> = if cfg.ai.classifier.enabled {
+        let role_cfg = cfg.ai.classifier.to_ai_config();
+        match ai::build_provider(&role_cfg) {
+            Ok(p) => {
+                info!(
+                    provider = role_cfg.provider.as_str(),
+                    "AI router: classifier slot configured"
+                );
+                Some(Arc::from(p))
+            }
+            Err(e) => {
+                warn!(
+                    provider = role_cfg.provider.as_str(),
+                    "failed to build [ai.classifier] provider, falling back to primary: {e:#}"
+                );
+                ai_provider.as_ref().map(Arc::clone)
             }
         }
-        None => ai::AiRouter::disabled(),
+    } else {
+        ai_provider.as_ref().map(Arc::clone)
+    };
+
+    let llm_slot: Option<Arc<dyn ai::AiProvider>> = if cfg.ai.llm.enabled {
+        let role_cfg = cfg.ai.llm.to_ai_config();
+        match ai::build_provider(&role_cfg) {
+            Ok(p) => {
+                info!(
+                    provider = role_cfg.provider.as_str(),
+                    "AI router: llm slot configured"
+                );
+                Some(Arc::from(p))
+            }
+            Err(e) => {
+                warn!(
+                    provider = role_cfg.provider.as_str(),
+                    "failed to build [ai.llm] provider, falling back to primary: {e:#}"
+                );
+                ai_provider.as_ref().map(Arc::clone)
+            }
+        }
+    } else {
+        ai_provider.as_ref().map(Arc::clone)
+    };
+
+    let ai_router = match ai::AiRouter::new(classifier_slot, llm_slot) {
+        Ok(r) => r,
+        Err(_) => {
+            // Both slots empty. Happens when [ai] is disabled and
+            // neither per-role block was enabled. The agent runs in
+            // Falco-mode: rules-only detection, zero LLM cost.
+            ai::AiRouter::disabled()
+        }
     };
     info!(router = %ai_router.describe(), "AI router ready");
 
