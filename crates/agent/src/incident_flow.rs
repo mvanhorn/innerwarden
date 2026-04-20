@@ -39,6 +39,29 @@ pub(super) struct PreAiGuardInputs {
     pub in_decision_cooldown: bool,
     pub ai_calls_this_tick: usize,
     pub max_ai_calls_per_tick: usize,
+    /// Spec 028-b skip-fase3: detector prefix matches the operator's
+    /// high-signal skip list (e.g. `threat_intel:`, `sudo_abuse:`,
+    /// `suspicious_execution:`). When true, the below-severity and
+    /// decision-cooldown guards are bypassed so the incident reaches
+    /// decide(). Allowlist and per-tick budget still apply because
+    /// those are safety, not noise.
+    pub skip_fase3: bool,
+}
+
+/// Spec 028-b skip-fase3: return true when the incident_id is either
+/// an exact match for an entry in the skip list or has the entry as a
+/// prefix followed by `:`. Prefix matching handles both the
+/// "just-the-detector" form (`threat_intel`) and the qualified form
+/// (`threat_intel:threat_ip`). The colon guard prevents accidental
+/// substring collisions (e.g. `threat_intel` must not match
+/// `threat_intel_something_else` if such a thing ever appeared).
+pub(super) fn matches_skip_fase3(incident_id: &str, skip_list: &[String]) -> bool {
+    skip_list.iter().any(|entry| {
+        if entry.is_empty() {
+            return false;
+        }
+        incident_id == entry || incident_id.starts_with(&format!("{entry}:"))
+    })
 }
 
 pub(super) fn decide_pre_ai_guard(inputs: PreAiGuardInputs) -> PreAiGuardDecision {
@@ -59,15 +82,23 @@ pub(super) fn decide_pre_ai_guard(inputs: PreAiGuardInputs) -> PreAiGuardDecisio
         return PreAiGuardDecision::SkipAllowlisted;
     }
 
-    if !inputs.passes_ai_gate {
-        if inputs.below_severity_threshold {
-            return PreAiGuardDecision::SkipBelowSeverity;
+    // Spec 028-b skip-fase3: high-signal detectors bypass the
+    // below-severity and decision-cooldown guards but still respect
+    // allowlist (above) and the per-tick budget (below). The point is
+    // that threat_intel / sudo_abuse / suspicious_execution should
+    // never be noise-gated away — operators enable this list after
+    // seeing zero-decision evidence in prod.
+    if !inputs.skip_fase3 {
+        if !inputs.passes_ai_gate {
+            if inputs.below_severity_threshold {
+                return PreAiGuardDecision::SkipBelowSeverity;
+            }
+            return PreAiGuardDecision::SkipPrivateOrBlocked;
         }
-        return PreAiGuardDecision::SkipPrivateOrBlocked;
-    }
 
-    if inputs.in_decision_cooldown {
-        return PreAiGuardDecision::SkipDecisionCooldown;
+        if inputs.in_decision_cooldown {
+            return PreAiGuardDecision::SkipDecisionCooldown;
+        }
     }
 
     if inputs.max_ai_calls_per_tick > 0 && inputs.ai_calls_this_tick >= inputs.max_ai_calls_per_tick
@@ -90,6 +121,12 @@ pub(crate) fn evaluate_pre_ai_flow(
     ai_calls_this_tick: usize,
 ) -> PreAiFlowDecision {
     let detector = incident.incident_id.split(':').next().unwrap_or("");
+    // Spec 028-b skip-fase3: delegate the skip-list match to the pure
+    // helper so it can be unit tested without a full AgentState.
+    let skip_fase3 = matches_skip_fase3(
+        &incident.incident_id,
+        &cfg.incident_flow.detectors_skip_fase3,
+    );
     let mut guard_inputs = PreAiGuardInputs {
         is_pipeline_test: incident.tags.iter().any(|tag| tag == "pipeline-test"),
         is_advisory_detector: detector == "neural_anomaly" || detector == "host_drift",
@@ -100,6 +137,7 @@ pub(crate) fn evaluate_pre_ai_flow(
         in_decision_cooldown: false,
         ai_calls_this_tick,
         max_ai_calls_per_tick: cfg.ai.max_ai_calls_per_tick,
+        skip_fase3,
     };
 
     if ai_enabled {
@@ -251,6 +289,7 @@ mod tests {
             in_decision_cooldown: false,
             ai_calls_this_tick: 0,
             max_ai_calls_per_tick: 10,
+            skip_fase3: false,
         }
     }
 
@@ -369,5 +408,135 @@ mod tests {
         let inputs = default_guard_inputs();
 
         assert_eq!(decide_pre_ai_guard(inputs), PreAiGuardDecision::Proceed);
+    }
+
+    // Spec 028-b skip-fase3: when the detector is on the operator's
+    // skip list, the below-severity and decision-cooldown guards are
+    // bypassed. This is the fix for the spec 028 evidence where
+    // threat_intel / suspicious_execution / sudo_abuse had zero
+    // decisions because they never survived the pre-AI gate.
+    #[test]
+    fn skip_fase3_bypasses_below_severity_guard() {
+        let mut inputs = default_guard_inputs();
+        inputs.passes_ai_gate = false;
+        inputs.below_severity_threshold = true;
+        // Without the skip: would return SkipBelowSeverity.
+        inputs.skip_fase3 = true;
+        assert_eq!(decide_pre_ai_guard(inputs), PreAiGuardDecision::Proceed);
+    }
+
+    #[test]
+    fn skip_fase3_bypasses_decision_cooldown_guard() {
+        let mut inputs = default_guard_inputs();
+        inputs.in_decision_cooldown = true;
+        // Without the skip: would return SkipDecisionCooldown.
+        inputs.skip_fase3 = true;
+        assert_eq!(decide_pre_ai_guard(inputs), PreAiGuardDecision::Proceed);
+    }
+
+    #[test]
+    fn skip_fase3_still_respects_allowlist() {
+        // Allowlist is safety, not noise — skip_fase3 must not bypass
+        // it. A threat_intel hit on an allowlisted IP still skips AI.
+        let mut inputs = default_guard_inputs();
+        inputs.skip_fase3 = true;
+        inputs.is_allowlisted = true;
+        assert_eq!(
+            decide_pre_ai_guard(inputs),
+            PreAiGuardDecision::SkipAllowlisted
+        );
+    }
+
+    #[test]
+    fn skip_fase3_still_respects_per_tick_budget() {
+        // Per-tick AI budget is the operator's cost cap; skip_fase3
+        // must respect it so a burst of threat_intel hits does not
+        // exhaust the budget in a single tick.
+        let mut inputs = default_guard_inputs();
+        inputs.skip_fase3 = true;
+        inputs.ai_calls_this_tick = 3;
+        inputs.max_ai_calls_per_tick = 3;
+        assert_eq!(
+            decide_pre_ai_guard(inputs),
+            PreAiGuardDecision::SkipAiCallBudget
+        );
+    }
+
+    #[test]
+    fn skip_fase3_still_respects_ai_disabled() {
+        // If AI is turned off entirely, skip_fase3 is meaningless.
+        let mut inputs = default_guard_inputs();
+        inputs.skip_fase3 = true;
+        inputs.ai_enabled = false;
+        assert_eq!(
+            decide_pre_ai_guard(inputs),
+            PreAiGuardDecision::SkipAiDisabled
+        );
+    }
+
+    #[test]
+    fn skip_fase3_off_default_preserves_existing_behaviour() {
+        // Regression guard: the new field must default to false so
+        // incidents that do not match the operator's skip list behave
+        // identically to the pre-028-b gate.
+        let mut inputs = default_guard_inputs();
+        inputs.skip_fase3 = false;
+        inputs.passes_ai_gate = false;
+        inputs.below_severity_threshold = true;
+        assert_eq!(
+            decide_pre_ai_guard(inputs),
+            PreAiGuardDecision::SkipBelowSeverity
+        );
+    }
+
+    // Spec 028-b skip-fase3: matches_skip_fase3 covers the prefix /
+    // exact / colon-separator matching rules. Kept pure so the match
+    // logic can be tested without an AgentState or AgentConfig.
+    #[test]
+    fn matches_skip_fase3_exact_match() {
+        let skip = vec!["threat_intel:threat_ip".to_string()];
+        assert!(matches_skip_fase3("threat_intel:threat_ip", &skip));
+    }
+
+    #[test]
+    fn matches_skip_fase3_prefix_match_with_colon() {
+        let skip = vec!["sudo_abuse".to_string()];
+        assert!(matches_skip_fase3("sudo_abuse:ubuntu", &skip));
+        assert!(matches_skip_fase3("sudo_abuse:root:2026-04-20", &skip));
+    }
+
+    #[test]
+    fn matches_skip_fase3_rejects_substring_without_colon() {
+        // `threat_intel` must not match `threat_intel_extended` because
+        // that is a different detector. The colon guard enforces this.
+        let skip = vec!["threat_intel".to_string()];
+        assert!(!matches_skip_fase3("threat_intel_extended:foo", &skip));
+        assert!(!matches_skip_fase3("threat_intelligence_feed", &skip));
+    }
+
+    #[test]
+    fn matches_skip_fase3_empty_list_returns_false() {
+        assert!(!matches_skip_fase3("threat_intel:threat_ip", &[]));
+    }
+
+    #[test]
+    fn matches_skip_fase3_ignores_empty_entries() {
+        // Defensive: operator typo in the config that leaves an empty
+        // string in the list must not match every incident.
+        let skip = vec!["".to_string()];
+        assert!(!matches_skip_fase3("any:incident:id", &skip));
+    }
+
+    #[test]
+    fn matches_skip_fase3_mixed_list() {
+        let skip = vec![
+            "threat_intel:threat_ip".to_string(),
+            "sudo_abuse".to_string(),
+            "suspicious_execution".to_string(),
+        ];
+        assert!(matches_skip_fase3("threat_intel:threat_ip", &skip));
+        assert!(matches_skip_fase3("sudo_abuse:ubuntu", &skip));
+        assert!(matches_skip_fase3("suspicious_execution:unknown", &skip));
+        assert!(!matches_skip_fase3("ssh_bruteforce:1.2.3.4", &skip));
     }
 }
