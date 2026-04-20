@@ -239,13 +239,33 @@ pub fn build_from_config(
     primary: Option<Arc<dyn AiProvider>>,
     classifier_cfg: &crate::config::RoleProviderConfig,
     llm_cfg: &crate::config::RoleProviderConfig,
+    shadow_cfg: Option<&crate::config::ShadowConfig>,
+    confidence_threshold: f32,
     mut on_slot_configured: impl FnMut(&'static str, &str),
     mut on_slot_fallback: impl FnMut(&'static str, &str, &anyhow::Error),
 ) -> AiRouter {
+    // Shadow wraps the Decide-serving slot. When a dedicated
+    // classifier is configured it takes Decide (router rules in
+    // `provider_for`); otherwise Decide falls back to the llm slot.
+    // Pass the shadow config to whichever slot will answer Decide so
+    // the `differs from` guard compares against the right provider.
+    let classifier_shadow = if classifier_cfg.enabled {
+        shadow_cfg
+    } else {
+        None
+    };
+    let llm_shadow = if !classifier_cfg.enabled && llm_cfg.enabled {
+        shadow_cfg
+    } else {
+        None
+    };
+
     let classifier_slot = resolve_slot(
         "classifier",
         &primary,
         classifier_cfg,
+        classifier_shadow,
+        confidence_threshold,
         &mut on_slot_configured,
         &mut on_slot_fallback,
     );
@@ -253,6 +273,8 @@ pub fn build_from_config(
         "llm",
         &primary,
         llm_cfg,
+        llm_shadow,
+        confidence_threshold,
         &mut on_slot_configured,
         &mut on_slot_fallback,
     );
@@ -272,11 +294,15 @@ pub fn build_for_dashboard(
     primary: Option<Arc<dyn AiProvider>>,
     classifier_cfg: &crate::config::RoleProviderConfig,
     llm_cfg: &crate::config::RoleProviderConfig,
+    shadow_cfg: Option<&crate::config::ShadowConfig>,
+    confidence_threshold: f32,
 ) -> AiRouter {
     build_from_config(
         primary,
         classifier_cfg,
         llm_cfg,
+        shadow_cfg,
+        confidence_threshold,
         |slot, provider_name| {
             tracing::info!(
                 slot,
@@ -298,6 +324,8 @@ fn resolve_slot(
     slot_name: &'static str,
     primary: &Option<Arc<dyn AiProvider>>,
     role_cfg: &crate::config::RoleProviderConfig,
+    shadow_cfg: Option<&crate::config::ShadowConfig>,
+    confidence_threshold: f32,
     on_configured: &mut impl FnMut(&'static str, &str),
     on_fallback: &mut impl FnMut(&'static str, &str, &anyhow::Error),
 ) -> Option<Arc<dyn AiProvider>> {
@@ -306,9 +334,29 @@ fn resolve_slot(
     }
     let ai_cfg = role_cfg.to_ai_config();
     match crate::ai::build_provider(&ai_cfg) {
-        Ok(p) => {
+        Ok(primary_box) => {
             on_configured(slot_name, &ai_cfg.provider);
-            Some(Arc::from(p))
+            let wrapped_box = match shadow_cfg {
+                Some(scfg) if scfg.enabled => {
+                    match crate::ai::build_shadow_observer(
+                        scfg,
+                        &ai_cfg.provider,
+                        &ai_cfg.base_url,
+                        &ai_cfg.model,
+                        confidence_threshold,
+                    ) {
+                        Ok(shadow_opt) => {
+                            crate::ai::wrap_with_shadow(primary_box, shadow_opt, &scfg.log_path)
+                        }
+                        Err(e) => {
+                            on_fallback(slot_name, &scfg.provider, &e);
+                            primary_box
+                        }
+                    }
+                }
+                _ => primary_box,
+            };
+            Some(Arc::from(wrapped_box))
         }
         Err(e) => {
             on_fallback(slot_name, &ai_cfg.provider, &e);
@@ -654,6 +702,8 @@ mod tests {
             Some(Arc::clone(&primary)),
             &RoleProviderConfig::default(),
             &RoleProviderConfig::default(),
+            None,
+            0.85_f32,
             move |slot, p| {
                 cfg_configured
                     .lock()
@@ -694,6 +744,8 @@ mod tests {
             Some(Arc::clone(&primary)),
             &classifier_cfg,
             &llm_cfg,
+            None,
+            0.85_f32,
             move |slot, p| {
                 cfg_configured
                     .lock()
@@ -738,6 +790,8 @@ mod tests {
             Some(Arc::clone(&primary)),
             &classifier_cfg,
             &llm_cfg,
+            None,
+            0.85_f32,
             move |slot, p| {
                 cfg_configured
                     .lock()
@@ -786,6 +840,8 @@ mod tests {
             Some(Arc::clone(&primary)),
             &classifier_cfg,
             &llm_cfg,
+            None,
+            0.85_f32,
             move |slot, p| {
                 cfg_configured
                     .lock()
@@ -833,6 +889,8 @@ mod tests {
             Some(Arc::clone(&primary)),
             &classifier_cfg,
             &RoleProviderConfig::default(),
+            None,
+            0.85_f32,
             move |slot, p| {
                 cfg_configured
                     .lock()
@@ -873,6 +931,8 @@ mod tests {
             None,
             &RoleProviderConfig::default(),
             &RoleProviderConfig::default(),
+            None,
+            0.85_f32,
             move |slot, p| {
                 cfg_configured
                     .lock()
@@ -911,6 +971,8 @@ mod tests {
             None, // no primary
             &classifier_cfg,
             &RoleProviderConfig::default(),
+            None,
+            0.85_f32,
             move |slot, p| {
                 cfg_configured
                     .lock()
@@ -940,6 +1002,8 @@ mod tests {
             Some(Arc::clone(&primary)),
             &RoleProviderConfig::default(),
             &RoleProviderConfig::default(),
+            None,
+            0.85_f32,
         );
         assert_eq!(r.decider().unwrap().name(), "legacy");
         assert_eq!(r.any_llm().unwrap().name(), "legacy");
@@ -951,6 +1015,8 @@ mod tests {
             None,
             &RoleProviderConfig::default(),
             &RoleProviderConfig::default(),
+            None,
+            0.85_f32,
         );
         assert!(r.is_disabled());
     }
@@ -967,8 +1033,189 @@ mod tests {
             Some(Arc::clone(&primary)),
             &classifier_cfg,
             &RoleProviderConfig::default(),
+            None,
+            0.85_f32,
         );
         assert_eq!(r.decider().unwrap().name(), "primary");
         assert_eq!(r.any_llm().unwrap().name(), "primary");
+    }
+
+    // ── shadow routing ──────────────────────────────────────────────
+    //
+    // Spec 029: `[ai.shadow]` wraps the Decide-serving slot. When a
+    // dedicated classifier is configured, shadow wraps that.
+
+    #[test]
+    fn shadow_wraps_classifier_when_classifier_is_configured() {
+        use crate::config::ShadowConfig;
+        // Stub classifier + stub shadow with a different model. The
+        // router should wrap the classifier slot with a ShadowProvider.
+        let classifier_cfg = RoleProviderConfig {
+            enabled: true,
+            provider: "stub".into(),
+            model: "clf-model".into(),
+            ..Default::default()
+        };
+        let shadow_cfg = ShadowConfig {
+            enabled: true,
+            provider: "stub".into(),
+            model: "shadow-model".into(),
+            ..Default::default()
+        };
+        let (configured, fallbacks) = record_callbacks();
+        let cfg_configured = configured.clone();
+        let cfg_fallbacks = fallbacks.clone();
+        let r = build_from_config(
+            None,
+            &classifier_cfg,
+            &RoleProviderConfig::default(),
+            Some(&shadow_cfg),
+            0.85,
+            move |slot, p| {
+                cfg_configured
+                    .lock()
+                    .unwrap()
+                    .push((slot.to_string(), p.to_string()))
+            },
+            move |slot, p, e| {
+                cfg_fallbacks
+                    .lock()
+                    .unwrap()
+                    .push((slot.to_string(), p.to_string(), e.to_string()))
+            },
+        );
+        // Decide routes to the classifier slot which is now a
+        // ShadowProvider wrapper. ShadowProvider delegates `name()` to
+        // the primary, so the stub name surfaces through the wrapper.
+        assert_eq!(r.decider().unwrap().name(), "stub");
+        assert!(fallbacks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn shadow_rejects_identical_target_config() {
+        use crate::config::ShadowConfig;
+        // Classifier config == shadow config. Router must log a fallback
+        // (shadow build rejected) but keep the classifier slot usable.
+        let classifier_cfg = RoleProviderConfig {
+            enabled: true,
+            provider: "stub".into(),
+            ..Default::default()
+        };
+        let shadow_cfg = ShadowConfig {
+            enabled: true,
+            provider: "stub".into(),
+            ..Default::default()
+        };
+        let (configured, fallbacks) = record_callbacks();
+        let cfg_configured = configured.clone();
+        let cfg_fallbacks = fallbacks.clone();
+        let r = build_from_config(
+            None,
+            &classifier_cfg,
+            &RoleProviderConfig::default(),
+            Some(&shadow_cfg),
+            0.85,
+            move |slot, p| {
+                cfg_configured
+                    .lock()
+                    .unwrap()
+                    .push((slot.to_string(), p.to_string()))
+            },
+            move |slot, p, e| {
+                cfg_fallbacks
+                    .lock()
+                    .unwrap()
+                    .push((slot.to_string(), p.to_string(), e.to_string()))
+            },
+        );
+        let fbs = fallbacks.lock().unwrap().clone();
+        assert_eq!(fbs.len(), 1, "expected shadow differs-from fallback");
+        assert!(
+            fbs[0].2.contains("must differ"),
+            "expected 'must differ' in error, got {}",
+            fbs[0].2
+        );
+        // Classifier slot still built successfully without the shadow wrap.
+        assert_eq!(r.decider().unwrap().name(), "stub");
+    }
+
+    #[test]
+    fn shadow_wraps_llm_when_no_classifier_configured() {
+        use crate::config::ShadowConfig;
+        // No classifier, only llm. Decide falls back to llm, so shadow
+        // attaches there.
+        let llm_cfg = RoleProviderConfig {
+            enabled: true,
+            provider: "stub".into(),
+            model: "llm-model".into(),
+            ..Default::default()
+        };
+        let shadow_cfg = ShadowConfig {
+            enabled: true,
+            provider: "stub".into(),
+            model: "shadow-model".into(),
+            ..Default::default()
+        };
+        let (configured, fallbacks) = record_callbacks();
+        let cfg_configured = configured.clone();
+        let cfg_fallbacks = fallbacks.clone();
+        let r = build_from_config(
+            None,
+            &RoleProviderConfig::default(),
+            &llm_cfg,
+            Some(&shadow_cfg),
+            0.85,
+            move |slot, p| {
+                cfg_configured
+                    .lock()
+                    .unwrap()
+                    .push((slot.to_string(), p.to_string()))
+            },
+            move |slot, p, e| {
+                cfg_fallbacks
+                    .lock()
+                    .unwrap()
+                    .push((slot.to_string(), p.to_string(), e.to_string()))
+            },
+        );
+        assert!(fallbacks.lock().unwrap().is_empty());
+        // Decide and any_llm both reach llm, which is shadow-wrapped.
+        assert_eq!(r.decider().unwrap().name(), "stub");
+        assert_eq!(r.any_llm().unwrap().name(), "stub");
+    }
+
+    #[test]
+    fn shadow_disabled_does_not_wrap() {
+        use crate::config::ShadowConfig;
+        let classifier_cfg = RoleProviderConfig {
+            enabled: true,
+            provider: "stub".into(),
+            ..Default::default()
+        };
+        let shadow_cfg = ShadowConfig::default(); // enabled = false
+        let (configured, fallbacks) = record_callbacks();
+        let cfg_configured = configured.clone();
+        let cfg_fallbacks = fallbacks.clone();
+        let r = build_from_config(
+            None,
+            &classifier_cfg,
+            &RoleProviderConfig::default(),
+            Some(&shadow_cfg),
+            0.85,
+            move |slot, p| {
+                cfg_configured
+                    .lock()
+                    .unwrap()
+                    .push((slot.to_string(), p.to_string()))
+            },
+            move |slot, p, e| {
+                cfg_fallbacks
+                    .lock()
+                    .unwrap()
+                    .push((slot.to_string(), p.to_string(), e.to_string()))
+            },
+        );
+        assert!(fallbacks.lock().unwrap().is_empty());
+        assert_eq!(r.decider().unwrap().name(), "stub");
     }
 }

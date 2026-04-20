@@ -366,6 +366,8 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             dashboard_ai.as_ref().map(Arc::clone),
             &cfg.ai.classifier,
             &cfg.ai.llm,
+            Some(&cfg.ai.shadow),
+            cfg.ai.confidence_threshold,
         );
         let dashboard_briefing = Arc::new(tokio::sync::Mutex::new(None::<briefing::Briefing>));
         let briefing_hour = cfg.briefing.hour;
@@ -670,6 +672,8 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         ai_provider.as_ref().map(Arc::clone),
         &cfg.ai.classifier,
         &cfg.ai.llm,
+        Some(&cfg.ai.shadow),
+        cfg.ai.confidence_threshold,
         |slot, provider_name| {
             info!(
                 slot,
