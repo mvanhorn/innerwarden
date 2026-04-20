@@ -635,6 +635,43 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         });
     }
 
+    // Build the AI provider once and populate both the legacy
+    // `ai_provider` handle and the spec 029 capability router from it.
+    // During PR-B the router is additive — both slots of the router
+    // hold the same provider so pre-029 call sites (which still use
+    // `state.ai_provider`) see identical behaviour. PR-C migrates the
+    // call sites and introduces the classifier/llm split.
+    let ai_provider: Option<Arc<dyn ai::AiProvider>> = if cfg.ai.enabled {
+        match ai::build_provider(&cfg.ai) {
+            Ok(p) => Some(Arc::from(p)),
+            Err(e) => {
+                warn!("failed to create AI provider: {e:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let ai_router = match &ai_provider {
+        Some(p) => {
+            // Same provider in both slots: router resolves every
+            // capability the provider declares. General-purpose LLMs
+            // default to ALL, narrow providers (LocalClassifier) cover
+            // Decide + Classify only — the router still routes
+            // correctly because `provider_for` consults `capabilities()`.
+            let shared = Arc::clone(p);
+            match ai::AiRouter::new(Some(Arc::clone(&shared)), Some(shared)) {
+                Ok(r) => r,
+                Err(_) => {
+                    warn!("AI router refused both-none config; falling back to disabled");
+                    ai::AiRouter::disabled()
+                }
+            }
+        }
+        None => ai::AiRouter::disabled(),
+    };
+    info!(router = %ai_router.describe(), "AI router ready");
+
     let mut state = AgentState {
         skill_registry: skills::SkillRegistry::default_builtin(),
         blocklist: startup_blocklist,
@@ -654,17 +691,8 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         } else {
             None
         },
-        ai_provider: if cfg.ai.enabled {
-            match ai::build_provider(&cfg.ai) {
-                Ok(p) => Some(Arc::from(p)),
-                Err(e) => {
-                    warn!("failed to create AI provider: {e:#}");
-                    None
-                }
-            }
-        } else {
-            None
-        },
+        ai_provider,
+        ai_router,
         // Decision writer is always created — Layer 1/2 decisions are written
         // even without AI. Previously gated on cfg.ai.enabled which caused
         // zero audit trail when AI was disabled or during agent restarts.

@@ -181,6 +181,7 @@ pub(crate) fn triage_test_state(data_dir: &Path) -> AgentState {
         telemetry: telemetry::TelemetryState::default(),
         telemetry_writer: None,
         ai_provider: None,
+        ai_router: ai::AiRouter::disabled(),
         decision_writer: Some(decisions::DecisionWriter::new(data_dir).unwrap()),
         last_narrative_at: None,
         last_daily_summary_telegram: None,
@@ -466,7 +467,12 @@ async fn golden_path_dry_run_produces_decision_entry() {
         correlator: correlation::TemporalCorrelator::new(300, 4096),
         telemetry: telemetry::TelemetryState::default(),
         telemetry_writer: None,
-        ai_provider: Some(mock as Arc<dyn ai::AiProvider>),
+        ai_provider: Some(mock.clone() as Arc<dyn ai::AiProvider>),
+        ai_router: ai::AiRouter::new(
+            Some(mock.clone() as Arc<dyn ai::AiProvider>),
+            Some(mock.clone() as Arc<dyn ai::AiProvider>),
+        )
+        .expect("test router with mock provider"),
         decision_writer: Some(decisions::DecisionWriter::new(dir.path()).unwrap()),
         last_narrative_at: None,
         last_daily_summary_telegram: None,
@@ -650,7 +656,12 @@ async fn allowed_skills_whitelist_enforced() {
         correlator: correlation::TemporalCorrelator::new(300, 4096),
         telemetry: telemetry::TelemetryState::default(),
         telemetry_writer: None,
-        ai_provider: Some(mock as Arc<dyn ai::AiProvider>),
+        ai_provider: Some(mock.clone() as Arc<dyn ai::AiProvider>),
+        ai_router: ai::AiRouter::new(
+            Some(mock.clone() as Arc<dyn ai::AiProvider>),
+            Some(mock.clone() as Arc<dyn ai::AiProvider>),
+        )
+        .expect("test router with mock provider"),
         decision_writer: Some(decisions::DecisionWriter::new(dir.path()).unwrap()),
         last_narrative_at: None,
         last_daily_summary_telegram: None,
@@ -815,7 +826,12 @@ async fn same_ip_in_same_tick_triggers_single_ai_call() {
         correlator: correlation::TemporalCorrelator::new(300, 4096),
         telemetry: telemetry::TelemetryState::default(),
         telemetry_writer: None,
-        ai_provider: Some(mock as Arc<dyn ai::AiProvider>),
+        ai_provider: Some(mock.clone() as Arc<dyn ai::AiProvider>),
+        ai_router: ai::AiRouter::new(
+            Some(mock.clone() as Arc<dyn ai::AiProvider>),
+            Some(mock.clone() as Arc<dyn ai::AiProvider>),
+        )
+        .expect("test router with mock provider"),
         decision_writer: Some(decisions::DecisionWriter::new(dir.path()).unwrap()),
         last_narrative_at: None,
         last_daily_summary_telegram: None,
@@ -981,7 +997,12 @@ async fn temporal_correlation_context_is_passed_to_ai() {
         correlator: correlation::TemporalCorrelator::new(300, 4096),
         telemetry: telemetry::TelemetryState::default(),
         telemetry_writer: None,
-        ai_provider: Some(mock as Arc<dyn ai::AiProvider>),
+        ai_provider: Some(mock.clone() as Arc<dyn ai::AiProvider>),
+        ai_router: ai::AiRouter::new(
+            Some(mock.clone() as Arc<dyn ai::AiProvider>),
+            Some(mock.clone() as Arc<dyn ai::AiProvider>),
+        )
+        .expect("test router with mock provider"),
         decision_writer: Some(decisions::DecisionWriter::new(dir.path()).unwrap()),
         last_narrative_at: None,
         last_daily_summary_telegram: None,
@@ -1132,7 +1153,12 @@ async fn honeypot_demo_writes_synthetic_decoy_event() {
         correlator: correlation::TemporalCorrelator::new(300, 4096),
         telemetry: telemetry::TelemetryState::default(),
         telemetry_writer: None,
-        ai_provider: Some(mock as Arc<dyn ai::AiProvider>),
+        ai_provider: Some(mock.clone() as Arc<dyn ai::AiProvider>),
+        ai_router: ai::AiRouter::new(
+            Some(mock.clone() as Arc<dyn ai::AiProvider>),
+            Some(mock.clone() as Arc<dyn ai::AiProvider>),
+        )
+        .expect("test router with mock provider"),
         decision_writer: Some(decisions::DecisionWriter::new(dir.path()).unwrap()),
         last_narrative_at: None,
         last_daily_summary_telegram: None,
@@ -1293,7 +1319,12 @@ async fn decision_cooldown_suppresses_repeat() {
         correlator: correlation::TemporalCorrelator::new(300, 4096),
         telemetry: telemetry::TelemetryState::default(),
         telemetry_writer: None,
-        ai_provider: Some(mock as Arc<dyn ai::AiProvider>),
+        ai_provider: Some(mock.clone() as Arc<dyn ai::AiProvider>),
+        ai_router: ai::AiRouter::new(
+            Some(mock.clone() as Arc<dyn ai::AiProvider>),
+            Some(mock.clone() as Arc<dyn ai::AiProvider>),
+        )
+        .expect("test router with mock provider"),
         decision_writer: Some(decisions::DecisionWriter::new(dir.path()).unwrap()),
         last_narrative_at: None,
         last_daily_summary_telegram: None,
