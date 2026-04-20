@@ -101,6 +101,17 @@ impl AiProvider for ShadowProvider {
         self.primary.name()
     }
 
+    /// Spec 029: delegate to the wrapped primary. The shadow does not
+    /// add capabilities of its own - it audits whatever the primary
+    /// can do. Without this override the router would see a
+    /// shadow-wrapped classifier as having every capability (trait
+    /// default `ALL`) and route `Classify` or `Generate` calls to the
+    /// wrapper's `chat()`, which forwards to the primary and fails
+    /// because the real classifier has no decoder.
+    fn capabilities(&self) -> crate::ai::capability::AiCapabilities {
+        self.primary.capabilities()
+    }
+
     async fn decide(&self, ctx: &DecisionContext<'_>) -> Result<AiDecision> {
         let incident_id = ctx.incident.incident_id.clone();
 
@@ -385,6 +396,54 @@ mod tests {
             0,
             "chat must not hit shadow provider"
         );
+    }
+
+    #[tokio::test]
+    async fn capabilities_delegates_to_primary() {
+        use crate::ai::capability::{AiCapabilities, Capability};
+
+        // Narrow "classifier-like" primary that only claims Decide.
+        struct DecideOnly;
+        #[async_trait]
+        impl AiProvider for DecideOnly {
+            fn name(&self) -> &'static str {
+                "decide-only"
+            }
+            fn capabilities(&self) -> AiCapabilities {
+                AiCapabilities::from_slice(&[Capability::Decide])
+            }
+            async fn decide(&self, _ctx: &DecisionContext<'_>) -> Result<AiDecision> {
+                Ok(AiDecision {
+                    action: AiAction::Ignore {
+                        reason: "ok".into(),
+                    },
+                    confidence: 0.9,
+                    auto_execute: false,
+                    reason: "t".into(),
+                    alternatives: vec![],
+                    estimated_threat: "low".into(),
+                })
+            }
+            async fn chat(&self, _s: &str, _u: &str) -> Result<String> {
+                anyhow::bail!("DecideOnly has no decoder")
+            }
+        }
+
+        let primary = Box::new(DecideOnly);
+        let shadow = Box::new(FakeProvider {
+            name: "shad",
+            action: AiAction::Ignore { reason: "s".into() },
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let sp = ShadowProvider::new(primary, shadow, tmp.path());
+
+        let caps = sp.capabilities();
+        assert!(caps.has(Capability::Decide));
+        assert!(!caps.has(Capability::Classify));
+        assert!(!caps.has(Capability::Generate));
+        assert!(!caps.has(Capability::Explain));
+        assert!(!caps.has(Capability::SimulateShell));
     }
 
     #[tokio::test]
