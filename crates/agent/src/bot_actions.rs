@@ -112,7 +112,7 @@ pub(crate) async fn handle_telegram_action_callback(
             host: inc.host.clone(),
             data_dir: data_dir.to_path_buf(),
             honeypot: honeypot_runtime(cfg),
-            ai_provider: state.ai_provider.clone(),
+            ai_provider: state.ai_router.any_llm(),
         };
 
         let exec_result = skill.execute(&ctx, cfg.responder.dry_run).await;
@@ -188,7 +188,8 @@ pub(crate) async fn handle_telegram_action_callback(
                 // Build SkillContext and execute the honeypot skill
                 if let Some(skill) = state.skill_registry.get("honeypot") {
                     let mut runtime = honeypot_runtime(cfg);
-                    runtime.ai_provider = state.ai_provider.clone();
+                    let skill_ai = state.ai_router.any_llm();
+                    runtime.ai_provider = skill_ai.clone();
                     let ctx = skills::SkillContext {
                         incident: choice.incident.clone(),
                         target_ip: Some(ip.clone()),
@@ -198,7 +199,7 @@ pub(crate) async fn handle_telegram_action_callback(
                         host: host.clone(),
                         data_dir: data_dir.to_path_buf(),
                         honeypot: runtime.clone(),
-                        ai_provider: state.ai_provider.clone(),
+                        ai_provider: skill_ai,
                     };
                     let exec_result = skill.execute(&ctx, cfg.responder.dry_run).await;
                     let msg = if exec_result.success {
@@ -281,7 +282,7 @@ pub(crate) async fn handle_telegram_action_callback(
                         host: host.clone(),
                         data_dir: data_dir.to_path_buf(),
                         honeypot: honeypot_runtime(cfg),
-                        ai_provider: state.ai_provider.clone(),
+                        ai_provider: state.ai_router.any_llm(),
                     };
                     let exec_result = skill.execute(&ctx, cfg.responder.dry_run).await;
                     if exec_result.success {

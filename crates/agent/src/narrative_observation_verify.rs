@@ -1057,8 +1057,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = triage_test_state(tmp.path());
         assert!(
-            state.ai_provider.is_none(),
-            "triage_test_state baseline has no ai_provider"
+            state.ai_router.is_disabled(),
+            "triage_test_state baseline has a disabled router"
         );
         let cfg = AgentConfig::default();
 
@@ -1128,11 +1128,6 @@ mod tests {
         };
         let provider = crate::ai::build_provider(&ai_cfg).expect("stub provider builds");
         let provider_arc: Arc<dyn crate::ai::AiProvider> = Arc::from(provider);
-        state.ai_provider = Some(Arc::clone(&provider_arc));
-        // Spec 029 PR-C.2: promote_escalated_to_decision now reads
-        // from the router, not the legacy field. Populate both slots
-        // with the same provider so the test exercises the same
-        // decide() path as before.
         state.ai_router =
             crate::ai::AiRouter::new(Some(Arc::clone(&provider_arc)), Some(provider_arc))
                 .expect("router with stub provider");
@@ -1356,7 +1351,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = triage_test_state(tmp.path());
         let err_arc: Arc<dyn crate::ai::AiProvider> = Arc::new(ErroringProvider);
-        state.ai_provider = Some(Arc::clone(&err_arc));
         state.ai_router = crate::ai::AiRouter::new(Some(Arc::clone(&err_arc)), Some(err_arc))
             .expect("router with erroring provider");
 
@@ -1423,7 +1417,6 @@ mod tests {
         };
         let provider = crate::ai::build_provider(&ai_cfg).expect("stub builds");
         let provider_arc: Arc<dyn crate::ai::AiProvider> = Arc::from(provider);
-        state.ai_provider = Some(Arc::clone(&provider_arc));
         state.ai_router =
             crate::ai::AiRouter::new(Some(Arc::clone(&provider_arc)), Some(provider_arc))
                 .expect("router with stub");
