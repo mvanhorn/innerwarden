@@ -443,7 +443,12 @@ pub(crate) async fn process_narrative_tick(
     // Spec 021 — Observation verification (Fase 3).
     // Score undecided incidents and auto-dismiss/escalate clear-cut cases.
     // Ambiguous items go to AI batch verification.
-    let ambiguous_items = narrative_observation_verify::verify_observing_incidents(cfg, state);
+    //
+    // Spec 028-b: verify_observing_incidents is async because the Escalate
+    // branch can now promote the incident all the way through decide() and
+    // the skill executor when the operator has enabled the feature flag.
+    let ambiguous_items =
+        narrative_observation_verify::verify_observing_incidents(cfg, state, data_dir).await;
     narrative_observation_verify::ai_verify_ambiguous(ambiguous_items, cfg, state).await;
 
     narrative_daily_summary::maybe_write_daily_summary_and_digest(
