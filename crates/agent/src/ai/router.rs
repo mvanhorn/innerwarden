@@ -1,6 +1,9 @@
-// See the matching comment in capability.rs. Nothing in the agent
-// consumes the router yet; PR-B adds `state.ai_router` and PR-C
-// migrates the call sites off `state.ai_provider`.
+// Spec 029 PR-B: `AiRouter` is now a field on `AgentState` and
+// constructed in `loops/boot.rs`. The router itself is reachable
+// but its per-capability resolver is not called from any pre-PR-C
+// call site, so `provider_for`, `any_llm`, `describe` etc. still
+// appear unused to clippy. PR-C migrates the call sites and removes
+// this allow.
 #![allow(dead_code)]
 
 //! AI capability router (spec 029).
@@ -429,5 +432,46 @@ mod tests {
         let r = AiRouter::disabled();
         let d = r.describe();
         assert_eq!(d, "classifier=none, llm=none");
+    }
+
+    // Spec 029 PR-B back-compat guarantee: the agent's boot path
+    // populates both slots with the same provider (because pre-029
+    // config only has one `[ai]` block). The router must resolve
+    // every capability to that same provider. Breaking this would
+    // silently change production behaviour when PR-B lands.
+    #[test]
+    fn back_compat_same_provider_in_both_slots_resolves_every_capability() {
+        let single = arc("legacy-single", AiCapabilities::ALL);
+        let r = AiRouter::new(Some(Arc::clone(&single)), Some(Arc::clone(&single))).unwrap();
+        for c in Capability::all() {
+            assert_eq!(
+                r.provider_for(*c).expect("every cap resolves").name(),
+                "legacy-single",
+                "back-compat break: capability {c:?} did not resolve to the legacy provider"
+            );
+        }
+        // describe() must show the same provider name in both slots.
+        let d = r.describe();
+        assert!(d.contains("classifier=legacy-single|"));
+        assert!(d.contains("llm=legacy-single|"));
+    }
+
+    // Spec 029 PR-B: when the legacy provider declares narrow caps
+    // (LocalClassifier scenario), the router resolves only the caps
+    // the provider actually supports and returns None for the rest.
+    // This is the graceful-degradation path the agent's no-AI code
+    // already handles.
+    #[test]
+    fn back_compat_narrow_provider_returns_none_for_unsupported() {
+        let narrow = arc(
+            "classifier-only",
+            AiCapabilities::from_slice(&[Capability::Decide, Capability::Classify]),
+        );
+        let r = AiRouter::new(Some(Arc::clone(&narrow)), Some(Arc::clone(&narrow))).unwrap();
+        assert!(r.provider_for(Capability::Decide).is_some());
+        assert!(r.provider_for(Capability::Classify).is_some());
+        assert!(r.provider_for(Capability::Generate).is_none());
+        assert!(r.provider_for(Capability::Explain).is_none());
+        assert!(r.provider_for(Capability::SimulateShell).is_none());
     }
 }

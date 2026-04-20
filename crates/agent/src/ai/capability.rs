@@ -1,9 +1,7 @@
-// Spec 029 PR-A: this module ships the capability type infrastructure.
-// Nothing in the agent consumes it yet — PR-B wires `AiRouter` into
-// `AgentState` and PR-C migrates call sites. During PR-A, clippy
-// (run with -D warnings) flags every item as dead code; the allow
-// covers only this module so the warning stays on for anyone who
-// forgets to hook new items up when PR-B extends it.
+// Spec 029 PR-B: the types are now consumed transitively via
+// `AgentState.ai_router`, but individual `provider_for` call sites
+// do not yet reach the enum variants. PR-C migrates the ~30 call
+// sites and removes this allow.
 #![allow(dead_code)]
 
 //! AI capability types (spec 029).
