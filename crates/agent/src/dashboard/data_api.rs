@@ -33,6 +33,20 @@ pub(super) fn briefing_system_prompt(personality: &str) -> String {
     }
 }
 
+/// Spec 029 PR-C.2: uniform error response when the LLM role is not
+/// configured. Centralises the wording so every endpoint that needs
+/// `Capability::Generate` or `Capability::Explain` points operators
+/// at the same `[ai.llm]` config key. Kept as a small helper so the
+/// fallback path is unit-testable without spinning up a
+/// `DashboardState` and an axum router.
+pub(super) fn llm_unavailable_error(feature: &str) -> serde_json::Value {
+    serde_json::json!({
+        "error": format!(
+            "LLM role not configured. Set [ai.llm] in agent.toml to enable {feature}."
+        ),
+    })
+}
+
 /// Build the AI explain-threat system prompt used by the Threats drill-down.
 /// Uses the same base personality as the briefing so all three AI surfaces
 /// (Home briefing, Threats explain, Telegram /ask) speak in one voice,
@@ -407,9 +421,7 @@ pub(super) async fn api_briefing_generate(
     {
         Some(p) => p,
         None => {
-            return Json(serde_json::json!({
-                "error": "LLM role not configured. Set [ai.llm] in agent.toml to enable briefings.",
-            }));
+            return Json(llm_unavailable_error("briefings"));
         }
     };
     let system = briefing_system_prompt(&state.action_cfg.ai_personality);
@@ -452,17 +464,13 @@ pub(super) async fn api_ai_explain(
 
     // Spec 029 PR-C.2: the entity-context explainer maps to the
     // Explain role (structured context → natural-language summary).
-    let ai: std::sync::Arc<dyn crate::ai::AiProvider> = match state
-        .ai_router
-        .provider_for(crate::ai::Capability::Explain)
-    {
-        Some(p) => p,
-        None => {
-            return Json(serde_json::json!({
-                "error": "LLM role not configured. Set [ai.llm] in agent.toml to enable explanations."
-            }));
-        }
-    };
+    let ai: std::sync::Arc<dyn crate::ai::AiProvider> =
+        match state.ai_router.provider_for(crate::ai::Capability::Explain) {
+            Some(p) => p,
+            None => {
+                return Json(llm_unavailable_error("explanations"));
+            }
+        };
 
     // Build context from the knowledge graph: incidents, decisions,
     // events linked to this entity. Keep it compact for the LLM.
@@ -880,5 +888,32 @@ mod tests {
         // Invalid date formats should fail parsing rather than silently succeed.
         let invalid = chrono::NaiveDate::parse_from_str("16-04-2026", "%Y-%m-%d");
         assert!(invalid.is_err());
+    }
+
+    // Spec 029 PR-C.2: the llm_unavailable_error helper powers every
+    // `None` branch of provider_for(Generate | Explain) in the
+    // dashboard endpoints. Lock the exact shape so grant/operator
+    // docs that quote the error string do not drift.
+    #[test]
+    fn llm_unavailable_error_shape() {
+        let json = llm_unavailable_error("briefings");
+        assert_eq!(
+            json["error"],
+            "LLM role not configured. Set [ai.llm] in agent.toml to enable briefings."
+        );
+    }
+
+    #[test]
+    fn llm_unavailable_error_feature_is_interpolated() {
+        let json = llm_unavailable_error("explanations");
+        assert!(json["error"]
+            .as_str()
+            .unwrap()
+            .contains("to enable explanations."));
+        let json_ask = llm_unavailable_error("/ask");
+        assert!(json_ask["error"]
+            .as_str()
+            .unwrap()
+            .contains("to enable /ask."));
     }
 }

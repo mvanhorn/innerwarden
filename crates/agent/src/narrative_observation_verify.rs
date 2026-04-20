@@ -1820,4 +1820,43 @@ mod tests {
         assert!(profile.contains("bare_metal"));
         assert!(profile.contains("sshd"));
     }
+
+    // Spec 029 PR-C.2: ai_verify_ambiguous now resolves the provider
+    // via `state.ai_router.provider_for(Classify)` instead of reading
+    // the legacy `state.ai_provider` field. When the router has no
+    // Classify-capable provider (Falco-mode or classifier-only with
+    // the classifier declining Classify), the function must return
+    // early without panicking.
+    #[tokio::test]
+    async fn ai_verify_ambiguous_noop_when_router_has_no_classify_provider() {
+        use crate::config::AgentConfig;
+        use crate::tests::triage_test_state;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = triage_test_state(tmp.path());
+        // triage_test_state leaves state.ai_router as AiRouter::disabled();
+        // the router yields None for every capability.
+        assert!(state
+            .ai_router
+            .provider_for(crate::ai::Capability::Classify)
+            .is_none());
+
+        let mut cfg = AgentConfig::default();
+        cfg.observation.ai_verification = true;
+
+        // One ambiguous item forces the early-return branch we care
+        // about (otherwise the function returns on the empty-items
+        // check above it).
+        let items = vec![AmbiguousItem {
+            incident_id: "proto_anomaly:SshVersionAnomaly:198.51.100.99:t".into(),
+            score: 55,
+            evidence: serde_json::json!({}),
+            detector: "proto_anomaly".into(),
+            title: "t".into(),
+        }];
+
+        // No panic, no mutation of decision_writer state, graph stays
+        // untouched.
+        ai_verify_ambiguous(items, &cfg, &mut state).await;
+    }
 }
