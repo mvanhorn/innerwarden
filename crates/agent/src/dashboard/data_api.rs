@@ -916,4 +916,48 @@ mod tests {
             .unwrap()
             .contains("to enable /ask."));
     }
+
+    // Spec 029 PR-C.2: exercise the briefing endpoint with a disabled
+    // router so the `provider_for(Generate) => None` branch runs end-
+    // to-end (not just the helper). Locks the public JSON contract.
+    #[tokio::test]
+    async fn api_briefing_generate_returns_unavailable_when_router_has_no_generate() {
+        use axum::extract::State;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = crate::dashboard::state::test_dashboard_state(tmp.path());
+        let Json(body) = api_briefing_generate(State(state)).await;
+        assert_eq!(
+            body["error"],
+            "LLM role not configured. Set [ai.llm] in agent.toml to enable briefings."
+        );
+    }
+
+    #[tokio::test]
+    async fn api_ai_explain_returns_unavailable_when_router_has_no_explain() {
+        use axum::extract::{Query, State};
+        let tmp = tempfile::tempdir().unwrap();
+        let state = crate::dashboard::state::test_dashboard_state(tmp.path());
+        let query = AiExplainQuery {
+            r#type: Some("ip".into()),
+            value: Some("198.51.100.10".into()),
+        };
+        let Json(body) = api_ai_explain(State(state), Query(query)).await;
+        assert_eq!(
+            body["error"],
+            "LLM role not configured. Set [ai.llm] in agent.toml to enable explanations."
+        );
+    }
+
+    #[tokio::test]
+    async fn api_ai_explain_missing_value_short_circuits_before_router() {
+        use axum::extract::{Query, State};
+        let tmp = tempfile::tempdir().unwrap();
+        let state = crate::dashboard::state::test_dashboard_state(tmp.path());
+        let query = AiExplainQuery {
+            r#type: Some("ip".into()),
+            value: None,
+        };
+        let Json(body) = api_ai_explain(State(state), Query(query)).await;
+        assert_eq!(body["error"], "Missing 'value' parameter");
+    }
 }

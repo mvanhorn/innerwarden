@@ -170,6 +170,17 @@ impl AiRouter {
             .or_else(|| self.provider_for(Capability::SimulateShell))
     }
 
+    /// Spec 029 PR-C.2: honeypot always-on and other "nice-to-have"
+    /// explain callers want an Explain-capable provider but will
+    /// accept any free-form LLM if Explain is not configured
+    /// separately. Prefer Explain, fall back to any LLM. Extracted
+    /// here so boot.rs can spawn the honeypot task without an inline
+    /// `.or_else()` chain that codecov cannot reach from unit tests.
+    pub fn explain_or_any_llm(&self) -> Option<Arc<dyn AiProvider>> {
+        self.provider_for(Capability::Explain)
+            .or_else(|| self.any_llm())
+    }
+
     /// Union of all capabilities this router can serve. For startup
     /// telemetry and the `/api/diagnostics/ai` endpoint (future).
     pub fn capabilities(&self) -> AiCapabilities {
@@ -251,6 +262,37 @@ pub fn build_from_config(
         Ok(r) => r,
         Err(_) => AiRouter::disabled(),
     }
+}
+
+/// Convenience wrapper over `build_from_config` that emits the
+/// dashboard-flavoured tracing lines. Called twice at boot (once for
+/// the agent loop, once for the dashboard spawn) so the callbacks
+/// live here, not inline in `loops/boot.rs`, which keeps the boot
+/// path flat and makes the tracing covered by a router unit test.
+pub fn build_for_dashboard(
+    primary: Option<Arc<dyn AiProvider>>,
+    classifier_cfg: &crate::config::RoleProviderConfig,
+    llm_cfg: &crate::config::RoleProviderConfig,
+) -> AiRouter {
+    build_from_config(
+        primary,
+        classifier_cfg,
+        llm_cfg,
+        |slot, provider_name| {
+            tracing::info!(
+                slot,
+                provider = provider_name,
+                "dashboard router: per-role slot configured"
+            );
+        },
+        |slot, provider_name, err| {
+            tracing::warn!(
+                slot,
+                provider = provider_name,
+                "dashboard router: per-role provider build failed, falling back to primary: {err:#}"
+            );
+        },
+    )
 }
 
 fn resolve_slot(
@@ -462,6 +504,44 @@ mod tests {
         );
         let r = AiRouter::new(Some(c), None).unwrap();
         assert!(r.any_llm().is_none());
+    }
+
+    #[test]
+    fn explain_or_any_llm_prefers_explain_slot() {
+        let l = arc(
+            "llm",
+            AiCapabilities::from_slice(&[Capability::Generate, Capability::Explain]),
+        );
+        let r = AiRouter::new(None, Some(l)).unwrap();
+        assert_eq!(r.explain_or_any_llm().unwrap().name(), "llm");
+    }
+
+    #[test]
+    fn explain_or_any_llm_falls_back_to_generate_when_no_explain() {
+        // Provider only claims Generate. explain_or_any_llm must still
+        // return it via the any_llm fallback.
+        let l = arc(
+            "gen-only",
+            AiCapabilities::from_slice(&[Capability::Generate]),
+        );
+        let r = AiRouter::new(None, Some(l)).unwrap();
+        assert_eq!(r.explain_or_any_llm().unwrap().name(), "gen-only");
+    }
+
+    #[test]
+    fn explain_or_any_llm_returns_none_when_classifier_only() {
+        let c = arc(
+            "clf",
+            AiCapabilities::from_slice(&[Capability::Decide, Capability::Classify]),
+        );
+        let r = AiRouter::new(Some(c), None).unwrap();
+        assert!(r.explain_or_any_llm().is_none());
+    }
+
+    #[test]
+    fn explain_or_any_llm_returns_none_when_router_disabled() {
+        let r = AiRouter::disabled();
+        assert!(r.explain_or_any_llm().is_none());
     }
 
     #[test]
@@ -846,7 +926,48 @@ mod tests {
 
         assert!(r.is_disabled());
         // Fallback callback fired even though the fallback itself
-        // yielded None — operators still see "we tried and failed".
+        // yielded None. Operators still see "we tried and failed".
         assert_eq!(fallbacks.lock().unwrap().len(), 1);
+    }
+
+    // ── build_for_dashboard ─────────────────────────────────────────
+
+    #[test]
+    fn build_for_dashboard_legacy_primary_fills_both_slots() {
+        let primary = arc("legacy", AiCapabilities::ALL);
+        let r = build_for_dashboard(
+            Some(Arc::clone(&primary)),
+            &RoleProviderConfig::default(),
+            &RoleProviderConfig::default(),
+        );
+        assert_eq!(r.decider().unwrap().name(), "legacy");
+        assert_eq!(r.any_llm().unwrap().name(), "legacy");
+    }
+
+    #[test]
+    fn build_for_dashboard_no_primary_no_per_role_is_disabled() {
+        let r = build_for_dashboard(
+            None,
+            &RoleProviderConfig::default(),
+            &RoleProviderConfig::default(),
+        );
+        assert!(r.is_disabled());
+    }
+
+    #[test]
+    fn build_for_dashboard_per_role_build_failure_falls_back_to_primary() {
+        let primary = arc("primary", AiCapabilities::ALL);
+        let classifier_cfg = RoleProviderConfig {
+            enabled: true,
+            provider: "nonexistent-provider".into(),
+            ..Default::default()
+        };
+        let r = build_for_dashboard(
+            Some(Arc::clone(&primary)),
+            &classifier_cfg,
+            &RoleProviderConfig::default(),
+        );
+        assert_eq!(r.decider().unwrap().name(), "primary");
+        assert_eq!(r.any_llm().unwrap().name(), "primary");
     }
 }

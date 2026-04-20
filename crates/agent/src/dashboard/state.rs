@@ -259,6 +259,38 @@ pub(crate) fn generate_session_token() -> String {
 }
 
 #[cfg(test)]
+pub(super) fn test_dashboard_state(data_dir: &std::path::Path) -> DashboardState {
+    let (event_tx, _) = broadcast::channel(8);
+    let (agent_alert_tx, _rx) = tokio::sync::mpsc::channel(8);
+    DashboardState {
+        data_dir: data_dir.to_path_buf(),
+        action_cfg: Arc::new(DashboardActionConfig::default()),
+        event_tx,
+        web_push_vapid_public_key: String::new(),
+        insecure_http: false,
+        last_activity: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        sensor_cache: Arc::new(tokio::sync::Mutex::new((0, serde_json::json!({})))),
+        trusted_proxies: Arc::new(Vec::new()),
+        sessions: Arc::new(RwLock::new(HashMap::new())),
+        session_timeout_minutes: 30,
+        max_sessions: 16,
+        advisory_cache: Arc::new(RwLock::new(VecDeque::new())),
+        agent_registry: Arc::new(tokio::sync::Mutex::new(
+            innerwarden_agent_guard::registry::Registry::new(),
+        )),
+        rule_engine: Arc::new(innerwarden_agent_guard::rules::RuleEngine::empty()),
+        agent_alert_tx,
+        deep_security: Arc::new(RwLock::new(DeepSecuritySnapshot::default())),
+        knowledge_graph: Arc::new(RwLock::new(crate::knowledge_graph::KnowledgeGraph::new())),
+        ai_router: crate::ai::AiRouter::disabled(),
+        latest_briefing: Arc::new(tokio::sync::Mutex::new(None)),
+        briefing_hour: 0,
+        briefing_minute: 0,
+        sqlite_store: None,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

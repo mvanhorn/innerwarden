@@ -359,30 +359,13 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         } else {
             None
         };
-        // Spec 029 PR-C.2: build a dedicated router for the dashboard
-        // from the same cfg. The dashboard process is a separate tokio
-        // task from the agent fast loop, so sharing the agent's
-        // router Arc would require threading it across the spawn
-        // boundary. A fresh router with the same config resolves to
-        // the same providers and keeps the spawn path clean.
-        let dashboard_router = ai::router::build_from_config(
+        // Spec 029 PR-C.2: dedicated router for the dashboard spawn.
+        // Logic (including tracing) lives in `ai::router::build_for_dashboard`
+        // so it is unit-tested and this boot path stays a single call.
+        let dashboard_router = ai::router::build_for_dashboard(
             dashboard_ai.as_ref().map(Arc::clone),
             &cfg.ai.classifier,
             &cfg.ai.llm,
-            |slot, provider_name| {
-                info!(
-                    slot,
-                    provider = provider_name,
-                    "dashboard router: per-role slot configured"
-                );
-            },
-            |slot, provider_name, err| {
-                warn!(
-                    slot,
-                    provider = provider_name,
-                    "dashboard router: per-role provider build failed, falling back to primary: {err:#}"
-                );
-            },
         );
         let dashboard_briefing = Arc::new(tokio::sync::Mutex::new(None::<briefing::Briefing>));
         let briefing_hour = cfg.briefing.hour;
@@ -1099,12 +1082,10 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             let abuseipdb_threshold = cfg.abuseipdb.auto_block_threshold;
             // Spec 029 PR-C.2: honeypot always-on uses the AI provider
             // for short attack-profile explanations of auth attempts.
-            // Maps to Explain capability; fall back to any LLM-capable
-            // provider (typical deploy has only one anyway).
-            let ai_clone = state
-                .ai_router
-                .provider_for(crate::ai::Capability::Explain)
-                .or_else(|| state.ai_router.any_llm());
+            // Prefer Explain, fall back to any LLM (typical deploy has
+            // only one anyway). Logic lives in `AiRouter::explain_or_any_llm`
+            // so it is unit-tested without spawning the honeypot loop.
+            let ai_clone = state.ai_router.explain_or_any_llm();
             let tg_clone = state.telegram_client.clone();
             let gate_counter = state.telemetry.gate_suppressed_counter();
             let data_dir_clone = cli.data_dir.clone();
