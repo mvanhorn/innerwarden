@@ -159,6 +159,18 @@ impl AiProvider for LocalClassifier {
         "local_classifier"
     }
 
+    /// Spec 029: declare only the capabilities this classifier truly
+    /// supports. It cannot generate free-form text (no decoder stage
+    /// in MiniLM), cannot explain, cannot simulate a shell. If the
+    /// router ever asks this provider for Generate/Explain/SimulateShell
+    /// the call is routed elsewhere instead.
+    fn capabilities(&self) -> super::capability::AiCapabilities {
+        super::capability::AiCapabilities::from_slice(&[
+            super::capability::Capability::Decide,
+            super::capability::Capability::Classify,
+        ])
+    }
+
     async fn decide(&self, ctx: &DecisionContext<'_>) -> Result<AiDecision> {
         let text = Self::build_text(ctx);
         debug!(
