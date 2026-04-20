@@ -1,11 +1,22 @@
 mod anthropic;
 mod azure_openai;
+pub mod capability;
 #[cfg(feature = "local-classifier")]
 mod local_classifier;
 mod ollama;
 mod openai;
+mod router;
 mod shadow;
 mod stub;
+
+// Spec 029 PR-A: these re-exports become consumed in PR-B when
+// `AgentState` gains an `ai_router` field. During PR-A they are
+// unused externally, so allow(unused_imports) keeps clippy happy on
+// the infrastructure PR without weakening the lint elsewhere.
+#[allow(unused_imports)]
+pub use capability::{AiCapabilities, Capability};
+#[allow(unused_imports)]
+pub use router::{AiRouter, RouterBuildError};
 
 use std::collections::HashSet;
 use std::net::IpAddr;
@@ -174,6 +185,19 @@ pub struct SkillInfo {
 pub trait AiProvider: Send + Sync {
     /// Short identifier shown in logs, e.g. "openai", "anthropic".
     fn name(&self) -> &'static str;
+
+    /// Which capability roles this provider can serve. The `AiRouter`
+    /// reads this to decide where to dispatch each call site.
+    ///
+    /// Default is `ALL` for backwards compatibility with general-
+    /// purpose LLM providers that already implement both `decide()`
+    /// and `chat()`. Narrow providers (the distilled local
+    /// classifier, deterministic stubs) override with their real
+    /// capability set so the router does not send them work they
+    /// cannot do.
+    fn capabilities(&self) -> capability::AiCapabilities {
+        capability::AiCapabilities::ALL
+    }
 
     /// Analyse an incident and return a decision.
     async fn decide(&self, ctx: &DecisionContext<'_>) -> Result<AiDecision>;
