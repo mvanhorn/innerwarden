@@ -1,9 +1,3 @@
-// Spec 029 PR-B: the types are now consumed transitively via
-// `AgentState.ai_router`, but individual `provider_for` call sites
-// do not yet reach the enum variants. PR-C migrates the ~30 call
-// sites and removes this allow.
-#![allow(dead_code)]
-
 //! AI capability types (spec 029).
 //!
 //! Replaces the single-method-fits-all surface of the old `AiProvider`
@@ -112,7 +106,9 @@ pub struct AiCapabilities(u8);
 impl AiCapabilities {
     /// An empty capability set. Providers that are still under
     /// development can start here without getting routed to for any
-    /// role.
+    /// role. Used by `AiRouter::capabilities()` as the accumulator
+    /// seed and by router tests that build up sets incrementally.
+    #[allow(dead_code)]
     pub const NONE: AiCapabilities = AiCapabilities(0);
 
     /// Every capability set, for providers that fulfil every role
@@ -120,7 +116,9 @@ impl AiCapabilities {
     /// together.
     pub const ALL: AiCapabilities = AiCapabilities(0b0001_1111);
 
-    /// Build from a list of capabilities.
+    /// Build from a list of capabilities. Used by tests and by
+    /// classifier-style providers that declare a narrow subset.
+    #[allow(dead_code)]
     pub fn from_slice(caps: &[Capability]) -> Self {
         let mut bits = 0u8;
         for c in caps {
@@ -135,6 +133,7 @@ impl AiCapabilities {
     }
 
     /// Number of capabilities declared. For diagnostics.
+    #[allow(dead_code)]
     pub fn count(&self) -> usize {
         self.0.count_ones() as usize
     }

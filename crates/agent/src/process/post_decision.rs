@@ -62,7 +62,7 @@ pub(crate) async fn execute_decision(
                     host: incident.host.clone(),
                     data_dir: data_dir.to_path_buf(),
                     honeypot: honeypot_runtime(cfg),
-                    ai_provider: state.ai_provider.clone(),
+                    ai_provider: state.ai_router.any_llm(),
                 };
                 (
                     skill.execute(&ctx, cfg.responder.dry_run).await.message,
@@ -96,7 +96,7 @@ pub(crate) async fn execute_decision(
                     host: incident.host.clone(),
                     data_dir: data_dir.to_path_buf(),
                     honeypot: honeypot_runtime(cfg),
-                    ai_provider: state.ai_provider.clone(),
+                    ai_provider: state.ai_router.any_llm(),
                 };
                 (
                     skill.execute(&ctx, cfg.responder.dry_run).await.message,
@@ -130,7 +130,7 @@ pub(crate) async fn execute_decision(
                     host: incident.host.clone(),
                     data_dir: data_dir.to_path_buf(),
                     honeypot: honeypot_runtime(cfg),
-                    ai_provider: state.ai_provider.clone(),
+                    ai_provider: state.ai_router.any_llm(),
                 };
                 (
                     skill.execute(&ctx, cfg.responder.dry_run).await.message,

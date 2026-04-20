@@ -92,7 +92,7 @@ pub(crate) async fn execute_block_ip_decision(
         host: incident.host.clone(),
         data_dir: data_dir.to_path_buf(),
         honeypot: crate::honeypot_runtime(cfg),
-        ai_provider: state.ai_provider.clone(),
+        ai_provider: state.ai_router.any_llm(),
     };
 
     let mut layers_applied = Vec::new();

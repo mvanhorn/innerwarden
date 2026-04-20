@@ -1,11 +1,3 @@
-// Spec 029 PR-B: `AiRouter` is now a field on `AgentState` and
-// constructed in `loops/boot.rs`. The router itself is reachable
-// but its per-capability resolver is not called from any pre-PR-C
-// call site, so `provider_for`, `any_llm`, `describe` etc. still
-// appear unused to clippy. PR-C migrates the call sites and removes
-// this allow.
-#![allow(dead_code)]
-
 //! AI capability router (spec 029).
 //!
 //! Replaces `state.ai_provider: Option<Arc<dyn AiProvider>>` with a
@@ -155,8 +147,10 @@ impl AiRouter {
         }
     }
 
-    /// Convenience: provider for `Decide`. Replaces the old
-    /// `state.ai_provider` single-getter.
+    /// Convenience: provider for `Decide`. Kept as a public shorthand
+    /// and exercised by router back-compat tests. Production code
+    /// calls `provider_for(Capability::Decide)` directly.
+    #[allow(dead_code)]
     pub fn decider(&self) -> Option<Arc<dyn AiProvider>> {
         self.provider_for(Capability::Decide)
     }
@@ -181,8 +175,10 @@ impl AiRouter {
             .or_else(|| self.any_llm())
     }
 
-    /// Union of all capabilities this router can serve. For startup
-    /// telemetry and the `/api/diagnostics/ai` endpoint (future).
+    /// Union of all capabilities this router can serve. Consumed by
+    /// router tests and reserved for a future `/api/diagnostics/ai`
+    /// endpoint.
+    #[allow(dead_code)]
     pub fn capabilities(&self) -> AiCapabilities {
         let mut bits = AiCapabilities::NONE;
         if let Some(c) = &self.classifier {
@@ -195,6 +191,9 @@ impl AiRouter {
     }
 
     /// Is the router effectively "Falco mode" (no capabilities)?
+    /// Used by test helpers (`dashboard::state::test_dashboard_state`)
+    /// and router unit tests to assert on construction results.
+    #[allow(dead_code)]
     pub fn is_disabled(&self) -> bool {
         self.classifier.is_none() && self.llm.is_none()
     }
@@ -320,7 +319,9 @@ fn resolve_slot(
 
 /// Merge two capability sets. Small helper kept module-local because
 /// it is only used by the router; `AiCapabilities` itself does not
-/// need a public `|` impl yet.
+/// need a public `|` impl yet. Reachable via `capabilities()` which
+/// is currently test-only.
+#[allow(dead_code)]
 fn merge(a: AiCapabilities, b: AiCapabilities) -> AiCapabilities {
     let mut caps = AiCapabilities::NONE;
     for c in Capability::all() {

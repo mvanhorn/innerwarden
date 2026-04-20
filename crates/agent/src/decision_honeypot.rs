@@ -15,7 +15,8 @@ pub(crate) async fn execute_honeypot_decision(
     if let Some(skill) = state.skill_registry.get("honeypot") {
         let mut runtime = crate::honeypot_runtime(cfg);
         // Thread the AI provider into the runtime so llm_shell interaction works.
-        runtime.ai_provider = state.ai_provider.clone();
+        let skill_ai = state.ai_router.any_llm();
+        runtime.ai_provider = skill_ai.clone();
         let ctx = skills::SkillContext {
             incident: incident.clone(),
             target_ip: Some(ip.to_string()),
@@ -25,7 +26,7 @@ pub(crate) async fn execute_honeypot_decision(
             host: incident.host.clone(),
             data_dir: data_dir.to_path_buf(),
             honeypot: runtime.clone(),
-            ai_provider: state.ai_provider.clone(),
+            ai_provider: skill_ai,
         };
         let result = skill.execute(&ctx, cfg.responder.dry_run).await;
         if result.success {
@@ -40,7 +41,7 @@ pub(crate) async fn execute_honeypot_decision(
             let post_ip = ip.to_string();
             let post_session_id = session_id.clone();
             let post_data_dir = data_dir.to_path_buf();
-            let post_ai = state.ai_provider.clone();
+            let post_ai = state.ai_router.any_llm();
             let post_tg = state.telegram_client.clone();
             let post_gate_counter = state.telemetry.gate_suppressed_counter();
             let post_responder_enabled = cfg.responder.enabled;

@@ -643,12 +643,11 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         });
     }
 
-    // Build the AI provider once and populate both the legacy
-    // `ai_provider` handle and the spec 029 capability router from it.
-    // During PR-B the router is additive — both slots of the router
-    // hold the same provider so pre-029 call sites (which still use
-    // `state.ai_provider`) see identical behaviour. PR-C migrates the
-    // call sites and introduces the classifier/llm split.
+    // Build the primary AI provider once; it feeds the spec 029
+    // capability router. When `[ai.classifier]` / `[ai.llm]` are not
+    // set, both router slots hold this same provider (legacy
+    // behaviour). When they are set, the router builds dedicated
+    // per-role providers and reserves this primary for fallback.
     let ai_provider: Option<Arc<dyn ai::AiProvider>> = if cfg.ai.enabled {
         match ai::build_provider(&cfg.ai) {
             Ok(p) => Some(Arc::from(p)),
@@ -707,7 +706,6 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         } else {
             None
         },
-        ai_provider,
         ai_router,
         // Decision writer is always created — Layer 1/2 decisions are written
         // even without AI. Previously gated on cfg.ai.enabled which caused

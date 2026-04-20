@@ -374,19 +374,11 @@ struct AgentState {
     correlator: correlation::TemporalCorrelator,
     telemetry: telemetry::TelemetryState,
     telemetry_writer: Option<telemetry::TelemetryWriter>,
-    /// Wrapped in Arc so we can clone a handle for use within a loop iteration
-    /// without holding a borrow of `state` across async calls that need `&mut state`.
-    ai_provider: Option<Arc<dyn ai::AiProvider>>,
-    /// Spec 029 PR-B: capability router. Serves the same provider(s)
-    /// as `ai_provider` today (both populated from the same boot step)
-    /// but exposes them by role so call sites can request by
-    /// capability rather than by "the one provider". PR-C migrates
-    /// the ~30 call sites off `ai_provider` and onto this field;
-    /// during PR-B the router is additive and the legacy field stays
-    /// in place. Back-compat test in `ai::router::back_compat_tests`
-    /// guarantees that a router built from a single legacy provider
-    /// resolves every capability identically to pre-029 code.
-    #[allow(dead_code)] // consumed by call sites in PR-C (spec 029)
+    /// Spec 029: capability router. Call sites resolve providers by
+    /// role (classifier vs llm) via `provider_for(Capability::X)`.
+    /// Back-compat test in `ai::router::back_compat_tests` guarantees
+    /// that a router built from a single legacy provider resolves
+    /// every capability identically to pre-029 code.
     ai_router: ai::AiRouter,
     decision_writer: Option<decisions::DecisionWriter>,
     /// Tracks when the daily narrative was last written so we can enforce a
