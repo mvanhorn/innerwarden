@@ -325,10 +325,13 @@ async fn promote_escalated_to_decision(
 ) {
     // 1. Provider must exist. If AI is disabled entirely this path is a
     //    no-op and we stay at the "escalate" label in the graph.
-    let Some(provider) = state.ai_provider.as_ref().map(std::sync::Arc::clone) else {
+    //
+    // Spec 029 PR-C.2: this is the Decide role (the escalate-to-decide
+    // wiring from 028-b), so route through the capability router.
+    let Some(provider) = state.ai_router.provider_for(crate::ai::Capability::Decide) else {
         tracing::debug!(
             incident_id,
-            "028-b: ai_provider not configured, leaving escalated in graph"
+            "028-b: no Decide provider configured, leaving escalated in graph"
         );
         return;
     };
@@ -677,9 +680,15 @@ pub(crate) async fn ai_verify_ambiguous(
         return;
     }
 
-    let ai = match &state.ai_provider {
-        Some(ai) => ai.clone(),
-        None => return,
+    // Spec 029 PR-C.2: ai_verify_ambiguous uses the LLM chat() API to
+    // group-score N OBSERVING incidents in a single prompt. Maps to
+    // the Classify capability (structured input → short structured
+    // label per incident).
+    let Some(ai) = state
+        .ai_router
+        .provider_for(crate::ai::Capability::Classify)
+    else {
+        return;
     };
 
     // Build host profile from environment
@@ -1118,7 +1127,15 @@ mod tests {
             ..Default::default()
         };
         let provider = crate::ai::build_provider(&ai_cfg).expect("stub provider builds");
-        state.ai_provider = Some(Arc::from(provider));
+        let provider_arc: Arc<dyn crate::ai::AiProvider> = Arc::from(provider);
+        state.ai_provider = Some(Arc::clone(&provider_arc));
+        // Spec 029 PR-C.2: promote_escalated_to_decision now reads
+        // from the router, not the legacy field. Populate both slots
+        // with the same provider so the test exercises the same
+        // decide() path as before.
+        state.ai_router =
+            crate::ai::AiRouter::new(Some(Arc::clone(&provider_arc)), Some(provider_arc))
+                .expect("router with stub provider");
         let cfg = AgentConfig::default();
 
         // ssh_bruteforce + public IP: stub returns BlockIp.
@@ -1338,7 +1355,10 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let mut state = triage_test_state(tmp.path());
-        state.ai_provider = Some(Arc::new(ErroringProvider));
+        let err_arc: Arc<dyn crate::ai::AiProvider> = Arc::new(ErroringProvider);
+        state.ai_provider = Some(Arc::clone(&err_arc));
+        state.ai_router = crate::ai::AiRouter::new(Some(Arc::clone(&err_arc)), Some(err_arc))
+            .expect("router with erroring provider");
 
         let incident = Incident {
             ts: chrono::Utc::now(),
@@ -1402,7 +1422,11 @@ mod tests {
             ..Default::default()
         };
         let provider = crate::ai::build_provider(&ai_cfg).expect("stub builds");
-        state.ai_provider = Some(Arc::from(provider));
+        let provider_arc: Arc<dyn crate::ai::AiProvider> = Arc::from(provider);
+        state.ai_provider = Some(Arc::clone(&provider_arc));
+        state.ai_router =
+            crate::ai::AiRouter::new(Some(Arc::clone(&provider_arc)), Some(provider_arc))
+                .expect("router with stub");
         let cfg = AgentConfig::default();
 
         let incident = Incident {

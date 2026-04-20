@@ -184,8 +184,12 @@ pub(crate) struct DashboardState {
     pub(super) deep_security: Arc<RwLock<DeepSecuritySnapshot>>,
     /// Shared knowledge graph for live queries (not snapshot file).
     pub(super) knowledge_graph: Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
-    /// AI provider for on-demand briefing generation (None if AI disabled).
-    pub(super) ai_provider: Option<Arc<dyn crate::ai::AiProvider>>,
+    /// Spec 029 PR-C.2: capability router. Replaces the legacy
+    /// single `ai_provider` field. Briefing / explain endpoints
+    /// resolve by capability (Generate / Explain) so the dashboard
+    /// works whether the operator runs a full LLM, a classifier-
+    /// only deployment, or Falco-mode with no AI at all.
+    pub(super) ai_router: crate::ai::AiRouter,
     /// Latest AI intelligence briefing.
     pub(super) latest_briefing: Arc<tokio::sync::Mutex<Option<crate::briefing::Briefing>>>,
     /// Briefing schedule (hour, minute).

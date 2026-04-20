@@ -359,6 +359,31 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         } else {
             None
         };
+        // Spec 029 PR-C.2: build a dedicated router for the dashboard
+        // from the same cfg. The dashboard process is a separate tokio
+        // task from the agent fast loop, so sharing the agent's
+        // router Arc would require threading it across the spawn
+        // boundary. A fresh router with the same config resolves to
+        // the same providers and keeps the spawn path clean.
+        let dashboard_router = ai::router::build_from_config(
+            dashboard_ai.as_ref().map(Arc::clone),
+            &cfg.ai.classifier,
+            &cfg.ai.llm,
+            |slot, provider_name| {
+                info!(
+                    slot,
+                    provider = provider_name,
+                    "dashboard router: per-role slot configured"
+                );
+            },
+            |slot, provider_name, err| {
+                warn!(
+                    slot,
+                    provider = provider_name,
+                    "dashboard router: per-role provider build failed, falling back to primary: {err:#}"
+                );
+            },
+        );
         let dashboard_briefing = Arc::new(tokio::sync::Mutex::new(None::<briefing::Briefing>));
         let briefing_hour = cfg.briefing.hour;
         let briefing_minute = cfg.briefing.minute;
@@ -381,7 +406,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                 agent_alert_tx,
                 deep_security,
                 dashboard_graph,
-                dashboard_ai,
+                dashboard_router,
                 dashboard_briefing,
                 briefing_hour,
                 briefing_minute,
@@ -1072,7 +1097,14 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                 None
             };
             let abuseipdb_threshold = cfg.abuseipdb.auto_block_threshold;
-            let ai_clone = state.ai_provider.clone();
+            // Spec 029 PR-C.2: honeypot always-on uses the AI provider
+            // for short attack-profile explanations of auth attempts.
+            // Maps to Explain capability; fall back to any LLM-capable
+            // provider (typical deploy has only one anyway).
+            let ai_clone = state
+                .ai_router
+                .provider_for(crate::ai::Capability::Explain)
+                .or_else(|| state.ai_router.any_llm());
             let tg_clone = state.telegram_client.clone();
             let gate_counter = state.telemetry.gate_suppressed_counter();
             let data_dir_clone = cli.data_dir.clone();
@@ -1185,7 +1217,12 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                             // normal filter path runs — spec § fallback.
                             let batch_classes: Option<Vec<notification_pipeline::BatchClassification>> =
                                 if cfg.ai.batch_triage {
-                                    if let Some(provider) = state.ai_provider.as_ref() {
+                                    // Spec 029 PR-C.2: batch triage is a
+                                    // classification task (incident group
+                                    // → category label). Classify role.
+                                    if let Some(provider) =
+                                        state.ai_router.provider_for(crate::ai::Capability::Classify)
+                                    {
                                         notification_pipeline::run_batch_triage(
                                             provider.as_ref(),
                                             &summaries,

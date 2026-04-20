@@ -634,8 +634,12 @@ pub(crate) async fn handle_telegram_bot_command(
                 &recent_decisions,
             );
 
-            if let Some(ref ai) = state.ai_provider {
-                let ai = ai.clone();
+            // Spec 029 PR-C.2: `/ask` is operator-facing free-form
+            // chat → Generate capability.
+            if let Some(ai) = state
+                .ai_router
+                .provider_for(crate::ai::Capability::Generate)
+            {
                 let tg = state.telegram_client.clone();
                 tokio::spawn(async move {
                     if let Some(ref tg) = tg {

@@ -204,8 +204,19 @@ pub(crate) async fn process_incidents(
         state.circuit_breaker_until.is_some()
     };
 
-    // Pre-compute AI context (only if AI is configured and circuit breaker is not open)
-    let ai_enabled = cfg.ai.enabled && state.ai_provider.is_some() && !circuit_breaker_open;
+    // Pre-compute AI context (only if AI is configured and circuit breaker is not open).
+    //
+    // Spec 029 PR-C.2: provider resolution migrated to the capability
+    // router. This is the Decide path, so we pull from
+    // `state.ai_router.provider_for(Capability::Decide)`. When the
+    // operator has configured a dedicated classifier via
+    // `[ai.classifier]`, this now routes triage through the
+    // classifier without touching the rest of the decision pipeline.
+    // The legacy `state.ai_provider` field still populates both
+    // router slots during PR-C (removed in PR-C.3), so behaviour is
+    // identical for legacy configs.
+    let decide_provider = state.ai_router.provider_for(ai::Capability::Decide);
+    let ai_enabled = cfg.ai.enabled && decide_provider.is_some() && !circuit_breaker_open;
     let (all_events, skill_infos, ai_provider, provider_name, already_blocked, mut blocked_set) =
         if ai_enabled {
             let events = if let Some(ref sq) = state.sqlite_store {
@@ -217,8 +228,9 @@ pub(crate) async fn process_incidents(
                 vec![]
             };
             let infos = state.skill_registry.infos();
-            // Clone the Arc - owned handle, no borrow of `state`
-            let prov: Arc<dyn ai::AiProvider> = state.ai_provider.as_ref().unwrap().clone();
+            // Owned handle from the router, no borrow of `state` across
+            // async calls below.
+            let prov: Arc<dyn ai::AiProvider> = decide_provider.expect("decide_provider checked");
             let pname = prov.name();
             let blocked = state.blocklist.as_vec();
             // Mutable so we can update it mid-tick to prevent duplicate AI calls

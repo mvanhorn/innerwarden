@@ -1376,7 +1376,7 @@ enabled = false
             knowledge_graph: std::sync::Arc::new(std::sync::RwLock::new(
                 crate::knowledge_graph::KnowledgeGraph::new(),
             )),
-            ai_provider: None,
+            ai_router: crate::ai::AiRouter::disabled(),
             latest_briefing: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             briefing_hour: 0,
             briefing_minute: 0,

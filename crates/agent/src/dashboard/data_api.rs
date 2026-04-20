@@ -397,10 +397,20 @@ pub(super) async fn api_briefing_generate(
         "LOW"
     };
 
-    let Some(ref ai) = state.ai_provider else {
-        return Json(serde_json::json!({
-            "error": "AI provider not configured. Enable AI in agent.toml to generate briefings.",
-        }));
+    // Spec 029 PR-C.2: briefing generation is the Generate role.
+    // When the operator runs classifier-only (no [ai.llm]), this
+    // endpoint returns the "configure an LLM" error rather than
+    // asking a text-less classifier to produce prose.
+    let ai: std::sync::Arc<dyn crate::ai::AiProvider> = match state
+        .ai_router
+        .provider_for(crate::ai::Capability::Generate)
+    {
+        Some(p) => p,
+        None => {
+            return Json(serde_json::json!({
+                "error": "LLM role not configured. Set [ai.llm] in agent.toml to enable briefings.",
+            }));
+        }
     };
     let system = briefing_system_prompt(&state.action_cfg.ai_personality);
     match ai.chat(&system, &prompt).await {
@@ -440,10 +450,18 @@ pub(super) async fn api_ai_explain(
         }
     };
 
-    let Some(ref ai) = state.ai_provider else {
-        return Json(serde_json::json!({
-            "error": "AI provider not configured. Enable AI in agent.toml."
-        }));
+    // Spec 029 PR-C.2: the entity-context explainer maps to the
+    // Explain role (structured context → natural-language summary).
+    let ai: std::sync::Arc<dyn crate::ai::AiProvider> = match state
+        .ai_router
+        .provider_for(crate::ai::Capability::Explain)
+    {
+        Some(p) => p,
+        None => {
+            return Json(serde_json::json!({
+                "error": "LLM role not configured. Set [ai.llm] in agent.toml to enable explanations."
+            }));
+        }
     };
 
     // Build context from the knowledge graph: incidents, decisions,
