@@ -159,16 +159,16 @@ impl AiProvider for LocalClassifier {
         "local_classifier"
     }
 
-    /// Spec 029: declare only the capabilities this classifier truly
-    /// supports. It cannot generate free-form text (no decoder stage
-    /// in MiniLM), cannot explain, cannot simulate a shell. If the
-    /// router ever asks this provider for Generate/Explain/SimulateShell
-    /// the call is routed elsewhere instead.
+    /// Spec 029: only declare `Decide`. The current `Classify`
+    /// call sites (batch triage, ambiguous verification) dispatch
+    /// via `chat()` with a prompt asking for a label, which this
+    /// classifier cannot serve (no decoder). Declaring only `Decide`
+    /// keeps the router honest: Classify requests fall through to
+    /// the llm slot where `chat()` actually works, and this provider
+    /// is only invoked for the one path it was trained for (incident
+    /// triage -> block_ip/monitor/ignore/dismiss).
     fn capabilities(&self) -> super::capability::AiCapabilities {
-        super::capability::AiCapabilities::from_slice(&[
-            super::capability::Capability::Decide,
-            super::capability::Capability::Classify,
-        ])
+        super::capability::AiCapabilities::from_slice(&[super::capability::Capability::Decide])
     }
 
     async fn decide(&self, ctx: &DecisionContext<'_>) -> Result<AiDecision> {

@@ -364,49 +364,79 @@ fn validate_ai_base_url(url: &str) -> Result<()> {
 }
 
 pub fn build_provider(cfg: &AiConfig) -> Result<Box<dyn AiProvider>> {
-    let primary = build_single(
+    build_single(
         &cfg.provider,
         cfg.resolved_api_key(),
         &cfg.model,
         &cfg.base_url,
         &cfg.api_version,
         cfg.confidence_threshold,
-    )?;
+    )
+}
 
-    if cfg.shadow.enabled {
-        if cfg.shadow.provider.is_empty() {
-            anyhow::bail!("[ai.shadow].enabled is true but provider is empty");
-        }
-        if cfg.shadow.provider == cfg.provider
-            && cfg.shadow.base_url == cfg.base_url
-            && cfg.shadow.model == cfg.model
-        {
-            anyhow::bail!(
-                "[ai.shadow] must differ from [ai] primary (same provider+base_url+model configured)"
-            );
-        }
-        let shadow = build_single(
-            &cfg.shadow.provider,
-            cfg.shadow.resolved_api_key(),
-            &cfg.shadow.model,
-            &cfg.shadow.base_url,
-            &cfg.shadow.api_version,
-            cfg.confidence_threshold,
-        )?;
-        tracing::info!(
-            primary = %cfg.provider,
-            shadow = %cfg.shadow.provider,
-            log_path = %cfg.shadow.log_path,
-            "shadow mode enabled"
-        );
-        return Ok(Box::new(shadow::ShadowProvider::new(
-            primary,
-            shadow,
-            &cfg.shadow.log_path,
-        )));
+/// Build the shadow observer as a standalone provider. Returns `None`
+/// when `[ai.shadow]` is disabled. Errors when enabled but the
+/// resulting provider would duplicate the Decide-serving one (same
+/// provider+base_url+model), which would silently degrade shadow
+/// into a useless self-comparison.
+///
+/// Called by the router after the Decide slot is resolved, so the
+/// "differs from" check compares against whatever provider actually
+/// serves Decide (classifier slot when configured, primary [ai]
+/// otherwise) rather than hardcoding [ai] primary.
+pub fn build_shadow_observer(
+    shadow_cfg: &crate::config::ShadowConfig,
+    decide_provider_provider: &str,
+    decide_provider_base_url: &str,
+    decide_provider_model: &str,
+    confidence_threshold: f32,
+) -> Result<Option<Box<dyn AiProvider>>> {
+    if !shadow_cfg.enabled {
+        return Ok(None);
     }
+    if shadow_cfg.provider.is_empty() {
+        anyhow::bail!("[ai.shadow].enabled is true but provider is empty");
+    }
+    if shadow_cfg.provider == decide_provider_provider
+        && shadow_cfg.base_url == decide_provider_base_url
+        && shadow_cfg.model == decide_provider_model
+    {
+        anyhow::bail!(
+            "[ai.shadow] must differ from the Decide-serving provider (same provider+base_url+model configured)"
+        );
+    }
+    let shadow = build_single(
+        &shadow_cfg.provider,
+        shadow_cfg.resolved_api_key(),
+        &shadow_cfg.model,
+        &shadow_cfg.base_url,
+        &shadow_cfg.api_version,
+        confidence_threshold,
+    )?;
+    Ok(Some(shadow))
+}
 
-    Ok(primary)
+/// Wrap a primary provider with a shadow observer for parallel
+/// Decide auditing. Returns the primary unchanged when shadow is
+/// `None`. Keeps the shadow path a one-liner at call sites so the
+/// router stays easy to read.
+pub fn wrap_with_shadow(
+    primary: Box<dyn AiProvider>,
+    shadow: Option<Box<dyn AiProvider>>,
+    log_path: &str,
+) -> Box<dyn AiProvider> {
+    match shadow {
+        Some(shadow) => {
+            tracing::info!(
+                primary = %primary.name(),
+                shadow = %shadow.name(),
+                log_path = %log_path,
+                "shadow mode enabled"
+            );
+            Box::new(shadow::ShadowProvider::new(primary, shadow, log_path))
+        }
+        None => primary,
+    }
 }
 
 /// Build a single provider from flat parameters. Extracted so the same logic
@@ -702,17 +732,15 @@ mod tests {
     }
 
     #[test]
-    fn build_provider_shadow_enabled_empty_provider_fails() {
-        let cfg = crate::config::AiConfig {
+    fn build_shadow_observer_empty_provider_fails() {
+        let shadow = crate::config::ShadowConfig {
             enabled: true,
-            provider: "stub".into(),
-            shadow: crate::config::ShadowConfig {
-                enabled: true,
-                ..Default::default()
-            },
             ..Default::default()
         };
-        let err = build_provider(&cfg).err().unwrap().to_string();
+        let err = build_shadow_observer(&shadow, "stub", "", "", 0.85)
+            .err()
+            .unwrap()
+            .to_string();
         assert!(
             err.contains("shadow") && err.contains("empty"),
             "expected shadow-empty error, got: {err}"
@@ -720,24 +748,26 @@ mod tests {
     }
 
     #[test]
-    fn build_provider_shadow_enabled_matching_primary_fails() {
-        // Same provider + same base_url + same model as primary must be
-        // rejected; otherwise shadow provides no signal.
-        let cfg = crate::config::AiConfig {
+    fn build_shadow_observer_matching_target_fails() {
+        // Same provider + same base_url + same model as the Decide-serving
+        // slot must be rejected; otherwise shadow provides no signal.
+        let shadow = crate::config::ShadowConfig {
             enabled: true,
             provider: "ollama".into(),
             base_url: "http://localhost:11434".into(),
             model: "llama3.2".into(),
-            shadow: crate::config::ShadowConfig {
-                enabled: true,
-                provider: "ollama".into(),
-                base_url: "http://localhost:11434".into(),
-                model: "llama3.2".into(),
-                ..Default::default()
-            },
             ..Default::default()
         };
-        let err = build_provider(&cfg).err().unwrap().to_string();
+        let err = build_shadow_observer(
+            &shadow,
+            "ollama",
+            "http://localhost:11434",
+            "llama3.2",
+            0.85,
+        )
+        .err()
+        .unwrap()
+        .to_string();
         assert!(
             err.contains("must differ"),
             "expected 'must differ' error, got: {err}"
@@ -745,25 +775,39 @@ mod tests {
     }
 
     #[test]
-    fn build_provider_shadow_enabled_with_distinct_config_succeeds() {
-        // Primary stub + shadow stub-with-different-model is allowed because
-        // the check compares (provider, base_url, model) tuple. Two stubs
-        // distinguish by model here.
-        let cfg = crate::config::AiConfig {
+    fn build_shadow_observer_distinct_config_succeeds() {
+        // Target stub + shadow stub-with-different-model is allowed because
+        // the check compares (provider, base_url, model) tuple.
+        let shadow = crate::config::ShadowConfig {
             enabled: true,
             provider: "stub".into(),
-            shadow: crate::config::ShadowConfig {
-                enabled: true,
-                provider: "stub".into(),
-                model: "different".into(),
-                ..Default::default()
-            },
+            model: "different".into(),
             ..Default::default()
         };
-        let provider = build_provider(&cfg).expect("shadow wrapper must build");
-        // ShadowProvider::name() delegates to primary so existing telemetry
-        // labels stay stable.
-        assert_eq!(provider.name(), "stub");
+        let observer = build_shadow_observer(&shadow, "stub", "", "", 0.85)
+            .expect("shadow observer must build")
+            .expect("enabled shadow must return Some");
+        assert_eq!(observer.name(), "stub");
+    }
+
+    #[test]
+    fn build_shadow_observer_disabled_returns_none() {
+        let shadow = crate::config::ShadowConfig::default();
+        let observer = build_shadow_observer(&shadow, "stub", "", "", 0.85)
+            .expect("disabled shadow must not error");
+        assert!(observer.is_none());
+    }
+
+    #[test]
+    fn wrap_with_shadow_no_shadow_returns_primary_unchanged() {
+        let primary = build_provider(&crate::config::AiConfig {
+            enabled: true,
+            provider: "stub".into(),
+            ..Default::default()
+        })
+        .expect("stub builds");
+        let wrapped = wrap_with_shadow(primary, None, "/tmp/unused.jsonl");
+        assert_eq!(wrapped.name(), "stub");
     }
 
     #[test]
