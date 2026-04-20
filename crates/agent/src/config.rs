@@ -142,9 +142,13 @@ pub struct IncidentFlowConfig {
     /// `threat_intel:*`, `sudo_abuse:*`, and `suspicious_execution:*` as
     /// candidates because they are inherently high-signal. Matched via
     /// prefix (case-sensitive). Empty by default; the skip path is also
-    /// part of the follow-up PR.
+    /// Consumed by `incident_flow::evaluate_pre_ai_flow` (spec 028-b
+    /// full wiring): when the incident id starts with any entry in
+    /// this list (optionally followed by `:`), the pre-AI gate
+    /// bypasses the below-severity and decision-cooldown guards so
+    /// the incident reaches `ai_provider.decide()`. Allowlist and
+    /// per-tick budget still apply.
     #[serde(default)]
-    #[allow(dead_code)] // wiring lands in the 028-b follow-up PR
     pub detectors_skip_fase3: Vec<String>,
 }
 
