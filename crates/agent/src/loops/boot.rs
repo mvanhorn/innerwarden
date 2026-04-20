@@ -652,24 +652,32 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
     } else {
         None
     };
-    let ai_router = match &ai_provider {
-        Some(p) => {
-            // Same provider in both slots: router resolves every
-            // capability the provider declares. General-purpose LLMs
-            // default to ALL, narrow providers (LocalClassifier) cover
-            // Decide + Classify only — the router still routes
-            // correctly because `provider_for` consults `capabilities()`.
-            let shared = Arc::clone(p);
-            match ai::AiRouter::new(Some(Arc::clone(&shared)), Some(shared)) {
-                Ok(r) => r,
-                Err(_) => {
-                    warn!("AI router refused both-none config; falling back to disabled");
-                    ai::AiRouter::disabled()
-                }
-            }
-        }
-        None => ai::AiRouter::disabled(),
-    };
+
+    // Spec 029 PR-C.1: per-role providers. When `[ai.classifier].enabled`
+    // is true, build a separate provider for the classifier slot;
+    // otherwise the primary `[ai]` provider fills that slot (PR-B
+    // back-compat). Same for `[ai.llm]`. Branch logic lives in the
+    // unit-testable `ai::router::build_from_config`; this block just
+    // wires tracing callbacks.
+    let ai_router = ai::router::build_from_config(
+        ai_provider.as_ref().map(Arc::clone),
+        &cfg.ai.classifier,
+        &cfg.ai.llm,
+        |slot, provider_name| {
+            info!(
+                slot,
+                provider = provider_name,
+                "AI router: per-role slot configured"
+            );
+        },
+        |slot, provider_name, err| {
+            warn!(
+                slot,
+                provider = provider_name,
+                "failed to build per-role provider, falling back to primary: {err:#}"
+            );
+        },
+    );
     info!(router = %ai_router.describe(), "AI router ready");
 
     let mut state = AgentState {
