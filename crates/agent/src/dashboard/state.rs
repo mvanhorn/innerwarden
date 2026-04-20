@@ -184,8 +184,12 @@ pub(crate) struct DashboardState {
     pub(super) deep_security: Arc<RwLock<DeepSecuritySnapshot>>,
     /// Shared knowledge graph for live queries (not snapshot file).
     pub(super) knowledge_graph: Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
-    /// AI provider for on-demand briefing generation (None if AI disabled).
-    pub(super) ai_provider: Option<Arc<dyn crate::ai::AiProvider>>,
+    /// Spec 029 PR-C.2: capability router. Replaces the legacy
+    /// single `ai_provider` field. Briefing / explain endpoints
+    /// resolve by capability (Generate / Explain) so the dashboard
+    /// works whether the operator runs a full LLM, a classifier-
+    /// only deployment, or Falco-mode with no AI at all.
+    pub(super) ai_router: crate::ai::AiRouter,
     /// Latest AI intelligence briefing.
     pub(super) latest_briefing: Arc<tokio::sync::Mutex<Option<crate::briefing::Briefing>>>,
     /// Briefing schedule (hour, minute).
@@ -252,6 +256,38 @@ pub(crate) fn generate_session_token() -> String {
     OsRng.fill_bytes(&mut bytes);
     // Format as hex without external crate
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+pub(super) fn test_dashboard_state(data_dir: &std::path::Path) -> DashboardState {
+    let (event_tx, _) = broadcast::channel(8);
+    let (agent_alert_tx, _rx) = tokio::sync::mpsc::channel(8);
+    DashboardState {
+        data_dir: data_dir.to_path_buf(),
+        action_cfg: Arc::new(DashboardActionConfig::default()),
+        event_tx,
+        web_push_vapid_public_key: String::new(),
+        insecure_http: false,
+        last_activity: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        sensor_cache: Arc::new(tokio::sync::Mutex::new((0, serde_json::json!({})))),
+        trusted_proxies: Arc::new(Vec::new()),
+        sessions: Arc::new(RwLock::new(HashMap::new())),
+        session_timeout_minutes: 30,
+        max_sessions: 16,
+        advisory_cache: Arc::new(RwLock::new(VecDeque::new())),
+        agent_registry: Arc::new(tokio::sync::Mutex::new(
+            innerwarden_agent_guard::registry::Registry::new(),
+        )),
+        rule_engine: Arc::new(innerwarden_agent_guard::rules::RuleEngine::empty()),
+        agent_alert_tx,
+        deep_security: Arc::new(RwLock::new(DeepSecuritySnapshot::default())),
+        knowledge_graph: Arc::new(RwLock::new(crate::knowledge_graph::KnowledgeGraph::new())),
+        ai_router: crate::ai::AiRouter::disabled(),
+        latest_briefing: Arc::new(tokio::sync::Mutex::new(None)),
+        briefing_hour: 0,
+        briefing_minute: 0,
+        sqlite_store: None,
+    }
 }
 
 #[cfg(test)]

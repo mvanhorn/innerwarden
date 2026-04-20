@@ -359,6 +359,14 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         } else {
             None
         };
+        // Spec 029 PR-C.2: dedicated router for the dashboard spawn.
+        // Logic (including tracing) lives in `ai::router::build_for_dashboard`
+        // so it is unit-tested and this boot path stays a single call.
+        let dashboard_router = ai::router::build_for_dashboard(
+            dashboard_ai.as_ref().map(Arc::clone),
+            &cfg.ai.classifier,
+            &cfg.ai.llm,
+        );
         let dashboard_briefing = Arc::new(tokio::sync::Mutex::new(None::<briefing::Briefing>));
         let briefing_hour = cfg.briefing.hour;
         let briefing_minute = cfg.briefing.minute;
@@ -381,7 +389,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                 agent_alert_tx,
                 deep_security,
                 dashboard_graph,
-                dashboard_ai,
+                dashboard_router,
                 dashboard_briefing,
                 briefing_hour,
                 briefing_minute,
@@ -1072,7 +1080,12 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                 None
             };
             let abuseipdb_threshold = cfg.abuseipdb.auto_block_threshold;
-            let ai_clone = state.ai_provider.clone();
+            // Spec 029 PR-C.2: honeypot always-on uses the AI provider
+            // for short attack-profile explanations of auth attempts.
+            // Prefer Explain, fall back to any LLM (typical deploy has
+            // only one anyway). Logic lives in `AiRouter::explain_or_any_llm`
+            // so it is unit-tested without spawning the honeypot loop.
+            let ai_clone = state.ai_router.explain_or_any_llm();
             let tg_clone = state.telegram_client.clone();
             let gate_counter = state.telemetry.gate_suppressed_counter();
             let data_dir_clone = cli.data_dir.clone();
@@ -1185,7 +1198,12 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                             // normal filter path runs — spec § fallback.
                             let batch_classes: Option<Vec<notification_pipeline::BatchClassification>> =
                                 if cfg.ai.batch_triage {
-                                    if let Some(provider) = state.ai_provider.as_ref() {
+                                    // Spec 029 PR-C.2: batch triage is a
+                                    // classification task (incident group
+                                    // → category label). Classify role.
+                                    if let Some(provider) =
+                                        state.ai_router.provider_for(crate::ai::Capability::Classify)
+                                    {
                                         notification_pipeline::run_batch_triage(
                                             provider.as_ref(),
                                             &summaries,
