@@ -50,17 +50,27 @@ impl Store {
 
         // Pre-create the DB file with group-writable permissions (0660) so that
         // both sensor (root:innerwarden) and agent (innerwarden:innerwarden) can
-        // write. NOT world-readable — contains security-sensitive data (incidents,
+        // write. NOT world-readable: contains security-sensitive data (incidents,
         // decisions, attacker profiles). SQLite's internal open() uses 0644,
         // ignoring the process UMask.
         if !db_path.exists() {
             if let Ok(f) = std::fs::File::create(&db_path) {
                 drop(f);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ =
-                        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o660));
+            }
+        }
+        // Enforce 0660 on every open, not only on first-create. Heals existing
+        // deployments where SQLite or an older build left the file at 0644, and
+        // re-applies after any out-of-band chmod. Fail-silent on non-unix or
+        // missing file.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o660));
+            // SQLite WAL sidecars carry the same sensitive data.
+            for sidecar in ["innerwarden.db-wal", "innerwarden.db-shm"] {
+                let p = data_dir.join(sidecar);
+                if p.exists() {
+                    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o660));
                 }
             }
         }
