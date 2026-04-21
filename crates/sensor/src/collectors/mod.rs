@@ -24,6 +24,20 @@ pub mod sysctl_drift;
 pub mod syslog_firewall;
 pub mod systemd_inventory;
 pub mod tcp_stream;
-#[cfg(feature = "ebpf")]
+// The pure TLS ClientHello parser + JA3/JA4 hashing logic does not
+// need `aya`/`aya-log`, so the module compiles without the `ebpf`
+// feature. The eBPF-backed packet pump that feeds the parser is
+// gated internally (search for `cfg(all(target_os = "linux",
+// feature = "ebpf"))` inside the module). Leaving the outer gate on
+// broke the `tls_client_hello` fuzz target because the fuzz
+// workflow builds the sensor without the `ebpf` feature.
+//
+// `cfg_attr` scopes the dead-code + unused-import silence to
+// non-ebpf builds: when the feature is off no sensor code path
+// calls the parser (only the fuzz target does, from outside the
+// crate), so the items look unused to `-D warnings`. Under the
+// ebpf feature the collector pump uses them and the allows are
+// a no-op.
+#[cfg_attr(not(feature = "ebpf"), allow(dead_code, unused_imports))]
 pub mod tls_fingerprint;
 pub mod usb_monitor;
