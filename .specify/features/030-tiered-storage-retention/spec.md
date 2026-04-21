@@ -3,18 +3,21 @@
 **Feature Branch**: `030-tiered-storage-retention`
 **Created**: 2026-04-21
 **Status**: Draft
-**Input**: Oracle production deploy of spec 029 surfaced that `innerwarden.db` grew to 1.36 GB in 9 days with no pruning. The sqlite store is treated as permanent state, but most of its content is ephemeral processing data that already has a durable home in the per-day JSONL files. Agent RSS is 432 MB (sqlite page cache accounts for ~40% of that) and trending up.
+**Input**: Oracle production deploy of spec 029 surfaced that `innerwarden.db` grew to 1.36 GB in 9 days. On inspection, spec 016 already ships a `MaintenanceScheduler` (WAL checkpoint every 5 min, incremental_vacuum hourly, `run_retention(events=2d, incidents=30d, decisions=90d, graph_snapshots=7d)` daily). The file is big despite retention because (a) `incremental_vacuum` does not shrink the file, only marks pages free; (b) `graph-snapshot-*.json` files on disk are outside the sqlite table and not in the retention sweep; (c) warm-tier JSONL is kept uncompressed. Agent RSS is 432 MB.
 
 ## Origin
 
-Spec 013 Phase 6 (2026-04-10) moved read paths from JSONL scans to sqlite for speed. That landed correctly — queries went from ~200ms to ~5ms — but the retention side of the swap never landed. Today:
+Spec 013 Phase 6 (2026-04-10) moved read paths from JSONL scans to sqlite. Spec 016 added the `MaintenanceScheduler`. Both landed, but the gap between "mark pages free" and "file shrinks on disk" was never closed, and cold-tier compression was deferred. Today:
 
-- JSONL retention is configured and working (`events-*.jsonl`, `incidents-*.jsonl`, `decisions-*.jsonl` pruned after `[data]` retention days).
-- Sqlite retention is absent. Events/incidents/decisions/graph_snapshots tables grow forever.
-- `graph-snapshot-YYYY-MM-DD.json` files on disk also never expire (9 daily snapshots at ~40 MB each on Oracle).
-- WAL checkpoint is implicit (sqlite default every ~1000 pages) and `VACUUM` is never called, so freed pages stay.
+- Sqlite row-level retention **is running** (daily tick, aggressive defaults).
+- `wal_checkpoint` **is running** (5-min tick, TRUNCATE mode).
+- `incremental_vacuum(1000)` **is running** hourly, `incremental_vacuum(5000)` daily if DB > 500 MB. Reclaims free pages to the freelist but the sqlite file size stays roughly constant — the freelist is in-file.
+- **No full `VACUUM`** ever runs. That is the only operation that rebuilds the file and actually shrinks it.
+- **No `graph-snapshot-*.json` file pruning**: `data_retention::cleanup` knows about `events-*.jsonl`, `incidents-*.jsonl`, `decisions-*.jsonl`, `telemetry-*`, `admin-actions-*`, `agent-guard-events-*`, `trial-report-*`, `summary-*`, `monthly-report-*`. Graph snapshots are not in the pattern list, so they accumulate at ~40 MB/day.
+- **No warm-tier compression**: older JSONL sits uncompressed. `gzip -9` on event JSONL compresses ~85% in practice, so a 30-day warm window currently costing 300 MB on disk becomes ~45 MB compressed.
+- **Transparent `.gz` reads** do not exist. If we compress old JSONL, the reader module needs to handle both extensions.
 
-The system accidentally became tiered: the JSONL files are a perfectly good append-only log of truth, sqlite is the hot index. The missing piece is explicit retention on the hot tier so only the processing window lives there.
+The system accidentally became tiered: JSONL files are the append-only log of truth, sqlite is the hot index. Spec 016 closed hot-tier retention; this spec closes the disk-shrink, graph-snapshot-file, and warm-tier compression gaps.
 
 ## Problem statement
 
@@ -125,37 +128,32 @@ Already wrote `data_retention.rs::cleanup`. Extend the pattern list with `graph-
 
 ## Rollout
 
-PR-A: **sqlite pruning primitives**
-- `store::prune_events_older_than(days: u32) -> usize`
-- `store::prune_incidents_older_than(days: u32) -> usize`
-- `store::prune_decisions_older_than(days: u32) -> usize`
-- `store::prune_graph_snapshots_keep_latest(n: usize) -> usize`
-- Pure sqlite tests (in-memory): insert old + new rows, prune, assert count.
+Since spec 016 already covers the sqlite row-pruning + WAL + incremental_vacuum path, this spec only closes the three remaining gaps. Everything ships in one PR (#225):
 
-PR-B: **retention loop wiring**
-- `data_retention::run_sqlite_retention(store, cfg)` invoked from slow loop.
-- Runs at most once per `retention_interval_hours` (default 24).
-- Emits metrics + logs.
-- Backfill the graph-snapshot file pattern into the existing JSONL sweep.
-- Integration test: run loop twice in ≤ interval, assert second is no-op.
+**Gap 1: full VACUUM**
+- `Store::vacuum_full_into_tempfile()` — runs `VACUUM INTO '<tmp>'`, fsyncs, atomically swaps over `innerwarden.db`. Non-blocking for readers during the rebuild.
+- Scheduler: weekly, gated on `free_page_ratio > 0.20` (avoid rebuild when the file is already dense).
+- Tests: insert rows, delete half, assert post-vacuum file size < pre-vacuum.
 
-PR-C: **housekeeping (WAL + VACUUM)**
-- `store::wal_checkpoint_passive()` — hourly.
-- `store::vacuum_if_free_space_ratio_exceeds(ratio: f32)` — weekly.
-- Tests: insert/delete then assert file size shrinks after vacuum.
+**Gap 2: graph-snapshot file pruning**
+- Extend `data_retention::cleanup` patterns with `graph-snapshot-` prefix.
+- Add `graph_snapshot_keep_days: u32` to `[data]` config (default 3).
+- Test: write five fake snapshot files, run cleanup, assert oldest two removed.
 
-PR-D: **dashboard fallback**
-- `read_incident_from_warm_tier(data_dir, incident_id, ts) -> Option<Incident>` in reader module.
-- Dashboard `/api/incidents/:id` checks sqlite, then warm on miss.
-- Log + metric when falling back. UI hint (small "archive" badge).
-- Test: prune an incident from sqlite, assert the dashboard still returns it with the archive-source flag.
+**Gap 3: warm-tier gzip + transparent reads**
+- `data_retention::gzip_warm_files_older_than(data_dir, days, prefixes)` — compresses matching files older than N days with gzip, atomic rename to `.gz`, deletes original.
+- Add `warm_gzip_days: u32` to `[data]` (default 7). `0` disables.
+- Reader module: open helper tries `path.jsonl`, falls back to `path.jsonl.gz` via `flate2::read::GzDecoder`. Existing call sites keep their signature; the helper is transparent.
+- Pre-existing `innerwarden query` / `innerwarden report` CLI paths inherit the transparent read. No call-site audit needed.
+- Tests:
+  - Compress sample JSONL, decode back, assert content match.
+  - Reader opens `.jsonl` when present, falls back to `.jsonl.gz` when original deleted.
+  - `data_retention` sweep compresses files past threshold, leaves recent files untouched.
 
-PR-E (optional, deferred if rollout is running long): **cold-tier gzip**
-- `data_retention::gzip_warm_files_older_than(days)`.
-- Reader opens both `.jsonl` and `.jsonl.gz` transparently.
-- Config: `cold_enabled = false` default.
+**Out of this PR (separate follow-up)**:
+- Dashboard warm-tier fallback for old incidents — keep in spec but ship in its own PR after dashboard query surface audit. Shipping the compress helper first means sqlite-prune + file-compress is independently valuable, and the dashboard change gets its own focused review.
 
-Each PR ships with tests above the patch coverage floor (70% with 15pp slack per the project codecov config). PR-D is the only one with user-facing behavior change (dashboard badge) — everything else is operationally silent.
+Patch coverage ≥ 70% (project floor with 15pp slack).
 
 ## Success criteria
 
