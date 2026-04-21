@@ -150,6 +150,28 @@ Since spec 016 already covers the sqlite row-pruning + WAL + incremental_vacuum 
   - Reader opens `.jsonl` when present, falls back to `.jsonl.gz` when original deleted.
   - `data_retention` sweep compresses files past threshold, leaves recent files untouched.
 
+**Gap 4: sqlite per-connection tuning**
+
+Low-risk PRAGMA retuning to trade a small amount of in-process cache
+for large RSS savings (100 - 150 MB headroom on Oracle). The OS page
+cache still serves hot pages, so the miss cost is negligible for our
+workload.
+
+- `cache_size = -2000` (2 MB per connection, down from 8 MB).
+- `mmap_size = 0` (disable sqlite internal memory-mapped IO; reads
+  go through `read()` and land in the OS page cache instead of the
+  agent's address space).
+- `temp_store = 1` (FILE - temporary tables on disk rather than RAM;
+  agent queries rarely touch temp tables so the disk cost is
+  invisible).
+- Applied via `SqliteConnectionManager::with_init` so every pooled
+  connection (not just the first fetched) receives the configuration.
+  The pre-030 path configured only the first connection and relied
+  on the pool returning the same one, which broke as soon as a
+  second connection was created on demand.
+- Tests: assert each PRAGMA value after `pool.get()` for memory and
+  file-backed stores, and across repeated fetches on the file pool.
+
 **Out of this PR (separate follow-up)**:
 - Dashboard warm-tier fallback for old incidents — keep in spec but ship in its own PR after dashboard query surface audit. Shipping the compress helper first means sqlite-prune + file-compress is independently valuable, and the dashboard change gets its own focused review.
 

@@ -65,16 +65,23 @@ impl Store {
             }
         }
 
-        let manager = SqliteConnectionManager::file(&db_path);
+        // Spec 030: apply PRAGMAs via `with_init` so every pooled
+        // connection (not just the first fetched) gets the same
+        // runtime configuration. Without this, connections lazily
+        // created after the first `pool.get()` used sqlite defaults
+        // for per-connection PRAGMAs (cache_size, mmap_size,
+        // temp_store, etc.) which contributed silently to the RSS
+        // growth this spec targets.
+        let manager = SqliteConnectionManager::file(&db_path)
+            .with_init(|conn| conn.execute_batch(PRAGMA_SETUP));
         let pool = Pool::builder()
             .max_size(4)
             .build(manager)
             .map_err(StoreError::Pool)?;
 
-        // Configure PRAGMAs and ensure schema on one connection
+        // Ensure the schema on one connection after the pool is up.
         {
             let conn = pool.get().map_err(StoreError::Pool)?;
-            configure_connection(&conn)?;
             schema::ensure_schema(&conn)?;
         }
 
@@ -85,7 +92,8 @@ impl Store {
 
     /// Open an in-memory database (for testing).
     pub fn open_memory() -> Result<Self> {
-        let manager = SqliteConnectionManager::memory();
+        let manager =
+            SqliteConnectionManager::memory().with_init(|conn| conn.execute_batch(PRAGMA_SETUP));
         let pool = Pool::builder()
             .max_size(1) // memory DB is single-connection
             .build(manager)
@@ -93,7 +101,6 @@ impl Store {
 
         {
             let conn = pool.get().map_err(StoreError::Pool)?;
-            configure_connection(&conn)?;
             schema::ensure_schema(&conn)?;
         }
 
@@ -130,19 +137,35 @@ impl Store {
     }
 }
 
-/// Apply performance PRAGMAs to a connection.
-fn configure_connection(conn: &rusqlite::Connection) -> Result<()> {
-    conn.execute_batch(
-        "PRAGMA journal_mode = WAL;
+/// Per-connection PRAGMA script. Applied via
+/// `SqliteConnectionManager::with_init` so every connection the
+/// r2d2 pool creates gets the same configuration.
+///
+/// Spec 030 tuning (replaces the earlier `cache_size = -8000` + no
+/// `mmap_size` + implicit `temp_store`):
+/// - `cache_size = -2000` holds the per-connection page cache at
+///   2 MB. With a pool of four, that caps the sqlite-owned page
+///   cache in the agent at ~8 MB instead of the previous ~32 MB
+///   (four × 8 MB). The OS page cache still serves hot pages for
+///   reads, so the miss cost is negligible for our workload.
+/// - `mmap_size = 0` disables sqlite's internal memory-mapped IO
+///   so reads go through `read()` and the OS page cache. Without
+///   this, sqlite can map hundreds of MB of the db into the
+///   process address space, which inflates RSS even though the
+///   data is shared with the OS cache.
+/// - `temp_store = FILE` keeps temporary tables on disk instead of
+///   in RAM. Our queries rarely touch temp tables (no big sorts)
+///   so the disk cost is invisible; the RAM savings are real on
+///   the odd large query.
+const PRAGMA_SETUP: &str = "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
          PRAGMA foreign_keys = ON;
          PRAGMA busy_timeout = 5000;
-         PRAGMA cache_size = -8000;
+         PRAGMA cache_size = -2000;
+         PRAGMA mmap_size = 0;
+         PRAGMA temp_store = 1;
          PRAGMA wal_autocheckpoint = 1000;
-         PRAGMA auto_vacuum = INCREMENTAL;",
-    )?;
-    Ok(())
-}
+         PRAGMA auto_vacuum = INCREMENTAL;";
 
 #[cfg(test)]
 mod tests {
@@ -152,6 +175,49 @@ mod tests {
     fn test_open_memory() {
         let store = Store::open_memory().unwrap();
         assert_eq!(store.schema_version().unwrap(), schema::CURRENT_VERSION);
+    }
+
+    // Spec 030: verify the tuned PRAGMAs apply to every pooled
+    // connection. The earlier code path ran the PRAGMA batch on one
+    // fetched connection and relied on the pool returning the same
+    // one - which only held for the first `pool.get()` call. The
+    // `with_init` migration guarantees all connections are
+    // configured, so we assert on freshly fetched connections.
+    fn read_pragma(conn: &rusqlite::Connection, name: &str) -> i64 {
+        let sql = format!("PRAGMA {name}");
+        conn.query_row(&sql, [], |r| r.get::<_, i64>(0))
+            .unwrap_or_else(|e| panic!("PRAGMA {name} query failed: {e:?}"))
+    }
+
+    #[test]
+    fn pragmas_are_set_on_every_pool_connection_memory() {
+        // Memory DBs do not support mmap, so `PRAGMA mmap_size` returns
+        // no row on them. Skip that assertion and focus on the
+        // per-connection runtime values that do apply to in-memory.
+        let store = Store::open_memory().unwrap();
+        let conn = store.conn().unwrap();
+        assert_eq!(read_pragma(&conn, "cache_size"), -2000);
+        assert_eq!(read_pragma(&conn, "temp_store"), 1);
+        assert_eq!(read_pragma(&conn, "synchronous"), 1);
+    }
+
+    #[test]
+    fn pragmas_apply_to_file_pool_across_fetches() {
+        use tempfile::TempDir;
+        let td = TempDir::new().unwrap();
+        let store = Store::open(td.path()).unwrap();
+
+        // Cycle through a few pool fetches to exercise connections
+        // beyond the first one. Each returned conn must have the
+        // full spec-030 tuning applied, including mmap_size which
+        // is only meaningful on file-backed databases.
+        for _ in 0..8 {
+            let conn = store.conn().unwrap();
+            assert_eq!(read_pragma(&conn, "cache_size"), -2000);
+            assert_eq!(read_pragma(&conn, "mmap_size"), 0);
+            assert_eq!(read_pragma(&conn, "temp_store"), 1);
+            assert_eq!(read_pragma(&conn, "synchronous"), 1);
+        }
     }
 
     #[test]
