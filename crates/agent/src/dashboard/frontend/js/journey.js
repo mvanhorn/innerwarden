@@ -455,7 +455,12 @@ async function loadJourney(subjectType, subjectValue) {
         // TL;DR — human-readable narrative, mode-aware.
         const incidents = j.entries.filter(e => e.kind === 'incident');
         const decisions = j.entries.filter(e => e.kind === 'decision');
-        const blocks = decisions.filter(e => (e.action||'').includes('block'));
+        // Journey entries serialize decisions as {kind, ts, data:{action_type,...}}.
+        // The legacy read of `e.action` returned undefined for every entry so
+        // `wasBlocked` was always false and the narrative fell through to
+        // "AI decided to monitor" even when a block_ip actually executed.
+        const actionOf = e => ((e && e.data && e.data.action_type) || '');
+        const blocks = decisions.filter(e => actionOf(e).includes('block'));
         if (incidents.length === 0 && decisions.length === 0) return '';
 
         const topIncident = incidents.length > 0 ? incidents[0] : null;
@@ -492,7 +497,9 @@ async function loadJourney(subjectType, subjectValue) {
           if (blocks.length > 1) narrative += ' (' + blocks.length + ' actions)';
           narrative += '. ';
         } else if (decisions.length > 0) {
-          const action = decisions[0].action || 'monitor';
+          // Pair with the actionOf() reader above: decisions carry the
+          // action label on `data.action_type`, not on the entry itself.
+          const action = actionOf(decisions[0]) || 'monitor';
           narrative += 'The AI decided to <strong>' + esc(action.replace(/_/g, ' ')) + '</strong>. ';
         }
         if (isResolved) {
