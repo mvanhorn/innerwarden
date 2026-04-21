@@ -1611,6 +1611,21 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                         info!(removed, "data_retention: cleaned up old files");
                     }
 
+                    // Spec 030: compress warm-tier JSONL files past the
+                    // `warm_gzip_days` threshold. Runs alongside the
+                    // delete sweep (once per slow tick) so a long-idle
+                    // agent catches up in one pass. The call is a no-op
+                    // when `warm_gzip_days = 0`.
+                    let (compressed, bytes_saved) =
+                        data_retention::gzip_warm_jsonl(&cli.data_dir, &cfg.data);
+                    if compressed > 0 {
+                        info!(
+                            compressed,
+                            bytes_saved,
+                            "data_retention: gzipped warm-tier files"
+                        );
+                    }
+
                     // ── SQLite maintenance (time-gated inside tick) ──
                     if let (Some(ref mut sched), Some(ref sq)) =
                         (&mut state.maintenance_scheduler, &state.sqlite_store)

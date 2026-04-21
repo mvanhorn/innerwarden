@@ -2214,6 +2214,21 @@ pub struct DataRetentionConfig {
     /// Keep trial-report-*.{json,md} for N days (default: 30)
     #[serde(default = "default_data_reports_keep_days")]
     pub reports_keep_days: usize,
+
+    /// Spec 030: keep `graph-snapshot-YYYY-MM-DD.json` files for N
+    /// days. Only the most recent snapshot is needed for recovery;
+    /// older ones pile up at ~40 MB/day if not pruned. (default: 3)
+    #[serde(default = "default_data_graph_snapshot_keep_days")]
+    pub graph_snapshot_keep_days: usize,
+
+    /// Spec 030: compress warm-tier JSONL files (events, incidents,
+    /// decisions, telemetry, admin-actions, agent-guard-events) with
+    /// gzip once they are older than this many days. The reader
+    /// transparently decompresses `.jsonl.gz` so downstream callers
+    /// do not have to know the difference. Set to 0 to disable
+    /// compression. (default: 7)
+    #[serde(default = "default_data_warm_gzip_days")]
+    pub warm_gzip_days: usize,
 }
 
 impl Default for DataRetentionConfig {
@@ -2224,6 +2239,8 @@ impl Default for DataRetentionConfig {
             decisions_keep_days: default_data_decisions_keep_days(),
             telemetry_keep_days: default_data_telemetry_keep_days(),
             reports_keep_days: default_data_reports_keep_days(),
+            graph_snapshot_keep_days: default_data_graph_snapshot_keep_days(),
+            warm_gzip_days: default_data_warm_gzip_days(),
         }
     }
 }
@@ -2242,6 +2259,12 @@ fn default_data_telemetry_keep_days() -> usize {
 }
 fn default_data_reports_keep_days() -> usize {
     30
+}
+fn default_data_graph_snapshot_keep_days() -> usize {
+    3
+}
+fn default_data_warm_gzip_days() -> usize {
+    7
 }
 
 fn default_telegram_min_severity() -> String {
