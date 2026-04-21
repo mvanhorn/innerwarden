@@ -443,8 +443,8 @@ pub fn parse_client_hello(
                 0x0000 if pos + 5 <= ext_data_end => {
                     let name_len = u16::from_be_bytes([data[pos + 3], data[pos + 4]]) as usize;
                     if pos + 5 + name_len <= ext_data_end {
-                        sni = String::from_utf8_lossy(&data[pos + 5..pos + 5 + name_len])
-                            .to_string();
+                        sni =
+                            String::from_utf8_lossy(&data[pos + 5..pos + 5 + name_len]).to_string();
                     }
                 }
                 // Supported Groups (elliptic curves)
