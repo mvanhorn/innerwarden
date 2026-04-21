@@ -11,11 +11,13 @@ User=root
 # to write to incidents-*.jsonl without permission conflicts.
 Group=innerwarden
 SupplementaryGroups=adm systemd-journal
-# UMask 0002 makes new files mode 664 (group writable). Combined with
-# Group=innerwarden above, this lets the agent append to files created
-# by the sensor. Without this, killchain_inline incidents are silently
-# lost with "Permission denied" errors.
-UMask=0002
+# UMask 0007 makes new files mode 660 and directories 770. Group write
+# (combined with Group=innerwarden above) lets the agent append to files
+# created by the sensor. Without this, killchain_inline incidents are
+# silently lost with "Permission denied" errors. World bits are cleared
+# because /var/lib/innerwarden holds security-sensitive state (incidents,
+# decisions, attacker profiles, keys) and must not leak to other users.
+UMask=0007
 ExecStart=/usr/local/bin/innerwarden-sensor --config /etc/innerwarden/config.toml
 Restart=on-failure
 RestartSec=5

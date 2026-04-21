@@ -361,22 +361,23 @@ impl MaintenanceScheduler {
             Err(e) => warn!("maintenance: verify_hash_chain failed: {e:#}"),
         }
 
-        // DB file permissions check (should be 0660, not world-readable)
+        // Self-heal world-readable files in data_dir. The agent/sensor only
+        // hold security-sensitive artefacts here (incidents, decisions,
+        // attacker profiles, DB, graph snapshots). We strip the world-read
+        // bit on every hourly tick instead of only alerting, so existing
+        // deployments are fixed in place without operator intervention.
+        // New installs are already protected by UMask=0007 in the systemd
+        // units; this path only matters for files rotated in or created
+        // before that change landed.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let db_path = store.data_dir.join("innerwarden.db");
-            if let Ok(meta) = std::fs::metadata(&db_path) {
-                let mode = meta.permissions().mode() & 0o777;
-                if mode & 0o004 != 0 {
-                    let msg = format!(
-                        "DATABASE WORLD-READABLE (mode {:o}). Run: chmod 660 {}",
-                        mode,
-                        db_path.display()
-                    );
-                    warn!("{msg}");
-                    alerts.push(msg);
-                }
+            let healed = heal_world_readable(&store.data_dir);
+            if healed > 0 {
+                info!(
+                    files = healed,
+                    dir = %store.data_dir.display(),
+                    "maintenance: stripped world-read bit from data files"
+                );
             }
         }
 
@@ -471,11 +472,66 @@ impl MaintenanceScheduler {
     }
 }
 
+/// Walk `dir` one level deep, stripping the world-read bit on any regular
+/// file whose mode has `0o004` set. Returns the number of files healed.
+///
+/// Non-recursive and fail-silent: any `io::Error` on a single entry is
+/// swallowed so a transient permission issue doesn't block the rest of
+/// the hourly maintenance tick. The caller logs the aggregate count.
+#[cfg(unix)]
+fn heal_world_readable(dir: &std::path::Path) -> usize {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut healed = 0;
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else { continue };
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o004 != 0 {
+            let new_mode = mode & !0o007;
+            if std::fs::set_permissions(&path, std::fs::Permissions::from_mode(new_mode)).is_ok() {
+                healed += 1;
+            }
+        }
+    }
+    healed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Utc;
     use innerwarden_core::event::{Event, Severity};
+
+    #[cfg(unix)]
+    #[test]
+    fn heal_world_readable_strips_other_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let loose = tmp.path().join("loose.json");
+        std::fs::write(&loose, b"x").unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let tight = tmp.path().join("tight.json");
+        std::fs::write(&tight, b"x").unwrap();
+        std::fs::set_permissions(&tight, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        assert_eq!(heal_world_readable(tmp.path()), 1);
+        assert_eq!(
+            std::fs::metadata(&loose).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(
+            std::fs::metadata(&tight).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
 
     #[test]
     fn test_wal_checkpoint() {
