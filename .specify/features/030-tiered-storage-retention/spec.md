@@ -172,6 +172,33 @@ workload.
 - Tests: assert each PRAGMA value after `pool.get()` for memory and
   file-backed stores, and across repeated fetches on the file pool.
 
+**Gap 5: jemalloc runtime tuning**
+
+The agent already uses jemalloc on Linux (`tikv-jemallocator` as
+global allocator) but ships without an explicit `MALLOC_CONF`, so
+jemalloc uses its generic defaults. The security agent has spiky
+allocation patterns (JSON parsing, graph rebuilds, tokenizer
+batches) that leave RSS close to the recent peak instead of the
+working set.
+
+Embed a `malloc_conf` static string in the binary so operators get
+production-ready memory behaviour without touching env vars:
+
+- `background_thread:true` purges off the hot path.
+- `dirty_decay_ms:1000` returns dirty pages to the OS after 1 s of
+  idleness (jemalloc default is 10 s).
+- `muzzy_decay_ms:1000` matches the dirty interval so there is a
+  single predictable decay window.
+
+Compile-time only (Linux, non-test builds); macOS uses the system
+allocator. No runtime tests because `#[export_name = "malloc_conf"]`
+is a symbol the jemalloc runtime reads at startup; behavioural
+verification is possible via `jemalloc-ctl` but the dependency bloat
+is not worth the marginal signal.
+
+Expected: additional ~50 MB RSS reduction beyond the sqlite tuning,
+with no latency regression for our workload.
+
 **Out of this PR (separate follow-up)**:
 - Dashboard warm-tier fallback for old incidents — keep in spec but ship in its own PR after dashboard query surface audit. Shipping the compress helper first means sqlite-prune + file-compress is independently valuable, and the dashboard change gets its own focused review.
 

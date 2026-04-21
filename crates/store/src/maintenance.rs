@@ -583,6 +583,64 @@ mod tests {
     }
 
     #[test]
+    fn weekly_tick_skips_vacuum_when_freelist_below_threshold() {
+        // Fresh DB has a near-zero freelist (just the empty schema
+        // pages). The weekly tick must observe ratio < 0.20 and skip
+        // the VACUUM call. We assert by verifying the file size does
+        // not churn and that tick_weekly runs without error.
+        let td = tempfile::TempDir::new().unwrap();
+        let store = Store::open(td.path()).unwrap();
+        let mut sched = MaintenanceScheduler::new();
+        let before = store.db_size_bytes().unwrap();
+        // Drive the weekly tick directly so the wall-clock gate does
+        // not interfere.
+        sched.tick_weekly(&store);
+        let after = store.db_size_bytes().unwrap();
+        // File size is unchanged (no VACUUM happened).
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn weekly_tick_runs_vacuum_when_freelist_above_threshold() {
+        // Populate, bulk-delete, then drive tick_weekly. Expected:
+        // freelist ratio crosses 0.20 so the tick fires VACUUM and
+        // `vacuum_last_reclaimed_bytes` metric gets set.
+        let td = tempfile::TempDir::new().unwrap();
+        let store = Store::open(td.path()).unwrap();
+
+        for i in 0..400 {
+            let ev = Event {
+                ts: Utc::now(),
+                host: format!("h-{i}"),
+                source: "test".into(),
+                kind: "test.weekly".into(),
+                severity: Severity::Low,
+                summary: format!("e-{i}"),
+                details: serde_json::json!({ "pad": "x".repeat(4096) }),
+                tags: vec![],
+                entities: vec![],
+            };
+            store.insert_event(&ev).unwrap();
+        }
+        store.wal_checkpoint().unwrap();
+        let conn = store.conn().unwrap();
+        conn.execute("DELETE FROM events", []).unwrap();
+        drop(conn);
+        store.wal_checkpoint().unwrap();
+        assert!(store.free_page_ratio().unwrap() > 0.20);
+
+        let mut sched = MaintenanceScheduler::new();
+        sched.tick_weekly(&store);
+
+        // VACUUM ran. Freelist should be near zero. The
+        // `vacuum_last_reclaimed_bytes` metric is populated by
+        // `tick_weekly`; on small test datasets the byte count can
+        // legitimately be zero (page-aligned file size unchanged)
+        // so we only assert the freelist drained.
+        assert!(store.free_page_ratio().unwrap() < 0.05);
+    }
+
+    #[test]
     fn free_page_ratio_drops_after_delete_and_vacuum() {
         use tempfile::TempDir;
 

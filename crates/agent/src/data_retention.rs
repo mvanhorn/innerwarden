@@ -606,4 +606,87 @@ mod tests {
 
         assert_eq!(removed, 2, "both raw and gz should be pruned together");
     }
+
+    // ── Error / edge paths ───────────────────────────────────────────
+
+    #[test]
+    fn cleanup_returns_zero_when_data_dir_does_not_exist() {
+        // Non-existent data_dir must not panic; the function should
+        // log a warning and return 0. This covers the `read_dir` err
+        // branch at the top of `cleanup`.
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let cfg = DataRetentionConfig::default();
+        assert_eq!(cleanup(&missing, &cfg), 0);
+    }
+
+    #[test]
+    fn gzip_sweep_returns_zero_when_data_dir_does_not_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let cfg = DataRetentionConfig {
+            warm_gzip_days: 1,
+            ..Default::default()
+        };
+        assert_eq!(gzip_warm_jsonl(&missing, &cfg), (0, 0));
+    }
+
+    #[test]
+    fn gzip_sweep_ignores_files_that_do_not_match_any_pattern() {
+        let tmp = tempfile::tempdir().unwrap();
+        let today = Local::now().date_naive();
+        let old_date = today - Duration::days(30);
+
+        // Non-warm-tier filename (no matching prefix): the sweep
+        // should skip it entirely even though the date is "old".
+        let name = format!("random-{}.log", old_date.format("%Y-%m-%d"));
+        let mut f = File::create(tmp.path().join(&name)).unwrap();
+        f.write_all(b"not a warm-tier file\n").unwrap();
+
+        let cfg = DataRetentionConfig {
+            warm_gzip_days: 7,
+            ..Default::default()
+        };
+        let (compressed, _) = gzip_warm_jsonl(tmp.path(), &cfg);
+        assert_eq!(compressed, 0);
+        assert!(tmp.path().join(&name).exists());
+    }
+
+    #[test]
+    fn gzip_sweep_ignores_files_with_unparseable_date() {
+        let tmp = tempfile::tempdir().unwrap();
+        // events-foo.jsonl matches the prefix+suffix but "foo" is
+        // not a YYYY-MM-DD date; the parse_from_str branch returns
+        // Err and the iteration continues without compressing.
+        let path = tmp.path().join("events-foo.jsonl");
+        let mut f = File::create(&path).unwrap();
+        f.write_all(b"line\n").unwrap();
+        let cfg = DataRetentionConfig {
+            warm_gzip_days: 7,
+            ..Default::default()
+        };
+        let (compressed, _) = gzip_warm_jsonl(tmp.path(), &cfg);
+        assert_eq!(compressed, 0);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn open_jsonl_or_gz_handles_non_jsonl_suffix_fallback() {
+        // When the caller passes a path whose extension is not
+        // ".jsonl", the fallback appends ".gz" to the full path
+        // rather than replacing the extension. This covers the
+        // non-jsonl branch of `open_jsonl_or_gz`.
+        let tmp = tempfile::tempdir().unwrap();
+        let raw = tmp.path().join("telemetry.log");
+        let gz = tmp.path().join("telemetry.log.gz");
+
+        // Only the `.gz` exists; the raw `.log` is missing.
+        let mut gz_writer = GzEncoder::new(File::create(&gz).unwrap(), Compression::default());
+        gz_writer.write_all(b"log-line-1\nlog-line-2\n").unwrap();
+        gz_writer.finish().unwrap();
+
+        let reader = open_jsonl_or_gz(&raw).unwrap().expect("fallback found");
+        let lines: Vec<String> = reader.lines().collect::<Result<_, _>>().unwrap();
+        assert_eq!(lines, vec!["log-line-1", "log-line-2"]);
+    }
 }

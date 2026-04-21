@@ -12,6 +12,27 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// Spec 030: embed jemalloc runtime configuration in the binary so
+// operators do not need to set a MALLOC_CONF env var to get
+// production-ready memory behaviour.
+//
+// - `background_thread:true` runs purging off the hot path.
+// - `dirty_decay_ms:1000` returns dirty pages to the OS after 1 s of
+//   idleness (default is 10 s). A security agent has spiky
+//   allocation patterns (JSON parsing, graph rebuilds, tokenizer
+//   batches) and the lower decay keeps RSS close to the working set
+//   instead of the recent peak.
+// - `muzzy_decay_ms:1000` does the same for muzzy pages (the state
+//   between "dirty" and "returned to the OS"). Matching the dirty
+//   interval gives a single predictable decay window.
+//
+// Linux-only; the macOS build uses the system allocator so this
+// symbol is not needed there.
+#[cfg(all(not(target_os = "macos"), not(test)))]
+#[allow(non_upper_case_globals)]
+#[export_name = "malloc_conf"]
+pub static MALLOC_CONF: &[u8] = b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
+
 mod abuseipdb;
 mod abuseipdb_report_budget;
 mod agent_context;
