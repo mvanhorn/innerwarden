@@ -4,6 +4,23 @@ use tracing::{info, warn};
 
 use crate::{ai, config, correlation, defender_brain, AgentState};
 
+/// Capacity of the rolling `recent_event_kinds` buffer that feeds defender
+/// brain feature positions 36..=59. Matches the `hist` window in
+/// `innerwarden-gym::environment` (line 31) so training and serving see the
+/// same shape of signal.
+pub const BRAIN_FEATURE_HISTORY_CAP: usize = 20;
+
+/// Push an event kind into the rolling history, dropping oldest entries to
+/// stay at or under `BRAIN_FEATURE_HISTORY_CAP`. Extracted so the slow-loop
+/// hot path stays a one-liner and the bounded-buffer logic has a direct
+/// unit test.
+pub(crate) fn push_event_kind_history(buf: &mut std::collections::VecDeque<String>, kind: &str) {
+    buf.push_back(kind.to_string());
+    while buf.len() > BRAIN_FEATURE_HISTORY_CAP {
+        buf.pop_front();
+    }
+}
+
 /// Apply correlation confidence boost, query defender brain, and emit the canonical decision log.
 pub(crate) fn apply_correlation_boost_and_log_decision(
     incident: &innerwarden_core::incident::Incident,
@@ -323,7 +340,264 @@ pub(crate) fn build_brain_features(
         0.0
     };
 
+    // Spec 031: positions 30..=71 mirror the gym's enriched observation
+    // (innerwarden-gym/src/environment.rs). Derived from the rolling
+    // event-kind window maintained in AgentState plus the incident itself.
+    // Position semantics must stay in sync with
+    // `innerwarden-gym/src/production_features.rs` — update both sides
+    // together when extending.
+    fill_history_features(&mut f, state);
+    fill_new_detector_flags(&mut f, det);
+
     f
+}
+
+/// Classify an event kind into one of the six layers the gym uses for
+/// feature positions 30..=35. Heuristic on the `kind` prefix/substring.
+/// Any kind that does not match lands in `Layer::Userspace` (index 3).
+fn event_kind_layer(kind: &str) -> usize {
+    // Firmware, SMM, UEFI integrity events.
+    if kind.starts_with("firmware.") || kind.starts_with("smm.") || kind.contains("uefi") {
+        return 0;
+    }
+    // Hypervisor/ring-1 events.
+    if kind.starts_with("hypervisor.") || kind.contains("blue_pill") || kind.contains("vm_escape") {
+        return 1;
+    }
+    // Kernel, eBPF, rootkit, kernel module, integrity.
+    if kind.starts_with("kernel.")
+        || kind.starts_with("ebpf.")
+        || kind.starts_with("integrity.")
+        || kind.contains("rootkit")
+        || kind.contains("kernel_module")
+    {
+        return 2;
+    }
+    // Network: DNS, HTTP, TLS, outbound, port scan, DDoS, proto anomaly.
+    if kind.starts_with("dns.")
+        || kind.starts_with("http.")
+        || kind.starts_with("tls.")
+        || kind.starts_with("net.")
+        || kind.starts_with("proto_anomaly")
+        || kind.starts_with("packet_flood")
+        || kind.contains("port_scan")
+        || kind.contains("c2_callback")
+        || kind.contains("dns_tunneling")
+    {
+        return 4;
+    }
+    // AI agent guard / MCP.
+    if kind.starts_with("agent_guard.") || kind.starts_with("mcp.") || kind.starts_with("atr.") {
+        return 5;
+    }
+    // Fallback: userspace (auth, docker, exec, suspicious binaries).
+    3
+}
+
+/// Populate features 30..=67 from `state.recent_event_kinds`. Positions
+/// 68..=71 are handled separately by `fill_new_detector_flags` so they
+/// reflect the *current* incident's detector rather than the window.
+fn fill_history_features(f: &mut [f32; 72], state: &AgentState) {
+    let hist: Vec<&str> = state
+        .recent_event_kinds
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+
+    // [30..=35] layer counts (firmware, hypervisor, kernel, userspace, network, ai_agent).
+    let mut layer_counts = [0u32; 6];
+    for kind in &hist {
+        let idx = event_kind_layer(kind);
+        layer_counts[idx] = layer_counts[idx].saturating_add(1);
+    }
+    for (i, &c) in layer_counts.iter().enumerate() {
+        f[30 + i] = (c as f32 / 5.0).min(1.0);
+    }
+
+    // [36..=39] kill chain stage presence.
+    let has_recon = hist.iter().any(|k| {
+        k.contains("port_scan")
+            || k.contains("web_scan")
+            || k.contains("DnsRecon")
+            || k.contains("discovery")
+    });
+    let has_access = hist.iter().any(|k| {
+        k.contains("ssh_bruteforce")
+            || k.contains("credential_stuffing")
+            || k.contains("web_shell")
+            || k.contains("WebExploit")
+    });
+    let has_exec = hist.iter().any(|k| {
+        k.contains("reverse_shell")
+            || k.contains("shell.command")
+            || k.contains("exec.")
+            || k.contains("fileless")
+    });
+    let has_persist = hist.iter().any(|k| {
+        k.contains("persistence")
+            || k.contains("crontab")
+            || k.contains("systemd_persistence")
+            || k.contains("ssh_key_injection")
+    });
+    f[36] = if has_recon { 1.0 } else { 0.0 };
+    f[37] = if has_access { 1.0 } else { 0.0 };
+    f[38] = if has_exec { 1.0 } else { 0.0 };
+    f[39] = if has_persist { 1.0 } else { 0.0 };
+
+    // [40] kill chain depth (stages completed / 4).
+    let kc_stages = has_recon as u8 + has_access as u8 + has_exec as u8 + has_persist as u8;
+    f[40] = kc_stages as f32 / 4.0;
+
+    // [41] event diversity (unique kinds / 10, saturating).
+    let mut unique: Vec<&str> = hist.clone();
+    unique.sort();
+    unique.dedup();
+    f[41] = (unique.len() as f32 / 10.0).min(1.0);
+
+    // [42] event burst density (window fullness).
+    f[42] = (hist.len() as f32 / BRAIN_FEATURE_HISTORY_CAP as f32).min(1.0);
+
+    // [43..=47] technique category counts (saturating at 1.0).
+    let cat_recon = hist
+        .iter()
+        .filter(|k| {
+            k.contains("scan")
+                || k.contains("port_scan")
+                || k.contains("web_scan")
+                || k.contains("discovery")
+                || k.contains("DnsRecon")
+        })
+        .count();
+    let cat_exploit = hist
+        .iter()
+        .filter(|k| {
+            k.contains("exploit")
+                || k.contains("bruteforce")
+                || k.contains("credential_stuffing")
+                || k.contains("web_shell")
+        })
+        .count();
+    let cat_privesc = hist
+        .iter()
+        .filter(|k| {
+            k.contains("privesc")
+                || k.contains("sudo_abuse")
+                || k.contains("kernel_module")
+                || k.contains("container_escape")
+                || k.contains("ld_preload")
+        })
+        .count();
+    let cat_evasion = hist
+        .iter()
+        .filter(|k| {
+            k.contains("log_tampering")
+                || k.contains("timestomp")
+                || k.contains("process_injection")
+                || k.contains("rootkit")
+        })
+        .count();
+    let cat_exfil = hist
+        .iter()
+        .filter(|k| {
+            k.contains("data_exfil") || k.contains("exfiltration") || k.contains("dns_tunneling")
+        })
+        .count();
+    f[43] = (cat_recon as f32 / 5.0).min(1.0);
+    f[44] = (cat_exploit as f32 / 5.0).min(1.0);
+    f[45] = (cat_privesc as f32 / 3.0).min(1.0);
+    f[46] = (cat_evasion as f32 / 3.0).min(1.0);
+    f[47] = (cat_exfil as f32 / 3.0).min(1.0);
+
+    // [48..=59] attack bigram transitions. 12 patterns matching the gym's
+    // `bigram_patterns` array. Use substring match so agent-side event
+    // kinds (`exec.shell_command` etc.) line up with gym's
+    // (`attack.ShellCommand`) via the tail keyword.
+    const BIGRAM_PATTERNS: &[(&str, &str)] = &[
+        ("ssh_bruteforce", "shell"),
+        ("shell", "shadow"),
+        ("shadow", "exfil"),
+        ("shell", "exfil"),
+        ("reverse_shell", "shell"),
+        ("sudo_abuse", "shell"),
+        ("shell", "log_tampering"),
+        ("shell", "timestomp"),
+        ("kernel_module", "rootkit"),
+        ("shell", "crontab"),
+        ("shell", "ssh_key_injection"),
+        ("ld_preload", "shell"),
+    ];
+    for (i, &(a, b)) in BIGRAM_PATTERNS.iter().enumerate() {
+        let count = hist
+            .windows(2)
+            .filter(|w| w[0].contains(a) && w[1].contains(b))
+            .count();
+        f[48 + i] = (count as f32 / 3.0).min(1.0);
+    }
+
+    // [60..=63] kernel/firmware state. Derived from recent history since
+    // the agent does not carry a separate kernel/firmware struct today.
+    let kmod_count = hist.iter().filter(|k| k.contains("kernel_module")).count();
+    f[60] = (kmod_count as f32 / 20.0).min(1.0);
+    f[61] = if hist.iter().any(|k| k.contains("rootkit")) {
+        1.0
+    } else {
+        0.0
+    };
+    f[62] = if hist
+        .iter()
+        .any(|k| k.starts_with("firmware.") || k.contains("uefi") || k.starts_with("smm."))
+    {
+        1.0
+    } else {
+        0.0
+    };
+    f[63] = hist.iter().filter(|k| k.starts_with("smm.")).count() as f32 / 100.0;
+
+    // [64..=67] network state.
+    let net_conn = hist
+        .iter()
+        .filter(|k| {
+            k.starts_with("net.")
+                || k.starts_with("http.")
+                || k.starts_with("tls.")
+                || k.contains("connect")
+        })
+        .count();
+    f[64] = (net_conn as f32 / 20.0).min(1.0);
+    let dns_queries = hist.iter().filter(|k| k.starts_with("dns.")).count();
+    f[65] = (dns_queries as f32 / 100.0).min(1.0);
+    let exfil_like = hist
+        .iter()
+        .filter(|k| k.contains("data_exfil") || k.contains("dns_tunneling"))
+        .count();
+    f[66] = (exfil_like as f32 / 5.0).min(1.0);
+    f[67] = if hist.iter().any(|k| k.contains("honeypot")) {
+        1.0
+    } else {
+        0.0
+    };
+}
+
+/// Spec 031 FR-3: grouped one-hot flags for production detectors not
+/// covered by the V5 slots at 12..=23. Lives in the reserved block
+/// 68..=71 to preserve the V5 contract on existing positions.
+fn fill_new_detector_flags(f: &mut [f32; 72], det: &str) {
+    f[68] = if det == "host_drift" || det == "sigma" {
+        1.0
+    } else {
+        0.0
+    };
+    f[69] = if det == "network_sniffing" || det == "discovery_burst" {
+        1.0
+    } else {
+        0.0
+    };
+    f[70] = if det == "proto_anomaly" || det == "packet_flood" {
+        1.0
+    } else {
+        0.0
+    };
+    f[71] = if det == "correlation" { 1.0 } else { 0.0 };
 }
 
 /// Log a deterministic (Layer 1/2) decision to the brain so it learns from
@@ -546,5 +820,291 @@ mod tests {
             state.latest_anomaly_score.is_none(),
             "anomaly score should be consumed by decision evaluation"
         );
+    }
+
+    // ─── Spec 031: feature positions 30..=71 ──────────────────────────
+
+    fn push_kinds(state: &mut AgentState, kinds: &[&str]) {
+        for k in kinds {
+            state.recent_event_kinds.push_back((*k).into());
+        }
+    }
+
+    #[test]
+    fn event_kind_layer_classifies_all_six_buckets() {
+        assert_eq!(event_kind_layer("firmware.tampered"), 0);
+        assert_eq!(event_kind_layer("smm.breach"), 0);
+        assert_eq!(event_kind_layer("hypervisor.vm_escape"), 1);
+        assert_eq!(event_kind_layer("blue_pill.detected"), 1);
+        assert_eq!(event_kind_layer("kernel.module_load"), 2);
+        assert_eq!(event_kind_layer("rootkit.installed"), 2);
+        assert_eq!(event_kind_layer("ebpf.syscall"), 2);
+        assert_eq!(event_kind_layer("integrity.altered"), 2);
+        assert_eq!(event_kind_layer("dns.query"), 4);
+        assert_eq!(event_kind_layer("http.request"), 4);
+        assert_eq!(event_kind_layer("tls.clienthello"), 4);
+        assert_eq!(event_kind_layer("net.connect"), 4);
+        assert_eq!(event_kind_layer("proto_anomaly:SlowConnection"), 4);
+        assert_eq!(event_kind_layer("packet_flood:rate_anomaly"), 4);
+        assert_eq!(event_kind_layer("port_scan"), 4);
+        assert_eq!(event_kind_layer("c2_callback"), 4);
+        assert_eq!(event_kind_layer("dns_tunneling"), 4);
+        assert_eq!(event_kind_layer("agent_guard.prompt_injection"), 5);
+        assert_eq!(event_kind_layer("mcp.tool_call"), 5);
+        assert_eq!(event_kind_layer("atr.rule_match"), 5);
+        // Fallback: userspace.
+        assert_eq!(event_kind_layer("exec.shell"), 3);
+        assert_eq!(event_kind_layer("random_unknown_kind"), 3);
+        assert_eq!(event_kind_layer(""), 3);
+    }
+
+    #[test]
+    fn build_brain_features_empty_history_zeros_30_to_67() {
+        let dir = TempDir::new().unwrap();
+        let state = crate::tests::triage_test_state(dir.path());
+        let incident = crate::tests::test_incident_with_kind("1.2.3.4", "neural_anomaly");
+
+        let f = build_brain_features(&incident, &state);
+
+        for i in 30..=67 {
+            assert_eq!(
+                f[i], 0.0,
+                "position {i} should be zero when history is empty"
+            );
+        }
+    }
+
+    #[test]
+    fn build_brain_features_layer_counts_saturate_and_distribute() {
+        let dir = TempDir::new().unwrap();
+        let mut state = crate::tests::triage_test_state(dir.path());
+        push_kinds(
+            &mut state,
+            &[
+                "firmware.tampered",
+                "hypervisor.vm_escape",
+                "kernel.module_load",
+                "dns.query",
+                "http.request",
+                "agent_guard.prompt_injection",
+                "exec.shell",
+                "exec.shell",
+            ],
+        );
+        let incident = crate::tests::test_incident_with_kind("1.2.3.4", "neural_anomaly");
+        let f = build_brain_features(&incident, &state);
+
+        assert!(f[30] > 0.0, "firmware layer count populated");
+        assert!(f[31] > 0.0, "hypervisor layer count populated");
+        assert!(f[32] > 0.0, "kernel layer count populated");
+        assert!(f[33] > 0.0, "userspace layer count populated");
+        assert!(f[34] > 0.0, "network layer count populated");
+        assert!(f[35] > 0.0, "ai_agent layer count populated");
+    }
+
+    #[test]
+    fn build_brain_features_kill_chain_stages_and_depth() {
+        let dir = TempDir::new().unwrap();
+        let mut state = crate::tests::triage_test_state(dir.path());
+        push_kinds(
+            &mut state,
+            &[
+                "port_scan",           // recon
+                "ssh_bruteforce",      // access
+                "exec.shell_command",  // exec
+                "crontab_persistence", // persist
+            ],
+        );
+        let incident = crate::tests::test_incident_with_kind("1.2.3.4", "neural_anomaly");
+        let f = build_brain_features(&incident, &state);
+
+        assert_eq!(f[36], 1.0, "recon stage");
+        assert_eq!(f[37], 1.0, "access stage");
+        assert_eq!(f[38], 1.0, "exec stage");
+        assert_eq!(f[39], 1.0, "persist stage");
+        assert!((f[40] - 1.0).abs() < f32::EPSILON, "full depth");
+    }
+
+    #[test]
+    fn build_brain_features_diversity_and_burst() {
+        let dir = TempDir::new().unwrap();
+        let mut state = crate::tests::triage_test_state(dir.path());
+        // 6 unique kinds out of 10 total events.
+        push_kinds(
+            &mut state,
+            &[
+                "a.x", "a.x", "b.y", "c.z", "d.w", "d.w", "e.v", "f.u", "f.u", "a.x",
+            ],
+        );
+        let incident = crate::tests::test_incident_with_kind("1.2.3.4", "neural_anomaly");
+        let f = build_brain_features(&incident, &state);
+
+        assert!((f[41] - 0.6).abs() < 0.05, "diversity ~6/10");
+        assert!((f[42] - 0.5).abs() < 0.05, "burst ~10/20");
+    }
+
+    #[test]
+    fn build_brain_features_technique_categories() {
+        let dir = TempDir::new().unwrap();
+        let mut state = crate::tests::triage_test_state(dir.path());
+        push_kinds(
+            &mut state,
+            &[
+                "port_scan",       // recon
+                "web_scan",        // recon
+                "ssh_bruteforce",  // exploit
+                "sudo_abuse",      // privesc
+                "log_tampering",   // evasion
+                "data_exfil_ebpf", // exfil
+            ],
+        );
+        let incident = crate::tests::test_incident_with_kind("1.2.3.4", "neural_anomaly");
+        let f = build_brain_features(&incident, &state);
+
+        assert!(f[43] > 0.0, "recon category");
+        assert!(f[44] > 0.0, "exploit category");
+        assert!(f[45] > 0.0, "privesc category");
+        assert!(f[46] > 0.0, "evasion category");
+        assert!(f[47] > 0.0, "exfil category");
+    }
+
+    #[test]
+    fn build_brain_features_bigrams_detect_known_sequence() {
+        let dir = TempDir::new().unwrap();
+        let mut state = crate::tests::triage_test_state(dir.path());
+        push_kinds(
+            &mut state,
+            &[
+                "ssh_bruteforce",
+                "exec.shell_command",
+                "exec.shell_command",
+                "log_tampering",
+            ],
+        );
+        let incident = crate::tests::test_incident_with_kind("1.2.3.4", "neural_anomaly");
+        let f = build_brain_features(&incident, &state);
+
+        assert!(f[48] > 0.0, "ssh_bruteforce -> shell bigram");
+        assert!(f[54] > 0.0, "shell -> log_tampering bigram");
+    }
+
+    #[test]
+    fn build_brain_features_kernel_and_network_state() {
+        let dir = TempDir::new().unwrap();
+        let mut state = crate::tests::triage_test_state(dir.path());
+        push_kinds(
+            &mut state,
+            &[
+                "kernel_module.load",
+                "rootkit.detected",
+                "firmware.tampered",
+                "smm.breach",
+                "net.connect",
+                "dns.query",
+                "data_exfil_cmd",
+                "honeypot.ssh_session",
+            ],
+        );
+        let incident = crate::tests::test_incident_with_kind("1.2.3.4", "neural_anomaly");
+        let f = build_brain_features(&incident, &state);
+
+        assert!(f[60] > 0.0, "kernel module count populated");
+        assert_eq!(f[61], 1.0, "rootkit flag");
+        assert_eq!(f[62], 1.0, "firmware tampered flag");
+        assert!(f[63] > 0.0, "smm count");
+        assert!(f[64] > 0.0, "network connection count");
+        assert!(f[65] > 0.0, "dns queries count");
+        assert!(f[66] > 0.0, "exfil-like count");
+        assert_eq!(f[67], 1.0, "honeypot active flag");
+    }
+
+    #[test]
+    fn build_brain_features_new_detector_flags_map_to_68_71() {
+        let dir = TempDir::new().unwrap();
+        let state = crate::tests::triage_test_state(dir.path());
+        let ip = "1.2.3.4";
+
+        for (det, slot) in [
+            ("host_drift", 68),
+            ("sigma", 68),
+            ("network_sniffing", 69),
+            ("discovery_burst", 69),
+            ("proto_anomaly", 70),
+            ("packet_flood", 70),
+            ("correlation", 71),
+        ] {
+            let incident = crate::tests::test_incident_with_kind(ip, det);
+            let f = build_brain_features(&incident, &state);
+            assert_eq!(
+                f[slot],
+                1.0,
+                "{det} should flip slot {slot}, got {:?}",
+                &f[68..=71]
+            );
+            // V5 slots 12..=23 should not be set for these new detectors.
+            assert!(
+                f[12..=23].iter().all(|v| *v == 0.0),
+                "V5 contract preserved for {det}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_brain_features_produces_distinct_vectors_for_distinct_incidents() {
+        // Spec 031 FR-5: the regression guard. Three incidents with meaningfully
+        // different severity/detector/profile must yield non-identical 72-dim
+        // feature vectors.
+        let dir = TempDir::new().unwrap();
+        let mut state = crate::tests::triage_test_state(dir.path());
+        push_kinds(&mut state, &["port_scan", "ssh_bruteforce", "exec.shell"]);
+
+        let neural = crate::tests::test_incident_with_kind("10.0.0.1", "neural_anomaly");
+        let drift = crate::tests::test_incident_with_kind("8.8.8.8", "host_drift");
+        let brute = crate::tests::test_incident_with_kind("9.9.9.9", "ssh_bruteforce");
+
+        let fa = build_brain_features(&neural, &state);
+        let fb = build_brain_features(&drift, &state);
+        let fc = build_brain_features(&brute, &state);
+
+        assert_ne!(fa, fb, "neural_anomaly vs host_drift must differ");
+        assert_ne!(fb, fc, "host_drift vs ssh_bruteforce must differ");
+        assert_ne!(fa, fc, "neural_anomaly vs ssh_bruteforce must differ");
+    }
+
+    #[test]
+    fn brain_feature_history_cap_matches_gym_window() {
+        // If the gym and the agent disagree on the window size the
+        // bigram/diversity features go out of distribution. Pin to 20.
+        assert_eq!(BRAIN_FEATURE_HISTORY_CAP, 20);
+    }
+
+    #[test]
+    fn fill_new_detector_flags_all_zero_for_unrelated_detector() {
+        let mut f = [0.0f32; 72];
+        fill_new_detector_flags(&mut f, "reverse_shell");
+        assert_eq!(&f[68..=71], &[0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn push_event_kind_history_respects_cap_and_preserves_order() {
+        let mut buf = std::collections::VecDeque::new();
+        for i in 0..(BRAIN_FEATURE_HISTORY_CAP + 5) {
+            push_event_kind_history(&mut buf, &format!("k{i}"));
+        }
+        assert_eq!(buf.len(), BRAIN_FEATURE_HISTORY_CAP);
+        // Oldest 5 dropped; newest (cap+4) is the tail.
+        assert_eq!(buf.front().unwrap(), "k5");
+        assert_eq!(
+            buf.back().unwrap(),
+            &format!("k{}", BRAIN_FEATURE_HISTORY_CAP + 4)
+        );
+    }
+
+    #[test]
+    fn push_event_kind_history_empty_string_is_accepted() {
+        let mut buf = std::collections::VecDeque::new();
+        push_event_kind_history(&mut buf, "");
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf.front().unwrap(), "");
     }
 }

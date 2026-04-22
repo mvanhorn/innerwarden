@@ -830,6 +830,9 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             None
         },
         recent_blocks: std::collections::VecDeque::new(),
+        recent_event_kinds: std::collections::VecDeque::with_capacity(
+            crate::incident_decision_eval::BRAIN_FEATURE_HISTORY_CAP,
+        ),
         xdp_block_times: HashMap::new(),
         response_lifecycle: response_lifecycle::ResponseLifecycle::load_snapshot(
             &cli.data_dir,

@@ -474,6 +474,12 @@ struct AgentState {
     /// Rate limiter: timestamps of recent block actions (rolling 1-minute window).
     /// Prevents false-positive cascades from blocking too many IPs at once.
     recent_blocks: std::collections::VecDeque<chrono::DateTime<chrono::Utc>>,
+    /// Spec 031: rolling window of the last 20 event `kind` strings. Feeds
+    /// defender-brain feature positions 36..=59 (kill chain stage presence,
+    /// event diversity, burst density, technique categories, attack bigrams).
+    /// Mirrors the `hist` rolling window in `innerwarden-gym::environment`
+    /// so training and serving see the same signal shape.
+    recent_event_kinds: std::collections::VecDeque<String>,
     /// XDP blocklist entries with timestamps and per-IP TTL for adaptive expiration.
     /// Periodically cleaned: IPs older than their individual TTL are removed.
     xdp_block_times: HashMap<String, (chrono::DateTime<chrono::Utc>, i64)>,

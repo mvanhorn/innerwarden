@@ -78,6 +78,16 @@ pub(crate) async fn process_narrative_tick(
 
     state.telemetry.observe_events(&events_entries);
 
+    // Spec 031: feed the rolling event-kind history used by defender brain
+    // feature positions 36..=59. Bounded ring maintained by the tested
+    // helper so this hot-path stays a one-liner.
+    for ev in &events_entries {
+        crate::incident_decision_eval::push_event_kind_history(
+            &mut state.recent_event_kinds,
+            &ev.kind,
+        );
+    }
+
     // Track operator IPs: any SSH login via publickey is an operator (has the private key).
     for ev in &events_entries {
         if ev.kind == "ssh.login_success"
@@ -728,6 +738,110 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
         assert_eq!(status_tgid(status), Some(4242));
         assert_eq!(status_ppid(status), Some(7));
         assert_eq!(status_field_u32(status, "Pid:"), None);
+    }
+
+    #[test]
+    fn status_field_u32_handles_malformed_values() {
+        // Field present but non-numeric value -> None.
+        assert_eq!(status_field_u32("Tgid:\tnot_a_number\n", "Tgid:"), None);
+        // Field present but no value after whitespace.
+        assert_eq!(status_field_u32("Tgid:\n", "Tgid:"), None);
+        // Empty content.
+        assert_eq!(status_field_u32("", "Tgid:"), None);
+    }
+
+    #[test]
+    fn is_pid_in_own_tree_same_pid_short_circuits_to_true() {
+        // The self-reference base case does not touch /proc; safe in tests.
+        assert!(is_pid_in_own_tree(4242, 4242));
+    }
+
+    #[test]
+    fn is_pid_in_own_tree_unreadable_proc_returns_false() {
+        // PID 0 has no /proc/0/status; the Ok(_) read fails and we fall
+        // through to `false`. Exercises the early-return path.
+        assert!(!is_pid_in_own_tree(0, 4242));
+    }
+
+    #[test]
+    fn boot_self_test_does_not_panic() {
+        // Pure logging helper. Exercises both arms (counts > 0 and == 0)
+        // depending on how the test binary initialises `cloud_safelist`;
+        // either way the call itself should succeed without panicking.
+        boot_self_test();
+    }
+
+    #[test]
+    fn backfill_graph_decisions_skips_bad_lines_and_dry_runs() {
+        use std::io::Write;
+
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+
+        // Write a decisions jsonl with: a blank line, a malformed json line,
+        // a dry_run entry, and a valid entry that has no matching graph
+        // incident (so the backfill path is taken but finds nothing to update).
+        let path = dir.path().join("decisions-2026-04-22.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f).unwrap(); // blank
+        writeln!(f, "{{not valid json").unwrap(); // malformed
+        writeln!(
+            f,
+            "{}",
+            serde_json::to_string(&decisions::DecisionEntry {
+                ts: chrono::Utc::now(),
+                incident_id: "missing:dryrun".into(),
+                host: String::new(),
+                ai_provider: "test".into(),
+                action_type: "block_ip".into(),
+                target_ip: None,
+                target_user: None,
+                skill_id: None,
+                confidence: 0.1,
+                auto_executed: false,
+                dry_run: true,
+                reason: String::new(),
+                estimated_threat: String::new(),
+                execution_result: "ok".into(),
+                prev_hash: None,
+            })
+            .unwrap()
+        )
+        .unwrap();
+        f.flush().unwrap();
+
+        // No panic; function should tolerate bad lines, dry_run, and missing graph nodes.
+        backfill_graph_decisions(dir.path(), &mut state);
+    }
+
+    #[test]
+    fn backfill_graph_decisions_returns_early_on_missing_data_dir() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let missing = dir.path().join("does-not-exist");
+        // No panic even though the dir is unreadable.
+        backfill_graph_decisions(&missing, &mut state);
+    }
+
+    #[test]
+    fn refresh_operator_ips_logs_removed_session() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+
+        // Seed a stale operator IP. `who -i` in the test process is unlikely
+        // to report anyone, so `active_ips` comes back empty and the
+        // "session ended" log branch fires for the seeded entry.
+        state
+            .operator_ips
+            .insert("198.51.100.77".to_string(), std::time::Instant::now());
+        let allowlist = config::AllowlistConfig::default();
+
+        refresh_operator_ips(&mut state, &allowlist);
+
+        assert!(
+            !state.operator_ips.contains_key("198.51.100.77"),
+            "stale operator IP should be evicted after refresh"
+        );
     }
 
     #[test]

@@ -262,6 +262,7 @@ pub(crate) fn triage_test_state(data_dir: &Path) -> AgentState {
         notification_burst_tracker: notification_gate::BurstTracker::new(),
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
+        recent_event_kinds: std::collections::VecDeque::new(),
     }
 }
 
@@ -550,6 +551,7 @@ async fn golden_path_dry_run_produces_decision_entry() {
         notification_burst_tracker: notification_gate::BurstTracker::new(),
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
+        recent_event_kinds: std::collections::VecDeque::new(),
     };
 
     // 4. Run the incident tick
@@ -736,6 +738,7 @@ async fn allowed_skills_whitelist_enforced() {
         notification_burst_tracker: notification_gate::BurstTracker::new(),
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
+        recent_event_kinds: std::collections::VecDeque::new(),
     };
 
     let mut cursor = reader::AgentCursor::default();
@@ -903,6 +906,7 @@ async fn same_ip_in_same_tick_triggers_single_ai_call() {
         notification_burst_tracker: notification_gate::BurstTracker::new(),
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
+        recent_event_kinds: std::collections::VecDeque::new(),
     };
 
     let mut cursor = reader::AgentCursor::default();
@@ -1071,6 +1075,7 @@ async fn temporal_correlation_context_is_passed_to_ai() {
         notification_burst_tracker: notification_gate::BurstTracker::new(),
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
+        recent_event_kinds: std::collections::VecDeque::new(),
     };
 
     let mut cursor = reader::AgentCursor::default();
@@ -1224,6 +1229,7 @@ async fn honeypot_demo_writes_synthetic_decoy_event() {
         notification_burst_tracker: notification_gate::BurstTracker::new(),
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
+        recent_event_kinds: std::collections::VecDeque::new(),
     };
 
     let mut cursor = reader::AgentCursor::default();
@@ -1387,6 +1393,7 @@ async fn decision_cooldown_suppresses_repeat() {
         notification_burst_tracker: notification_gate::BurstTracker::new(),
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
+        recent_event_kinds: std::collections::VecDeque::new(),
     };
 
     let mut cursor = reader::AgentCursor::default();

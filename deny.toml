@@ -1,14 +1,18 @@
 [advisories]
 ignore = [
-    # rsa timing sidechannel via russh - no fix available upstream
+    # rsa timing sidechannel via russh - no fix available upstream.
     "RUSTSEC-2023-0071",
-    # notify crate unmaintained - used only by DNA daemon binary, not the library
+    # `instant` unmaintained, pulled transitively by notify -> notify-types ->
+    # innerwarden-dna. No safe upgrade available upstream; the notify crate
+    # still depends on instant.
     "RUSTSEC-2024-0384",
-    # rustls-pemfile unmaintained - transitive dep via axum-server, no upgrade path yet
-    "RUSTSEC-2025-0134",
-    # paste unmaintained - transitive via tokenizers + tract-core behind optional
-    # local-classifier feature only. Macro crate with zero runtime surface.
+    # `paste` unmaintained. Only enters the tree when the `local-classifier`
+    # feature is on (via tokenizers + tract-core). Macro crate with zero
+    # runtime surface; no safe alternative today.
     "RUSTSEC-2024-0436",
+    # Removed (confirmed absent from the dep graph with `--all-features`):
+    # - RUSTSEC-2025-0134 (rustls-pemfile): dropped when axum-server bumped
+    #   0.7 -> 0.8 in PR #230.
 ]
 
 [licenses]
