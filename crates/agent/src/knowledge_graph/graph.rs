@@ -26,6 +26,13 @@ pub struct KnowledgeGraph {
     pub(crate) outgoing: HashMap<NodeId, Vec<usize>>,
     pub(crate) incoming: HashMap<NodeId, Vec<usize>>,
 
+    /// Per-node "most recent edge timestamp", used by `enforce_memory_limit`
+    /// to evict by LRU without paying O(E_avg log E_avg) per node. Updated on
+    /// every `add_edge`, cleared on `remove_node`. Rebuilt from `edges` on
+    /// `reconstruct_from_snapshot` (same precedent as `outgoing`/`incoming`),
+    /// so it does not enter the persistence wire format.
+    pub(crate) last_edge_ts: HashMap<NodeId, DateTime<Utc>>,
+
     // ── Fast-access sets ──
     pub(crate) threat_intel_nodes: HashSet<NodeId>,
 
@@ -73,6 +80,7 @@ impl KnowledgeGraph {
             system_node: None,
             outgoing: HashMap::new(),
             incoming: HashMap::new(),
+            last_edge_ts: HashMap::new(),
             threat_intel_nodes: HashSet::new(),
             next_id: 1,
             memory_estimate: 0,
@@ -157,6 +165,7 @@ impl KnowledgeGraph {
                 .saturating_sub(Self::estimate_node_size(&node));
             self.deindex_node(id, &node);
             self.threat_intel_nodes.remove(&id);
+            self.last_edge_ts.remove(&id);
 
             // Collect edge indexes to tombstone
             let mut edge_idxs: Vec<usize> = self.outgoing.remove(&id).unwrap_or_default();
@@ -282,6 +291,34 @@ impl KnowledgeGraph {
         self.outgoing.entry(edge.from).or_default().push(idx);
         self.incoming.entry(edge.to).or_default().push(idx);
         self.memory_estimate += Self::estimate_edge_size(&edge);
+
+        // Maintain `last_edge_ts` index for both endpoints. This replaces the
+        // O(E_avg log E_avg) per-node `all_edges()` scan that
+        // `enforce_memory_limit` used to do under memory pressure (the worst
+        // possible time to allocate). See RECURRING_BUGS.md
+        // "enforce_memory_limit allocates O(N × E) under memory pressure".
+        let edge_from = edge.from;
+        let edge_to = edge.to;
+        let edge_ts = edge.ts;
+        self.last_edge_ts
+            .entry(edge_from)
+            .and_modify(|t| {
+                if edge_ts > *t {
+                    *t = edge_ts;
+                }
+            })
+            .or_insert(edge_ts);
+        if edge_to != edge_from {
+            self.last_edge_ts
+                .entry(edge_to)
+                .and_modify(|t| {
+                    if edge_ts > *t {
+                        *t = edge_ts;
+                    }
+                })
+                .or_insert(edge_ts);
+        }
+
         self.edges.push(edge);
 
         // Real-time critical triggers (O(1) checks per edge)
@@ -931,24 +968,31 @@ impl KnowledgeGraph {
     }
 
     /// If memory exceeds max, prune oldest nodes by last edge timestamp (LRU).
+    ///
+    /// Uses the `last_edge_ts` index (maintained on every `add_edge`) to
+    /// resolve each node's last activity in O(1). The previous implementation
+    /// called `all_edges(id)` per node, which allocates a `Vec<&Edge>` and
+    /// sort-merges in/out adjacency lists — O(N × E_avg log E_avg) in total,
+    /// and the worst possible time to allocate is exactly when memory
+    /// pressure has triggered this path. See `RECURRING_BUGS.md`
+    /// "enforce_memory_limit allocates O(N × E) under memory pressure".
     pub fn enforce_memory_limit(&mut self) {
         if self.memory_estimate <= self.max_memory {
             return;
         }
 
-        // Collect (node_id, last_edge_ts) sorted oldest first
+        // Collect (node_id, last_edge_ts) sorted oldest first.
+        // Nodes with no edges fall back to `created_at` so they are not
+        // unfairly evicted ahead of the working set.
         let mut candidates: Vec<(NodeId, DateTime<Utc>)> = self
             .nodes
-            .keys()
-            .filter(|&&id| {
-                // Never prune System or permanent nodes
-                !matches!(self.nodes.get(&id), Some(Node::System { .. }))
-            })
-            .map(|&id| {
+            .iter()
+            .filter(|(_, node)| !matches!(node, Node::System { .. }))
+            .map(|(&id, _)| {
                 let last_ts = self
-                    .all_edges(id)
-                    .last()
-                    .map(|e| e.ts)
+                    .last_edge_ts
+                    .get(&id)
+                    .copied()
                     .unwrap_or(self.created_at);
                 (id, last_ts)
             })
@@ -1683,5 +1727,154 @@ mod tests {
         let m = g.metrics();
         assert_eq!(m.node_count, 2);
         assert_eq!(m.edge_count, 0);
+    }
+
+    // ── last_edge_ts / enforce_memory_limit regression suite ─────────
+    //
+    // Anchors for `RECURRING_BUGS.md` "enforce_memory_limit allocates
+    // O(N × E) under memory pressure". Cached `last_edge_ts` MUST stay
+    // consistent with the slow-but-correct `all_edges()` derivation, AND
+    // the LRU eviction order MUST be identical to the previous behaviour.
+
+    fn build_graph_with_edges(edges: &[(u32, &str, i64)]) -> KnowledgeGraph {
+        let mut g = KnowledgeGraph::new();
+        for (pid, ip, secs) in edges {
+            let p = g.ensure_process(*pid, 0, "test", 0, ts(*secs));
+            let ip_node = g.ensure_ip(ip, ts(*secs));
+            g.add_edge(Edge::new(p, ip_node, Relation::ConnectedTo, ts(*secs)));
+        }
+        g
+    }
+
+    fn slow_last_edge_ts(g: &KnowledgeGraph, id: NodeId) -> Option<chrono::DateTime<chrono::Utc>> {
+        // Reference implementation: derive the answer by scanning every edge
+        // touching `id`. The cached `last_edge_ts` must agree for every node.
+        g.all_edges(id).iter().map(|e| e.ts).max()
+    }
+
+    #[test]
+    fn last_edge_ts_matches_full_scan_after_inserts() {
+        let g = build_graph_with_edges(&[
+            (101, "1.1.1.1", 0),
+            (101, "1.1.1.1", 60),
+            (102, "2.2.2.2", 30),
+        ]);
+        for &id in g.nodes.keys() {
+            let cached = g.last_edge_ts.get(&id).copied();
+            let derived = slow_last_edge_ts(&g, id);
+            assert_eq!(
+                cached, derived,
+                "cached last_edge_ts must equal full-scan derivation for node {id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn last_edge_ts_takes_max_not_last_inserted() {
+        // Insert out of chronological order — cache must hold the MAX timestamp,
+        // not the most recently inserted.
+        let mut g = KnowledgeGraph::new();
+        g.ensure_process(101, 0, "test", 0, ts(0));
+        g.ensure_ip("1.1.1.1", ts(0));
+        let p = g.find_by_pid(101).unwrap();
+        let ip = g.find_by_ip("1.1.1.1").unwrap();
+        g.add_edge(Edge::new(p, ip, Relation::ConnectedTo, ts(100)));
+        g.add_edge(Edge::new(p, ip, Relation::ConnectedTo, ts(50))); // older
+        g.add_edge(Edge::new(p, ip, Relation::ConnectedTo, ts(80))); // still older than 100
+
+        assert_eq!(g.last_edge_ts.get(&p).copied(), Some(ts(100)));
+        assert_eq!(g.last_edge_ts.get(&ip).copied(), Some(ts(100)));
+    }
+
+    #[test]
+    fn last_edge_ts_cleared_on_remove_node() {
+        let mut g = build_graph_with_edges(&[(303, "9.9.9.9", 10)]);
+        let p = g.find_by_pid(303).unwrap();
+        assert!(g.last_edge_ts.contains_key(&p));
+        g.remove_node(p);
+        assert!(
+            !g.last_edge_ts.contains_key(&p),
+            "removing a node must drop its last_edge_ts entry"
+        );
+    }
+
+    #[test]
+    fn enforce_memory_limit_evicts_oldest_first() {
+        // Three IP nodes touched at t=0, t=100, t=200. With max_memory clamped
+        // below the actual estimate, the t=0 node must be evicted before the
+        // others (LRU eviction).
+        let mut g = KnowledgeGraph::new();
+        let p = g.ensure_process(7, 0, "p", 0, ts(0));
+        let a = g.ensure_ip("10.0.0.1", ts(0));
+        let b = g.ensure_ip("10.0.0.2", ts(100));
+        let c = g.ensure_ip("10.0.0.3", ts(200));
+        g.add_edge(Edge::new(p, a, Relation::ConnectedTo, ts(0)));
+        g.add_edge(Edge::new(p, b, Relation::ConnectedTo, ts(100)));
+        g.add_edge(Edge::new(p, c, Relation::ConnectedTo, ts(200)));
+
+        // Force eviction by clamping the budget below the current estimate
+        // but above what any single node + edge weighs, so we evict exactly one.
+        g.max_memory = g.memory_estimate.saturating_sub(1);
+        g.enforce_memory_limit();
+
+        // Oldest IP should be gone, newer two retained.
+        assert!(
+            g.find_by_ip("10.0.0.1").is_none(),
+            "oldest IP must be evicted"
+        );
+        assert!(g.find_by_ip("10.0.0.2").is_some());
+        assert!(g.find_by_ip("10.0.0.3").is_some());
+    }
+
+    #[test]
+    fn enforce_memory_limit_no_op_when_under_budget() {
+        let mut g = build_graph_with_edges(&[(1, "1.1.1.1", 0)]);
+        let nodes_before = g.nodes.len();
+        g.max_memory = usize::MAX;
+        g.enforce_memory_limit();
+        assert_eq!(g.nodes.len(), nodes_before);
+    }
+
+    #[test]
+    fn last_edge_ts_handles_self_loop_without_double_count() {
+        // Self-loop: from == to. Inserting an edge from a node to itself must
+        // not panic and must record the timestamp once. Defensive guard for
+        // a class of callers we may add later (e.g. SystemEvent → System).
+        let mut g = KnowledgeGraph::new();
+        let p = g.ensure_process(1, 0, "p", 0, ts(0));
+        g.add_edge(Edge::new(p, p, Relation::ConnectedTo, ts(42)));
+        assert_eq!(g.last_edge_ts.get(&p).copied(), Some(ts(42)));
+    }
+
+    #[test]
+    fn last_edge_ts_rebuilds_from_snapshot_load() {
+        // The cache is NOT in the wire format. Loading an old snapshot must
+        // rebuild it from the edge vector; otherwise enforce_memory_limit on a
+        // freshly-restored agent would treat every node as "as old as graph
+        // creation time" and evict things at random.
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("snap.json");
+
+        let g_before = build_graph_with_edges(&[(1, "1.1.1.1", 0), (2, "2.2.2.2", 60)]);
+        g_before.save_snapshot(&path).unwrap();
+        let g_after = KnowledgeGraph::load_snapshot(&path);
+
+        for (id_before, _) in g_before.nodes.iter() {
+            // Find the corresponding node in g_after by entity, since IDs
+            // may differ across reload.
+            let derived_before = slow_last_edge_ts(&g_before, *id_before);
+            let cached_before = g_before.last_edge_ts.get(id_before).copied();
+            assert_eq!(derived_before, cached_before);
+        }
+        // Rebuilt cache must match a full scan on the loaded graph.
+        for &id in g_after.nodes.keys() {
+            let derived = slow_last_edge_ts(&g_after, id);
+            let cached = g_after.last_edge_ts.get(&id).copied();
+            assert_eq!(
+                cached, derived,
+                "loaded graph: cached last_edge_ts must match full-scan derivation"
+            );
+        }
     }
 }
