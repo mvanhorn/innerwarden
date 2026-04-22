@@ -42,7 +42,6 @@ PrivateTmp=yes
 ProtectSystem=strict
 # /run       - UFW needs /run/ufw.lock
 # /etc/ufw   - UFW writes updated rules
-# /run/redis  - optional Redis socket
 ReadWritePaths=/var/lib/innerwarden /run /etc/ufw
 ReadOnlyPaths=/etc/innerwarden
 ProtectHome=yes

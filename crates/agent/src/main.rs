@@ -122,8 +122,6 @@ mod process;
 mod process_health;
 #[allow(dead_code)]
 mod reader;
-#[cfg(feature = "redis-reader")]
-mod redis_reader;
 mod report;
 mod response_lifecycle;
 mod scoring;
@@ -571,9 +569,6 @@ struct AgentState {
     graph_detector_state: knowledge_graph::detectors::GraphDetectorState,
     /// Timestamp of last knowledge graph snapshot save.
     last_graph_snapshot: std::time::Instant,
-    /// Redis stream reader for events (None when redis_url is not configured).
-    #[cfg(feature = "redis-reader")]
-    redis_reader: Option<redis_reader::RedisStreamReader>,
     /// Notification gate burst tracker — counts contained threats for burst summary.
     notification_burst_tracker: notification_gate::BurstTracker,
     /// Spec 005 Phase 7 — implicit operator feedback (ignore-driven demotion).
