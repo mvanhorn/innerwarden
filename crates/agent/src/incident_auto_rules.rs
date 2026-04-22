@@ -205,10 +205,6 @@ pub(crate) async fn try_handle_auto_rule(
         rep.record_block();
     }
 
-    // Brain-training feed removed: defender_brain replaced by SecureBERT
-    // classifier provider routed through the AI router.
-    let _ = (data_dir, &auto_decision, detector);
-
     // Set cooldown
     state.store.set_cooldown(
         crate::state_store::CooldownTable::Decision,

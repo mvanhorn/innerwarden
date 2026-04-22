@@ -576,6 +576,24 @@ pub(crate) fn cmd_install_classifier(
     sha256_override: Option<&str>,
     yes: bool,
 ) -> Result<()> {
+    cmd_install_classifier_with_target(
+        cli,
+        model,
+        url_override,
+        sha256_override,
+        yes,
+        CLASSIFIER_INSTALL_DIR,
+    )
+}
+
+fn cmd_install_classifier_with_target(
+    cli: &Cli,
+    model: &str,
+    url_override: Option<&str>,
+    sha256_override: Option<&str>,
+    yes: bool,
+    target_dir: &str,
+) -> Result<()> {
     if !cli.dry_run {
         require_sudo(cli);
     }
@@ -596,13 +614,13 @@ pub(crate) fn cmd_install_classifier(
     println!("  Variant: {} - {}", variant.name, variant.description);
     println!("  URL:     {url}");
     println!("  SHA-256: {expected_sha}");
-    println!("  Target:  {CLASSIFIER_INSTALL_DIR}");
+    println!("  Target:  {target_dir}");
     println!("  Size:    ~{} MB", variant.approx_size_mb);
     println!();
     println!("Active classifier replaces the (now removed) AlphaZero defender brain.");
     println!("The agent's `local_classifier` provider activates automatically when");
     println!("`agent.toml` has `[ai.classifier].provider = \"local_classifier\"` and");
-    println!("`base_url = \"{CLASSIFIER_INSTALL_DIR}\"`. Run `innerwarden configure ai`");
+    println!("`base_url = \"{target_dir}\"`. Run `innerwarden configure ai`");
     println!("after install to wire the slot if you have not already.");
     println!();
 
@@ -614,31 +632,40 @@ pub(crate) fn cmd_install_classifier(
         anyhow::bail!("classifier install requires --sha256 until the release artifact is pinned");
     }
 
-    if !yes {
-        print!("Proceed with install? [Y/n] ");
-        std::io::stdout().flush()?;
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        let trimmed = input.trim().to_lowercase();
-        if !trimmed.is_empty() && trimmed != "y" {
-            println!("Aborted.");
-            return Ok(());
-        }
+    let stdin = std::io::stdin();
+    let mut stdin_lock = stdin.lock();
+    if !confirm_install(yes, &mut stdin_lock)? {
+        println!("Aborted.");
+        return Ok(());
     }
 
     if cli.dry_run {
         println!("[dry-run] would download {url}");
         println!("[dry-run] would verify SHA-256 against {expected_sha}");
-        println!("[dry-run] would extract into {CLASSIFIER_INSTALL_DIR}");
+        println!("[dry-run] would extract into {target_dir}");
         return Ok(());
     }
 
-    install_classifier_archive(url, expected_sha, CLASSIFIER_INSTALL_DIR)?;
+    install_classifier_archive(url, expected_sha, target_dir)?;
 
     println!();
     println!("Done. Restart the agent to load the classifier:");
     println!("  sudo systemctl restart innerwarden-agent");
     Ok(())
+}
+
+fn confirm_install<R: std::io::BufRead>(yes: bool, input: &mut R) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+
+    print!("Proceed with install? [Y/n] ");
+    std::io::stdout().flush()?;
+
+    let mut line = String::new();
+    input.read_line(&mut line)?;
+    let trimmed = line.trim().to_lowercase();
+    Ok(trimmed.is_empty() || trimmed == "y")
 }
 
 /// Download the archive at `url`, verify the SHA-256, and extract it
@@ -696,6 +723,49 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+    use std::process::Command as ProcessCommand;
+    use std::sync::{Mutex, OnceLock};
+    use tempfile::TempDir;
+
+    fn install_archive_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn make_cli(data_dir: &std::path::Path, dry_run: bool) -> Cli {
+        Cli {
+            sensor_config: data_dir.join("config.toml"),
+            agent_config: data_dir.join("agent.toml"),
+            data_dir: data_dir.to_path_buf(),
+            dry_run,
+            command: None,
+        }
+    }
+
+    fn create_classifier_archive(tmp: &TempDir, name: &str) -> (std::path::PathBuf, String) {
+        let payload = tmp.path().join("payload");
+        std::fs::create_dir_all(&payload).expect("create payload dir");
+        std::fs::write(payload.join("model.onnx"), b"fake-model").expect("write model");
+        std::fs::write(payload.join("tokenizer.json"), br#"{"type":"fake"}"#)
+            .expect("write tokenizer");
+
+        let archive = tmp.path().join(name);
+        let status = ProcessCommand::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&payload)
+            .arg("model.onnx")
+            .arg("tokenizer.json")
+            .status()
+            .expect("spawn tar");
+        assert!(status.success(), "tar failed with status {status}");
+
+        let bytes = std::fs::read(&archive).expect("read archive");
+        let sha = sha256_hex(&bytes);
+        (archive, sha)
+    }
 
     #[test]
     fn models_url_builds_expected_paths_per_api_style() {
@@ -800,6 +870,144 @@ mod tests {
     }
 
     // ── install-classifier helpers ─────────────────────────────────────
+
+    #[test]
+    fn confirm_install_accepts_default_yes_and_explicit_yes() {
+        let mut empty = Cursor::new(b"\n");
+        assert!(confirm_install(false, &mut empty).expect("empty input accepted"));
+
+        let mut yes = Cursor::new(b"y\n");
+        assert!(confirm_install(false, &mut yes).expect("explicit yes accepted"));
+
+        let mut ignored = Cursor::new(b"n\n");
+        assert!(confirm_install(true, &mut ignored).expect("--yes bypasses prompt"));
+    }
+
+    #[test]
+    fn confirm_install_rejects_negative_input() {
+        let mut no = Cursor::new(b"n\n");
+        assert!(!confirm_install(false, &mut no).expect("n rejects"));
+
+        let mut no_word = Cursor::new(b"no\n");
+        assert!(!confirm_install(false, &mut no_word).expect("no rejects"));
+    }
+
+    #[test]
+    fn cmd_install_classifier_with_target_rejects_unknown_variant() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(tmp.path(), false);
+        let err = cmd_install_classifier_with_target(
+            &cli,
+            "unknown-model",
+            None,
+            Some("deadbeef"),
+            true,
+            tmp.path().to_str().expect("utf8 temp path"),
+        )
+        .expect_err("unknown variant must fail");
+
+        let msg = err.to_string();
+        assert!(msg.contains("unknown classifier variant"));
+        assert!(msg.contains("minilm-l6"));
+        assert!(msg.contains("roberta-v1"));
+    }
+
+    #[test]
+    fn cmd_install_classifier_with_target_requires_sha_until_pinned() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(tmp.path(), true);
+        let err = cmd_install_classifier_with_target(
+            &cli,
+            "minilm-l6",
+            None,
+            None,
+            true,
+            tmp.path().to_str().expect("utf8 temp path"),
+        )
+        .expect_err("missing override hash must fail until pin is published");
+
+        assert!(
+            err.to_string().contains("requires --sha256"),
+            "error should mention --sha256, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn cmd_install_classifier_with_target_dry_run_allows_explicit_sha() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(tmp.path(), true);
+        cmd_install_classifier_with_target(
+            &cli,
+            "minilm-l6",
+            Some("https://example.invalid/classifier.tar.gz"),
+            Some("0123456789abcdef"),
+            true,
+            tmp.path().to_str().expect("utf8 temp path"),
+        )
+        .expect("dry-run with explicit hash should pass");
+    }
+
+    #[test]
+    fn install_classifier_archive_rejects_sha_mismatch() {
+        let _guard = install_archive_lock().lock().expect("lock");
+        let tmp = TempDir::new().expect("tempdir");
+        let target = tmp.path().join("target");
+        let (archive, _sha) = create_classifier_archive(&tmp, "classifier.tar.gz");
+        let url = format!("file://{}", archive.display());
+        let err = install_classifier_archive(
+            &url,
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            target.to_str().expect("utf8 temp path"),
+        )
+        .expect_err("sha mismatch must fail");
+
+        assert!(
+            err.to_string().contains("SHA-256 mismatch"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn install_classifier_archive_reports_tar_error_for_invalid_archive() {
+        let _guard = install_archive_lock().lock().expect("lock");
+        let tmp = TempDir::new().expect("tempdir");
+        let archive = tmp.path().join("broken.tar.gz");
+        std::fs::write(&archive, b"this-is-not-a-tarball").expect("write bad archive");
+        let sha = sha256_hex(&std::fs::read(&archive).expect("read bad archive"));
+        let url = format!("file://{}", archive.display());
+        let target = tmp.path().join("target");
+        let err =
+            install_classifier_archive(&url, &sha, target.to_str().expect("utf8 target path"))
+                .expect_err("invalid archive must fail tar");
+
+        assert!(
+            err.to_string().contains("tar failed"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn cmd_install_classifier_with_target_installs_local_archive() {
+        let _guard = install_archive_lock().lock().expect("lock");
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(tmp.path(), false);
+        let target = tmp.path().join("installed");
+        let (archive, sha) = create_classifier_archive(&tmp, "ok.tar.gz");
+        let url = format!("file://{}", archive.display());
+
+        cmd_install_classifier_with_target(
+            &cli,
+            "minilm-l6",
+            Some(url.as_str()),
+            Some(sha.as_str()),
+            true,
+            target.to_str().expect("utf8 target path"),
+        )
+        .expect("local install should succeed");
+
+        assert!(target.join("model.onnx").is_file());
+        assert!(target.join("tokenizer.json").is_file());
+    }
 
     #[test]
     fn resolve_classifier_variant_returns_known_names() {

@@ -233,19 +233,6 @@ async fn handle_completed_chain(
         rep.reputation_score += chain.confidence * 3.0;
     }
 
-    // Brain-training feed removed: defender_brain replaced by SecureBERT
-    // classifier provider routed through the AI router. Keep arguments
-    // bound so the surrounding closure still type-checks.
-    let _brain_train_inputs = (
-        &incident,
-        format!("{:?}", decision.action),
-        chain.confidence,
-        format!("correlation:{}", chain.rule_id),
-        data_dir,
-        &state,
-    );
-    drop(_brain_train_inputs);
-
     // Cooldown.
     state.store.set_cooldown(
         crate::state_store::CooldownTable::Decision,

@@ -18,7 +18,7 @@ pub(crate) fn apply_correlation_boost_and_log_decision(
     cfg: &config::AgentConfig,
     state: &mut AgentState,
     decision: &mut ai::AiDecision,
-    data_dir: &Path,
+    _data_dir: &Path,
 ) {
     // If the same IP triggered multiple distinct detectors within the
     // correlation window, boost the confidence.
@@ -117,8 +117,6 @@ pub(crate) fn apply_correlation_boost_and_log_decision(
         reason = %decision.reason,
         "AI decision"
     );
-
-    let _ = data_dir; // reserved for future audit-trail wiring
 }
 
 #[cfg(test)]

@@ -491,8 +491,8 @@ enum Command {
     ///   innerwarden install-classifier --model minilm-l6 --yes
     ///   innerwarden install-classifier --url https://github.com/InnerWarden/innerwarden/releases/download/classifier-v1/minilm-l6.tar.gz
     InstallClassifier {
-        /// Model variant to install. Supported: `minilm-l6` (86 MB,
-        /// distilled, default) and `roberta-v1` (474 MB, full
+        /// Model variant to install. Supported: `minilm-l6` (87 MB,
+        /// distilled, default) and `roberta-v1` (478 MB, full
         /// precision validated 0.975).
         #[arg(long, default_value = "minilm-l6")]
         model: String,
@@ -1983,6 +1983,16 @@ fn reexec_with_sudo() -> Result<()> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
+fn dispatch_install_classifier(
+    cli: &Cli,
+    model: &str,
+    url: Option<&str>,
+    sha256: Option<&str>,
+    yes: bool,
+) -> Result<()> {
+    commands::ai::cmd_install_classifier(cli, model, url, sha256, yes)
+}
+
 fn main() -> Result<()> {
     let mut cli = Cli::parse();
     let registry = CapabilityRegistry::default_all();
@@ -2464,13 +2474,7 @@ fn main() -> Result<()> {
             ref url,
             ref sha256,
             yes,
-        } => commands::ai::cmd_install_classifier(
-            &cli,
-            model,
-            url.as_deref(),
-            sha256.as_deref(),
-            yes,
-        ),
+        } => dispatch_install_classifier(&cli, model, url.as_deref(), sha256.as_deref(), yes),
     }
 }
 
@@ -2669,6 +2673,7 @@ mod tests {
         ai_provider_defaults, count_failed_setup_checks, setup_remediation_command, setup_verdict,
         SetupCheck,
     };
+    use clap::Parser;
     use tempfile::TempDir;
 
     fn make_cli(data_dir: &std::path::Path) -> Cli {
@@ -2682,6 +2687,78 @@ mod tests {
                 action: None,
             }),
         }
+    }
+
+    #[test]
+    fn cli_parses_install_classifier_defaults() {
+        let cli = Cli::try_parse_from(["innerwarden", "install-classifier"]).expect("parse cli");
+        match cli.command {
+            Some(Command::InstallClassifier {
+                model,
+                url,
+                sha256,
+                yes,
+            }) => {
+                assert_eq!(model, "minilm-l6");
+                assert!(url.is_none());
+                assert!(sha256.is_none());
+                assert!(!yes);
+            }
+            _ => panic!("expected install-classifier command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_install_classifier_overrides() {
+        let cli = Cli::try_parse_from([
+            "innerwarden",
+            "install-classifier",
+            "--model",
+            "roberta-v1",
+            "--url",
+            "https://example.invalid/roberta.tar.gz",
+            "--sha256",
+            "abc123",
+            "--yes",
+        ])
+        .expect("parse cli");
+        match cli.command {
+            Some(Command::InstallClassifier {
+                model,
+                url,
+                sha256,
+                yes,
+            }) => {
+                assert_eq!(model, "roberta-v1");
+                assert_eq!(
+                    url.as_deref(),
+                    Some("https://example.invalid/roberta.tar.gz")
+                );
+                assert_eq!(sha256.as_deref(), Some("abc123"));
+                assert!(yes);
+            }
+            _ => panic!("expected install-classifier command"),
+        }
+    }
+
+    #[test]
+    fn dispatch_install_classifier_routes_to_ai_command() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut cli = make_cli(tmp.path());
+        cli.dry_run = true;
+
+        let ok = dispatch_install_classifier(
+            &cli,
+            "minilm-l6",
+            Some("https://example.invalid/minilm.tar.gz"),
+            Some("deadbeef"),
+            true,
+        );
+        assert!(ok.is_ok(), "dry-run dispatch should succeed: {ok:#?}");
+
+        let err = dispatch_install_classifier(&cli, "unknown-model", None, Some("deadbeef"), true)
+            .expect_err("unknown model should fail");
+        assert!(err.to_string().contains("unknown classifier variant"));
     }
 
     #[test]
