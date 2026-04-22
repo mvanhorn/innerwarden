@@ -876,8 +876,19 @@ fn recent_window_cache_handle(
 }
 
 fn compute_recent_window(data_dir: &Path, analyzed_date: &str) -> RecentWindow {
+    compute_recent_window_at(data_dir, analyzed_date, Utc::now())
+}
+
+/// Time-injected variant of `compute_recent_window`. The public function
+/// passes `Utc::now()`; tests pass a controlled instant to exercise the
+/// midnight-rollover path deterministically.
+fn compute_recent_window_at(
+    data_dir: &Path,
+    analyzed_date: &str,
+    now: DateTime<Utc>,
+) -> RecentWindow {
     const WINDOW_SECS: i64 = 6 * 3600;
-    let cutoff = Utc::now() - chrono::Duration::seconds(WINDOW_SECS);
+    let cutoff = now - chrono::Duration::seconds(WINDOW_SECS);
 
     // Cache check: keyed on snapshot mtime + date.
     let snap_path = data_dir.join(format!("graph-snapshot-{analyzed_date}.json"));
@@ -894,38 +905,79 @@ fn compute_recent_window(data_dir: &Path, analyzed_date: &str) -> RecentWindow {
         }
     }
 
-    // Phase 7 Gap 5: try graph snapshot for approximate 6h window.
-    // event_timeline uses 5-min buckets (HH:MM keys). Sum last 72 buckets.
-    if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, analyzed_date)
+    // Phase 7 Gap 5: try graph snapshots for an approximate 6h window. We
+    // load BOTH today's and yesterday's snapshots so cross-midnight windows
+    // see all relevant buckets — pre-2026-04-23 the fast path only loaded
+    // today's snapshot and string-compared bucket keys, which produced
+    // zero events around midnight (`RECURRING_BUGS.md` "report.rs 6h-window
+    // snapshot fast path subcounts near midnight"). Bucket keys are now
+    // ISO `YYYY-MM-DDTHH:MM` (parsed via `super::knowledge_graph::buckets`)
+    // so the comparison is `chrono::DateTime`-typed, not string.
+    let mut snapshots: Vec<(NaiveDate, crate::knowledge_graph::KnowledgeGraph)> = Vec::new();
+    if let Some(today_g) =
+        crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, analyzed_date)
     {
-        if graph.metrics().node_count > 0 {
-            use crate::knowledge_graph::types::{Node, NodeType};
-            let cutoff_key = cutoff.format("%H:%M").to_string();
+        if let Ok(d) = NaiveDate::parse_from_str(analyzed_date, "%Y-%m-%d") {
+            snapshots.push((d, today_g));
+        }
+    }
+    if let Some(prev_date_str) = NaiveDate::parse_from_str(analyzed_date, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.pred_opt())
+        .map(|d| (d, d.format("%Y-%m-%d").to_string()))
+    {
+        let (prev_d, prev_str) = prev_date_str;
+        if cutoff.date_naive() <= prev_d {
+            if let Some(prev_g) =
+                crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, &prev_str)
+            {
+                snapshots.push((prev_d, prev_g));
+            }
+        }
+    }
 
-            // Sum events from timeline buckets in the window
-            let mut events: u64 = 0;
+    let total_nodes: usize = snapshots.iter().map(|(_, g)| g.metrics().node_count).sum();
+    if total_nodes > 0 {
+        use crate::knowledge_graph::buckets::parse_bucket_key;
+        use crate::knowledge_graph::types::{Node, NodeType};
+
+        let mut events: u64 = 0;
+        let mut incidents: u64 = 0;
+        let mut high_critical: u64 = 0;
+        let mut decisions: u64 = 0;
+        let mut decisions_by_action: BTreeMap<String, u64> = BTreeMap::new();
+        let mut latest_incident_ts = String::from("none");
+        let mut seen_incident_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        for (snap_date, graph) in &snapshots {
+            // Walk the timeline with chrono comparison instead of string compare.
+            // Old `HH:MM`-only keys (pre-fix snapshots) are interpreted as the
+            // snapshot's date.
             for (bucket, sources) in &graph.event_timeline {
-                if bucket.as_str() >= cutoff_key.as_str() {
-                    events += sources.values().sum::<usize>() as u64;
+                if let Some(bucket_ts) = parse_bucket_key(bucket, *snap_date) {
+                    if bucket_ts >= cutoff {
+                        events += sources.values().sum::<usize>() as u64;
+                    }
                 }
             }
-
-            // Count incidents and decisions in window from Incident nodes
-            let mut incidents: u64 = 0;
-            let mut high_critical: u64 = 0;
-            let mut decisions: u64 = 0;
-            let mut decisions_by_action: BTreeMap<String, u64> = BTreeMap::new();
-            let mut latest_incident_ts = String::from("none");
 
             for id in graph.nodes_of_type(NodeType::Incident) {
                 if let Some(Node::Incident {
                     ts,
                     severity,
                     decision,
+                    incident_id,
                     ..
                 }) = graph.get_node(id)
                 {
                     if *ts >= cutoff {
+                        // Dedup across two snapshots so an Incident that was
+                        // ingested yesterday and persists in today's graph too
+                        // does not get double-counted.
+                        if !seen_incident_ids.insert(incident_id.clone()) {
+                            continue;
+                        }
                         incidents += 1;
                         let sev = severity.to_lowercase();
                         if sev == "high" || sev == "critical" {
@@ -942,27 +994,27 @@ fn compute_recent_window(data_dir: &Path, analyzed_date: &str) -> RecentWindow {
                     }
                 }
             }
-
-            let result = RecentWindow {
-                window_secs: WINDOW_SECS as u64,
-                events,
-                incidents,
-                high_critical_incidents: high_critical,
-                decisions,
-                decisions_by_action,
-                latest_event_ts: "graph".to_string(),
-                latest_incident_ts,
-                latest_decision_ts: "graph".to_string(),
-                latest_telemetry_ts: "graph".to_string(),
-            };
-            if let Ok(mut cache) = recent_window_cache_handle().lock() {
-                if cache.len() > 30 {
-                    cache.clear();
-                }
-                cache.insert(key.clone(), result.clone());
-            }
-            return result;
         }
+
+        let result = RecentWindow {
+            window_secs: WINDOW_SECS as u64,
+            events,
+            incidents,
+            high_critical_incidents: high_critical,
+            decisions,
+            decisions_by_action,
+            latest_event_ts: "graph".to_string(),
+            latest_incident_ts,
+            latest_decision_ts: "graph".to_string(),
+            latest_telemetry_ts: "graph".to_string(),
+        };
+        if let Ok(mut cache) = recent_window_cache_handle().lock() {
+            if cache.len() > 30 {
+                cache.clear();
+            }
+            cache.insert(key.clone(), result.clone());
+        }
+        return result;
     }
 
     // Fallback: JSONL scan
@@ -3031,6 +3083,144 @@ mod tests {
                 .get("webhook")
                 .copied(),
             Some(1)
+        );
+    }
+
+    // ── compute_recent_window cross-midnight regression ──────────────
+    //
+    // Anchor for `RECURRING_BUGS.md` "report.rs 6h-window snapshot fast
+    // path subcounts near midnight". The previous implementation
+    // string-compared bucket keys against `cutoff.format("%H:%M")` which
+    // returned zero events whenever the cutoff fell into yesterday.
+    // The fix:
+    //   1. bucket key carries a date dimension (`YYYY-MM-DDTHH:MM`),
+    //   2. comparison is `chrono::DateTime`-typed via `parse_bucket_key`,
+    //   3. yesterday's snapshot is loaded whenever cutoff is yesterday.
+
+    fn write_kg_with_telemetry(
+        dir: &Path,
+        date: &str,
+        telemetry_events: &[(chrono::DateTime<chrono::Utc>, &str)],
+    ) {
+        use crate::knowledge_graph::KnowledgeGraph;
+        let mut g = KnowledgeGraph::new();
+        // Need at least one node so `metrics().node_count > 0` and the fast
+        // path engages.
+        g.ensure_ip("203.0.113.1", chrono::Utc::now());
+        for (ts, source) in telemetry_events {
+            g.record_event_telemetry(source, "test_kind", *ts);
+        }
+        let path = dir.join(format!("graph-snapshot-{date}.json"));
+        g.save_snapshot(&path).expect("save snapshot");
+    }
+
+    #[test]
+    fn recent_window_crosses_midnight_correctly() {
+        use chrono::TimeZone;
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // "now" is 02:00 UTC on 2026-04-23. The 6h window covers
+        // 20:00 yesterday (2026-04-22) → 02:00 today.
+        let now = chrono::Utc.with_ymd_and_hms(2026, 4, 23, 2, 0, 0).unwrap();
+        let yesterday_2030 = chrono::Utc
+            .with_ymd_and_hms(2026, 4, 22, 20, 30, 0)
+            .unwrap();
+        let yesterday_1900 = chrono::Utc.with_ymd_and_hms(2026, 4, 22, 19, 0, 0).unwrap();
+        let today_0100 = chrono::Utc.with_ymd_and_hms(2026, 4, 23, 1, 0, 0).unwrap();
+
+        // Today's snapshot: 1 event at 01:00 (in window).
+        write_kg_with_telemetry(dir.path(), "2026-04-23", &[(today_0100, "test_source")]);
+        // Yesterday's snapshot: 1 event at 20:30 (in window) + 1 event at
+        // 19:00 (BEFORE the window cutoff of 20:00 — must NOT be counted).
+        write_kg_with_telemetry(
+            dir.path(),
+            "2026-04-22",
+            &[
+                (yesterday_2030, "test_source"),
+                (yesterday_1900, "test_source"),
+            ],
+        );
+
+        // Important: clear the in-process cache because other tests in this
+        // file may have populated it for the same `analyzed_date`.
+        if let Ok(mut cache) = recent_window_cache_handle().lock() {
+            cache.clear();
+        }
+
+        let win = compute_recent_window_at(dir.path(), "2026-04-23", now);
+        assert_eq!(
+            win.events, 2,
+            "must count 20:30 (yesterday) + 01:00 (today), not 19:00 (out of window)"
+        );
+    }
+
+    #[test]
+    fn recent_window_only_today_when_cutoff_within_today() {
+        use chrono::TimeZone;
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // "now" is 18:00 UTC. Cutoff = 12:00 same day. No need to load
+        // yesterday's snapshot at all; if it exists it must NOT be summed.
+        let now = chrono::Utc.with_ymd_and_hms(2026, 4, 23, 18, 0, 0).unwrap();
+        let today_1500 = chrono::Utc.with_ymd_and_hms(2026, 4, 23, 15, 0, 0).unwrap();
+        let today_0900 = chrono::Utc.with_ymd_and_hms(2026, 4, 23, 9, 0, 0).unwrap();
+        let yesterday_2200 = chrono::Utc.with_ymd_and_hms(2026, 4, 22, 22, 0, 0).unwrap();
+
+        write_kg_with_telemetry(
+            dir.path(),
+            "2026-04-23",
+            &[(today_1500, "src"), (today_0900, "src")],
+        );
+        // Yesterday has events but the cutoff is within today; yesterday's
+        // events must be ignored. (We still LOAD yesterday's snapshot in
+        // case the cutoff date equals yesterday, but in this scenario
+        // cutoff.date_naive() == today, so the yesterday load is skipped.)
+        write_kg_with_telemetry(dir.path(), "2026-04-22", &[(yesterday_2200, "src")]);
+
+        if let Ok(mut cache) = recent_window_cache_handle().lock() {
+            cache.clear();
+        }
+
+        let win = compute_recent_window_at(dir.path(), "2026-04-23", now);
+        // Only the 15:00 event is within the 12:00–18:00 window. 09:00 is
+        // before, yesterday is irrelevant.
+        assert_eq!(win.events, 1);
+    }
+
+    #[test]
+    fn recent_window_legacy_hhmm_keys_interpreted_as_snapshot_date() {
+        // A snapshot written by an agent BEFORE the bucket-key fix has
+        // bare `HH:MM` keys. The reader interprets them as the snapshot's
+        // date (back-compat). This test pins that contract so we cannot
+        // accidentally drop it during a future refactor.
+        use crate::knowledge_graph::KnowledgeGraph;
+        use chrono::TimeZone;
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let now = chrono::Utc.with_ymd_and_hms(2026, 4, 23, 2, 0, 0).unwrap();
+
+        // Build a graph and inject a legacy bare-HH:MM bucket key directly,
+        // simulating a snapshot written before the fix.
+        let mut g = KnowledgeGraph::new();
+        g.ensure_ip("203.0.113.1", chrono::Utc::now());
+        g.event_timeline
+            .entry("20:30".to_string())
+            .or_default()
+            .insert("legacy_source".to_string(), 1);
+        let path = dir.path().join("graph-snapshot-2026-04-22.json");
+        g.save_snapshot(&path).expect("save snapshot");
+
+        // Today's snapshot is empty but present so the today-load succeeds.
+        write_kg_with_telemetry(dir.path(), "2026-04-23", &[]);
+
+        if let Ok(mut cache) = recent_window_cache_handle().lock() {
+            cache.clear();
+        }
+
+        let win = compute_recent_window_at(dir.path(), "2026-04-23", now);
+        assert_eq!(
+            win.events, 1,
+            "legacy HH:MM key must be interpreted as the snapshot's date (yesterday) and counted"
         );
     }
 }

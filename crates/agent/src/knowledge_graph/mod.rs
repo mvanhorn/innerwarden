@@ -22,6 +22,7 @@
 //! Estimated 10-24 MB for a typical 24h window. Hard cap at 50 MB with
 //! LRU pruning.
 
+pub mod buckets;
 pub mod detectors;
 pub mod graph;
 pub mod ingestion;

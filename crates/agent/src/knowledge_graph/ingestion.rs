@@ -144,15 +144,22 @@ fn sanitized_incident_path(value: &str) -> Option<String> {
 impl KnowledgeGraph {
     /// Record event source/kind for sensors tab telemetry.
     /// Stored in a lightweight counter, not on every edge.
+    ///
+    /// Bucket key is `YYYY-MM-DDTHH:MM` (5-min granularity), ISO 8601-ish so
+    /// it sorts lexicographically AND carries a date dimension. The bare
+    /// `HH:MM` form used before 2026-04-23 mixed days under multi-day
+    /// uptime and broke `report.rs::compute_recent_window` near midnight
+    /// (see `RECURRING_BUGS.md` "report.rs 6h-window snapshot fast path
+    /// subcounts near midnight"). Reader-side helpers in `super::buckets`
+    /// accept both formats for back-compat with snapshots written before
+    /// the change.
     pub fn record_event_telemetry(
         &mut self,
         source: &str,
         kind: &str,
         ts: chrono::DateTime<chrono::Utc>,
     ) {
-        let hour = ts.format("%H").to_string();
-        let min: usize = ts.format("%M").to_string().parse().unwrap_or(0);
-        let bucket = format!("{}:{:02}", hour, (min / 5) * 5);
+        let bucket = super::buckets::format_bucket_key(ts);
 
         *self.source_counts.entry(source.to_string()).or_insert(0) += 1;
         *self.kind_counts.entry(kind.to_string()).or_insert(0) += 1;

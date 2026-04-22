@@ -74,7 +74,10 @@ pub(super) async fn api_sensors_inner(state: &DashboardState) -> serde_json::Val
     kinds.sort_by(|a, b| b.1.cmp(&a.1));
     kinds.truncate(15);
 
-    // Detector counts from Incident nodes
+    // Detector counts + timeline from Incident nodes. Bucket key now matches
+    // the format used by `event_timeline` (`YYYY-MM-DDTHH:MM`, see
+    // `knowledge_graph::buckets`) so cross-day uptime no longer collapses
+    // different days into the same time-of-day bucket.
     let mut detector_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     let mut detector_timeline: std::collections::BTreeMap<
@@ -86,17 +89,12 @@ pub(super) async fn api_sensors_inner(state: &DashboardState) -> serde_json::Val
     for id in graph.nodes_of_type(NodeType::Incident) {
         if let Some(Node::Incident { detector, ts, .. }) = graph.get_node(id) {
             *detector_counts.entry(detector.clone()).or_insert(0) += 1;
-            let ts_str = ts.format("%H:%M").to_string();
-            if ts_str.len() >= 5 {
-                let hour = &ts_str[0..2];
-                let min: usize = ts_str[3..5].parse().unwrap_or(0);
-                let bucket = format!("{}:{:02}", hour, (min / 5) * 5);
-                *detector_timeline
-                    .entry(bucket)
-                    .or_default()
-                    .entry(detector.clone())
-                    .or_insert(0) += 1;
-            }
+            let bucket = crate::knowledge_graph::buckets::format_bucket_key(*ts);
+            *detector_timeline
+                .entry(bucket)
+                .or_default()
+                .entry(detector.clone())
+                .or_insert(0) += 1;
         }
     }
 
@@ -105,11 +103,43 @@ pub(super) async fn api_sensors_inner(state: &DashboardState) -> serde_json::Val
 
     // event_timeline may be empty after restart (cursor/snapshot race).
     // Use detector_timeline as fallback — it's rebuilt from persisted Incident nodes.
-    let event_tl = if graph.event_timeline.is_empty() {
+    let event_tl_source: &std::collections::BTreeMap<
+        String,
+        std::collections::HashMap<String, usize>,
+    > = if graph.event_timeline.is_empty() {
         &detector_timeline
     } else {
         &graph.event_timeline
     };
+
+    // Project bucket keys to bare `HH:MM` for the chart so the x-axis stays
+    // compact. The Sensors tab shows a single day's data at a time, so the
+    // date prefix is redundant for display. The full date is retained in the
+    // in-memory map for windowed queries (`report.rs::compute_recent_window`).
+    let event_tl_display: std::collections::BTreeMap<
+        String,
+        &std::collections::HashMap<String, usize>,
+    > = event_tl_source
+        .iter()
+        .map(|(k, v)| {
+            (
+                crate::knowledge_graph::buckets::strip_date_prefix(k).to_string(),
+                v,
+            )
+        })
+        .collect();
+    let detector_tl_display: std::collections::BTreeMap<
+        String,
+        &std::collections::HashMap<String, usize>,
+    > = detector_timeline
+        .iter()
+        .map(|(k, v)| {
+            (
+                crate::knowledge_graph::buckets::strip_date_prefix(k).to_string(),
+                v,
+            )
+        })
+        .collect();
 
     serde_json::json!({
         "date": today,
@@ -118,8 +148,8 @@ pub(super) async fn api_sensors_inner(state: &DashboardState) -> serde_json::Val
         "sources": sources.iter().map(|(s, c)| serde_json::json!({"name": s, "count": c})).collect::<Vec<_>>(),
         "top_kinds": kinds.iter().map(|(k, c)| serde_json::json!({"name": k, "count": c})).collect::<Vec<_>>(),
         "detectors": detectors.iter().map(|(d, c)| serde_json::json!({"name": d, "count": c})).collect::<Vec<_>>(),
-        "event_timeline": event_tl,
-        "detector_timeline": detector_timeline,
+        "event_timeline": event_tl_display,
+        "detector_timeline": detector_tl_display,
     })
 }
 
