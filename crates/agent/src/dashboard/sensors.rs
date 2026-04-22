@@ -244,6 +244,7 @@ pub(super) async fn api_status(State(state): State<DashboardState>) -> Json<serd
             "patterns": kc_patterns
         },
         "graph": graph_stats,
+        "process_health": crate::process_health::ProcessHealth::snapshot(),
         "version": env!("CARGO_PKG_VERSION")
     }))
 }

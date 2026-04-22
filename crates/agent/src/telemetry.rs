@@ -282,6 +282,7 @@ fn action_tag(action: &AiAction) -> &'static str {
         AiAction::RequestConfirmation { .. } => "request_confirmation",
         AiAction::KillChainResponse { .. } => "kill_chain_response",
         AiAction::Ignore { .. } => "ignore",
+        AiAction::Dismiss { .. } => "dismiss",
     }
 }
 

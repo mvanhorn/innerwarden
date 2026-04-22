@@ -458,6 +458,7 @@ async fn promote_escalated_to_decision(
                 ("block_container", Some(container_id.as_str()))
             }
             crate::ai::AiAction::Ignore { .. } => ("ignore", None),
+            crate::ai::AiAction::Dismiss { .. } => ("dismiss", None),
             crate::ai::AiAction::RequestConfirmation { .. } => ("request_confirmation", None),
             crate::ai::AiAction::KillChainResponse { .. } => ("kill_chain_response", None),
         };

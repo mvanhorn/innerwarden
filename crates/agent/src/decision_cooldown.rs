@@ -128,7 +128,9 @@ pub(crate) fn decision_cooldown_key_for_decision(
             "pid",
             "-",
         )),
-        ai::AiAction::Ignore { .. } | ai::AiAction::RequestConfirmation { .. } => None,
+        ai::AiAction::Ignore { .. }
+        | ai::AiAction::Dismiss { .. }
+        | ai::AiAction::RequestConfirmation { .. } => None,
     }
 }
 

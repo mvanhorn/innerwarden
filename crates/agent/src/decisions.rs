@@ -329,6 +329,7 @@ pub fn build_entry(
             Some("kill-chain-response".to_string()),
         ),
         AiAction::Ignore { .. } => ("ignore".to_string(), None, None, None),
+        AiAction::Dismiss { .. } => ("dismiss".to_string(), None, None, None),
     };
 
     DecisionEntry {
@@ -471,5 +472,36 @@ mod tests {
         assert_eq!(entry.target_user, Some("alice".to_string()));
         assert_eq!(entry.target_ip, None);
         assert_eq!(entry.dry_run, true);
+    }
+
+    #[test]
+    fn test_build_entry_dismiss_uses_dismiss_action_type() {
+        // Regression: before AiAction::Dismiss existed, classifier
+        // predictions of "dismiss" were silently collapsed into "ignore"
+        // in the decision record. Check the distinct action_type survives.
+        let decision = AiDecision {
+            action: AiAction::Dismiss {
+                reason: "below noise floor".to_string(),
+            },
+            confidence: 0.95,
+            reason: "noise-gate filter".to_string(),
+            auto_execute: true,
+            estimated_threat: "low".to_string(),
+            alternatives: vec![],
+        };
+
+        let entry = build_entry(
+            "inc-dismiss-1",
+            "host",
+            "local_classifier",
+            &decision,
+            false,
+            "filed",
+        );
+
+        assert_eq!(entry.action_type, "dismiss");
+        assert_eq!(entry.target_ip, None);
+        assert_eq!(entry.target_user, None);
+        assert_eq!(entry.skill_id, None);
     }
 }

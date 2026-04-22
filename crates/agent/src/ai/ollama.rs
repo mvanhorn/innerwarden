@@ -34,18 +34,18 @@ pub struct OllamaProvider {
 }
 
 impl OllamaProvider {
-    pub fn new(base_url: String, model: String, api_key: Option<String>) -> Self {
+    pub fn new(base_url: String, model: String, api_key: Option<String>) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
             // Cloud inference can occasionally be slower for large models
             .timeout(std::time::Duration::from_secs(120))
             .build()
-            .expect("failed to build Ollama HTTP client");
-        Self {
+            .map_err(|e| anyhow::anyhow!("failed to build HTTP client for ollama: {e}"))?;
+        Ok(Self {
             base_url,
             model,
             api_key,
             client,
-        }
+        })
     }
 }
 
@@ -251,7 +251,8 @@ mod tests {
 
     #[test]
     fn new_uses_supplied_values() {
-        let p = OllamaProvider::new("http://192.168.1.10:11434".into(), "mistral".into(), None);
+        let p = OllamaProvider::new("http://192.168.1.10:11434".into(), "mistral".into(), None)
+            .unwrap();
         assert_eq!(p.base_url, "http://192.168.1.10:11434");
         assert_eq!(p.model, "mistral");
         assert!(p.api_key.is_none());
@@ -263,13 +264,15 @@ mod tests {
             "https://api.ollama.com".into(),
             "qwen3-coder:480b".into(),
             Some("test-key".into()),
-        );
+        )
+        .unwrap();
         assert_eq!(p.api_key.as_deref(), Some("test-key"));
     }
 
     #[test]
     fn url_construction_strips_trailing_slash() {
-        let p = OllamaProvider::new("http://localhost:11434/".into(), "llama3.2".into(), None);
+        let p =
+            OllamaProvider::new("http://localhost:11434/".into(), "llama3.2".into(), None).unwrap();
         let url = format!("{}/api/chat", p.base_url.trim_end_matches('/'));
         assert_eq!(url, "http://localhost:11434/api/chat");
     }

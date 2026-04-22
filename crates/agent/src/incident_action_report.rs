@@ -47,6 +47,7 @@ pub(crate) fn maybe_send_post_execution_telegram_report(
             ),
         ),
         AiAction::Ignore { .. } => ("Ignored".to_string(), "-".to_string()),
+        AiAction::Dismiss { .. } => ("Dismissed".to_string(), "-".to_string()),
         AiAction::RequestConfirmation { .. } => {
             ("Requested confirmation for".to_string(), "-".to_string())
         }
@@ -187,6 +188,9 @@ mod tests {
             },
             ai::AiAction::Ignore {
                 reason: "false positive".to_string(),
+            },
+            ai::AiAction::Dismiss {
+                reason: "below noise floor".to_string(),
             },
             ai::AiAction::RequestConfirmation {
                 summary: "needs approval".to_string(),

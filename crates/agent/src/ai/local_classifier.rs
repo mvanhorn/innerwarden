@@ -211,8 +211,11 @@ impl AiProvider for LocalClassifier {
             "monitor" => AiAction::Monitor {
                 ip: target_ip.unwrap_or_else(|| "unknown".to_string()),
             },
-            "ignore" | "dismiss" => AiAction::Ignore {
-                reason: format!("classifier: {} (confidence {:.3})", action_name, conf),
+            "ignore" => AiAction::Ignore {
+                reason: format!("classifier: ignore (confidence {:.3})", conf),
+            },
+            "dismiss" => AiAction::Dismiss {
+                reason: format!("classifier: dismiss (confidence {:.3})", conf),
             },
             _ => AiAction::Ignore {
                 reason: format!("unknown classifier action: {}", action_name),

@@ -115,14 +115,25 @@ impl AiProvider for ShadowProvider {
     async fn decide(&self, ctx: &DecisionContext<'_>) -> Result<AiDecision> {
         let incident_id = ctx.incident.incident_id.clone();
 
-        // Run both concurrently. Primary error fails the whole call (same
-        // behavior as without shadow). Shadow error is logged, not propagated.
-        let t0 = Instant::now();
-        let (primary_res, shadow_res) =
-            tokio::join!(self.primary.decide(ctx), self.shadow.decide(ctx));
+        // Run both concurrently and time each provider independently so
+        // shadow_latency_ms reflects the shadow's own inference time, not the
+        // wall-clock of the joined call. Primary error fails the whole call
+        // (same behavior as without shadow). Shadow error is logged, not
+        // propagated.
+        let primary_fut = async {
+            let t = Instant::now();
+            let res = self.primary.decide(ctx).await;
+            (res, t.elapsed().as_millis() as u64)
+        };
+        let shadow_fut = async {
+            let t = Instant::now();
+            let res = self.shadow.decide(ctx).await;
+            (res, t.elapsed().as_millis() as u64)
+        };
+        let ((primary_res, primary_latency), (shadow_res, shadow_latency)) =
+            tokio::join!(primary_fut, shadow_fut);
 
         let primary = primary_res?;
-        let primary_latency = t0.elapsed().as_millis() as u64;
 
         let primary_action = primary.action.name();
         match shadow_res {
@@ -139,9 +150,7 @@ impl AiProvider for ShadowProvider {
                     shadow_provider: self.shadow.name(),
                     shadow_action: Some(shadow_action),
                     shadow_confidence: Some(shadow.confidence),
-                    // Shadow latency is <= primary_latency because they ran
-                    // in parallel; log the total ms observed.
-                    shadow_latency_ms: Some(primary_latency),
+                    shadow_latency_ms: Some(shadow_latency),
                     shadow_error: None,
                     action_match: Some(match_),
                 };
@@ -165,7 +174,7 @@ impl AiProvider for ShadowProvider {
                     shadow_provider: self.shadow.name(),
                     shadow_action: None,
                     shadow_confidence: None,
-                    shadow_latency_ms: None,
+                    shadow_latency_ms: Some(shadow_latency),
                     shadow_error: Some(e.to_string()),
                     action_match: None,
                 };
@@ -461,6 +470,78 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let sp = ShadowProvider::new(primary, shadow, tmp.path());
         assert_eq!(sp.name(), "primary-name");
+    }
+
+    #[tokio::test]
+    async fn shadow_latency_measured_independently_from_primary() {
+        // Regression guard: shadow_latency_ms must reflect the shadow
+        // provider's own inference time, not the wall-clock of the joined
+        // call (which is dominated by the slower side). Use a slow shadow
+        // and a fast primary and assert the logged shadow latency is larger.
+        struct SleepyProvider {
+            name: &'static str,
+            delay_ms: u64,
+        }
+        #[async_trait]
+        impl AiProvider for SleepyProvider {
+            fn name(&self) -> &'static str {
+                self.name
+            }
+            async fn decide(&self, _ctx: &DecisionContext<'_>) -> Result<AiDecision> {
+                tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+                Ok(AiDecision {
+                    action: AiAction::Ignore {
+                        reason: self.name.into(),
+                    },
+                    confidence: 0.9,
+                    auto_execute: false,
+                    reason: String::new(),
+                    alternatives: vec![],
+                    estimated_threat: "low".into(),
+                })
+            }
+            async fn chat(&self, _s: &str, _u: &str) -> Result<String> {
+                Ok(String::new())
+            }
+        }
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let primary = Box::new(SleepyProvider {
+            name: "fast-primary",
+            delay_ms: 0,
+        });
+        let shadow = Box::new(SleepyProvider {
+            name: "slow-shadow",
+            delay_ms: 80,
+        });
+        let sp = ShadowProvider::new(primary, shadow, tmp.path());
+
+        let inc = dummy_incident();
+        let ctx = DecisionContext {
+            incident: &inc,
+            recent_events: vec![],
+            related_incidents: vec![],
+            already_blocked: vec![],
+            available_skills: vec![],
+            ip_reputation: None,
+            ip_geo: None,
+            graph_context: None,
+            graph_subgraph: None,
+        };
+        let _ = sp.decide(&ctx).await.unwrap();
+
+        let logged = std::fs::read_to_string(tmp.path()).unwrap();
+        let entry: serde_json::Value = serde_json::from_str(logged.trim()).unwrap();
+        let primary_ms = entry["primary_latency_ms"].as_u64().unwrap();
+        let shadow_ms = entry["shadow_latency_ms"].as_u64().unwrap();
+        assert!(
+            shadow_ms >= 70,
+            "shadow latency should reflect the 80ms sleep, got {shadow_ms}ms"
+        );
+        assert!(
+            primary_ms + 20 < shadow_ms,
+            "primary ({primary_ms}ms) should be materially faster than shadow ({shadow_ms}ms)"
+        );
     }
 
     #[tokio::test]

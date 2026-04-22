@@ -1689,6 +1689,22 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                         // ── Pcap capture cooldown cleanup ──
                         state.pcap_capture.cleanup();
 
+                        // ── Process-health self-observation ──
+                        // Detects child-process leaks (e.g. tcpdump that
+                        // never exits) at the service boundary instead of
+                        // waiting for someone to notice on the host.
+                        {
+                            let snapshot = crate::process_health::ProcessHealth::snapshot();
+                            if snapshot.looks_stuck() {
+                                warn!(
+                                    children = snapshot.children_total,
+                                    oldest_age_secs = ?snapshot.oldest_child_age_secs,
+                                    by_comm = ?snapshot.children_by_comm,
+                                    "process_health: unusual child-process state; possible spawn leak"
+                                );
+                            }
+                        }
+
                         // ── 2FA pending action expiry cleanup ──
                         state.two_factor_state.cleanup_expired();
 

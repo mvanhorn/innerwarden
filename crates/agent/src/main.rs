@@ -119,6 +119,7 @@ mod observation_verify;
 mod pcap_capture;
 mod playbook;
 mod process;
+mod process_health;
 #[allow(dead_code)]
 mod reader;
 #[cfg(feature = "redis-reader")]

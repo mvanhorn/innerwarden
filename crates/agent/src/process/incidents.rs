@@ -626,6 +626,7 @@ pub(crate) async fn process_incidents(
                     ("block_container", Some(container_id.as_str()))
                 }
                 ai::AiAction::Ignore { .. } => ("ignore", None),
+                ai::AiAction::Dismiss { .. } => ("dismiss", None),
                 ai::AiAction::RequestConfirmation { .. } => ("request_confirmation", None),
                 ai::AiAction::KillChainResponse { .. } => ("kill_chain_response", None),
             };

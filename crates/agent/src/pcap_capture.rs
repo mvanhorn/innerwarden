@@ -10,6 +10,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 use tracing::{debug, info, warn};
@@ -28,8 +30,10 @@ pub struct PcapCapture {
     data_dir: PathBuf,
     /// Cooldown per IP to prevent duplicate captures.
     cooldowns: HashMap<String, DateTime<Utc>>,
-    /// Currently running capture count.
-    active_captures: usize,
+    /// Live count of running capture threads. Shared with each spawned
+    /// thread so it can decrement itself on exit, which is the only way
+    /// MAX_CONCURRENT is actually enforced.
+    active_captures: Arc<AtomicUsize>,
 }
 
 /// Result of initiating a capture.
@@ -49,7 +53,7 @@ impl PcapCapture {
         Self {
             data_dir: data_dir.to_path_buf(),
             cooldowns: HashMap::new(),
-            active_captures: 0,
+            active_captures: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -74,7 +78,7 @@ impl PcapCapture {
         }
 
         // Concurrency check
-        if self.active_captures >= MAX_CONCURRENT {
+        if self.active_captures.load(Ordering::Acquire) >= MAX_CONCURRENT {
             debug!("pcap: skipping (max concurrent captures reached)");
             return None;
         }
@@ -106,21 +110,37 @@ impl PcapCapture {
             "pcap: starting packet capture"
         );
 
-        // Spawn tcpdump in background — non-blocking
-        self.active_captures += 1;
+        // Spawn tcpdump in background - non-blocking. Wrap with coreutils
+        // `timeout` so the capture is wall-clock bounded: tcpdump's own
+        // `-G`/`-W` flags only rotate when the `-w` path contains an strftime
+        // specifier, and `-c` only exits after N packets, so a quiet IP
+        // leaves tcpdump alive indefinitely. `timeout --kill-after` sends
+        // SIGTERM at the deadline and SIGKILL shortly after if tcpdump is
+        // still around. The RAII guard on `active_captures` decrements the
+        // counter whether the child exits normally, times out, or panics.
+        self.active_captures.fetch_add(1, Ordering::AcqRel);
+        let counter = Arc::clone(&self.active_captures);
         std::thread::spawn(move || {
-            let result = std::process::Command::new("tcpdump")
+            struct CounterGuard(Arc<AtomicUsize>);
+            impl Drop for CounterGuard {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+            let _guard = CounterGuard(counter);
+
+            let result = std::process::Command::new("timeout")
                 .args([
+                    "--signal=TERM",
+                    "--kill-after=5s",
+                    &format!("{}s", CAPTURE_DURATION_SECS),
+                    "tcpdump",
                     "-i",
                     "any",
                     "-c",
                     &MAX_PACKETS.to_string(),
                     "-w",
                     &path_clone.to_string_lossy(),
-                    "-G",
-                    &CAPTURE_DURATION_SECS.to_string(),
-                    "-W",
-                    "1", // rotate: 1 file only
                     "host",
                     &ip_owned,
                 ])
@@ -130,10 +150,14 @@ impl PcapCapture {
 
             match result {
                 Ok(status) => {
-                    if status.success() {
+                    // timeout(1) returns 124 when it kills the child at the
+                    // deadline; that is the normal/expected exit for a
+                    // low-traffic target, not an error.
+                    if status.success() || status.code() == Some(124) {
                         info!(
                             ip = %ip_owned,
                             pcap = %path_clone.display(),
+                            timed_out = status.code() == Some(124),
                             "pcap: capture completed"
                         );
                     } else {
@@ -157,14 +181,17 @@ impl PcapCapture {
         })
     }
 
-    /// Prune expired cooldowns.
+    /// Prune expired cooldowns. The active_captures counter is self-managed
+    /// by spawned threads (via CounterGuard on drop), so cleanup no longer
+    /// mutates it.
     pub fn cleanup(&mut self) {
         let cutoff = Utc::now() - Duration::seconds(COOLDOWN_SECS);
         self.cooldowns.retain(|_, ts| *ts > cutoff);
-        // Reset active counter (conservative — threads self-manage)
-        if self.active_captures > 0 {
-            self.active_captures = self.active_captures.saturating_sub(1);
-        }
+    }
+
+    #[cfg(test)]
+    fn active_count(&self) -> usize {
+        self.active_captures.load(Ordering::Acquire)
     }
 }
 
@@ -254,5 +281,30 @@ mod tests {
         let _ = cap.try_capture("8.8.8.8", "test-1");
         // Second attempt within cooldown should be skipped
         assert!(cap.try_capture("8.8.8.8", "test-2").is_none());
+    }
+
+    #[test]
+    fn max_concurrent_is_respected() {
+        // Regression: the old usize counter was never decremented by the
+        // spawned threads, and cleanup() blindly saturated-sub by 1, so
+        // MAX_CONCURRENT never actually capped anything. This test fills the
+        // counter directly and asserts that try_capture refuses to start a
+        // new one. With MAX_CONCURRENT = 3, four distinct IPs should yield
+        // zero successful starts once the counter is pinned at the cap.
+        let dir = tempfile::TempDir::new().unwrap();
+        let cap = PcapCapture::new(dir.path());
+        cap.active_captures.store(MAX_CONCURRENT, Ordering::Release);
+        let mut cap = cap;
+        for (i, ip) in ["1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4"]
+            .iter()
+            .enumerate()
+        {
+            let result = cap.try_capture(ip, &format!("cap-{i}"));
+            assert!(
+                result.is_none(),
+                "try_capture({ip}) should be skipped when counter is at MAX_CONCURRENT"
+            );
+        }
+        assert_eq!(cap.active_count(), MAX_CONCURRENT);
     }
 }

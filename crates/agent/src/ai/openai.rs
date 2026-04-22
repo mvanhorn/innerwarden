@@ -31,22 +31,22 @@ fn uses_new_token_param(model: &str) -> bool {
 
 impl OpenAiProvider {
     #[allow(dead_code)] // Used when provider = "openai" (matched explicitly in factory)
-    pub fn new(api_key: String, model: String) -> Self {
+    pub fn new(api_key: String, model: String) -> anyhow::Result<Self> {
         Self::with_base_url(api_key, model, "https://api.openai.com".to_string())
     }
 
-    pub fn with_base_url(api_key: String, model: String, base_url: String) -> Self {
+    pub fn with_base_url(api_key: String, model: String, base_url: String) -> anyhow::Result<Self> {
         let base_url = base_url.trim_end_matches('/').to_string();
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .build()
-            .expect("failed to build reqwest client");
-        Self {
+            .map_err(|e| anyhow::anyhow!("failed to build HTTP client for openai: {e}"))?;
+        Ok(Self {
             api_key,
             model,
             base_url,
             client,
-        }
+        })
     }
 }
 

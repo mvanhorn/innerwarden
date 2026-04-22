@@ -37,19 +37,24 @@ fn uses_new_token_param(deployment: &str) -> bool {
 }
 
 impl AzureOpenAiProvider {
-    pub fn new(api_key: String, deployment: String, base_url: String, api_version: String) -> Self {
+    pub fn new(
+        api_key: String,
+        deployment: String,
+        base_url: String,
+        api_version: String,
+    ) -> anyhow::Result<Self> {
         let base_url = base_url.trim_end_matches('/').to_string();
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .build()
-            .expect("failed to build reqwest client");
-        Self {
+            .map_err(|e| anyhow::anyhow!("failed to build HTTP client for azure_openai: {e}"))?;
+        Ok(Self {
             api_key,
             deployment,
             base_url,
             api_version,
             client,
-        }
+        })
     }
 
     fn chat_url(&self) -> String {
@@ -207,7 +212,8 @@ mod tests {
             "gpt-5-4-mini".into(),
             "https://example-resource.openai.azure.com/".into(),
             "2024-12-01-preview".into(),
-        );
+        )
+        .unwrap();
         assert_eq!(
             p.chat_url(),
             "https://example-resource.openai.azure.com/openai/deployments/gpt-5-4-mini/chat/completions?api-version=2024-12-01-preview"
@@ -221,7 +227,8 @@ mod tests {
             "d".into(),
             "https://x.openai.azure.com///".into(),
             "2024-12-01-preview".into(),
-        );
+        )
+        .unwrap();
         assert!(p
             .chat_url()
             .starts_with("https://x.openai.azure.com/openai/"));
@@ -266,7 +273,8 @@ mod tests {
             "gpt-5-4-mini".into(),
             "https://example-resource.openai.azure.com".into(),
             "2024-12-01-preview".into(),
-        );
+        )
+        .unwrap();
         let inc = dummy_incident();
         let ctx = DecisionContext {
             incident: &inc,
@@ -293,7 +301,8 @@ mod tests {
             "gpt-5-4-mini".into(),
             "https://example-resource.openai.azure.com".into(),
             "2024-12-01-preview".into(),
-        );
+        )
+        .unwrap();
         let err = p.chat("sys", "user").await.unwrap_err().to_string();
         assert!(
             err.contains("Azure OpenAI API key not configured"),
@@ -303,7 +312,8 @@ mod tests {
 
     #[test]
     fn name_is_stable() {
-        let p = AzureOpenAiProvider::new("k".into(), "d".into(), "https://x".into(), "v".into());
+        let p = AzureOpenAiProvider::new("k".into(), "d".into(), "https://x".into(), "v".into())
+            .unwrap();
         assert_eq!(p.name(), "azure_openai");
     }
 }

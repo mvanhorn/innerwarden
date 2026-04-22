@@ -75,6 +75,13 @@ pub enum AiAction {
 
     /// No action required - false positive or already handled.
     Ignore { reason: String },
+
+    /// Low-priority incident filed without any action. Semantically distinct
+    /// from Ignore: Dismiss is "below the noise floor, not worth reviewing",
+    /// Ignore is "considered and rejected". The local classifier (spec 027)
+    /// was trained with these as separate labels and collapsing them loses
+    /// information in shadow/audit logs and downstream metrics.
+    Dismiss { reason: String },
 }
 
 /// The structured decision returned by an AI provider.
@@ -112,6 +119,7 @@ impl AiAction {
             AiAction::RequestConfirmation { .. } => "request_confirmation",
             AiAction::KillChainResponse { .. } => "kill_chain_response",
             AiAction::Ignore { .. } => "ignore",
+            AiAction::Dismiss { .. } => "dismiss",
         }
     }
 }
@@ -477,7 +485,7 @@ fn build_single(
         };
         return Ok(Box::new(openai::OpenAiProvider::with_base_url(
             api_key, model, base_url,
-        )));
+        )?));
     }
 
     match provider {
@@ -526,12 +534,12 @@ fn build_single(
                 model.to_string(),
                 base_url.to_string(),
                 api_version,
-            )))
+            )?))
         }
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(
             api_key,
             model.to_string(),
-        ))),
+        )?)),
         "ollama" => {
             let api_key_opt = if api_key.is_empty() {
                 None
@@ -564,7 +572,7 @@ fn build_single(
                 base_url,
                 model,
                 api_key_opt,
-            )))
+            )?))
         }
         other => {
             // SEC-017: Unknown provider name — require explicit base_url.
@@ -581,7 +589,7 @@ fn build_single(
                     api_key,
                     model.to_string(),
                     base_url.to_string(),
-                )))
+                )?))
             } else {
                 anyhow::bail!(
                     "unknown AI provider '{}'. Set provider to 'openai', 'anthropic', \

@@ -152,6 +152,7 @@ pub(crate) async fn execute_simple_action(
             }
         }
         ai::AiAction::Ignore { reason } => Some((format!("ignored: {reason}"), false)),
+        ai::AiAction::Dismiss { reason } => Some((format!("dismissed: {reason}"), false)),
         _ => None,
     }
 }

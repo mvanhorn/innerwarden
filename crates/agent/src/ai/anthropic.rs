@@ -24,7 +24,7 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
-    pub fn new(api_key: String, model: String) -> Self {
+    pub fn new(api_key: String, model: String) -> anyhow::Result<Self> {
         let model = if model.is_empty() || model == "gpt-4o-mini" {
             // gpt-4o-mini is the OpenAI default; swap it for the Anthropic default
             DEFAULT_MODEL.to_string()
@@ -34,12 +34,12 @@ impl AnthropicProvider {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(20))
             .build()
-            .expect("failed to build reqwest client");
-        Self {
+            .map_err(|e| anyhow::anyhow!("failed to build HTTP client for anthropic: {e}"))?;
+        Ok(Self {
             api_key,
             model,
             client,
-        }
+        })
     }
 }
 
@@ -483,13 +483,13 @@ mod tests {
 
     #[test]
     fn provider_swaps_openai_default_model() {
-        let p = AnthropicProvider::new("key".into(), "gpt-4o-mini".into());
+        let p = AnthropicProvider::new("key".into(), "gpt-4o-mini".into()).unwrap();
         assert_eq!(p.model, DEFAULT_MODEL);
     }
 
     #[test]
     fn provider_preserves_explicit_claude_model() {
-        let p = AnthropicProvider::new("key".into(), "claude-opus-4-6".into());
+        let p = AnthropicProvider::new("key".into(), "claude-opus-4-6".into()).unwrap();
         assert_eq!(p.model, "claude-opus-4-6");
     }
 

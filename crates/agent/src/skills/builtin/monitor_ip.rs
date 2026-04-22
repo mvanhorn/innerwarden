@@ -71,7 +71,7 @@ impl ResponseSkill for MonitorIp {
             let timeout = format!("{}s", CAPTURE_TIMEOUT_SECS);
             let pcap_path_s = pcap_path.to_string_lossy().to_string();
             let command_preview = format!(
-                "sudo timeout {} tcpdump -nn -i any host {} -c {} -w {}",
+                "sudo -n timeout {} tcpdump -nn -i any host {} -c {} -w {}",
                 timeout,
                 ip,
                 CAPTURE_MAX_PACKETS,
@@ -99,8 +99,15 @@ impl ResponseSkill for MonitorIp {
                 };
             }
 
+            // -n forces sudo to fail immediately if a password is required
+            // instead of hanging on an interactive prompt that no one will
+            // answer (the agent runs as a systemd service without a TTY).
+            // Operators must add a NOPASSWD rule for tcpdump in the
+            // innerwarden sudoers drop-in, or grant CAP_NET_RAW + CAP_NET_ADMIN
+            // to tcpdump via setcap and drop sudo entirely.
             let output = Command::new("sudo")
                 .args([
+                    "-n",
                     "timeout",
                     &timeout,
                     "tcpdump",
@@ -149,7 +156,8 @@ impl ResponseSkill for MonitorIp {
                     SkillResult {
                         success: false,
                         message: format!(
-                            "monitor-ip capture failed for {ip} (status {status}): {stderr}"
+                            "monitor-ip capture failed for {ip} (status {status}): {stderr}{}",
+                            sudo_hint(&stderr)
                         ),
                     }
                 }
@@ -170,6 +178,20 @@ fn capture_dir() -> PathBuf {
 
 fn ip_filename_tag(ip: IpAddr) -> String {
     ip.to_string().replace(':', "_")
+}
+
+/// Build an actionable hint when tcpdump failed because sudo could not
+/// prompt for a password. Returns an empty string for any other failure
+/// so the base error message is not polluted. Extracted so the branch is
+/// trivially unit-testable without spawning sudo.
+fn sudo_hint(stderr: &str) -> &'static str {
+    if stderr.contains("a password is required") || stderr.contains("sudo: a terminal is required")
+    {
+        " [hint: agent has no TTY; grant passwordless sudo for tcpdump \
+         or setcap cap_net_raw,cap_net_admin=eip on /usr/bin/tcpdump]"
+    } else {
+        ""
+    }
 }
 
 fn write_metadata(
@@ -245,6 +267,25 @@ mod tests {
         let result = MonitorIp.execute(&ctx, true).await;
         assert!(!result.success);
         assert!(result.message.contains("invalid target IP"));
+    }
+
+    #[test]
+    fn sudo_hint_fires_on_password_required() {
+        let msg = sudo_hint("sudo: a password is required");
+        assert!(msg.contains("passwordless sudo"));
+        assert!(msg.contains("setcap"));
+    }
+
+    #[test]
+    fn sudo_hint_fires_on_terminal_required() {
+        let msg = sudo_hint("sudo: a terminal is required to read the password");
+        assert!(!msg.is_empty());
+    }
+
+    #[test]
+    fn sudo_hint_empty_for_unrelated_errors() {
+        assert_eq!(sudo_hint("tcpdump: permission denied"), "");
+        assert_eq!(sudo_hint(""), "");
     }
 
     #[test]
