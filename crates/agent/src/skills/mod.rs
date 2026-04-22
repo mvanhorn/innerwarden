@@ -422,40 +422,48 @@ impl Blocklist {
 /// line. Returns an empty vector for lines that are not DENY IN rules or
 /// that target a port/service rather than an IP address.
 ///
-/// Handles the real formats ufw emits:
+/// Handles the four formats ufw actually emits in production:
 ///
+/// - `Anywhere    DENY    203.0.113.10    # innerwarden`
+///   (`ufw status` — what the agent invokes; default direction is
+///   inbound, so there is **no `IN` token** in this format)
 /// - `[10] Anywhere    DENY IN    203.0.113.10    # innerwarden`
-///   (numbered format, from `ufw status numbered`)
+///   (`ufw status numbered` — what operators see, has `IN` and an
+///   index in brackets)
 /// - `Anywhere    DENY IN    203.0.113.10`
-///   (non-numbered format, from `ufw status`)
-/// - `81/tcp    DENY IN    Anywhere`
-///   (inbound port deny with no IP target — skipped)
+///   (`ufw status verbose` and similar)
+/// - `81/tcp    DENY    Anywhere`
+///   (inbound port-only deny; no IP to track, skipped)
+///
+/// Outbound rules (`DENY OUT`) are explicitly skipped because the
+/// in-memory blocklist tracks ingress blocks only.
 pub(crate) fn parse_ufw_deny_in_line(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let tokens: Vec<&str> = line.split_whitespace().collect();
 
-    // Must contain both "DENY" and "IN" (in that order, adjacent) to be a DENY IN rule.
-    let mut has_deny_in = false;
-    for pair in tokens.windows(2) {
-        if pair[0] == "DENY" && pair[1] == "IN" {
-            has_deny_in = true;
-            break;
-        }
-    }
-    if !has_deny_in {
+    // Find the `DENY` token. Default ufw direction is inbound, so a
+    // bare `DENY` is treated as ingress; only an explicit `DENY OUT`
+    // is excluded. The previous parser required `DENY` and `IN` to be
+    // adjacent, which silently dropped every rule from `ufw status`
+    // (no `IN` token there) — that left 1200+ ufw rules invisible to
+    // the agent on prod, so they never expired.
+    let Some(deny_idx) = tokens.iter().position(|t| *t == "DENY") else {
+        return out;
+    };
+    if tokens.get(deny_idx + 1) == Some(&"OUT") {
         return out;
     }
 
-    // Collect every token that parses as an IP address. Skip the literal
-    // "Anywhere" (that is a placeholder for the address family, not a host).
+    // Collect every token that parses as an IP address. Skip the
+    // literal `Anywhere` (placeholder for the address family) and its
+    // `(v6)` companion, and stop at the first comment marker.
     for tok in &tokens {
-        // Strip a leading bracket like "[10]" that `ufw status numbered`
-        // adds, and skip comment markers (`#` and anything after).
         if *tok == "#" {
             break;
         }
+        // Strip a leading numbered bracket like `[10]`.
         let cleaned = tok.trim_start_matches('[').trim_end_matches(']');
-        if cleaned == "Anywhere" {
+        if cleaned == "Anywhere" || cleaned == "(v6)" {
             continue;
         }
         if cleaned.parse::<std::net::IpAddr>().is_ok() {
@@ -570,27 +578,54 @@ mod tests {
     }
 
     #[test]
+    fn parse_ufw_deny_in_line_reads_default_status_format_no_in_token() {
+        // The exact format the agent reads from `sudo ufw status` (no
+        // `numbered`). DENY is bare, no `IN` token. Reproduces the prod
+        // bug that landed 1200+ ufw rules and zero in the in-memory
+        // blocklist.
+        let ips = parse_ufw_deny_in_line(
+            "Anywhere                   DENY        186.209.52.196             # innerwarden",
+        );
+        assert_eq!(ips, vec!["186.209.52.196"]);
+    }
+
+    #[test]
     fn parse_ufw_deny_in_line_skips_inbound_port_deny() {
-        // "[7] 81/tcp DENY IN Anywhere" is a port-family deny, no IP to
-        // track. Must return empty; returning "Anywhere" would poison the
-        // in-memory blocklist with a non-IP string.
-        let ips = parse_ufw_deny_in_line("[7] 81/tcp    DENY IN    Anywhere");
-        assert!(ips.is_empty());
+        // "81/tcp DENY Anywhere" is a port-family deny (default
+        // direction = inbound), no IP to track. Must return empty;
+        // returning "Anywhere" would poison the in-memory blocklist
+        // with a non-IP string.
+        assert!(
+            parse_ufw_deny_in_line("81/tcp                     DENY        Anywhere").is_empty()
+        );
+        // Same for the numbered variant with explicit IN.
+        assert!(parse_ufw_deny_in_line("[7] 81/tcp    DENY IN    Anywhere").is_empty());
     }
 
     #[test]
     fn parse_ufw_deny_in_line_skips_non_deny_lines() {
         assert!(parse_ufw_deny_in_line("Status: active").is_empty());
         assert!(parse_ufw_deny_in_line("[1] 22/tcp    LIMIT IN    Anywhere").is_empty());
+        assert!(
+            parse_ufw_deny_in_line("Anywhere                   ALLOW       10.0.0.1").is_empty()
+        );
         assert!(parse_ufw_deny_in_line("-- ------ ----").is_empty());
         assert!(parse_ufw_deny_in_line("").is_empty());
     }
 
     #[test]
-    fn parse_ufw_deny_in_line_requires_adjacent_deny_in_tokens() {
-        // "DENY OUT" and "ALLOW IN" must not be misread as DENY IN.
+    fn parse_ufw_deny_in_line_excludes_outbound_rules() {
+        // `DENY OUT` is an outbound rule. The in-memory blocklist
+        // tracks ingress only; do not pollute it with egress rules.
         assert!(parse_ufw_deny_in_line("[2] Anywhere    DENY OUT    10.0.0.1").is_empty());
+        assert!(parse_ufw_deny_in_line("Anywhere    DENY OUT    10.0.0.1").is_empty());
+    }
+
+    #[test]
+    fn parse_ufw_deny_in_line_skips_allow_rules() {
+        // ALLOW must never be read as DENY even with similar shape.
         assert!(parse_ufw_deny_in_line("[3] Anywhere    ALLOW IN    10.0.0.1").is_empty());
+        assert!(parse_ufw_deny_in_line("Anywhere    ALLOW    10.0.0.1").is_empty());
     }
 
     #[test]
