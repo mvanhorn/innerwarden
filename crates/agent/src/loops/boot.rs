@@ -893,8 +893,6 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         knowledge_graph: shared_graph.clone(),
         graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
         last_graph_snapshot: std::time::Instant::now(),
-        #[cfg(feature = "redis-reader")]
-        redis_reader: None,
         notification_burst_tracker: notification_gate::BurstTracker::new(),
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
@@ -964,21 +962,6 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             );
         }
         state.threat_feed = Some(client);
-    }
-
-    // Connect Redis reader if configured
-    #[cfg(feature = "redis-reader")]
-    if let Some(ref url) = cfg.redis_url {
-        let redis_cfg = redis_reader::agent_config(url, cfg.redis_stream.as_deref());
-        match redis_reader::RedisStreamReader::connect(redis_cfg).await {
-            Ok(r) => {
-                info!("Redis stream reader connected - events from Redis");
-                state.redis_reader = Some(r);
-            }
-            Err(e) => {
-                warn!("Redis reader connection failed ({e:#}), using JSONL fallback");
-            }
-        }
     }
 
     if !state.ip_reputations.is_empty() {

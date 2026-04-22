@@ -259,8 +259,6 @@ pub(crate) fn triage_test_state(data_dir: &Path) -> AgentState {
         )),
         graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
         last_graph_snapshot: std::time::Instant::now(),
-        #[cfg(feature = "redis-reader")]
-        redis_reader: None,
         notification_burst_tracker: notification_gate::BurstTracker::new(),
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
@@ -549,8 +547,6 @@ async fn golden_path_dry_run_produces_decision_entry() {
         )),
         graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
         last_graph_snapshot: std::time::Instant::now(),
-        #[cfg(feature = "redis-reader")]
-        redis_reader: None,
         notification_burst_tracker: notification_gate::BurstTracker::new(),
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
@@ -737,8 +733,6 @@ async fn allowed_skills_whitelist_enforced() {
         )),
         graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
         last_graph_snapshot: std::time::Instant::now(),
-        #[cfg(feature = "redis-reader")]
-        redis_reader: None,
         notification_burst_tracker: notification_gate::BurstTracker::new(),
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
@@ -906,8 +900,6 @@ async fn same_ip_in_same_tick_triggers_single_ai_call() {
         )),
         graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
         last_graph_snapshot: std::time::Instant::now(),
-        #[cfg(feature = "redis-reader")]
-        redis_reader: None,
         notification_burst_tracker: notification_gate::BurstTracker::new(),
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
@@ -1076,8 +1068,6 @@ async fn temporal_correlation_context_is_passed_to_ai() {
         )),
         graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
         last_graph_snapshot: std::time::Instant::now(),
-        #[cfg(feature = "redis-reader")]
-        redis_reader: None,
         notification_burst_tracker: notification_gate::BurstTracker::new(),
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
@@ -1231,8 +1221,6 @@ async fn honeypot_demo_writes_synthetic_decoy_event() {
         )),
         graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
         last_graph_snapshot: std::time::Instant::now(),
-        #[cfg(feature = "redis-reader")]
-        redis_reader: None,
         notification_burst_tracker: notification_gate::BurstTracker::new(),
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
@@ -1396,8 +1384,6 @@ async fn decision_cooldown_suppresses_repeat() {
         )),
         graph_detector_state: knowledge_graph::detectors::GraphDetectorState::new(),
         last_graph_snapshot: std::time::Instant::now(),
-        #[cfg(feature = "redis-reader")]
-        redis_reader: None,
         notification_burst_tracker: notification_gate::BurstTracker::new(),
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,

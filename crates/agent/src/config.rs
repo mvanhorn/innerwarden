@@ -76,15 +76,6 @@ pub struct AgentConfig {
     /// Environment auto-profiling and census.
     #[serde(default)]
     pub environment: EnvironmentConfig,
-    /// Redis URL for reading events from Redis Streams instead of JSONL files.
-    /// When set, events are consumed via XREADGROUP. Incidents still read from JSONL.
-    #[serde(default)]
-    #[cfg_attr(not(feature = "redis-reader"), allow(dead_code))]
-    pub redis_url: Option<String>,
-    /// Redis stream name for events. Default: "innerwarden:events".
-    #[serde(default)]
-    #[cfg_attr(not(feature = "redis-reader"), allow(dead_code))]
-    pub redis_stream: Option<String>,
     /// Daily AI intelligence briefing
     #[serde(default)]
     pub briefing: BriefingConfig,

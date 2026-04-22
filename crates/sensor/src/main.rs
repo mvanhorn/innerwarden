@@ -56,8 +56,6 @@ use detectors::user_agent_scanner::UserAgentScannerDetector;
 use detectors::user_creation::UserCreationDetector;
 use detectors::web_scan::WebScanDetector;
 use detectors::web_shell::WebShellDetector;
-#[cfg(feature = "redis-sink")]
-use sinks::redis_stream::{RedisStreamConfig, RedisStreamWriter};
 use sinks::{sqlite::SqliteWriter, state::State};
 use tokio::sync::mpsc;
 #[allow(unused_imports)]
@@ -169,26 +167,6 @@ async fn main() -> Result<()> {
 
     let mut state = State::load(&state_path)?;
     info!(cursors = state.cursors.len(), "state loaded");
-
-    // When Redis is configured, events also go to Redis Streams for
-    // high-throughput consumer group reads by the agent.
-    #[cfg(feature = "redis-sink")]
-    let mut redis_writer: Option<RedisStreamWriter> = if let Some(ref url) = cfg.output.redis_url {
-        let redis_cfg = RedisStreamConfig::new(
-            url,
-            cfg.output.redis_stream.as_deref(),
-            cfg.output.redis_maxlen,
-        );
-        match RedisStreamWriter::connect(redis_cfg).await {
-            Ok(w) => Some(w),
-            Err(e) => {
-                warn!("Redis connection failed ({e:#}), falling back to JSONL only");
-                None
-            }
-        }
-    } else {
-        None
-    };
 
     let write_events = cfg.output.write_events;
 
@@ -1132,14 +1110,6 @@ async fn main() -> Result<()> {
             info!("all collectors stopped");
             break 'main;
         };
-
-        // Publish event to Redis stream (if enabled)
-        #[cfg(feature = "redis-sink")]
-        if let Some(ref mut rw) = redis_writer {
-            if let Err(e) = rw.write_event(&ev).await {
-                warn!(kind = %ev.kind, "Redis publish failed: {e:#}");
-            }
-        }
 
         // Periodic dataset reload (every hour)
         threat_datasets.maybe_reload();

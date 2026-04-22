@@ -14,17 +14,3 @@ serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 anyhow = "1"
-
-# Binary-only deps (for standalone Redis daemon)
-tokio = { version = "1", features = ["full"], optional = true }
-redis = { version = "0.27", features = ["tokio-comp", "streams"], optional = true }
-clap = { version = "4", features = ["derive"], optional = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
-
-[features]
-default = []
-daemon = ["tokio", "redis", "clap", "tracing-subscriber"]
-
-[[bin]]
-name = "innerwarden-killchain"
-required-features = ["daemon"]
