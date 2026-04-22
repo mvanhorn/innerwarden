@@ -6,7 +6,14 @@ use tracing::info;
 use crate::error::{Result, StoreError};
 
 /// Current schema version.
-pub const CURRENT_VERSION: i64 = 1;
+///
+/// History:
+/// - v1: initial sqlite migration from JSONL+redb (spec 016).
+/// - v2: events.src_ip column. Replaces a per-row JSON re-parse in
+///   `events_for_training` with an indexed column lookup
+///   (`RECURRING_BUGS.md` "events_for_training reparses full JSON to
+///   extract src_ip"). Includes a one-time backfill of existing rows.
+pub const CURRENT_VERSION: i64 = 2;
 
 /// Initial DDL for schema v1.
 const SCHEMA_V1: &str = r#"
@@ -146,18 +153,19 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
         .unwrap_or(false);
 
     if !has_schema {
-        // Fresh database — apply v1 schema
+        // Fresh database — apply v1 schema, record version, then fall
+        // through to the migration loop so a fresh DB ends up at
+        // CURRENT_VERSION via the same code path as an upgraded one.
         conn.execute_batch(SCHEMA_V1)?;
         conn.execute(
             "INSERT INTO schema_version (version, migrated_at, notes) VALUES (?1, ?2, ?3)",
             rusqlite::params![
-                CURRENT_VERSION,
+                1_i64,
                 chrono::Utc::now().to_rfc3339(),
                 "initial sqlite migration from JSONL+redb"
             ],
         )?;
-        info!(version = CURRENT_VERSION, "schema initialized");
-        return Ok(());
+        info!(version = 1, "v1 schema initialized");
     }
 
     // Check current version
@@ -176,17 +184,94 @@ pub fn ensure_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn run_migrations(_conn: &Connection, from_version: i64) -> Result<()> {
-    // Future migrations go here as match arms:
-    // if from_version < 2 { apply_v2(conn)?; }
-    // if from_version < 3 { apply_v3(conn)?; }
-    let _ = from_version;
+fn run_migrations(conn: &Connection, from_version: i64) -> Result<()> {
+    if from_version < 2 {
+        apply_v2(conn)?;
+    }
 
     info!(
         from = from_version,
         to = CURRENT_VERSION,
         "schema migrations complete"
     );
+    Ok(())
+}
+
+/// v2 migration: add `events.src_ip` column + index, then backfill the
+/// new column for any existing rows by extracting `details.src_ip`
+/// (preferred) or `details.ip` (fallback) from the JSON payload. The
+/// backfill is a one-time scan; on a fresh database it runs over zero
+/// rows. On an upgraded production database it runs once and the column
+/// becomes the canonical source for `events_for_training`.
+fn apply_v2(conn: &Connection) -> Result<()> {
+    use rusqlite::params;
+
+    // Column may already exist if a partial migration was attempted —
+    // tolerate "duplicate column name" by checking pragma_table_info.
+    let already_present: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('events') WHERE name = 'src_ip'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|c| c > 0)
+        .unwrap_or(false);
+    if !already_present {
+        conn.execute("ALTER TABLE events ADD COLUMN src_ip TEXT", [])?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_src_ip ON events(src_ip) WHERE src_ip IS NOT NULL",
+            [],
+        )?;
+    }
+
+    // Backfill: scan rows where src_ip IS NULL, extract from data, update.
+    // Done in batches to avoid loading the entire table into memory on
+    // upgrade. Uses prepared statements so the per-row cost is parse +
+    // bind, not query compile.
+    let mut select =
+        conn.prepare("SELECT id, data FROM events WHERE src_ip IS NULL ORDER BY id LIMIT 1000")?;
+    let mut update = conn.prepare("UPDATE events SET src_ip = ?1 WHERE id = ?2")?;
+    loop {
+        let mut rows = select.query([])?;
+        let mut updated_in_batch = 0;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let data: String = row.get(1)?;
+            let ip = serde_json::from_str::<serde_json::Value>(&data)
+                .ok()
+                .and_then(|v| {
+                    v.get("details").and_then(|d| {
+                        d.get("src_ip")
+                            .or_else(|| d.get("ip"))
+                            .and_then(|s| s.as_str())
+                            .map(|s| s.to_string())
+                    })
+                });
+            // Always update to mark the row as "scanned" — without this
+            // the loop would never terminate on rows where src_ip is
+            // genuinely absent (they would re-match the WHERE clause
+            // forever). Use empty string as the "scanned but no IP"
+            // marker, then convert empty back to NULL.
+            update.execute(params![ip.as_deref().unwrap_or(""), id])?;
+            updated_in_batch += 1;
+        }
+        if updated_in_batch == 0 {
+            break;
+        }
+    }
+    // Convert the empty-string sentinel back to NULL so query semantics
+    // match the post-migration writers (which insert NULL when no IP).
+    conn.execute("UPDATE events SET src_ip = NULL WHERE src_ip = ''", [])?;
+
+    conn.execute(
+        "INSERT INTO schema_version (version, migrated_at, notes) VALUES (?1, ?2, ?3)",
+        rusqlite::params![
+            2_i64,
+            chrono::Utc::now().to_rfc3339(),
+            "events.src_ip column + backfill"
+        ],
+    )?;
+
     Ok(())
 }
 

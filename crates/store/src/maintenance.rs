@@ -593,7 +593,9 @@ mod tests {
         let stats = store.stats().unwrap();
         assert_eq!(stats.events_count, 0);
         assert_eq!(stats.incidents_count, 0);
-        assert_eq!(stats.schema_version, 1);
+        // CURRENT_VERSION is 2 since the v2 migration shipped (events.src_ip
+        // column + backfill). Bumping CURRENT_VERSION must update this guard.
+        assert_eq!(stats.schema_version, crate::schema::CURRENT_VERSION);
     }
 
     #[test]
