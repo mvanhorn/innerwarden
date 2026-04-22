@@ -33,6 +33,8 @@ CLAUDE.md
 **/CLAUDE.md
 .claude/
 **/.claude/
+.claude-local/
+**/.claude-local/
 
 # Project docs live in the GitHub wiki, not the repo
 docs/
