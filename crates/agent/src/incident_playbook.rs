@@ -20,26 +20,26 @@ pub(crate) fn maybe_evaluate_and_persist_playbook(
             exec.playbook_name
         );
 
-        // Persist playbook execution to JSON log.
+        // Persist playbook execution to JSON log via the shared
+        // atomic-rename helper. Pre-2026-04-23 each call site had its
+        // own RMW loop; a crash mid-write left dashboard readers with
+        // half-written JSON. `append_with_cap` uses temp-file + rename
+        // so observers see either old or new content, never a partial
+        // file. Dual-write to SQLite blob preserved for back-compat.
         let log_path = data_dir.join("playbook-log.json");
-        let mut log: Vec<serde_json::Value> = std::fs::read_to_string(&log_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        if let Ok(val) = serde_json::to_value(&exec) {
-            log.push(val);
+        if let Err(e) = crate::capped_log::append_with_cap(&log_path, &exec, 100) {
+            warn!("failed to append playbook-log: {e}");
         }
-        if log.len() > 100 {
-            log = log.split_off(log.len() - 100);
-        }
-        let json_str = serde_json::to_string(&log).unwrap_or_default();
-        // Dual-write: SQLite blob + JSON file
         if let Some(ref sq) = state.sqlite_store {
-            if let Err(e) = sq.set_blob("playbook_log", &json_str) {
-                warn!("failed to write playbook_log blob: {e}");
+            // Re-read the file we just wrote so the SQLite blob always
+            // mirrors the on-disk JSON exactly. Cheaper than re-doing
+            // the read+merge in two places.
+            if let Ok(content) = std::fs::read_to_string(&log_path) {
+                if let Err(e) = sq.set_blob("playbook_log", &content) {
+                    warn!("failed to write playbook_log blob: {e}");
+                }
             }
         }
-        let _ = std::fs::write(&log_path, json_str);
     }
 }
 

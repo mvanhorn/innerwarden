@@ -44,6 +44,7 @@ mod bot_actions;
 mod bot_commands;
 mod bot_helpers;
 mod briefing;
+mod capped_log;
 mod circuit_breaker;
 mod cloud_safelist;
 mod cloudflare;

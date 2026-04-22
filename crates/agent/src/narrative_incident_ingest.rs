@@ -149,24 +149,17 @@ pub(crate) fn ingest_new_incidents(
             }
         }
 
-        // Persist detected chains to JSON for dashboard
+        // Persist detected chains to JSON for dashboard via the shared
+        // atomic-rename helper (`crate::capped_log::append_with_cap`).
+        // Same back-compat anchor as `incident_playbook.rs` — see that
+        // file's note for the rationale.
         if !chains.is_empty() {
             let chains_path = data_dir.join("attack-chains.json");
-            let mut existing: Vec<serde_json::Value> = std::fs::read_to_string(&chains_path)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default();
             for chain in &chains {
-                if let Ok(val) = serde_json::to_value(chain) {
-                    existing.push(val);
+                if let Err(e) = crate::capped_log::append_with_cap(&chains_path, chain, 100) {
+                    warn!("failed to append attack-chains: {e}");
                 }
             }
-            // Keep last 100 chains
-            existing = trim_to_latest(existing, 100);
-            let _ = std::fs::write(
-                &chains_path,
-                serde_json::to_string(&existing).unwrap_or_default(),
-            );
         }
 
         // Check for multi-low elevation
@@ -192,13 +185,6 @@ fn split_incident_rows(
 
 fn should_process_new_incidents(count: usize) -> bool {
     count > 0
-}
-
-fn trim_to_latest(mut values: Vec<serde_json::Value>, limit: usize) -> Vec<serde_json::Value> {
-    if values.len() > limit {
-        values = values.split_off(values.len() - limit);
-    }
-    values
 }
 
 #[cfg(test)]
@@ -241,18 +227,7 @@ mod tests {
         assert!(should_process_new_incidents(1));
     }
 
-    #[test]
-    fn trim_to_latest_keeps_tail_slice_when_over_limit() {
-        // Verifies chain history pruning keeps the most recent entries for dashboard rendering.
-        let values: Vec<serde_json::Value> = (0..5).map(|n| serde_json::json!(n)).collect();
-        let trimmed = trim_to_latest(values, 3);
-        assert_eq!(
-            trimmed,
-            vec![
-                serde_json::json!(2),
-                serde_json::json!(3),
-                serde_json::json!(4)
-            ]
-        );
-    }
+    // Note: chain history pruning logic moved to
+    // `crate::capped_log::append_with_cap` and is exercised by that
+    // module's tests (`append_caps_to_most_recent_n_entries`).
 }
