@@ -209,6 +209,27 @@ pub(super) async fn api_export(
     State(state): State<DashboardState>,
     Query(query): Query<ExportQuery>,
 ) -> Response {
+    // Acquires the KG read lock multiple times (overview + pivots +
+    // clusters + journey) and serialises a potentially-large snapshot to
+    // JSON or markdown — order of tens of milliseconds on a busy host.
+    // Run the whole pipeline on the blocking pool so the dashboard's async
+    // workers stay responsive (`RECURRING_BUGS.md` "Dashboard handlers
+    // block tokio worker threads").
+    let kg = std::sync::Arc::clone(&state.knowledge_graph);
+    let data_dir = state.data_dir.clone();
+    let result =
+        tokio::task::spawn_blocking(move || build_export_response(kg, data_dir, query)).await;
+    match result {
+        Ok(resp) => resp,
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "export task panicked").into_response(),
+    }
+}
+
+fn build_export_response(
+    kg: std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
+    data_dir: std::path::PathBuf,
+    query: ExportQuery,
+) -> Response {
     let date = resolve_date(query.date.as_deref());
     let format = query
         .format
@@ -224,15 +245,16 @@ pub(super) async fn api_export(
     let limit = normalize_limit(query.limit);
     let window_seconds = query.window_seconds.unwrap_or(300).clamp(30, 3600);
 
-    let graph = state.knowledge_graph.read().unwrap();
-    let overview = compute_overview_from_graph(&graph, &state.data_dir, &date);
-    drop(graph);
-    let pivots = build_pivots_from_graph(&state.knowledge_graph, group_by, limit);
-    let clusters = build_cluster_items_from_graph(&state.knowledge_graph, limit, window_seconds);
+    let overview = {
+        let graph = kg.read().unwrap();
+        compute_overview_from_graph(&graph, &data_dir, &date)
+    };
+    let pivots = build_pivots_from_graph(&kg, group_by, limit);
+    let clusters = build_cluster_items_from_graph(&kg, limit, window_seconds);
     let journey = subject.as_ref().filter(|s| !s.is_empty()).map(|s| {
         build_journey_from_graph(
-            &state.knowledge_graph,
-            &state.data_dir,
+            &kg,
+            &data_dir,
             &date,
             subject_type,
             s,

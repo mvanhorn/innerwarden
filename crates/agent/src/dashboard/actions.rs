@@ -35,73 +35,119 @@ pub(super) async fn api_action_config(
     }))
 }
 /// GET /api/quickwins - return actionable suggestions based on recent unblocked threats.
+///
+/// Source-of-truth contract (see `.claude-local/NUMBER_CONSISTENCY.md` row "quickwins
+/// suggestions"): a suggestion is an `incidents-{today,yesterday}.jsonl` row with
+/// severity ∈ {`high`, `critical`} (lowercase, per `Severity` `#[serde(rename_all =
+/// "lowercase")]`) whose primary IP entity does NOT appear in `decisions-*.jsonl`
+/// with `action_type == "block_ip"` (NOT `action`, which is not a writer field —
+/// see `crates/agent/src/decisions.rs::DecisionEntry::action_type`).
+///
+/// Any change to `Severity` casing, `DecisionEntry::action_type`, or the JSONL
+/// filename pattern MUST update this handler AND the regression test that pins
+/// it (`tests::api_quickwins_*`).
+///
+/// The actual work (synchronous JSONL scan) runs on the blocking thread pool
+/// via `tokio::task::spawn_blocking` so it does not stall the dashboard's async
+/// worker threads — the JSONL scan can take tens of milliseconds on busy days
+/// (`RECURRING_BUGS.md` "Dashboard handlers block tokio worker threads").
 pub(super) async fn api_quickwins(State(state): State<DashboardState>) -> Json<serde_json::Value> {
-    let data_dir = &state.data_dir;
+    let data_dir = state.data_dir.clone();
+    let payload = tokio::task::spawn_blocking(move || quickwins_payload(&data_dir))
+        .await
+        .unwrap_or_else(|_| serde_json::json!({"suggestions": [], "count": 0}));
+    Json(payload)
+}
+
+/// Pure helper extracted from `api_quickwins` so the JSONL-based logic is
+/// directly unit-testable against a tempdir without spinning up the dashboard
+/// server.
+pub(super) fn quickwins_payload(data_dir: &std::path::Path) -> serde_json::Value {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
         .format("%Y-%m-%d")
         .to_string();
+    let dates = [today.as_str(), yesterday.as_str()];
 
-    // Collect blocked IPs from decisions (today + yesterday)
+    // Collect blocked IPs from decisions (today + yesterday).
+    // Field name MUST be `action_type` to match `DecisionEntry::action_type`
+    // (decisions.rs:26). The previous reader used `action`, which never exists
+    // in the writer schema and silently produced an empty set.
     let mut blocked_ips: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for date in &[today.as_str(), yesterday.as_str()] {
+    for date in &dates {
         let path = data_dir.join(format!("decisions-{date}.jsonl"));
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            for line in content.lines().filter(|l| !l.trim().is_empty()) {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                    if v["action"].as_str() == Some("block_ip") {
-                        if let Some(ip) = v["target_ip"].as_str() {
-                            blocked_ips.insert(ip.to_string());
-                        }
-                    }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if v["action_type"].as_str() == Some("block_ip") {
+                if let Some(ip) = v["target_ip"].as_str() {
+                    blocked_ips.insert(ip.to_string());
                 }
             }
         }
     }
 
-    // Collect unblocked High/Critical incidents from today + yesterday
+    // Collect high/critical incidents from today + yesterday.
+    // Severity comparison is case-insensitive — the wire format is lowercase
+    // (per Severity `#[serde(rename_all = "lowercase")]`), but the test fixture
+    // and any future writer that violates that should still be filtered, not
+    // silently included.
     let mut suggestions: Vec<serde_json::Value> = Vec::new();
     let mut seen_ips: std::collections::HashSet<String> = blocked_ips.clone();
-    for date in &[today.as_str(), yesterday.as_str()] {
+    for date in &dates {
         let path = data_dir.join(format!("incidents-{date}.jsonl"));
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            for line in content.lines().filter(|l| !l.trim().is_empty()) {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                    let sev = v["severity"].as_str().unwrap_or("");
-                    if sev != "High" && sev != "Critical" {
-                        continue;
-                    }
-                    // Find IP entity
-                    let ip = v["entities"].as_array().and_then(|arr| {
-                        arr.iter()
-                            .find(|e| e["type"].as_str() == Some("Ip"))
-                            .and_then(|e| e["value"].as_str())
-                            .map(|s| s.to_string())
-                    });
-                    if let Some(ip_str) = ip {
-                        if seen_ips.contains(&ip_str) {
-                            continue; // already handled or deduped
-                        }
-                        seen_ips.insert(ip_str.clone());
-                        suggestions.push(serde_json::json!({
-                            "type": "unblocked_attacker",
-                            "severity": sev,
-                            "ip": ip_str,
-                            "title": v["title"].as_str().unwrap_or("Threat detected"),
-                            "date": date,
-                            "action": format!("Block {ip_str} at the firewall"),
-                            "command": "innerwarden enable block-ip"
-                        }));
-                    }
-                }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let sev = v["severity"].as_str().unwrap_or("");
+            if !sev.eq_ignore_ascii_case("high") && !sev.eq_ignore_ascii_case("critical") {
+                continue;
             }
+            let ip = v["entities"].as_array().and_then(|arr| {
+                arr.iter()
+                    .find(|e| {
+                        // Match either the original "Ip" capitalization or the
+                        // serde-derived lowercase form. Defensive against future
+                        // serde rename changes on EntityType.
+                        e["type"]
+                            .as_str()
+                            .map(|s| s.eq_ignore_ascii_case("ip"))
+                            .unwrap_or(false)
+                    })
+                    .and_then(|e| e["value"].as_str())
+                    .map(|s| s.to_string())
+            });
+            let Some(ip_str) = ip else {
+                continue;
+            };
+            if seen_ips.contains(&ip_str) {
+                continue;
+            }
+            seen_ips.insert(ip_str.clone());
+            suggestions.push(serde_json::json!({
+                "type": "unblocked_attacker",
+                "severity": sev,
+                "ip": ip_str,
+                "title": v["title"].as_str().unwrap_or("Threat detected"),
+                "date": date,
+                "action": format!("Block {ip_str} at the firewall"),
+                "command": "innerwarden enable block-ip"
+            }));
         }
     }
 
-    Json(serde_json::json!({
+    serde_json::json!({
         "suggestions": suggestions,
         "count": suggestions.len()
-    }))
+    })
 }
 /// POST /api/action/block-ip - operator-initiated IP block with mandatory reason.
 pub(super) async fn api_action_block_ip(
@@ -771,5 +817,216 @@ mod tests {
         let removed = blocked.remove("9.9.9.9");
         assert!(!removed);
         assert!(blocked.contains("8.8.8.8"));
+    }
+
+    // ── api_quickwins regression suite ───────────────────────────────
+    //
+    // Anchors for the bug surfaced 2026-04-22 (`.claude-local/RECURRING_BUGS.md`):
+    //   1. Reader looked at JSON field `action`, but writer (`decisions.rs`)
+    //      writes `action_type`. Blocked-IP set was always empty.
+    //   2. Severity filter compared against "High"/"Critical" but on-disk values
+    //      are lowercase per `Severity` `#[serde(rename_all = "lowercase")]`.
+    //
+    // Fixtures use the on-disk JSONL field names directly so a future schema
+    // rename on either side will fail these tests.
+
+    fn write_jsonl(dir: &std::path::Path, name: &str, lines: &[serde_json::Value]) {
+        let path = dir.join(name);
+        let mut buf = String::new();
+        for v in lines {
+            buf.push_str(&serde_json::to_string(v).unwrap());
+            buf.push('\n');
+        }
+        std::fs::write(&path, buf).expect("write fixture jsonl");
+    }
+
+    fn today_str() -> String {
+        chrono::Utc::now().format("%Y-%m-%d").to_string()
+    }
+
+    fn high_incident(ip: &str, title: &str) -> serde_json::Value {
+        serde_json::json!({
+            "severity": "high",
+            "title": title,
+            "entities": [{"type": "Ip", "value": ip}],
+        })
+    }
+
+    fn critical_incident(ip: &str, title: &str) -> serde_json::Value {
+        serde_json::json!({
+            "severity": "critical",
+            "title": title,
+            "entities": [{"type": "Ip", "value": ip}],
+        })
+    }
+
+    fn block_decision(ip: &str) -> serde_json::Value {
+        // Use the writer's actual field names. If `decisions.rs::DecisionEntry`
+        // ever renames `action_type`, this fixture and the production reader
+        // both need to update — that is the contract.
+        serde_json::json!({
+            "action_type": "block_ip",
+            "target_ip": ip,
+        })
+    }
+
+    #[test]
+    fn api_quickwins_returns_unblocked_high_severity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let date = today_str();
+
+        // 1 high-severity incident from an unblocked IP, 1 high-severity from a
+        // blocked IP, 1 low-severity (must be filtered out).
+        write_jsonl(
+            dir.path(),
+            &format!("incidents-{date}.jsonl"),
+            &[
+                high_incident("203.0.113.10", "ssh bruteforce"),
+                high_incident("198.51.100.5", "port scan"),
+                serde_json::json!({
+                    "severity": "low",
+                    "title": "noise",
+                    "entities": [{"type": "Ip", "value": "203.0.113.99"}],
+                }),
+            ],
+        );
+        write_jsonl(
+            dir.path(),
+            &format!("decisions-{date}.jsonl"),
+            &[block_decision("198.51.100.5")],
+        );
+
+        let payload = quickwins_payload(dir.path());
+        let suggestions = payload["suggestions"].as_array().expect("suggestions");
+        assert_eq!(payload["count"].as_u64(), Some(1));
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0]["ip"].as_str(), Some("203.0.113.10"));
+        assert_eq!(suggestions[0]["severity"].as_str(), Some("high"));
+        assert_eq!(
+            suggestions[0]["title"].as_str(),
+            Some("ssh bruteforce"),
+            "title should round-trip from incident"
+        );
+    }
+
+    #[test]
+    fn api_quickwins_accepts_critical_severity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let date = today_str();
+        write_jsonl(
+            dir.path(),
+            &format!("incidents-{date}.jsonl"),
+            &[critical_incident("203.0.113.42", "ransomware burst")],
+        );
+        let payload = quickwins_payload(dir.path());
+        assert_eq!(payload["count"].as_u64(), Some(1));
+        assert_eq!(
+            payload["suggestions"][0]["severity"].as_str(),
+            Some("critical")
+        );
+    }
+
+    #[test]
+    fn api_quickwins_dedupes_blocked_ip_via_action_type_field() {
+        // Regression for the field-name bug. The writer uses `action_type`,
+        // the previous reader looked at `action`. If the reader reverts to
+        // `action`, the blocked IP will not be removed and this test fails.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let date = today_str();
+        write_jsonl(
+            dir.path(),
+            &format!("incidents-{date}.jsonl"),
+            &[high_incident("203.0.113.99", "double-counted threat")],
+        );
+        write_jsonl(
+            dir.path(),
+            &format!("decisions-{date}.jsonl"),
+            &[block_decision("203.0.113.99")],
+        );
+
+        let payload = quickwins_payload(dir.path());
+        assert_eq!(
+            payload["count"].as_u64(),
+            Some(0),
+            "blocked IP must be filtered out — if this fails, the action_type field name regressed"
+        );
+    }
+
+    #[test]
+    fn api_quickwins_ignores_low_severity_case_insensitive() {
+        // Regression for the severity-case bug. Fixture writes both "high"
+        // (correct) and "HIGH" (defensive — should still be accepted by a
+        // case-insensitive comparison) and "low" (must be rejected).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let date = today_str();
+        write_jsonl(
+            dir.path(),
+            &format!("incidents-{date}.jsonl"),
+            &[
+                serde_json::json!({
+                    "severity": "HIGH",
+                    "title": "uppercase wire format",
+                    "entities": [{"type": "Ip", "value": "203.0.113.1"}],
+                }),
+                serde_json::json!({
+                    "severity": "low",
+                    "title": "noise",
+                    "entities": [{"type": "Ip", "value": "203.0.113.2"}],
+                }),
+            ],
+        );
+        let payload = quickwins_payload(dir.path());
+        assert_eq!(payload["count"].as_u64(), Some(1));
+        assert_eq!(
+            payload["suggestions"][0]["ip"].as_str(),
+            Some("203.0.113.1")
+        );
+    }
+
+    #[test]
+    fn api_quickwins_dedupes_repeated_ip_within_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let date = today_str();
+        write_jsonl(
+            dir.path(),
+            &format!("incidents-{date}.jsonl"),
+            &[
+                high_incident("203.0.113.7", "first hit"),
+                high_incident("203.0.113.7", "second hit same IP"),
+            ],
+        );
+        let payload = quickwins_payload(dir.path());
+        assert_eq!(payload["count"].as_u64(), Some(1));
+    }
+
+    #[test]
+    fn api_quickwins_returns_empty_when_no_files_exist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let payload = quickwins_payload(dir.path());
+        assert_eq!(payload["count"].as_u64(), Some(0));
+        assert!(payload["suggestions"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn api_quickwins_skips_malformed_jsonl_lines() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let date = today_str();
+        let path = dir.path().join(format!("incidents-{date}.jsonl"));
+        std::fs::write(
+            &path,
+            // first line is valid, second is broken JSON, third is valid again
+            format!(
+                "{}\nnot-json-at-all\n{}\n",
+                serde_json::to_string(&high_incident("203.0.113.10", "valid 1")).unwrap(),
+                serde_json::to_string(&high_incident("203.0.113.20", "valid 2")).unwrap(),
+            ),
+        )
+        .unwrap();
+        let payload = quickwins_payload(dir.path());
+        assert_eq!(
+            payload["count"].as_u64(),
+            Some(2),
+            "malformed lines must be skipped, not abort the scan"
+        );
     }
 }

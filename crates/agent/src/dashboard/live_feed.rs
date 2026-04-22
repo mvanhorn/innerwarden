@@ -118,13 +118,41 @@ pub(super) fn count_unique_ips_blocked(
 }
 
 /// `GET /api/live-feed` - last 200 incidents with totals for the day (public).
+///
+/// The body holds the KG read lock and walks every `Incident` node, which can
+/// take tens of milliseconds on a busy host. Running it directly on an async
+/// worker thread would stall every other dashboard request handled by the same
+/// worker (`RECURRING_BUGS.md` "Dashboard handlers block tokio worker threads").
+/// `tokio::task::spawn_blocking` moves the work to the blocking pool so async
+/// workers stay responsive.
 pub(super) async fn api_live_feed(State(state): State<DashboardState>) -> Json<LiveFeedResponse> {
+    let kg = std::sync::Arc::clone(&state.knowledge_graph);
+    let data_dir = state.data_dir.clone();
+    let resp = tokio::task::spawn_blocking(move || build_live_feed_response(&kg, &data_dir))
+        .await
+        .unwrap_or_else(|_| LiveFeedResponse {
+            total_today: 0,
+            total_blocked: 0,
+            total_high: 0,
+            unique_sources: 0,
+            items: Vec::new(),
+        });
+    Json(resp)
+}
+
+/// Pure helper extracted from `api_live_feed` so the heavy work runs on the
+/// blocking pool and stays unit-testable. Same logic as before — only the
+/// scope of the read lock changed.
+fn build_live_feed_response(
+    kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
+    data_dir: &std::path::Path,
+) -> LiveFeedResponse {
     let _now = chrono::Utc::now();
-    let reputation_map = load_ip_reputation_map(&state.data_dir);
+    let reputation_map = load_ip_reputation_map(data_dir);
 
     // Read incidents from knowledge graph
     use crate::knowledge_graph::types::{Node, NodeType, Relation};
-    let graph = state.knowledge_graph.read().unwrap();
+    let graph = kg.read().unwrap();
 
     // Build incidents from graph Incident nodes
     let mut incidents: Vec<Incident> = Vec::new();
@@ -313,13 +341,13 @@ pub(super) async fn api_live_feed(State(state): State<DashboardState>) -> Json<L
         .collect();
     items.reverse();
 
-    Json(LiveFeedResponse {
+    LiveFeedResponse {
         total_today,
         total_blocked,
         total_high,
         unique_sources,
         items,
-    })
+    }
 }
 
 /// Sanitized title for public live feed. No paths, PIDs, UIDs, usernames.
