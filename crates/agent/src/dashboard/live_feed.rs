@@ -89,6 +89,34 @@ pub(super) struct LiveFeedResponse {
     items: Vec<LiveFeedItem>,
 }
 
+/// Count **unique IPs** blocked today, not raw block decisions.
+///
+/// Without dedup, a single attacker blocked N times (retries, new
+/// incidents, lifecycle re-entries) shows up N times, which is why the
+/// "Blocked" KPI on the site and the dashboard Home KPI used to report
+/// different numbers for the same traffic. The semantic this function
+/// pins is "how many distinct IPs did the agent contain today"; it is
+/// shared by `/api/live-feed` here and `/api/agent/security-context` in
+/// `agent_api.rs` so every surface that reads "Blocked Today" agrees.
+pub(super) fn count_unique_ips_blocked(
+    decisions: &[DecisionEntry],
+    real_ids: &std::collections::HashSet<&str>,
+) -> usize {
+    let mut ips: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for d in decisions {
+        if d.action_type != "block_ip" {
+            continue;
+        }
+        if !real_ids.contains(d.incident_id.as_str()) {
+            continue;
+        }
+        if let Some(ip) = d.target_ip.as_deref().filter(|s| !s.is_empty()) {
+            ips.insert(ip);
+        }
+    }
+    ips.len()
+}
+
 /// `GET /api/live-feed` - last 200 incidents with totals for the day (public).
 pub(super) async fn api_live_feed(State(state): State<DashboardState>) -> Json<LiveFeedResponse> {
     let _now = chrono::Utc::now();
@@ -206,10 +234,7 @@ pub(super) async fn api_live_feed(State(state): State<DashboardState>) -> Json<L
         .collect();
 
     let total_today = real_incidents.len();
-    let total_blocked = decisions
-        .iter()
-        .filter(|d| d.action_type == "block_ip" && real_ids.contains(d.incident_id.as_str()))
-        .count();
+    let total_blocked = count_unique_ips_blocked(&decisions, &real_ids);
     let total_high = real_incidents
         .iter()
         .filter(|i| matches!(i.severity, Severity::High | Severity::Critical))
@@ -850,5 +875,84 @@ mod tests {
         let query: GeoIpQuery =
             serde_json::from_value(serde_json::json!({"ips": "1.2.3.4"})).unwrap();
         assert_eq!(query.ips, "1.2.3.4");
+    }
+
+    // ── count_unique_ips_blocked (block-count consistency) ───────────
+
+    fn mk_decision(incident_id: &str, action: &str, ip: Option<&str>) -> DecisionEntry {
+        DecisionEntry {
+            ts: chrono::Utc::now(),
+            incident_id: incident_id.to_string(),
+            host: String::new(),
+            ai_provider: String::new(),
+            action_type: action.to_string(),
+            target_ip: ip.map(|s| s.to_string()),
+            target_user: None,
+            skill_id: None,
+            confidence: 0.9,
+            auto_executed: true,
+            dry_run: false,
+            reason: String::new(),
+            execution_result: "ok".into(),
+            estimated_threat: String::new(),
+            prev_hash: None,
+        }
+    }
+
+    #[test]
+    fn count_unique_ips_blocked_dedups_repeated_ip() {
+        // Same IP blocked three times across three incidents -> counted once.
+        let real: std::collections::HashSet<&str> = ["i1", "i2", "i3"].into_iter().collect();
+        let decisions = vec![
+            mk_decision("i1", "block_ip", Some("10.0.0.1")),
+            mk_decision("i2", "block_ip", Some("10.0.0.1")),
+            mk_decision("i3", "block_ip", Some("10.0.0.1")),
+        ];
+        assert_eq!(count_unique_ips_blocked(&decisions, &real), 1);
+    }
+
+    #[test]
+    fn count_unique_ips_blocked_counts_distinct_ips() {
+        let real: std::collections::HashSet<&str> = ["i1", "i2", "i3"].into_iter().collect();
+        let decisions = vec![
+            mk_decision("i1", "block_ip", Some("10.0.0.1")),
+            mk_decision("i2", "block_ip", Some("10.0.0.2")),
+            mk_decision("i3", "block_ip", Some("10.0.0.3")),
+        ];
+        assert_eq!(count_unique_ips_blocked(&decisions, &real), 3);
+    }
+
+    #[test]
+    fn count_unique_ips_blocked_skips_non_block_actions() {
+        let real: std::collections::HashSet<&str> = ["i1", "i2"].into_iter().collect();
+        let decisions = vec![
+            mk_decision("i1", "monitor", Some("10.0.0.1")),
+            mk_decision("i2", "ignore", Some("10.0.0.2")),
+        ];
+        assert_eq!(count_unique_ips_blocked(&decisions, &real), 0);
+    }
+
+    #[test]
+    fn count_unique_ips_blocked_skips_decisions_not_in_real_set() {
+        // Research-only / internal incidents get filtered out of the
+        // "real" set upstream; their block decisions must not inflate
+        // the public counter.
+        let real: std::collections::HashSet<&str> = ["i1"].into_iter().collect();
+        let decisions = vec![
+            mk_decision("i1", "block_ip", Some("10.0.0.1")),
+            mk_decision("research", "block_ip", Some("10.0.0.99")),
+        ];
+        assert_eq!(count_unique_ips_blocked(&decisions, &real), 1);
+    }
+
+    #[test]
+    fn count_unique_ips_blocked_ignores_missing_and_empty_target_ip() {
+        let real: std::collections::HashSet<&str> = ["i1", "i2", "i3"].into_iter().collect();
+        let decisions = vec![
+            mk_decision("i1", "block_ip", None),
+            mk_decision("i2", "block_ip", Some("")),
+            mk_decision("i3", "block_ip", Some("10.0.0.1")),
+        ];
+        assert_eq!(count_unique_ips_blocked(&decisions, &real), 1);
     }
 }

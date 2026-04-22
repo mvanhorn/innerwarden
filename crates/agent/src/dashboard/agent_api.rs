@@ -94,6 +94,41 @@ fn read_disabled_detectors_from_config() -> std::collections::HashSet<&'static s
 // Agent API - security context for AI agents (OpenClaw, n8n, etc.)
 // ---------------------------------------------------------------------------
 
+/// Count unique IP addresses that have an auto-executed `block_ip`
+/// decision attached to an Incident node currently live in the graph.
+/// Keeps the "Blocked Today" KPI aligned across `/api/live-feed` and
+/// `/api/agent/security-context`. Extracted as a pure function so it
+/// can be unit-tested against a small in-memory graph fixture.
+pub(super) fn count_unique_ips_blocked_in_graph(
+    graph: &crate::knowledge_graph::KnowledgeGraph,
+) -> usize {
+    use crate::knowledge_graph::types::{Node, NodeType, Relation};
+
+    let mut blocked_ips: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for id in graph.nodes_of_type(NodeType::Incident) {
+        let Some(Node::Incident {
+            decision,
+            auto_executed,
+            ..
+        }) = graph.get_node(id)
+        else {
+            continue;
+        };
+        let Some(dec) = decision else { continue };
+        if dec != "block_ip" || !*auto_executed {
+            continue;
+        }
+        for edge in graph.outgoing_edges(id) {
+            if edge.relation == Relation::TriggeredBy {
+                if let Some(Node::Ip { addr, .. }) = graph.get_node(edge.to) {
+                    blocked_ips.insert(addr.clone());
+                }
+            }
+        }
+    }
+    blocked_ips.len()
+}
+
 /// GET /api/agent/security-context - threat overview for AI agents (Phase 6A: graph-only)
 pub(super) async fn api_agent_security_context(
     State(state): State<DashboardState>,
@@ -106,16 +141,11 @@ pub(super) async fn api_agent_security_context(
     let incident_nodes = graph.nodes_of_type(NodeType::Incident);
     let total_incidents = incident_nodes.len();
     let mut high_or_critical = 0usize;
-    let mut blocks_today = 0usize;
     let mut detector_counts = std::collections::HashMap::<String, usize>::new();
 
     for &id in &incident_nodes {
         if let Some(Node::Incident {
-            detector,
-            severity,
-            decision,
-            auto_executed,
-            ..
+            detector, severity, ..
         }) = graph.get_node(id)
         {
             let sev = severity.to_lowercase();
@@ -123,14 +153,12 @@ pub(super) async fn api_agent_security_context(
                 high_or_critical += 1;
             }
             *detector_counts.entry(detector.clone()).or_default() += 1;
-
-            if let Some(dec) = decision {
-                if dec == "block_ip" && *auto_executed {
-                    blocks_today += 1;
-                }
-            }
         }
     }
+    // Unique IPs blocked today — pinned in a pure helper so
+    // `/api/live-feed` and `/api/agent/security-context` share the
+    // same definition of "Blocked Today".
+    let blocks_today = count_unique_ips_blocked_in_graph(&graph);
 
     let mut top: Vec<_> = detector_counts.into_iter().collect();
     top.sort_by(|a, b| b.1.cmp(&a.1));
@@ -1270,6 +1298,88 @@ enabled = false
     fn test_security_context_calm_with_zero_incidents() {
         // Zero incidents should map to calm context.
         assert_eq!(security_context_level(0), "calm");
+    }
+
+    // ── count_unique_ips_blocked_in_graph ───────────────────────────────
+
+    fn make_block_incident(
+        graph: &mut crate::knowledge_graph::KnowledgeGraph,
+        incident_id: &str,
+        ip_addr: &str,
+        decision: Option<&str>,
+        auto_executed: bool,
+    ) {
+        use crate::knowledge_graph::types::{Edge, Node, Relation};
+        let now = chrono::Utc::now();
+        let ip_id = graph.upsert_node(Node::Ip {
+            addr: ip_addr.into(),
+            is_internal: false,
+            datasets: vec![],
+            risk_score: 10,
+            is_tor: false,
+            first_seen: now,
+            last_seen: now,
+            attempted_usernames: vec![],
+        });
+        let incident_id_node = graph.upsert_node(Node::Incident {
+            incident_id: incident_id.into(),
+            detector: "ssh_bruteforce".into(),
+            severity: "high".into(),
+            title: "T".into(),
+            summary: "S".into(),
+            ts: now,
+            mitre_ids: vec![],
+            decision: decision.map(str::to_string),
+            confidence: Some(0.9),
+            decision_reason: None,
+            decision_target: Some(ip_addr.into()),
+            auto_executed,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        graph.add_edge(Edge::new(
+            incident_id_node,
+            ip_id,
+            Relation::TriggeredBy,
+            now,
+        ));
+    }
+
+    #[test]
+    fn count_unique_ips_blocked_in_graph_dedups_same_ip_across_incidents() {
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+        // Three incidents, all blocking the same IP -> 1.
+        make_block_incident(&mut graph, "i1", "10.0.0.1", Some("block_ip"), true);
+        make_block_incident(&mut graph, "i2", "10.0.0.1", Some("block_ip"), true);
+        make_block_incident(&mut graph, "i3", "10.0.0.1", Some("block_ip"), true);
+        assert_eq!(count_unique_ips_blocked_in_graph(&graph), 1);
+    }
+
+    #[test]
+    fn count_unique_ips_blocked_in_graph_counts_distinct_ips() {
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+        make_block_incident(&mut graph, "i1", "10.0.0.1", Some("block_ip"), true);
+        make_block_incident(&mut graph, "i2", "10.0.0.2", Some("block_ip"), true);
+        make_block_incident(&mut graph, "i3", "10.0.0.3", Some("block_ip"), true);
+        assert_eq!(count_unique_ips_blocked_in_graph(&graph), 3);
+    }
+
+    #[test]
+    fn count_unique_ips_blocked_in_graph_skips_non_block_and_non_auto_executed() {
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+        make_block_incident(&mut graph, "i1", "10.0.0.1", Some("monitor"), true);
+        make_block_incident(&mut graph, "i2", "10.0.0.2", Some("block_ip"), false);
+        make_block_incident(&mut graph, "i3", "10.0.0.3", None, true);
+        assert_eq!(count_unique_ips_blocked_in_graph(&graph), 0);
+    }
+
+    #[test]
+    fn count_unique_ips_blocked_in_graph_empty_graph_returns_zero() {
+        let graph = crate::knowledge_graph::KnowledgeGraph::new();
+        assert_eq!(count_unique_ips_blocked_in_graph(&graph), 0);
     }
 
     #[test]

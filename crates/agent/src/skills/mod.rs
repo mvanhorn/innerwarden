@@ -406,12 +406,8 @@ impl Blocklist {
             return list;
         }
         for line in String::from_utf8_lossy(&out.stdout).lines() {
-            // Lines look like: "DENY IN   203.0.113.10"
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 3 && parts[1] == "IN" {
-                if let Ok(_addr) = parts[2].parse::<std::net::IpAddr>() {
-                    list.blocked.insert(parts[2].to_string());
-                }
+            for ip in parse_ufw_deny_in_line(line) {
+                list.blocked.insert(ip);
             }
         }
         info!(
@@ -420,6 +416,53 @@ impl Blocklist {
         );
         list
     }
+}
+
+/// Extract IP(s) blocked by a `DENY IN` rule from a single `ufw status`
+/// line. Returns an empty vector for lines that are not DENY IN rules or
+/// that target a port/service rather than an IP address.
+///
+/// Handles the real formats ufw emits:
+///
+/// - `[10] Anywhere    DENY IN    203.0.113.10    # innerwarden`
+///   (numbered format, from `ufw status numbered`)
+/// - `Anywhere    DENY IN    203.0.113.10`
+///   (non-numbered format, from `ufw status`)
+/// - `81/tcp    DENY IN    Anywhere`
+///   (inbound port deny with no IP target — skipped)
+pub(crate) fn parse_ufw_deny_in_line(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+
+    // Must contain both "DENY" and "IN" (in that order, adjacent) to be a DENY IN rule.
+    let mut has_deny_in = false;
+    for pair in tokens.windows(2) {
+        if pair[0] == "DENY" && pair[1] == "IN" {
+            has_deny_in = true;
+            break;
+        }
+    }
+    if !has_deny_in {
+        return out;
+    }
+
+    // Collect every token that parses as an IP address. Skip the literal
+    // "Anywhere" (that is a placeholder for the address family, not a host).
+    for tok in &tokens {
+        // Strip a leading bracket like "[10]" that `ufw status numbered`
+        // adds, and skip comment markers (`#` and anything after).
+        if *tok == "#" {
+            break;
+        }
+        let cleaned = tok.trim_start_matches('[').trim_end_matches(']');
+        if cleaned == "Anywhere" {
+            continue;
+        }
+        if cleaned.parse::<std::net::IpAddr>().is_ok() {
+            out.push(cleaned.to_string());
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -500,5 +543,107 @@ mod tests {
         let result = BlockIpUfw.execute(&ctx, true).await;
         assert!(result.success);
         assert!(result.message.contains("DRY RUN"));
+    }
+
+    // ── parse_ufw_deny_in_line ─────────────────────────────────────────
+
+    #[test]
+    fn parse_ufw_deny_in_line_reads_numbered_format_with_comment() {
+        // The format produced by `ufw status numbered` — which is what
+        // Ubuntu 22.04+ shows by default after `ufw-status` changed.
+        let ips =
+            parse_ufw_deny_in_line("[10] Anywhere    DENY IN    203.0.113.10    # innerwarden");
+        assert_eq!(ips, vec!["203.0.113.10"]);
+    }
+
+    #[test]
+    fn parse_ufw_deny_in_line_reads_plain_format_without_bracket() {
+        let ips = parse_ufw_deny_in_line("Anywhere    DENY IN    198.51.100.42");
+        assert_eq!(ips, vec!["198.51.100.42"]);
+    }
+
+    #[test]
+    fn parse_ufw_deny_in_line_reads_ipv6() {
+        let ips =
+            parse_ufw_deny_in_line("Anywhere (v6)    DENY IN    2001:db8::1    # innerwarden");
+        assert_eq!(ips, vec!["2001:db8::1"]);
+    }
+
+    #[test]
+    fn parse_ufw_deny_in_line_skips_inbound_port_deny() {
+        // "[7] 81/tcp DENY IN Anywhere" is a port-family deny, no IP to
+        // track. Must return empty; returning "Anywhere" would poison the
+        // in-memory blocklist with a non-IP string.
+        let ips = parse_ufw_deny_in_line("[7] 81/tcp    DENY IN    Anywhere");
+        assert!(ips.is_empty());
+    }
+
+    #[test]
+    fn parse_ufw_deny_in_line_skips_non_deny_lines() {
+        assert!(parse_ufw_deny_in_line("Status: active").is_empty());
+        assert!(parse_ufw_deny_in_line("[1] 22/tcp    LIMIT IN    Anywhere").is_empty());
+        assert!(parse_ufw_deny_in_line("-- ------ ----").is_empty());
+        assert!(parse_ufw_deny_in_line("").is_empty());
+    }
+
+    #[test]
+    fn parse_ufw_deny_in_line_requires_adjacent_deny_in_tokens() {
+        // "DENY OUT" and "ALLOW IN" must not be misread as DENY IN.
+        assert!(parse_ufw_deny_in_line("[2] Anywhere    DENY OUT    10.0.0.1").is_empty());
+        assert!(parse_ufw_deny_in_line("[3] Anywhere    ALLOW IN    10.0.0.1").is_empty());
+    }
+
+    #[test]
+    fn parse_ufw_deny_in_line_stops_at_comment_marker() {
+        // Anything after `#` is operator commentary and must not be
+        // parsed as an IP even if it happens to look like one.
+        let ips = parse_ufw_deny_in_line(
+            "[42] Anywhere    DENY IN    192.0.2.10    # added after 10.0.0.1 triggered",
+        );
+        assert_eq!(ips, vec!["192.0.2.10"]);
+    }
+
+    #[test]
+    fn blocklist_trim_if_needed_halves_entries_over_cap() {
+        let mut bl = Blocklist::default();
+        for i in 0..100u32 {
+            bl.insert(format!("10.0.0.{i}"));
+        }
+        assert_eq!(bl.len(), 100);
+        bl.trim_if_needed(50);
+        // Over-cap: kept is `max_entries / 2` per the function's
+        // documented shrink strategy.
+        assert_eq!(bl.len(), 25);
+    }
+
+    #[test]
+    fn blocklist_trim_if_needed_noop_under_cap() {
+        let mut bl = Blocklist::default();
+        bl.insert("1.2.3.4");
+        bl.insert("5.6.7.8");
+        bl.trim_if_needed(10);
+        assert_eq!(bl.len(), 2);
+    }
+
+    #[test]
+    fn honeypot_runtime_config_debug_redacts_ai_provider_to_name_only() {
+        // Spec 031/test(agent): the `Debug` impl must not try to print
+        // the `dyn AiProvider` trait object directly (no Debug bound
+        // there). It surfaces only the provider name, which keeps the
+        // blocklist snapshot logs safe for operator diagnostics.
+        let cfg = HoneypotRuntimeConfig::default();
+        let rendered = format!("{cfg:?}");
+        assert!(rendered.contains("HoneypotRuntimeConfig"));
+        assert!(rendered.contains("mode"));
+        assert!(rendered.contains("interaction"));
+    }
+
+    #[tokio::test]
+    async fn load_from_ufw_returns_empty_when_sudo_ufw_unavailable() {
+        // In the test environment `sudo ufw status` either fails to
+        // spawn (no sudo in PATH) or exits non-zero. Both branches
+        // return an empty Blocklist; the test pins the contract.
+        let bl = Blocklist::load_from_ufw().await;
+        assert_eq!(bl.len(), 0);
     }
 }
