@@ -452,6 +452,14 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
     if removed > 0 {
         info!(removed, "data_retention: cleaned up old files on startup");
     }
+    let (fs_removed, fs_bytes) = data_retention::cleanup_filestore(&cli.data_dir, &cfg.data);
+    if fs_removed > 0 {
+        info!(
+            files = fs_removed,
+            bytes = fs_bytes,
+            "data_retention: pruned filestore on startup"
+        );
+    }
 
     // Build shared agent state
     // Pre-populate blocklist + decision cooldowns from recent (today + yesterday)
@@ -1593,6 +1601,15 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                     if removed > 0 {
                         info!(removed, "data_retention: cleaned up old files");
                     }
+                    let (fs_removed, fs_bytes) =
+                        data_retention::cleanup_filestore(&cli.data_dir, &cfg.data);
+                    if fs_removed > 0 {
+                        info!(
+                            files = fs_removed,
+                            bytes = fs_bytes,
+                            "data_retention: pruned filestore"
+                        );
+                    }
 
                     // Spec 030: compress warm-tier JSONL files past the
                     // `warm_gzip_days` threshold. Runs alongside the
@@ -2033,6 +2050,15 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                     let removed = data_retention::cleanup(&cli.data_dir, &cfg.data);
                     if removed > 0 {
                         info!(removed, "data_retention: cleaned up old files");
+                    }
+                    let (fs_removed, fs_bytes) =
+                        data_retention::cleanup_filestore(&cli.data_dir, &cfg.data);
+                    if fs_removed > 0 {
+                        info!(
+                            files = fs_removed,
+                            bytes = fs_bytes,
+                            "data_retention: pruned filestore"
+                        );
                     }
                     false
                 }

@@ -2220,6 +2220,24 @@ pub struct DataRetentionConfig {
     /// compression. (default: 7)
     #[serde(default = "default_data_warm_gzip_days")]
     pub warm_gzip_days: usize,
+
+    /// Retention for `filestore/extracted/<shard>/<sha256>.<ext>`
+    /// files captured by the sensor's HTTP body extractor. These
+    /// dedup-by-hash forensic artifacts have no pruning path of
+    /// their own and grow unbounded (observed 6 GB / 44k files on
+    /// prod). Uses mtime rather than filename-date since filenames
+    /// are content hashes. Set to 0 to disable age-based pruning.
+    /// (default: 30)
+    #[serde(default = "default_data_filestore_keep_days")]
+    pub filestore_keep_days: usize,
+
+    /// Hard size cap for the entire `filestore/extracted/` tree in
+    /// megabytes. After the age-based pass runs, oldest files are
+    /// pruned until the total is under this cap. Protects against
+    /// bursty captures overrunning disk between retention ticks.
+    /// Set to 0 to disable the size cap. (default: 2048)
+    #[serde(default = "default_data_filestore_max_size_mb")]
+    pub filestore_max_size_mb: u64,
 }
 
 impl Default for DataRetentionConfig {
@@ -2232,6 +2250,8 @@ impl Default for DataRetentionConfig {
             reports_keep_days: default_data_reports_keep_days(),
             graph_snapshot_keep_days: default_data_graph_snapshot_keep_days(),
             warm_gzip_days: default_data_warm_gzip_days(),
+            filestore_keep_days: default_data_filestore_keep_days(),
+            filestore_max_size_mb: default_data_filestore_max_size_mb(),
         }
     }
 }
@@ -2256,6 +2276,12 @@ fn default_data_graph_snapshot_keep_days() -> usize {
 }
 fn default_data_warm_gzip_days() -> usize {
     7
+}
+fn default_data_filestore_keep_days() -> usize {
+    30
+}
+fn default_data_filestore_max_size_mb() -> u64 {
+    2048
 }
 
 fn default_telegram_min_severity() -> String {

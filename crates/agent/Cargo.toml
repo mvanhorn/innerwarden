@@ -11,7 +11,13 @@ keywords = ["security", "incident-response", "autonomous-defense", "linux", "rus
 categories = ["command-line-utilities", "network-programming"]
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-tikv-jemallocator = "0.6"
+# `profiling` compiles the jemalloc heap profiler into the binary; it
+# is inert at runtime until `MALLOC_CONF=prof:true,...` is set, so
+# there is no steady-state overhead. `unprefixed_malloc_on_supported_platforms`
+# is required for `MALLOC_CONF` and the `malloc_conf` weak symbol to
+# be picked up by the runtime. See docs/heap-profile.md for the
+# on-demand workflow.
+tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
 
 [dependencies]
 innerwarden_core = { path = "../core" }
@@ -77,3 +83,4 @@ local-classifier = ["tract-onnx", "tokenizers"]
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+filetime = "0.2"

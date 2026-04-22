@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use chrono::{Local, NaiveDate};
 use flate2::read::GzDecoder;
@@ -152,6 +153,138 @@ pub fn cleanup(data_dir: &Path, cfg: &DataRetentionConfig) -> usize {
     }
 
     removed
+}
+
+/// Prune `filestore/extracted/<shard>/<sha256>.<ext>` forensic
+/// artifacts captured by the sensor's HTTP body extractor. Files are
+/// content-hashed, so filenames carry no date; age comes from mtime.
+///
+/// Two passes:
+/// 1. Drop every file with `now - mtime > keep_days` (skipped when
+///    `keep_days == 0`).
+/// 2. If the surviving tree still exceeds `max_size_mb`, delete the
+///    oldest files until the total is back under the cap (skipped
+///    when `max_size_mb == 0`).
+///
+/// Empty shard directories are removed at the end. Returns
+/// `(files_removed, bytes_freed)`.
+pub fn cleanup_filestore(data_dir: &Path, cfg: &DataRetentionConfig) -> (usize, u64) {
+    let root = data_dir.join("filestore").join("extracted");
+    if !root.exists() {
+        return (0, 0);
+    }
+
+    let now = SystemTime::now();
+    let keep = Duration::from_secs((cfg.filestore_keep_days as u64).saturating_mul(86400));
+    let cap_bytes = cfg.filestore_max_size_mb.saturating_mul(1024 * 1024);
+
+    // (path, size, mtime) for files that survive pass 1.
+    let mut alive: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
+    let mut files_removed = 0usize;
+    let mut bytes_freed: u64 = 0;
+
+    let shards = match fs::read_dir(&root) {
+        Ok(iter) => iter,
+        Err(e) => {
+            warn!(path = %root.display(), "cleanup_filestore: read_dir failed: {e:#}");
+            return (0, 0);
+        }
+    };
+
+    for shard in shards.flatten() {
+        let shard_path = shard.path();
+        let Ok(md) = shard.metadata() else {
+            continue;
+        };
+        if !md.is_dir() {
+            continue;
+        }
+        let files = match fs::read_dir(&shard_path) {
+            Ok(iter) => iter,
+            Err(e) => {
+                warn!(path = %shard_path.display(), "cleanup_filestore: shard read_dir failed: {e:#}");
+                continue;
+            }
+        };
+        for entry in files.flatten() {
+            let Ok(fmd) = entry.metadata() else { continue };
+            if !fmd.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let size = fmd.len();
+            let mtime = fmd.modified().unwrap_or(now);
+
+            let should_age_prune = cfg.filestore_keep_days > 0
+                && now.duration_since(mtime).map(|d| d > keep).unwrap_or(false);
+
+            if should_age_prune {
+                match fs::remove_file(&path) {
+                    Ok(()) => {
+                        files_removed += 1;
+                        bytes_freed += size;
+                    }
+                    Err(e) => {
+                        warn!(path = %path.display(), "cleanup_filestore: remove failed: {e:#}");
+                        alive.push((path, size, mtime));
+                    }
+                }
+            } else {
+                alive.push((path, size, mtime));
+            }
+        }
+    }
+
+    // Pass 2: size cap (oldest first).
+    if cap_bytes > 0 {
+        let total: u64 = alive.iter().map(|(_, s, _)| *s).sum();
+        if total > cap_bytes {
+            alive.sort_by_key(|(_, _, mtime)| *mtime);
+            let mut to_free = total - cap_bytes;
+            for (path, size, _) in &alive {
+                if to_free == 0 {
+                    break;
+                }
+                match fs::remove_file(path) {
+                    Ok(()) => {
+                        files_removed += 1;
+                        bytes_freed += size;
+                        to_free = to_free.saturating_sub(*size);
+                    }
+                    Err(e) => {
+                        warn!(path = %path.display(), "cleanup_filestore: cap remove failed: {e:#}");
+                    }
+                }
+            }
+        }
+    }
+
+    // Remove shard dirs that became empty.
+    if files_removed > 0 {
+        if let Ok(iter) = fs::read_dir(&root) {
+            for shard in iter.flatten() {
+                let p = shard.path();
+                let is_empty = fs::read_dir(&p)
+                    .map(|mut it| it.next().is_none())
+                    .unwrap_or(false);
+                if is_empty {
+                    let _ = fs::remove_dir(&p);
+                }
+            }
+        }
+    }
+
+    if files_removed > 0 {
+        debug!(
+            files_removed,
+            bytes_freed,
+            keep_days = cfg.filestore_keep_days,
+            cap_mb = cfg.filestore_max_size_mb,
+            "cleanup_filestore: pruned extracted artifacts"
+        );
+    }
+
+    (files_removed, bytes_freed)
 }
 
 /// Spec 030: compress warm-tier JSONL files older than
@@ -688,5 +821,91 @@ mod tests {
         let reader = open_jsonl_or_gz(&raw).unwrap().expect("fallback found");
         let lines: Vec<String> = reader.lines().collect::<Result<_, _>>().unwrap();
         assert_eq!(lines, vec!["log-line-1", "log-line-2"]);
+    }
+
+    // ── filestore retention ────────────────────────────────────────
+
+    fn write_shard_file(root: &Path, shard: &str, name: &str, bytes: &[u8], age_days: u64) {
+        let dir = root.join(shard);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        fs::write(&path, bytes).unwrap();
+        // `chrono::Duration` shadows `std::time::Duration` inside this
+        // test module, so qualify the std variant explicitly.
+        let mtime = SystemTime::now()
+            - std::time::Duration::from_secs(age_days.saturating_mul(86400).saturating_add(60));
+        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(mtime)).unwrap();
+    }
+
+    #[test]
+    fn filestore_age_prune_removes_old_files_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("filestore").join("extracted");
+
+        write_shard_file(&root, "aa", "aa_old.bin", &[0u8; 1024], 40);
+        write_shard_file(&root, "bb", "bb_fresh.bin", &[0u8; 1024], 5);
+
+        let cfg = DataRetentionConfig {
+            filestore_keep_days: 30,
+            filestore_max_size_mb: 0, // size cap disabled
+            ..Default::default()
+        };
+        let (removed, bytes) = cleanup_filestore(tmp.path(), &cfg);
+
+        assert_eq!(removed, 1);
+        assert_eq!(bytes, 1024);
+        assert!(!root.join("aa").exists(), "empty shard should be pruned");
+        assert!(root.join("bb").join("bb_fresh.bin").exists());
+    }
+
+    #[test]
+    fn filestore_size_cap_evicts_oldest_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("filestore").join("extracted");
+
+        // Three 1 MB files, all within keep window. Cap at 2 MB.
+        write_shard_file(&root, "aa", "oldest.bin", &vec![1u8; 1_048_576], 3);
+        write_shard_file(&root, "bb", "middle.bin", &vec![2u8; 1_048_576], 2);
+        write_shard_file(&root, "cc", "newest.bin", &vec![3u8; 1_048_576], 1);
+
+        let cfg = DataRetentionConfig {
+            filestore_keep_days: 0, // age pass disabled
+            filestore_max_size_mb: 2,
+            ..Default::default()
+        };
+        let (removed, _) = cleanup_filestore(tmp.path(), &cfg);
+
+        assert_eq!(removed, 1, "only one file needed to get under 2 MB cap");
+        assert!(
+            !root.join("aa").join("oldest.bin").exists(),
+            "oldest file evicted first"
+        );
+        assert!(root.join("bb").join("middle.bin").exists());
+        assert!(root.join("cc").join("newest.bin").exists());
+    }
+
+    #[test]
+    fn filestore_noop_when_root_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = DataRetentionConfig::default();
+        let (removed, bytes) = cleanup_filestore(tmp.path(), &cfg);
+        assert_eq!(removed, 0);
+        assert_eq!(bytes, 0);
+    }
+
+    #[test]
+    fn filestore_zero_values_disable_both_passes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("filestore").join("extracted");
+        write_shard_file(&root, "aa", "ancient.bin", &[0u8; 1024], 999);
+
+        let cfg = DataRetentionConfig {
+            filestore_keep_days: 0,
+            filestore_max_size_mb: 0,
+            ..Default::default()
+        };
+        let (removed, _) = cleanup_filestore(tmp.path(), &cfg);
+        assert_eq!(removed, 0);
+        assert!(root.join("aa").join("ancient.bin").exists());
     }
 }
