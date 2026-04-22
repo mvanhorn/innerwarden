@@ -66,7 +66,7 @@ bytes = "1"
 # but compiles cleanly on any target and is easier to distribute).
 tract-onnx = { version = "0.21", optional = true }
 tokenizers = { version = "0.20", default-features = false, features = ["onig"], optional = true }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rcgen = "0.13"
 rustls-pki-types = "1"

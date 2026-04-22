@@ -440,57 +440,49 @@ pub fn parse_client_hello(
 
             match ext_type {
                 // SNI (Server Name Indication)
-                0x0000 => {
-                    if pos + 5 <= ext_data_end {
-                        let name_len = u16::from_be_bytes([data[pos + 3], data[pos + 4]]) as usize;
-                        if pos + 5 + name_len <= ext_data_end {
-                            sni = String::from_utf8_lossy(&data[pos + 5..pos + 5 + name_len])
-                                .to_string();
-                        }
+                0x0000 if pos + 5 <= ext_data_end => {
+                    let name_len = u16::from_be_bytes([data[pos + 3], data[pos + 4]]) as usize;
+                    if pos + 5 + name_len <= ext_data_end {
+                        sni =
+                            String::from_utf8_lossy(&data[pos + 5..pos + 5 + name_len]).to_string();
                     }
                 }
                 // Supported Groups (elliptic curves)
-                0x000a => {
-                    if pos + 2 <= ext_data_end {
-                        let list_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
-                        let mut j = 2;
-                        while j + 1 < 2 + list_len && pos + j + 1 < ext_data_end {
-                            let curve = u16::from_be_bytes([data[pos + j], data[pos + j + 1]]);
-                            if !GREASE_VALUES.contains(&curve) {
-                                elliptic_curves.push(curve);
-                            }
-                            j += 2;
+                0x000a if pos + 2 <= ext_data_end => {
+                    let list_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+                    let mut j = 2;
+                    while j + 1 < 2 + list_len && pos + j + 1 < ext_data_end {
+                        let curve = u16::from_be_bytes([data[pos + j], data[pos + j + 1]]);
+                        if !GREASE_VALUES.contains(&curve) {
+                            elliptic_curves.push(curve);
                         }
+                        j += 2;
                     }
                 }
                 // EC Point Formats
-                0x000b => {
-                    if pos < ext_data_end {
-                        let fmt_len = data[pos] as usize;
-                        for k in 1..=fmt_len {
-                            if pos + k < ext_data_end {
-                                ec_point_formats.push(data[pos + k]);
-                            }
+                0x000b if pos < ext_data_end => {
+                    let fmt_len = data[pos] as usize;
+                    for k in 1..=fmt_len {
+                        if pos + k < ext_data_end {
+                            ec_point_formats.push(data[pos + k]);
                         }
                     }
                 }
                 // ALPN
-                0x0010 => {
-                    if pos + 2 <= ext_data_end {
-                        let list_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
-                        let mut j = 2;
-                        while j < 2 + list_len && pos + j < ext_data_end {
-                            let proto_len = data[pos + j] as usize;
-                            j += 1;
-                            if pos + j + proto_len <= ext_data_end {
-                                let proto =
-                                    String::from_utf8_lossy(&data[pos + j..pos + j + proto_len])
-                                        .to_string();
-                                alpn.push(proto);
-                                j += proto_len;
-                            } else {
-                                break;
-                            }
+                0x0010 if pos + 2 <= ext_data_end => {
+                    let list_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+                    let mut j = 2;
+                    while j < 2 + list_len && pos + j < ext_data_end {
+                        let proto_len = data[pos + j] as usize;
+                        j += 1;
+                        if pos + j + proto_len <= ext_data_end {
+                            let proto =
+                                String::from_utf8_lossy(&data[pos + j..pos + j + proto_len])
+                                    .to_string();
+                            alpn.push(proto);
+                            j += proto_len;
+                        } else {
+                            break;
                         }
                     }
                 }

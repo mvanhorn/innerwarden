@@ -18,7 +18,9 @@ jobs:
     runs-on: ubuntu-latest
 
     permissions:
-      contents: write   # needed to create the GitHub Release
+      contents: write         # needed to create the GitHub Release
+      id-token: write         # SLSA provenance: sign the attestation
+      attestations: write     # SLSA provenance: publish the attestation
 
     steps:
       # ── Source ────────────────────────────────────────────────────────────
@@ -202,6 +204,23 @@ jobs:
           fi
           echo "All 13 assets present (6 binaries + 6 SHA-256 sidecars + install.sh)."
 
+      # ── SLSA v1 build provenance attestation ──────────────────────────────
+      # Publishes a cryptographic attestation tying each Linux binary back to
+      # the exact workflow run and commit that produced it. Scorecard's
+      # Signed-Releases check (OpenSSF) reads these attestations via the
+      # GitHub API; without them the check stays partial ("signed but no
+      # provenance"). See https://slsa.dev for the spec.
+      - name: Attest build provenance for Linux binaries
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-path: |
+            dist/innerwarden-sensor-linux-x86_64
+            dist/innerwarden-agent-linux-x86_64
+            dist/innerwarden-ctl-linux-x86_64
+            dist/innerwarden-sensor-linux-aarch64
+            dist/innerwarden-agent-linux-aarch64
+            dist/innerwarden-ctl-linux-aarch64
+
       # ── Create GitHub Release ─────────────────────────────────────────────
       - name: Create GitHub Release
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
@@ -262,7 +281,9 @@ jobs:
     needs: build-release
 
     permissions:
-      contents: write   # needed to upload assets to existing release
+      contents: write         # needed to upload assets to existing release
+      id-token: write         # SLSA provenance: sign the attestation
+      attestations: write     # SLSA provenance: publish the attestation
 
     steps:
       # ── Source ────────────────────────────────────────────────────────────
@@ -347,6 +368,18 @@ jobs:
           " "$binary" > "${binary}.sig"
           done
           rm -f /tmp/sign-key.pem
+
+      # ── SLSA v1 build provenance attestation (macOS) ──────────────────────
+      - name: Attest build provenance for macOS binaries
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        with:
+          subject-path: |
+            dist/innerwarden-sensor-macos-x86_64
+            dist/innerwarden-agent-macos-x86_64
+            dist/innerwarden-ctl-macos-x86_64
+            dist/innerwarden-sensor-macos-aarch64
+            dist/innerwarden-agent-macos-aarch64
+            dist/innerwarden-ctl-macos-aarch64
 
       # ── Upload macOS assets to existing release ────────────────────────────
       - name: Upload macOS assets to GitHub Release

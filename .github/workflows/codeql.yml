@@ -1,0 +1,53 @@
+name: CodeQL
+
+# SAST with CodeQL. Runs on every push to main/development and every PR
+# so every merge commit carries a SAST marker (Scorecard's SAST check
+# scans merge commits; default setup only runs on PR events, which
+# leaves merge commits unmarked and dragged the score to 1).
+on:
+  push:
+    branches: [main, development]
+  pull_request:
+    branches: [main, development]
+  schedule:
+    # Weekly, same slot as the original scorecard.yml schedule.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ${{ matrix.language == 'rust' && 'ubuntu-latest' || 'ubuntu-latest' }}
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language:
+          - actions
+          - javascript-typescript
+          - python
+          - rust
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@ce64ddcb0d8d890d2df4a9d1c04ff297367dea2a # v3
+        with:
+          languages: ${{ matrix.language }}
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@ce64ddcb0d8d890d2df4a9d1c04ff297367dea2a # v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@ce64ddcb0d8d890d2df4a9d1c04ff297367dea2a # v3
+        with:
+          category: "/language:${{ matrix.language }}"
