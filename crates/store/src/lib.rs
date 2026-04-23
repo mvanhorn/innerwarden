@@ -90,9 +90,39 @@ impl Store {
             .map_err(StoreError::Pool)?;
 
         // Ensure the schema on one connection after the pool is up.
-        {
-            let conn = pool.get().map_err(StoreError::Pool)?;
-            schema::ensure_schema(&conn)?;
+        // Wrapped in a small retry — even with `busy_timeout = 5000` set
+        // as the first pragma, the FIRST `pool.get()` after process
+        // startup races with the sensor's own boot-time PRAGMA setup
+        // (both processes set `journal_mode = WAL` at the same instant
+        // when the database file is fresh-on-disk). Three attempts × 1 s
+        // back-off is enough for any realistic startup race; longer
+        // contention is a different problem (e.g. forgotten zombie
+        // process holding an exclusive lock) and should still surface
+        // as an error rather than block boot indefinitely.
+        const SCHEMA_OPEN_ATTEMPTS: u32 = 3;
+        const SCHEMA_OPEN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(1000);
+        let mut last_err: Option<StoreError> = None;
+        for attempt in 1..=SCHEMA_OPEN_ATTEMPTS {
+            match pool.get() {
+                Ok(conn) => match schema::ensure_schema(&conn) {
+                    Ok(()) => {
+                        last_err = None;
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                    }
+                },
+                Err(e) => {
+                    last_err = Some(StoreError::Pool(e));
+                }
+            }
+            if attempt < SCHEMA_OPEN_ATTEMPTS {
+                std::thread::sleep(SCHEMA_OPEN_BACKOFF);
+            }
+        }
+        if let Some(e) = last_err {
+            return Err(e);
         }
 
         info!(path = %db_path.display(), "store opened (sqlite WAL)");
@@ -167,10 +197,21 @@ impl Store {
 ///   in RAM. Our queries rarely touch temp tables (no big sorts)
 ///   so the disk cost is invisible; the RAM savings are real on
 ///   the odd large query.
-const PRAGMA_SETUP: &str = "PRAGMA journal_mode = WAL;
+// `busy_timeout` MUST be the first pragma. Setting `journal_mode = WAL`
+// (or any pragma that touches the journal in WAL mode) needs to acquire a
+// brief shared lock; if another process is mid-write at that instant the
+// call returns SQLITE_BUSY immediately. The SQLite default `busy_timeout`
+// is 0 — no wait. By setting it first we guarantee every subsequent pragma
+// (and every `ensure_schema` insert) honors the 5 s wait. Pre-2026-04-23
+// `journal_mode = WAL` was first; on a host where the sensor opens the
+// same database concurrently with the agent, the agent's `Store::open`
+// failed at boot with "database is locked" and the agent ran for the
+// rest of the session without SQLite (see `RECURRING_BUGS.md` "sensor
+// holds DB lock during agent boot").
+const PRAGMA_SETUP: &str = "PRAGMA busy_timeout = 5000;
+         PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
          PRAGMA foreign_keys = ON;
-         PRAGMA busy_timeout = 5000;
          PRAGMA cache_size = -2000;
          PRAGMA mmap_size = 0;
          PRAGMA temp_store = 1;
@@ -247,5 +288,82 @@ mod tests {
         // Reopen — should not fail or re-migrate
         let store = Store::open(dir.path()).unwrap();
         assert_eq!(store.schema_version().unwrap(), schema::CURRENT_VERSION);
+    }
+
+    // ── PRAGMA order regression (sensor↔agent boot race anchor) ──────
+    //
+    // `busy_timeout` MUST be the first pragma so the rest of the batch
+    // honors the 5 s wait. If a future refactor reorders the batch and
+    // puts `journal_mode = WAL` first again, two concurrent processes
+    // (sensor + agent) racing for the same DB at boot will reproduce
+    // "database is locked" because the journal_mode pragma runs with
+    // the SQLite default `busy_timeout = 0`. Pre-2026-04-23 prod
+    // symptom: agent ran for hours with `state.sqlite_store = None`
+    // because the boot-time `Store::open` lost the race.
+
+    #[test]
+    fn pragma_setup_starts_with_busy_timeout() {
+        // The text MUST start with `PRAGMA busy_timeout`. Any other
+        // pragma first reintroduces the race.
+        let trimmed = PRAGMA_SETUP.trim_start();
+        assert!(
+            trimmed.starts_with("PRAGMA busy_timeout"),
+            "PRAGMA_SETUP must set busy_timeout first; got: {}",
+            &trimmed[..40.min(trimmed.len())]
+        );
+    }
+
+    #[test]
+    fn pragma_setup_includes_journal_mode_wal_after_busy_timeout() {
+        let busy_pos = PRAGMA_SETUP
+            .find("PRAGMA busy_timeout")
+            .expect("busy_timeout pragma present");
+        let journal_pos = PRAGMA_SETUP
+            .find("PRAGMA journal_mode = WAL")
+            .expect("journal_mode pragma present");
+        assert!(
+            busy_pos < journal_pos,
+            "busy_timeout (pos {busy_pos}) must precede journal_mode (pos {journal_pos})"
+        );
+    }
+
+    #[test]
+    fn pragma_busy_timeout_is_active_on_freshly_pooled_connection() {
+        // After `Store::open`, every connection from the pool must report
+        // `busy_timeout = 5000`. Proves the with_init batch ran before any
+        // user code can call `pool.get()` — the very property that the
+        // PRAGMA_SETUP order fix relies on.
+        let store = Store::open_memory().unwrap();
+        let conn = store.conn().unwrap();
+        let busy = read_pragma(&conn, "busy_timeout");
+        assert_eq!(
+            busy, 5000,
+            "busy_timeout must be 5000 ms on every connection"
+        );
+    }
+
+    #[test]
+    fn store_open_succeeds_when_called_twice_concurrently() {
+        // Defense-in-depth: even if two processes race the journal_mode
+        // pragma, the SCHEMA_OPEN_ATTEMPTS retry inside `Store::open` must
+        // recover. Simulate by opening twice in rapid succession on the
+        // same data directory.
+        let dir = tempfile::tempdir().unwrap();
+        let h1 = std::thread::spawn({
+            let p = dir.path().to_path_buf();
+            move || Store::open(&p)
+        });
+        let h2 = std::thread::spawn({
+            let p = dir.path().to_path_buf();
+            move || Store::open(&p)
+        });
+        assert!(
+            h1.join().unwrap().is_ok(),
+            "first concurrent open must succeed"
+        );
+        assert!(
+            h2.join().unwrap().is_ok(),
+            "second concurrent open must succeed"
+        );
     }
 }
