@@ -30,17 +30,13 @@ fn gzip_snapshot_bytes(json: &[u8]) -> Vec<u8> {
     encoder.finish().unwrap_or_else(|_| json.to_vec())
 }
 
-/// Validate a date-string used as a filesystem path component. Accepts
-/// only the strict ISO form `YYYY-MM-DD` — exactly 10 ASCII chars,
-/// digits and dashes in the right positions, no path-traversal
-/// characters. Defends every `*_dated*` API against
-/// `?date=../../etc/passwd`-style query parameters that flow from the
-/// `/api/report` HTTP query into a `data_dir.join(...)` call.
-///
-/// Returns `false` for the empty string, `..`, `/`, leading dots, etc.
-/// Tests pin the exact predicate so a future "loosen this regex"
-/// refactor cannot reintroduce the path-traversal sink.
-pub(crate) fn is_safe_date_str(date: &str) -> bool {
+/// Strict shape predicate for a date-string used as a filesystem path
+/// component or SQL parameter. Accepts only the canonical
+/// `YYYY-MM-DD` form: exactly 10 ASCII chars, digits and dashes in
+/// fixed positions. Rejects loose variants chrono would otherwise
+/// accept (`2026-4-23`, `2026-04-23T00`, etc.) so the on-disk filename
+/// is always canonical and predictable.
+fn has_canonical_iso_date_shape(date: &str) -> bool {
     let bytes = date.as_bytes();
     if bytes.len() != 10 {
         return false;
@@ -49,6 +45,61 @@ pub(crate) fn is_safe_date_str(date: &str) -> bool {
         4 | 7 => b == b'-',
         _ => b.is_ascii_digit(),
     })
+}
+
+/// Parse a date-string and return a SAFE filename component for the
+/// snapshot store. The user-controlled `date: &str` flows from the
+/// `/api/report?date=...` HTTP query into a `data_dir.join(...)` call;
+/// without this guard a request like `?date=../../etc/passwd` would
+/// attempt to read outside `data_dir`.
+///
+/// Three layered defenses:
+///
+/// 1. **Shape check**: `has_canonical_iso_date_shape` rejects any
+///    string that is not exactly 10 ASCII chars in `YYYY-MM-DD` form,
+///    short-circuiting the path-traversal payloads that CodeQL flagged.
+/// 2. **Calendar validation**: `chrono::NaiveDate::parse_from_str`
+///    rejects shape-passing-but-impossible dates (`2026-13-01`,
+///    `2026-02-30`).
+/// 3. **Taint break**: the filename is **reconstructed** from the typed
+///    `(year, month, day)` primitives, NOT from the original `&str`.
+///    CodeQL's path-traversal taint analysis follows string flow; passing
+///    `date` through `parse → reformat` produces a fresh string whose
+///    contents are provably ASCII digits + dashes in fixed positions,
+///    breaking the taint chain at the function boundary.
+///
+/// Returns the safe filename (e.g. `"graph-snapshot-2026-04-23.json"`)
+/// or `None` if the input fails any of the three checks.
+pub(crate) fn safe_snapshot_filename(date: &str) -> Option<String> {
+    use chrono::Datelike;
+    if !has_canonical_iso_date_shape(date) {
+        return None;
+    }
+    let parsed = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+    Some(format!(
+        "graph-snapshot-{:04}-{:02}-{:02}.json",
+        parsed.year(),
+        parsed.month(),
+        parsed.day(),
+    ))
+}
+
+/// Like `safe_snapshot_filename` but returns the raw `YYYY-MM-DD` form,
+/// used by `load_dated_from_store` where the date is bound as a SQL
+/// parameter (no path component). The taint break is the same: parse +
+/// reformat from typed primitives, never the original string.
+pub(crate) fn safe_date_string(date: &str) -> Option<String> {
+    use chrono::Datelike;
+    if !has_canonical_iso_date_shape(date) {
+        return None;
+    }
+    let parsed = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+    Some(format!(
+        "{:04}-{:02}-{:02}",
+        parsed.year(),
+        parsed.month(),
+        parsed.day(),
+    ))
 }
 
 /// Decompress a snapshot blob if it carries the gzip magic header,
@@ -206,16 +257,13 @@ impl KnowledgeGraph {
 
     /// Load a historical dated snapshot for a specific date string (e.g. "2026-04-10").
     /// Returns None if the snapshot doesn't exist, is corrupt, or the
-    /// date string fails strict `YYYY-MM-DD` validation. The validation
-    /// closes a path-traversal sink: `date` flows from the
-    /// `/api/report?date=...` HTTP query into a `data_dir.join(...)`
-    /// call. Without this guard a request like `?date=../../etc/passwd`
-    /// would attempt to read outside `data_dir`.
+    /// date string fails strict `YYYY-MM-DD` parsing. The filename is
+    /// reconstructed from typed `(year, month, day)` primitives via
+    /// `safe_snapshot_filename`, breaking the path-traversal taint chain
+    /// for `?date=../../etc/passwd`-style HTTP query payloads.
     pub fn load_dated(data_dir: &Path, date: &str) -> Option<Self> {
-        if !is_safe_date_str(date) {
-            return None;
-        }
-        let path = data_dir.join(format!("graph-snapshot-{date}.json"));
+        let safe_name = safe_snapshot_filename(date)?;
+        let path = data_dir.join(safe_name);
         Self::try_load_snapshot(&path)
     }
 
@@ -324,14 +372,14 @@ impl KnowledgeGraph {
     }
 
     /// Load a graph snapshot for a specific date from the unified SQLite store.
-    /// Date is validated against the strict `YYYY-MM-DD` shape — the SQL
-    /// path is parameter-bound so SQL injection is not the risk; the
-    /// validation just keeps the API surface uniform with `load_dated`.
+    /// Date is parsed via `safe_date_string` — the SQL path is parameter-bound
+    /// so SQL injection is not the risk; the parse-and-reformat just keeps
+    /// the API surface uniform with `load_dated` and means the SQL parameter
+    /// is always the canonical reformatted form, not whatever the user
+    /// originally typed.
     pub fn load_dated_from_store(store: &innerwarden_store::Store, date: &str) -> Option<Self> {
-        if !is_safe_date_str(date) {
-            return None;
-        }
-        let raw = store.load_graph_snapshot(date).ok()??;
+        let safe_date = safe_date_string(date)?;
+        let raw = store.load_graph_snapshot(&safe_date).ok()??;
         let data = maybe_decompress(&raw)?;
         let snapshot: GraphSnapshot = serde_json::from_slice(&data).ok()?;
         let graph = Self::reconstruct_from_snapshot(snapshot)?;
@@ -716,36 +764,76 @@ mod tests {
     //
     // CodeQL flagged `try_load_snapshot` as a path-traversal sink because
     // `load_dated`'s `date: &str` flows from the `/api/report?date=...`
-    // HTTP query into a `data_dir.join(...)` call. `is_safe_date_str`
-    // closes the sink at the function boundary. These tests pin the
-    // exact accept/reject set so a future relaxation of the validator
-    // cannot reintroduce the traversal.
+    // HTTP query into a `data_dir.join(...)` call. The fix:
+    // `safe_snapshot_filename` parses the input to typed primitives and
+    // reconstructs the filename from those, breaking the taint chain.
+    // These tests pin both the accept/reject set AND the round-trip
+    // shape of the reconstructed filename.
 
     #[test]
-    fn is_safe_date_str_accepts_valid_iso_dates() {
-        assert!(is_safe_date_str("2026-04-23"));
-        assert!(is_safe_date_str("0001-01-01"));
-        assert!(is_safe_date_str("9999-12-31"));
+    fn safe_snapshot_filename_returns_canonical_form_for_valid_dates() {
+        assert_eq!(
+            safe_snapshot_filename("2026-04-23").as_deref(),
+            Some("graph-snapshot-2026-04-23.json")
+        );
+        assert_eq!(
+            safe_snapshot_filename("0001-01-01").as_deref(),
+            Some("graph-snapshot-0001-01-01.json")
+        );
+        assert_eq!(
+            safe_snapshot_filename("9999-12-31").as_deref(),
+            Some("graph-snapshot-9999-12-31.json")
+        );
     }
 
     #[test]
-    fn is_safe_date_str_rejects_path_traversal_payloads() {
+    fn safe_snapshot_filename_rejects_path_traversal_payloads() {
         // The exact attack payload from the CodeQL alert.
-        assert!(!is_safe_date_str("../../etc/passwd"));
+        assert_eq!(safe_snapshot_filename("../../etc/passwd"), None);
         // Variants that could slip past a naive contains-check.
-        assert!(!is_safe_date_str(".."));
-        assert!(!is_safe_date_str("/etc"));
-        assert!(!is_safe_date_str("2026-04-23/.."));
-        assert!(!is_safe_date_str("2026-04-23\0evil"));
-        assert!(!is_safe_date_str("2026-04-23\n"));
-        assert!(!is_safe_date_str("2026/04/23"));
-        assert!(!is_safe_date_str(""));
+        assert_eq!(safe_snapshot_filename(".."), None);
+        assert_eq!(safe_snapshot_filename("/etc"), None);
+        assert_eq!(safe_snapshot_filename("2026-04-23/.."), None);
+        assert_eq!(safe_snapshot_filename("2026-04-23\0evil"), None);
+        assert_eq!(safe_snapshot_filename("2026-04-23\n"), None);
+        assert_eq!(safe_snapshot_filename("2026/04/23"), None);
+        assert_eq!(safe_snapshot_filename(""), None);
         // Length 10 but non-digit content
-        assert!(!is_safe_date_str("aaaa-bb-cc"));
+        assert_eq!(safe_snapshot_filename("aaaa-bb-cc"), None);
         // Off-by-one length
-        assert!(!is_safe_date_str("2026-4-23"));
-        assert!(!is_safe_date_str("2026-04-2"));
-        assert!(!is_safe_date_str("2026-04-233"));
+        assert_eq!(safe_snapshot_filename("2026-4-23"), None);
+        assert_eq!(safe_snapshot_filename("2026-04-2"), None);
+        assert_eq!(safe_snapshot_filename("2026-04-233"), None);
+        // Out-of-range months/days that pass shape but fail calendar
+        assert_eq!(safe_snapshot_filename("2026-13-01"), None);
+        assert_eq!(safe_snapshot_filename("2026-02-30"), None);
+        assert_eq!(safe_snapshot_filename("2026-00-15"), None);
+    }
+
+    #[test]
+    fn safe_snapshot_filename_output_has_no_path_separators() {
+        // The whole point of the parse-and-reconstruct dance is that
+        // the output cannot contain a path separator. Belt-and-braces:
+        // assert it directly on a permissive set of inputs.
+        for date in ["2026-04-23", "0001-01-01", "9999-12-31"] {
+            let f = safe_snapshot_filename(date).unwrap();
+            assert!(!f.contains('/'), "filename must not contain '/': {f:?}");
+            assert!(!f.contains('\\'), "filename must not contain '\\\\': {f:?}");
+            assert!(
+                !f.contains(".."),
+                "filename must not contain parent-traversal: {f:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_date_string_round_trips_canonical_form() {
+        assert_eq!(
+            safe_date_string("2026-04-23").as_deref(),
+            Some("2026-04-23")
+        );
+        assert_eq!(safe_date_string("../etc"), None);
+        assert_eq!(safe_date_string(""), None);
     }
 
     #[test]
@@ -756,16 +844,15 @@ mod tests {
         let _ = std::fs::write(&outside, br#"{"nodes":{},"edges":[]}"#);
 
         // The attacker payload — even if `outside` exists, `load_dated`
-        // must return None because the date string fails validation.
+        // must return None because the date string fails parsing.
         assert!(KnowledgeGraph::load_dated(dir.path(), "../evil").is_none());
         assert!(KnowledgeGraph::load_dated(dir.path(), "../../etc/passwd").is_none());
     }
 
     #[test]
     fn load_dated_from_store_returns_none_for_path_traversal_payload() {
-        // SQL path is already parameter-bound, but the validator keeps
-        // the API uniform and prevents an attacker from probing for
-        // unrelated rows by spelling weird dates.
+        // SQL path is already parameter-bound. Parsing keeps the API
+        // uniform and means the parameter is always the canonical form.
         let store = innerwarden_store::Store::open_memory().unwrap();
         assert!(KnowledgeGraph::load_dated_from_store(&store, "../etc/passwd").is_none());
         assert!(KnowledgeGraph::load_dated_from_store(&store, "").is_none());
