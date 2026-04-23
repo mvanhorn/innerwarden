@@ -30,6 +30,27 @@ fn gzip_snapshot_bytes(json: &[u8]) -> Vec<u8> {
     encoder.finish().unwrap_or_else(|_| json.to_vec())
 }
 
+/// Validate a date-string used as a filesystem path component. Accepts
+/// only the strict ISO form `YYYY-MM-DD` — exactly 10 ASCII chars,
+/// digits and dashes in the right positions, no path-traversal
+/// characters. Defends every `*_dated*` API against
+/// `?date=../../etc/passwd`-style query parameters that flow from the
+/// `/api/report` HTTP query into a `data_dir.join(...)` call.
+///
+/// Returns `false` for the empty string, `..`, `/`, leading dots, etc.
+/// Tests pin the exact predicate so a future "loosen this regex"
+/// refactor cannot reintroduce the path-traversal sink.
+pub(crate) fn is_safe_date_str(date: &str) -> bool {
+    let bytes = date.as_bytes();
+    if bytes.len() != 10 {
+        return false;
+    }
+    bytes.iter().enumerate().all(|(i, &b)| match i {
+        4 | 7 => b == b'-',
+        _ => b.is_ascii_digit(),
+    })
+}
+
 /// Decompress a snapshot blob if it carries the gzip magic header,
 /// otherwise return the bytes unchanged. Pre-2026-04-23 snapshots were
 /// stored as raw JSON starting with `{`; the magic-byte check makes the
@@ -184,8 +205,16 @@ impl KnowledgeGraph {
     }
 
     /// Load a historical dated snapshot for a specific date string (e.g. "2026-04-10").
-    /// Returns None if the snapshot doesn't exist or is corrupt.
+    /// Returns None if the snapshot doesn't exist, is corrupt, or the
+    /// date string fails strict `YYYY-MM-DD` validation. The validation
+    /// closes a path-traversal sink: `date` flows from the
+    /// `/api/report?date=...` HTTP query into a `data_dir.join(...)`
+    /// call. Without this guard a request like `?date=../../etc/passwd`
+    /// would attempt to read outside `data_dir`.
     pub fn load_dated(data_dir: &Path, date: &str) -> Option<Self> {
+        if !is_safe_date_str(date) {
+            return None;
+        }
         let path = data_dir.join(format!("graph-snapshot-{date}.json"));
         Self::try_load_snapshot(&path)
     }
@@ -295,7 +324,13 @@ impl KnowledgeGraph {
     }
 
     /// Load a graph snapshot for a specific date from the unified SQLite store.
+    /// Date is validated against the strict `YYYY-MM-DD` shape — the SQL
+    /// path is parameter-bound so SQL injection is not the risk; the
+    /// validation just keeps the API surface uniform with `load_dated`.
     pub fn load_dated_from_store(store: &innerwarden_store::Store, date: &str) -> Option<Self> {
+        if !is_safe_date_str(date) {
+            return None;
+        }
         let raw = store.load_graph_snapshot(date).ok()??;
         let data = maybe_decompress(&raw)?;
         let snapshot: GraphSnapshot = serde_json::from_slice(&data).ok()?;
@@ -675,5 +710,64 @@ mod tests {
         for i in 0..20 {
             assert!(loaded.find_by_ip(&format!("198.51.100.{i}")).is_some());
         }
+    }
+
+    // ── path-traversal guard tests ───────────────────────────────────
+    //
+    // CodeQL flagged `try_load_snapshot` as a path-traversal sink because
+    // `load_dated`'s `date: &str` flows from the `/api/report?date=...`
+    // HTTP query into a `data_dir.join(...)` call. `is_safe_date_str`
+    // closes the sink at the function boundary. These tests pin the
+    // exact accept/reject set so a future relaxation of the validator
+    // cannot reintroduce the traversal.
+
+    #[test]
+    fn is_safe_date_str_accepts_valid_iso_dates() {
+        assert!(is_safe_date_str("2026-04-23"));
+        assert!(is_safe_date_str("0001-01-01"));
+        assert!(is_safe_date_str("9999-12-31"));
+    }
+
+    #[test]
+    fn is_safe_date_str_rejects_path_traversal_payloads() {
+        // The exact attack payload from the CodeQL alert.
+        assert!(!is_safe_date_str("../../etc/passwd"));
+        // Variants that could slip past a naive contains-check.
+        assert!(!is_safe_date_str(".."));
+        assert!(!is_safe_date_str("/etc"));
+        assert!(!is_safe_date_str("2026-04-23/.."));
+        assert!(!is_safe_date_str("2026-04-23\0evil"));
+        assert!(!is_safe_date_str("2026-04-23\n"));
+        assert!(!is_safe_date_str("2026/04/23"));
+        assert!(!is_safe_date_str(""));
+        // Length 10 but non-digit content
+        assert!(!is_safe_date_str("aaaa-bb-cc"));
+        // Off-by-one length
+        assert!(!is_safe_date_str("2026-4-23"));
+        assert!(!is_safe_date_str("2026-04-2"));
+        assert!(!is_safe_date_str("2026-04-233"));
+    }
+
+    #[test]
+    fn load_dated_returns_none_for_path_traversal_payload() {
+        let dir = tempdir().unwrap();
+        // Plant a file outside `data_dir` that the attacker would target.
+        let outside = dir.path().join("..").join("evil.json");
+        let _ = std::fs::write(&outside, br#"{"nodes":{},"edges":[]}"#);
+
+        // The attacker payload — even if `outside` exists, `load_dated`
+        // must return None because the date string fails validation.
+        assert!(KnowledgeGraph::load_dated(dir.path(), "../evil").is_none());
+        assert!(KnowledgeGraph::load_dated(dir.path(), "../../etc/passwd").is_none());
+    }
+
+    #[test]
+    fn load_dated_from_store_returns_none_for_path_traversal_payload() {
+        // SQL path is already parameter-bound, but the validator keeps
+        // the API uniform and prevents an attacker from probing for
+        // unrelated rows by spelling weird dates.
+        let store = innerwarden_store::Store::open_memory().unwrap();
+        assert!(KnowledgeGraph::load_dated_from_store(&store, "../etc/passwd").is_none());
+        assert!(KnowledgeGraph::load_dated_from_store(&store, "").is_none());
     }
 }
