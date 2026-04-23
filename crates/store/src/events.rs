@@ -94,7 +94,12 @@ impl Store {
             "SELECT kind, src_ip FROM events WHERE ts >= ?1 ORDER BY ts LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![since_ts_iso, limit as i64], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            // Normalize the backfill's empty-string sentinel ("scanned, no IP
+            // in JSON") back to None so callers see uniform NULL/missing
+            // semantics regardless of whether the row was inserted post-v2
+            // or backfilled from a legacy JSON-only payload.
+            let ip = row.get::<_, Option<String>>(1)?.filter(|s| !s.is_empty());
+            Ok((row.get::<_, String>(0)?, ip))
         })?;
 
         let mut out = Vec::new();
@@ -102,6 +107,71 @@ impl Store {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// Backfill `events.src_ip` for one batch of legacy rows where the
+    /// column is NULL. Returns the number of rows updated. Returns 0
+    /// when no NULL rows remain — caller can stop scheduling.
+    ///
+    /// Wrapped in a single explicit transaction so the batch lands as
+    /// one WAL frame instead of `batch_size` individual auto-commits.
+    /// Critical when running concurrently with the sensor's writes:
+    /// pre-fix the per-row auto-commit pattern lost the busy-timeout
+    /// race over and over and the migration never finished. The batch
+    /// transaction acquires RESERVED → COMMIT once.
+    ///
+    /// Idempotent and resumable: progress is implicit in the
+    /// `src_ip IS NULL` predicate. Rows whose JSON has no extractable
+    /// IP get the empty-string sentinel `''` so the next batch's
+    /// WHERE clause stops matching them — without this the loop would
+    /// spin forever on the same NULL rows. Readers normalize `''` back
+    /// to `None` (see `events_for_training`).
+    pub fn backfill_events_src_ip(&self, batch_size: usize) -> Result<usize> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction()?;
+        let mut updated = 0usize;
+        {
+            let mut select = tx
+                .prepare("SELECT id, data FROM events WHERE src_ip IS NULL ORDER BY id LIMIT ?1")?;
+            let mut update = tx.prepare("UPDATE events SET src_ip = ?1 WHERE id = ?2")?;
+            let mut rows = select.query(params![batch_size as i64])?;
+            while let Some(row) = rows.next()? {
+                let id: i64 = row.get(0)?;
+                let data: String = row.get(1)?;
+                let ip = serde_json::from_str::<serde_json::Value>(&data)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("details").and_then(|d| {
+                            d.get("src_ip")
+                                .or_else(|| d.get("ip"))
+                                .and_then(|s| s.as_str())
+                                .map(|s| s.to_string())
+                        })
+                    });
+                // Empty-string sentinel marks "scanned but no IP" so the
+                // WHERE clause stops matching the row on subsequent
+                // batches. Persisted; readers normalize `''` to `None`.
+                update.execute(params![ip.as_deref().unwrap_or(""), id])?;
+                updated += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Number of events still awaiting `src_ip` backfill. Used by the
+    /// agent slow_loop to decide whether to schedule another batch and
+    /// to surface progress in dashboards. Counts only rows where
+    /// `src_ip IS NULL` — the empty-string sentinel from a completed
+    /// scan is excluded.
+    pub fn events_pending_src_ip_backfill(&self) -> Result<u64> {
+        let conn = self.conn()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE src_ip IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count.max(0) as u64)
     }
 
     /// Read events with rowid > `after_id`, up to `limit`.
@@ -320,67 +390,117 @@ mod tests {
         assert_eq!(rows[0].1.as_deref(), Some("203.0.113.99"));
     }
 
-    #[test]
-    fn schema_v2_backfills_existing_rows_after_upgrade() {
-        // Simulate an upgrade: build a fresh store, roll back to v1 by
-        // dropping the v2-only index AND column, re-insert pre-v2 rows,
-        // then run ensure_schema and verify backfill populated the column.
-        use crate::schema::{ensure_schema, schema_version};
-
-        let store = Store::open_memory().unwrap();
+    /// Helper for the v2-upgrade tests: rebuild a v1-shaped table on
+    /// the open store. Drops the v2 index + column + schema_version
+    /// row so the next `ensure_schema` re-runs the migration. Returns
+    /// the connection so the caller can keep inserting v1-shape rows.
+    fn rollback_to_v1_schema(store: &Store) {
         let conn = store.conn().unwrap();
-
-        // Roll back to v1: drop the v2 index FIRST (it references the
-        // column we're about to drop), then the column, then the v2
-        // schema_version row.
         conn.execute("DROP INDEX IF EXISTS idx_events_src_ip", [])
             .unwrap();
         conn.execute("ALTER TABLE events DROP COLUMN src_ip", [])
             .unwrap();
         conn.execute("DELETE FROM schema_version WHERE version >= 2", [])
             .unwrap();
+    }
 
-        // Insert raw rows the way a v1 agent would (no src_ip column).
+    fn insert_v1_event(store: &Store, kind: &str, details: serde_json::Value) {
         let now = chrono::Utc::now().to_rfc3339();
+        let conn = store.conn().unwrap();
         conn.execute(
             "INSERT INTO events (ts, host, source, kind, severity, summary, data) \
-             VALUES (?1, 'h', 's', 'ssh.login_failed', 'medium', 'sum', ?2)",
-            rusqlite::params![
-                now,
-                serde_json::json!({"details": {"src_ip": "203.0.113.55"}}).to_string()
-            ],
+             VALUES (?1, 'h', 's', ?2, 'low', 'sum', ?3)",
+            rusqlite::params![now, kind, details.to_string()],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO events (ts, host, source, kind, severity, summary, data) \
-             VALUES (?1, 'h', 's', 'http', 'low', 'sum', ?2)",
-            rusqlite::params![
-                now,
-                serde_json::json!({"details": {"path": "/etc"}}).to_string()
-            ],
-        )
-        .unwrap();
+    }
 
+    #[test]
+    fn schema_v2_migration_does_not_backfill_inline() {
+        // The v2 migration must NOT do the row backfill itself — it
+        // must only add the column + index + version row. The backfill
+        // is driven asynchronously by the agent slow_loop. This is the
+        // anchor that prevents a regression to PR #262's behavior
+        // where an 800k+ row inline backfill blocked `Store::open` and
+        // caused the boot-time `database is locked` race.
+        use crate::schema::{ensure_schema, schema_version};
+
+        let store = Store::open_memory().unwrap();
+        rollback_to_v1_schema(&store);
+        insert_v1_event(
+            &store,
+            "ssh.login_failed",
+            serde_json::json!({"details": {"src_ip": "203.0.113.55"}}),
+        );
+        insert_v1_event(
+            &store,
+            "http",
+            serde_json::json!({"details": {"path": "/etc"}}),
+        );
+
+        let conn = store.conn().unwrap();
         assert_eq!(schema_version(&conn).unwrap(), 1);
+
+        ensure_schema(&conn).unwrap();
+        assert_eq!(
+            schema_version(&conn).unwrap(),
+            2,
+            "v2 migration must record its version even though backfill is deferred"
+        );
+
+        // Both rows still have NULL src_ip — backfill has not run.
+        let null_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE src_ip IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            null_count, 2,
+            "ensure_schema must NOT backfill rows inline — that work belongs to the slow_loop"
+        );
+    }
+
+    #[test]
+    fn backfill_events_src_ip_populates_legacy_rows_and_marks_no_ip_rows() {
+        let store = Store::open_memory().unwrap();
+        rollback_to_v1_schema(&store);
+        insert_v1_event(
+            &store,
+            "ssh.login_failed",
+            serde_json::json!({"details": {"src_ip": "203.0.113.55"}}),
+        );
+        insert_v1_event(
+            &store,
+            "http",
+            serde_json::json!({"details": {"path": "/etc"}}),
+        );
+        // Use the `ip` fallback path too.
+        insert_v1_event(
+            &store,
+            "outbound",
+            serde_json::json!({"details": {"ip": "198.51.100.7"}}),
+        );
+
+        let conn = store.conn().unwrap();
+        crate::schema::ensure_schema(&conn).unwrap();
         drop(conn);
 
-        // Trigger the migration.
-        let conn = store.conn().unwrap();
-        ensure_schema(&conn).unwrap();
-        assert_eq!(schema_version(&conn).unwrap(), 2);
+        assert_eq!(store.events_pending_src_ip_backfill().unwrap(), 3);
+        let updated = store.backfill_events_src_ip(100).unwrap();
+        assert_eq!(updated, 3);
+        // Row with no extractable IP is now sentinel-marked, so the
+        // pending count drops to zero — the loop is guaranteed to
+        // terminate.
+        assert_eq!(store.events_pending_src_ip_backfill().unwrap(), 0);
 
-        // Backfilled row has the IP; the row without an IP has NULL.
-        let mut stmt = conn
-            .prepare("SELECT kind, src_ip FROM events ORDER BY id")
+        // events_for_training normalizes the empty-string sentinel to
+        // None so callers see uniform NULL-or-IP semantics.
+        let rows = store
+            .events_for_training("1970-01-01T00:00:00Z", 100)
             .unwrap();
-        let rows: Vec<(String, Option<String>)> = stmt
-            .query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
-            })
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert_eq!(
             rows[0],
             (
@@ -389,5 +509,49 @@ mod tests {
             )
         );
         assert_eq!(rows[1], ("http".to_string(), None));
+        assert_eq!(
+            rows[2],
+            ("outbound".to_string(), Some("198.51.100.7".to_string()))
+        );
+    }
+
+    #[test]
+    fn backfill_events_src_ip_resumes_across_batches() {
+        // Five legacy rows, batch size 2 → must finish in 3 calls
+        // (2 + 2 + 1) and remain idempotent on a fourth call.
+        let store = Store::open_memory().unwrap();
+        rollback_to_v1_schema(&store);
+        for i in 0..5 {
+            insert_v1_event(
+                &store,
+                "ssh.login_failed",
+                serde_json::json!({"details": {"src_ip": format!("10.0.0.{i}")}}),
+            );
+        }
+        let conn = store.conn().unwrap();
+        crate::schema::ensure_schema(&conn).unwrap();
+        drop(conn);
+
+        assert_eq!(store.backfill_events_src_ip(2).unwrap(), 2);
+        assert_eq!(store.events_pending_src_ip_backfill().unwrap(), 3);
+        assert_eq!(store.backfill_events_src_ip(2).unwrap(), 2);
+        assert_eq!(store.events_pending_src_ip_backfill().unwrap(), 1);
+        assert_eq!(store.backfill_events_src_ip(2).unwrap(), 1);
+        assert_eq!(store.events_pending_src_ip_backfill().unwrap(), 0);
+        // Fourth call returns 0 — no work left.
+        assert_eq!(store.backfill_events_src_ip(2).unwrap(), 0);
+    }
+
+    #[test]
+    fn backfill_events_src_ip_is_noop_on_post_v2_inserts() {
+        // Rows inserted via the public Store::insert_event path already
+        // have src_ip populated at write time. The backfill must see
+        // zero pending rows on a fresh store.
+        let store = Store::open_memory().unwrap();
+        let mut ev = sample_event("ssh.login_failed");
+        ev.details = serde_json::json!({"src_ip": "203.0.113.99"});
+        store.insert_event(&ev).unwrap();
+        assert_eq!(store.events_pending_src_ip_backfill().unwrap(), 0);
+        assert_eq!(store.backfill_events_src_ip(1000).unwrap(), 0);
     }
 }

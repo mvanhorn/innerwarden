@@ -51,6 +51,50 @@ pub(crate) fn try_recover_sqlite_store(state: &mut AgentState) {
     }
 }
 
+/// Drive the v2 schema backfill of `events.src_ip` for one batch of
+/// legacy rows per tick. PR #262 moved the backfill out of `apply_v2`
+/// into the slow_loop so a multi-hundred-thousand-row table on an
+/// upgraded production database does not block `Store::open` and
+/// re-trigger the boot-time `database is locked` race that left
+/// `sqlite_store` permanently `None` (see `RECURRING_BUGS.md`
+/// "sqlite_store stuck at None after boot race").
+///
+/// One batch per slow_loop tick (every ~30s). Each batch is a single
+/// explicit transaction so the WAL acquires RESERVED → COMMIT once
+/// per 1000 rows instead of once per row — that is the property that
+/// lets the backfill make progress against a sensor that is
+/// concurrently writing. Returns silently when no rows remain.
+const BACKFILL_BATCH_SIZE: usize = 1000;
+pub(crate) fn drive_events_src_ip_backfill(state: &AgentState) {
+    let Some(ref sq) = state.sqlite_store else {
+        return;
+    };
+    let pending = match sq.events_pending_src_ip_backfill() {
+        Ok(0) => return,
+        Ok(n) => n,
+        Err(e) => {
+            warn!("events.src_ip backfill pending count failed: {e:#}");
+            return;
+        }
+    };
+    match sq.backfill_events_src_ip(BACKFILL_BATCH_SIZE) {
+        Ok(0) => {} // race with another writer; pick up next tick
+        Ok(updated) => {
+            info!(
+                updated,
+                pending_before = pending,
+                "events.src_ip backfill batch applied"
+            );
+        }
+        Err(e) => {
+            // warn-not-fail: backfill is best-effort. Readers already
+            // handle NULL src_ip gracefully so the agent stays
+            // functional while we retry next tick.
+            warn!("events.src_ip backfill batch failed: {e:#}");
+        }
+    }
+}
+
 /// Refresh operator IPs from active SSH sessions.
 /// Replaces the entire set - IPs whose sessions ended are automatically removed.
 pub(crate) fn refresh_operator_ips(state: &mut AgentState, allowlist: &config::AllowlistConfig) {
@@ -103,6 +147,12 @@ pub(crate) async fn process_narrative_tick(
     // no-op for hours after a contended startup. See
     // `RECURRING_BUGS.md` "sqlite_store stuck at None after boot race".
     try_recover_sqlite_store(state);
+
+    // Drive the v2 src_ip backfill one batch per tick. No-op when the
+    // store is missing or no NULL rows remain. Decoupled from
+    // `apply_v2` so a long-running historical backfill cannot block
+    // `Store::open` (see `drive_events_src_ip_backfill` doc comment).
+    drive_events_src_ip_backfill(state);
 
     let today = chrono::Local::now()
         .date_naive()

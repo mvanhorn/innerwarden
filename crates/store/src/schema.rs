@@ -197,15 +197,35 @@ fn run_migrations(conn: &Connection, from_version: i64) -> Result<()> {
     Ok(())
 }
 
-/// v2 migration: add `events.src_ip` column + index, then backfill the
-/// new column for any existing rows by extracting `details.src_ip`
-/// (preferred) or `details.ip` (fallback) from the JSON payload. The
-/// backfill is a one-time scan; on a fresh database it runs over zero
-/// rows. On an upgraded production database it runs once and the column
-/// becomes the canonical source for `events_for_training`.
+/// v2 migration: add `events.src_ip` column + index, then record the
+/// schema version. **The backfill is NOT part of the migration** — it
+/// runs as a background task in the slow_loop (`backfill_events_src_ip`)
+/// so a large table on an upgraded database cannot block `Store::open`.
+///
+/// Pre-2026-04-23 the migration inlined the backfill as 800k+ individual
+/// UPDATE statements. On production with the sensor concurrently writing
+/// to the same database, the loop never completed within the
+/// `busy_timeout` window, so the `INSERT schema_version` at the end
+/// never ran. Result: every `Store::open` re-attempted v2 migration,
+/// every attempt hit the same contention, and `state.sqlite_store`
+/// stayed `None` for the entire agent process lifetime.
+///
+/// The new split:
+///   - **Migration** (this function): column + index + version row,
+///     all idempotent. Takes milliseconds. Runs on every `Store::open`
+///     (fast path when already applied).
+///   - **Backfill** (`backfill_events_src_ip`): walk rows where
+///     `src_ip IS NULL`, extract from JSON, wrap each batch in a
+///     single explicit transaction. Progress is implicit via the
+///     `src_ip IS NULL` WHERE clause — no state to persist. Can be
+///     safely interrupted and resumed. Runs asynchronously from
+///     agent slow_loop.
+///
+/// Readers (`events_for_training`) already handle NULL `src_ip`
+/// gracefully, so the agent remains functional during the backfill
+/// window. Only the nightly training's historical-row coverage is
+/// gradual until the backfill completes.
 fn apply_v2(conn: &Connection) -> Result<()> {
-    use rusqlite::params;
-
     // Column may already exist if a partial migration was attempted —
     // tolerate "duplicate column name" by checking pragma_table_info.
     let already_present: bool = conn
@@ -218,57 +238,19 @@ fn apply_v2(conn: &Connection) -> Result<()> {
         .unwrap_or(false);
     if !already_present {
         conn.execute("ALTER TABLE events ADD COLUMN src_ip TEXT", [])?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_events_src_ip ON events(src_ip) WHERE src_ip IS NOT NULL",
-            [],
-        )?;
     }
-
-    // Backfill: scan rows where src_ip IS NULL, extract from data, update.
-    // Done in batches to avoid loading the entire table into memory on
-    // upgrade. Uses prepared statements so the per-row cost is parse +
-    // bind, not query compile.
-    let mut select =
-        conn.prepare("SELECT id, data FROM events WHERE src_ip IS NULL ORDER BY id LIMIT 1000")?;
-    let mut update = conn.prepare("UPDATE events SET src_ip = ?1 WHERE id = ?2")?;
-    loop {
-        let mut rows = select.query([])?;
-        let mut updated_in_batch = 0;
-        while let Some(row) = rows.next()? {
-            let id: i64 = row.get(0)?;
-            let data: String = row.get(1)?;
-            let ip = serde_json::from_str::<serde_json::Value>(&data)
-                .ok()
-                .and_then(|v| {
-                    v.get("details").and_then(|d| {
-                        d.get("src_ip")
-                            .or_else(|| d.get("ip"))
-                            .and_then(|s| s.as_str())
-                            .map(|s| s.to_string())
-                    })
-                });
-            // Always update to mark the row as "scanned" — without this
-            // the loop would never terminate on rows where src_ip is
-            // genuinely absent (they would re-match the WHERE clause
-            // forever). Use empty string as the "scanned but no IP"
-            // marker, then convert empty back to NULL.
-            update.execute(params![ip.as_deref().unwrap_or(""), id])?;
-            updated_in_batch += 1;
-        }
-        if updated_in_batch == 0 {
-            break;
-        }
-    }
-    // Convert the empty-string sentinel back to NULL so query semantics
-    // match the post-migration writers (which insert NULL when no IP).
-    conn.execute("UPDATE events SET src_ip = NULL WHERE src_ip = ''", [])?;
+    // Index creation is idempotent (IF NOT EXISTS) and cheap.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_src_ip ON events(src_ip) WHERE src_ip IS NOT NULL",
+        [],
+    )?;
 
     conn.execute(
         "INSERT INTO schema_version (version, migrated_at, notes) VALUES (?1, ?2, ?3)",
         rusqlite::params![
             2_i64,
             chrono::Utc::now().to_rfc3339(),
-            "events.src_ip column + backfill"
+            "events.src_ip column + index (backfill runs separately)"
         ],
     )?;
 
