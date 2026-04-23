@@ -89,6 +89,13 @@ pub(super) struct LiveFeedResponse {
     items: Vec<LiveFeedItem>,
 }
 
+impl LiveFeedResponse {
+    #[cfg(test)]
+    pub(super) fn total_blocked(&self) -> usize {
+        self.total_blocked
+    }
+}
+
 /// Count **unique IPs** blocked today, not raw block decisions.
 ///
 /// Without dedup, a single attacker blocked N times (retries, new
@@ -143,7 +150,7 @@ pub(super) async fn api_live_feed(State(state): State<DashboardState>) -> Json<L
 /// Pure helper extracted from `api_live_feed` so the heavy work runs on the
 /// blocking pool and stays unit-testable. Same logic as before — only the
 /// scope of the read lock changed.
-fn build_live_feed_response(
+pub(super) fn build_live_feed_response(
     kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
     data_dir: &std::path::Path,
 ) -> LiveFeedResponse {

@@ -24,6 +24,9 @@ mod push;
 mod sensors;
 mod sse;
 
+#[cfg(test)]
+mod consistency_block_counts;
+
 #[allow(unused_imports)]
 use actions::*;
 #[allow(unused_imports)]
