@@ -260,22 +260,9 @@ pub(crate) async fn process_firmware_tick(
                         report.trust_score * 100.0,
                     );
                     let tg = tg.clone();
-                    // Spec 036 PR-2: register the alert in the agent's
-                    // TaskGroup so SIGTERM-driven shutdown (wired in a
-                    // later PR) can wait for it within the deadline.
-                    // The alert itself is transactional (one HTTP call)
-                    // and does NOT observe `token.cancelled()` — dropping
-                    // a firmware alert mid-send loses the notification
-                    // silently, which is worse than letting it complete.
-                    // Shutdown deadline is the operator's knob.
-                    if let Err(e) = state.task_group.spawn("firmware-alert", async move {
+                    try_spawn_firmware_alert(&state.task_group, async move {
                         let _ = tg.send_alert_html(&msg).await;
-                    }) {
-                        tracing::warn!(
-                            error = %e,
-                            "firmware-alert spawn rejected: TaskGroup closed"
-                        );
-                    }
+                    });
                 }
                 crate::notification_gate::NotificationVerdict::DailyBriefingOnly => {
                     *state
@@ -324,6 +311,34 @@ fn classify_correlated_threat_severity(confidence: f64) -> innerwarden_core::eve
         innerwarden_core::event::Severity::High
     } else {
         innerwarden_core::event::Severity::Medium
+    }
+}
+
+/// Register a firmware alert task on the agent's TaskGroup.
+///
+/// Spec 036 PR-2: the alert is a single HTTP call (transactional) and
+/// deliberately does NOT observe `token.cancelled()` — dropping an
+/// alert mid-send loses the notification silently, which is worse
+/// than letting a short call complete within the shutdown deadline.
+/// The operator's knob is the deadline.
+///
+/// If the TaskGroup is already shut down, `spawn` returns
+/// `Err(TaskGroupError::Closed)`; we surface that via `tracing::warn!`
+/// so the operator sees the dropped alert. No silent drop — the
+/// primitive's explicit error is what lets us log here.
+///
+/// Extracted from the inline spawn in `process_firmware_tick` so the
+/// Ok/Err branches are directly unit-testable without fixturing a
+/// full firmware audit run.
+fn try_spawn_firmware_alert<F>(task_group: &crate::task_group::TaskGroup, alert: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Err(e) = task_group.spawn("firmware-alert", alert) {
+        tracing::warn!(
+            error = %e,
+            "firmware-alert spawn rejected: TaskGroup closed"
+        );
     }
 }
 
@@ -393,22 +408,24 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // Spec 036 PR-2 migration anchors — firmware-alert → TaskGroup
+    // Spec 036 PR-2 migration anchors — try_spawn_firmware_alert
     // ─────────────────────────────────────────────────────────────────
     //
-    // These tests mirror the spawn pattern at
-    // `crates/agent/src/firmware_tick.rs` (after migration; look for
-    // the `state.task_group.spawn("firmware-alert", ...)` call in
-    // `process_firmware_tick`). They do NOT re-exercise the full
-    // process_firmware_tick path — that is already covered by the
-    // existing firmware_tick tests above + the integration scenario
-    // harness. These tests protect the invariant the migration
-    // specifically introduces: firmware alerts go through the
-    // TaskGroup so shutdown can drain them, and a closed group
-    // rejects explicitly rather than silently dropping the alert.
+    // The migration in `process_firmware_tick` now goes through
+    // `try_spawn_firmware_alert`. These tests drive that helper
+    // directly so both the Ok and Err branches are line-covered —
+    // previously the Err branch (the `tracing::warn!` for a closed
+    // TaskGroup) was unreachable from any fixture and codecov flagged
+    // it as uncovered. Driving the helper avoids fixturing a full
+    // firmware audit run and still anchors the real invariants:
+    //
+    //   - Ok path: alert future is registered in the TaskGroup and
+    //     runs to completion under `shutdown()`.
+    //   - Err path: a closed TaskGroup drops the alert with a
+    //     visible `warn!` — NEVER silently.
 
     #[tokio::test]
-    async fn firmware_alert_spawn_via_task_group_tracks_and_completes() {
+    async fn try_spawn_firmware_alert_registers_and_drains_the_alert() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
         use std::time::Duration;
@@ -417,22 +434,18 @@ mod tests {
         let sent = Arc::new(AtomicBool::new(false));
         let sent_c = sent.clone();
 
-        // Stand-in for `tg.send_alert_html(&msg).await` — the real
-        // call at the migration site. Sleep to simulate an HTTP
-        // round-trip; the semantics we care about are "tracked +
-        // completes", not network I/O.
-        tg.spawn("firmware-alert", async move {
+        // Stand-in for `tg.send_alert_html(&msg).await`. The helper is
+        // generic over the alert future so tests can pass a stub that
+        // observably completes.
+        try_spawn_firmware_alert(&tg, async move {
             tokio::time::sleep(Duration::from_millis(15)).await;
             sent_c.store(true, Ordering::SeqCst);
-        })
-        .expect("spawn under fresh group");
+        });
 
-        // Group must count the in-flight alert.
-        assert_eq!(tg.len(), 1, "spawn must be tracked in the group");
+        assert_eq!(tg.len(), 1, "alert must be tracked in the group");
 
-        // Graceful shutdown drains the alert cleanly within deadline.
         let report = tg.shutdown(Duration::from_secs(1)).await;
-        assert_eq!(report.total, 1, "single alert was pending");
+        assert_eq!(report.total, 1);
         assert_eq!(
             report.joined, 1,
             "alert must complete within deadline, not be abandoned"
@@ -440,28 +453,43 @@ mod tests {
         assert_eq!(report.timed_out, 0);
         assert!(
             sent.load(Ordering::SeqCst),
-            "alert body must have run — if this fails the task was dropped before the HTTP send"
+            "alert body must have run — if this fails the helper dropped the future"
         );
     }
 
     #[tokio::test]
-    async fn firmware_alert_spawn_after_shutdown_returns_err_not_silent_drop() {
+    async fn try_spawn_firmware_alert_warns_and_drops_when_group_closed() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
         use std::time::Duration;
 
         let tg = crate::task_group::TaskGroup::new();
         let _ = tg.shutdown(Duration::from_millis(50)).await;
 
-        // The operator's hard requirement from the PR-1 plan: spawn
-        // after shutdown returns `Err(Closed)`. The migration at
-        // firmware_tick.rs logs this via `tracing::warn!` — the
-        // regression we guard against is silently dropping an alert
-        // because the tracker was closed.
-        let result = tg.spawn("firmware-alert", async {
-            panic!("this future must never be polled after group close")
+        // The alert future would set this to true — it must NOT run
+        // because the group is closed. Operator-visible evidence that
+        // the Err branch dropped the future intentionally (not by
+        // accident).
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_c = ran.clone();
+
+        // The helper returns `()` for both branches — the Err side
+        // logs `tracing::warn!` and returns, NEVER panics, NEVER
+        // silently spawns. This call exercises exactly that line.
+        try_spawn_firmware_alert(&tg, async move {
+            ran_c.store(true, Ordering::SeqCst);
         });
+
+        // Group must not have a tracked task — the spawn returned Err
+        // and the future was dropped.
+        assert_eq!(
+            tg.len(),
+            0,
+            "closed group must reject spawn, future must be dropped"
+        );
         assert!(
-            matches!(result, Err(crate::task_group::TaskGroupError::Closed)),
-            "spawn after shutdown must return Err(Closed), not silently execute or drop"
+            !ran.load(Ordering::SeqCst),
+            "alert body must NOT have run — the future was dropped, not executed"
         );
     }
 }

@@ -50,6 +50,18 @@ coverage:
         threshold: 15%
         if_ci_failed: error
         informational: false
+        # Exclude orchestration paths from the default patch gate.
+        # Status-level `paths` default to `"**/*"` — without these
+        # exclusions a patch that only wires orchestration (a new
+        # spawn in run_agent, a field added to AgentState) fails the
+        # 70 % gate even though the `orchestration` informational
+        # status below already measures those paths separately. Fix
+        # lands 2026-04-24 on PR #274 — see that PR's description for
+        # the diagnosis that this config was incomplete.
+        paths:
+          - "**/*"
+          - "!crates/agent/src/main.rs"
+          - "!crates/agent/src/loops/boot.rs"
       # Orchestration / boot wiring gets its own *informational* gauge so
       # it is measured (not hidden) but never blocks merges. Real ceiling
       # is set by integration tests, not unit tests.
