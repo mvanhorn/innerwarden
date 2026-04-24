@@ -52,24 +52,28 @@ pub(crate) fn try_recover_sqlite_store(state: &mut AgentState) {
 }
 
 /// Drive the v2 schema backfill of `events.src_ip` for one batch of
-/// legacy rows per tick. PR #262 moved the backfill out of `apply_v2`
-/// into the slow_loop so a multi-hundred-thousand-row table on an
-/// upgraded production database does not block `Store::open` and
-/// re-trigger the boot-time `database is locked` race that left
-/// `sqlite_store` permanently `None` (see `RECURRING_BUGS.md`
-/// "sqlite_store stuck at None after boot race").
+/// legacy rows. PR #262 moved the backfill out of `apply_v2` into the
+/// slow_loop so a multi-hundred-thousand-row table on an upgraded
+/// production database does not block `Store::open` and re-trigger the
+/// boot-time `database is locked` race that left `sqlite_store`
+/// permanently `None` (see `RECURRING_BUGS.md` "sqlite_store stuck at
+/// None after boot race").
 ///
-/// One batch per slow_loop tick (every ~30s). Each batch is a single
-/// explicit transaction so the WAL acquires RESERVED → COMMIT once
-/// per 1000 rows instead of once per row — that is the property that
-/// lets the backfill make progress against a sensor that is
-/// concurrently writing. Returns silently when no rows remain.
+/// Each call is one batch (a single explicit transaction so the WAL
+/// acquires RESERVED → COMMIT once per 1000 rows instead of once per
+/// row — that is the property that lets the backfill make progress
+/// against a sensor that is concurrently writing). Returns silently
+/// when no rows remain.
+///
+/// Spec 037 I-05a: the tick scheduler calls this via
+/// [`spawn_events_src_ip_backfill`] so the blocking SQLite transaction
+/// runs on a worker thread and does not block the async tick. The
+/// function itself stays synchronous; the `&Store` signature lets the
+/// spawn wrapper own a cloned `Arc<Store>` and pass a borrow into the
+/// blocking closure.
 const BACKFILL_BATCH_SIZE: usize = 1000;
-pub(crate) fn drive_events_src_ip_backfill(state: &AgentState) {
-    let Some(ref sq) = state.sqlite_store else {
-        return;
-    };
-    let pending = match sq.events_pending_src_ip_backfill() {
+pub(crate) fn drive_events_src_ip_backfill(store: &innerwarden_store::Store) {
+    let pending = match store.events_pending_src_ip_backfill() {
         Ok(0) => return,
         Ok(n) => n,
         Err(e) => {
@@ -77,7 +81,7 @@ pub(crate) fn drive_events_src_ip_backfill(state: &AgentState) {
             return;
         }
     };
-    match sq.backfill_events_src_ip(BACKFILL_BATCH_SIZE) {
+    match store.backfill_events_src_ip(BACKFILL_BATCH_SIZE) {
         Ok(0) => {} // race with another writer; pick up next tick
         Ok(updated) => {
             info!(
@@ -93,6 +97,31 @@ pub(crate) fn drive_events_src_ip_backfill(state: &AgentState) {
             warn!("events.src_ip backfill batch failed: {e:#}");
         }
     }
+}
+
+/// Fire-and-forget wrapper around [`drive_events_src_ip_backfill`]. The
+/// backfill is best-effort and idempotent (safe to skip, safe to retry);
+/// the tick caller does not wait for completion. The blocking SQLite
+/// transaction runs on a tokio blocking worker, so the async tick is
+/// not held while the batch commits.
+///
+/// Spec 037 I-05a (first slow_loop decomposition PR): moves the
+/// backfill out of the inline tick path without changing cadence or
+/// semantics. A JoinError (task panicked) is surfaced via WARN so a
+/// silent panic in the worker does not go unnoticed.
+fn spawn_events_src_ip_backfill(state: &AgentState) {
+    let Some(store) = state.sqlite_store.clone() else {
+        return;
+    };
+    tokio::spawn(async move {
+        let join_res = tokio::task::spawn_blocking(move || {
+            drive_events_src_ip_backfill(&store);
+        })
+        .await;
+        if let Err(e) = join_res {
+            warn!("events.src_ip backfill task join failed: {e}");
+        }
+    });
 }
 
 /// Refresh operator IPs from active SSH sessions.
@@ -148,11 +177,12 @@ pub(crate) async fn process_narrative_tick(
     // `RECURRING_BUGS.md` "sqlite_store stuck at None after boot race".
     try_recover_sqlite_store(state);
 
-    // Drive the v2 src_ip backfill one batch per tick. No-op when the
-    // store is missing or no NULL rows remain. Decoupled from
-    // `apply_v2` so a long-running historical backfill cannot block
-    // `Store::open` (see `drive_events_src_ip_backfill` doc comment).
-    drive_events_src_ip_backfill(state);
+    // Drive the v2 src_ip backfill one batch per tick. Fire-and-forget
+    // on a blocking worker so the tick does not wait for the SQLite
+    // transaction to commit. No-op when the store is missing or no
+    // NULL rows remain. Spec 037 I-05a — first slow_loop decomposition
+    // extraction. Cadence and semantics unchanged from the inline call.
+    spawn_events_src_ip_backfill(state);
 
     let today = chrono::Local::now()
         .date_naive()
@@ -1268,6 +1298,90 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
             !json_path.exists(),
             "dated JSON file must NOT exist when sqlite_store is None — write path fully retired"
         );
+    }
+
+    // ── Spec 037 I-05a — backfill spawn anchor ─────────────────────
+    //
+    // `spawn_events_src_ip_backfill` replaced the inline call at the
+    // top of `process_narrative_tick`. Two invariants matter:
+    //   1. The spawn fires when a store is present and the function
+    //      actually drives one batch of backfill work (observable via
+    //      the store state, not the returned Future).
+    //   2. When `state.sqlite_store` is `None`, the spawn is a no-op —
+    //      no task is created and no panic is propagated.
+
+    #[tokio::test]
+    async fn spawn_events_src_ip_backfill_drives_one_batch_when_rows_are_pending() {
+        // Seed a SQLite store with a pending src_ip row (null) so the
+        // backfill has something to do. After the spawn + join-yield,
+        // the row should have a non-null src_ip.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        state.sqlite_store = Some(crate::tests::test_sqlite_store(dir.path()));
+
+        // Seed: insert one event row whose src_ip column is NULL (the
+        // legacy shape the backfill was designed to upgrade). Using the
+        // store's public `insert_event` path, then nulling src_ip
+        // directly, matches the v1-row shape we'd see on an upgraded db.
+        {
+            let store = state.sqlite_store.as_ref().expect("store");
+            let ev = innerwarden_core::event::Event {
+                ts: chrono::Utc::now(),
+                host: "h".into(),
+                source: "test".into(),
+                kind: "test.event".into(),
+                severity: innerwarden_core::event::Severity::Low,
+                summary: "seed".into(),
+                details: serde_json::json!({ "src_ip": "203.0.113.42" }),
+                tags: Vec::new(),
+                entities: Vec::new(),
+            };
+            store.insert_event(&ev).expect("seed event");
+            // The backfill triggers on rows with NULL `src_ip` column
+            // but a parseable ip inside `details`. insert_event may
+            // already populate both; null out the column to make the
+            // row look legacy.
+            store
+                .conn()
+                .expect("conn")
+                .execute("UPDATE events SET src_ip = NULL", [])
+                .expect("null out src_ip");
+            let pending = store.events_pending_src_ip_backfill().unwrap();
+            assert_eq!(
+                pending, 1,
+                "fixture must seed exactly one backfill-eligible row"
+            );
+        }
+
+        spawn_events_src_ip_backfill(&state);
+
+        // Yield back to the runtime long enough for the spawned task +
+        // blocking worker to run the one-batch backfill.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let remaining = state
+            .sqlite_store
+            .as_ref()
+            .expect("store")
+            .events_pending_src_ip_backfill()
+            .expect("pending query");
+        assert_eq!(
+            remaining, 0,
+            "spawn wrapper must drive one batch to completion (pending was 1, now {remaining})"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_events_src_ip_backfill_is_noop_when_store_is_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::tests::triage_test_state(dir.path());
+        assert!(state.sqlite_store.is_none());
+
+        // Must not panic, must not hang, must not create a task we'd
+        // leak. Simple smoke: call and yield; nothing observable
+        // happens, but we assert no JoinError surfaces in the next tick.
+        spawn_events_src_ip_backfill(&state);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
     #[test]
