@@ -536,25 +536,26 @@ pub fn persist_snapshot(
     profiles: &HashMap<String, AttackerProfile>,
     store: Option<&innerwarden_store::Store>,
 ) {
-    let Some(sq) = store else {
-        // Pre-spec-030 no-op: no SQLite store attached. Before
-        // this PR the same branch still wrote the JSON file as a
-        // fallback; that path only matters when the agent runs
-        // without a SQLite backend, which is a test-only mode now
-        // that the store is a boot prerequisite.
-        return;
-    };
+    // Pre-spec-030 no-op branch: no SQLite store attached. Before
+    // this PR the same branch still wrote the JSON file as a
+    // fallback; that path only matters when the agent runs without
+    // a SQLite backend, which is a test-only mode now that the
+    // store is a boot prerequisite. Structured as `if let Some`
+    // instead of `let-else + early return` because tarpaulin's
+    // line-coverage attribution does not reliably count let-else
+    // arms; see PR #279 commit notes.
+    if let Some(sq) = store {
+        let mut sorted: Vec<&AttackerProfile> = profiles.values().collect();
+        sorted.sort_by(|a, b| b.risk_score.cmp(&a.risk_score));
 
-    let mut sorted: Vec<&AttackerProfile> = profiles.values().collect();
-    sorted.sort_by(|a, b| b.risk_score.cmp(&a.risk_score));
-
-    match serde_json::to_string(&sorted) {
-        Ok(json) => {
-            if let Err(e) = sq.set_blob("attacker_profiles", &json) {
-                warn!("failed to write attacker_profiles blob: {e}");
+        match serde_json::to_string(&sorted) {
+            Ok(json) => {
+                if let Err(e) = sq.set_blob("attacker_profiles", &json) {
+                    warn!("failed to write attacker_profiles blob: {e}");
+                }
             }
+            Err(e) => warn!("failed to serialize attacker profiles: {e}"),
         }
-        Err(e) => warn!("failed to serialize attacker profiles: {e}"),
     }
 }
 
