@@ -281,19 +281,44 @@ impl ResponseLifecycle {
         }
     }
 
-    /// Restore active responses from a previous `responses.json` snapshot.
-    /// Called once on agent startup to survive restarts. Expired entries are
-    /// moved to history automatically via the next `tick_cleanup` call.
-    /// Tries SQLite blob first, falls back to JSON file.
+    /// Restore active responses from a previous snapshot.
+    ///
+    /// Priority order:
+    ///   1. v2 SQLite blob `responses_snapshot`
+    ///   2. v2 file `responses.snapshot.json`
+    ///   3. v1 SQLite blob `responses` or file `responses.json`
+    ///      (the legacy `to_json()`-shaped dashboard view — preserved
+    ///      as fallback so existing data dirs keep working after
+    ///      upgrade; the first slow-loop tick writes v2 alongside v1
+    ///      so the next restart picks the v2 path).
+    ///
+    /// After load, hydrates any `block_ip` decisions from today's JSONL
+    /// that are not already tracked — covers code paths that bypass
+    /// `ResponseLifecycle::register` (always-on honeypot, dashboard
+    /// manual actions). This reconciliation step is preserved for both
+    /// v1 and v2 load paths.
     pub fn load_snapshot(
         data_dir: &std::path::Path,
         store: Option<&innerwarden_store::Store>,
     ) -> Self {
-        // Try SQLite blob first, fall back to JSON file
+        if let Some(mut lifecycle) = Self::try_load_v2(data_dir, store) {
+            Self::hydrate_from_decisions_jsonl(&mut lifecycle, data_dir);
+            if !lifecycle.active.is_empty() || !lifecycle.history.is_empty() {
+                info!(
+                    active = lifecycle.active.len(),
+                    history = lifecycle.history.len(),
+                    total_registered = lifecycle.total_registered,
+                    format = "v2",
+                    "response lifecycle restored"
+                );
+            }
+            return lifecycle;
+        }
+        // v1 fallback — legacy shape below.
         let content = if let Some(sq) = store {
             match sq.get_blob("responses") {
                 Ok(Some(json)) => {
-                    tracing::info!("loaded response lifecycle from sqlite blob");
+                    tracing::info!("loaded response lifecycle from sqlite blob (v1)");
                     json
                 }
                 _ => {
@@ -444,102 +469,221 @@ impl ResponseLifecycle {
             }
         }
 
-        // Also hydrate from today's decisions JSONL to catch blocks from code paths
-        // that don't go through ResponseLifecycle (e.g. honeypot, dashboard actions).
-        let today = chrono::Local::now()
-            .date_naive()
-            .format("%Y-%m-%d")
-            .to_string();
-        let decisions_path = data_dir.join(format!("decisions-{today}.jsonl"));
-        if let Ok(content) = std::fs::read_to_string(&decisions_path) {
-            let tracked_targets: std::collections::HashSet<String> =
-                lifecycle.active.iter().map(|r| r.target.clone()).collect();
-            let mut added = 0usize;
-            for line in content.lines() {
-                if line.is_empty() {
-                    continue;
-                }
-                let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
-                    continue;
-                };
-                if entry["action_type"].as_str() != Some("block_ip") {
-                    continue;
-                }
-                let Some(ip) = entry["target_ip"].as_str() else {
-                    continue;
-                };
-                if ip.is_empty() || tracked_targets.contains(ip) {
-                    continue;
-                }
-                // Drop malformed targets — a historical decision row with an
-                // invalid IP must not be rehydrated, otherwise it immediately
-                // becomes a zombie Active entry that can never be reverted.
-                if !crate::decision_block_ip::is_valid_block_target(ip) {
-                    tracing::warn!(
-                        target = %ip,
-                        "skipping invalid target while hydrating from decisions JSONL"
-                    );
-                    continue;
-                }
-                // Check if already in active set (may have been added from snapshot)
-                if lifecycle.active.iter().any(|r| r.target == ip) {
-                    continue;
-                }
-                let ts = entry["ts"]
-                    .as_str()
-                    .and_then(|s| s.parse::<DateTime<Utc>>().ok())
-                    .unwrap_or(now);
-                // Use 1-hour default TTL for rehydrated blocks
-                let ttl = 3600i64;
-                let expires_at = ts + chrono::Duration::seconds(ttl);
-                if expires_at <= now {
-                    // Already expired — skip
-                    continue;
-                }
-                let skill_id = entry["skill_id"].as_str().unwrap_or("block-ip-ufw");
-                let backend = if skill_id.contains("xdp") {
-                    ResponseBackend::Xdp
-                } else if skill_id.contains("iptables") {
-                    ResponseBackend::Iptables
-                } else if skill_id.contains("nftables") {
-                    ResponseBackend::Nftables
-                } else {
-                    ResponseBackend::Ufw
-                };
-                let incident_id = entry["incident_id"].as_str().unwrap_or("").to_string();
-
-                let id = format!("resp-{}", lifecycle.next_id);
-                lifecycle.next_id += 1;
-                lifecycle.active.push(ActiveResponse {
-                    id,
-                    response_type: ResponseType::BlockIp,
-                    backend,
-                    target: ip.to_string(),
-                    incident_id,
-                    created_at: ts,
-                    ttl_secs: ttl,
-                    expires_at,
-                    revert_handle: None,
-                    state: LifecycleState::Active,
-                });
-                lifecycle.total_registered += 1;
-                added += 1;
-            }
-            if added > 0 {
-                info!(added, "hydrated response lifecycle from today's decisions");
-            }
-        }
+        Self::hydrate_from_decisions_jsonl(&mut lifecycle, data_dir);
 
         if !lifecycle.active.is_empty() || !lifecycle.history.is_empty() {
             info!(
                 active = lifecycle.active.len(),
                 history = lifecycle.history.len(),
                 total_registered = lifecycle.total_registered,
+                format = "v1",
                 "response lifecycle restored"
             );
         }
 
         lifecycle
+    }
+
+    /// Try to load a v2 snapshot from SQLite blob or JSON file. Returns
+    /// `None` if neither source is present or if the content is not
+    /// tagged `schema_version: 2`. Kept separate from `load_snapshot`
+    /// so the v1 fallback path remains untouched on the failure branch.
+    fn try_load_v2(
+        data_dir: &std::path::Path,
+        store: Option<&innerwarden_store::Store>,
+    ) -> Option<Self> {
+        if let Some(sq) = store {
+            if let Ok(Some(content)) = sq.get_blob("responses_snapshot") {
+                if let Some(lc) = Self::from_v2_content(&content) {
+                    tracing::info!("loaded response lifecycle from sqlite blob (v2)");
+                    return Some(lc);
+                }
+            }
+        }
+        let path = data_dir.join("responses.snapshot.json");
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Some(lc) = Self::from_v2_content(&content) {
+                tracing::info!("loaded response lifecycle from responses.snapshot.json (v2)");
+                return Some(lc);
+            }
+        }
+        None
+    }
+
+    /// Parse a v2 snapshot. Strictly requires `schema_version: 2` so a
+    /// misrouted v1 payload (e.g. someone wrote the dashboard view into
+    /// the wrong blob by mistake) returns `None` and falls through to
+    /// the v1 loader instead of partial-matching a wrong shape.
+    fn from_v2_content(content: &str) -> Option<Self> {
+        let json: serde_json::Value = serde_json::from_str(content).ok()?;
+        if json.get("schema_version").and_then(|v| v.as_u64()) != Some(2) {
+            return None;
+        }
+        let now = Utc::now();
+        let mut lc = Self::new();
+
+        if let Some(arr) = json["active"].as_array() {
+            for item in arr {
+                let target = item["target"].as_str().unwrap_or_default();
+                if target.is_empty() {
+                    continue;
+                }
+                let response_type = parse_response_type(item["type"].as_str());
+                if response_type == ResponseType::BlockIp
+                    && !crate::decision_block_ip::is_valid_block_target(target)
+                {
+                    tracing::warn!(
+                        target = %target,
+                        "skipping invalid target while loading response lifecycle snapshot (v2)"
+                    );
+                    continue;
+                }
+                let created_at = item["created_at"]
+                    .as_str()
+                    .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+                    .unwrap_or(now);
+                let ttl_secs = item["ttl_secs"].as_i64().unwrap_or(3600);
+                let expires_at = item["expires_at"]
+                    .as_str()
+                    .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+                    .unwrap_or(created_at + chrono::Duration::seconds(ttl_secs));
+                lc.active.push(ActiveResponse {
+                    id: item["id"].as_str().unwrap_or("").to_string(),
+                    response_type,
+                    backend: parse_backend(item["backend"].as_str()),
+                    target: target.to_string(),
+                    incident_id: item["incident_id"].as_str().unwrap_or("").to_string(),
+                    created_at,
+                    ttl_secs,
+                    expires_at,
+                    revert_handle: item["revert_handle"].as_str().map(String::from),
+                    state: parse_state_from_json(&item["state"]).unwrap_or(LifecycleState::Active),
+                });
+            }
+        }
+
+        // History in natural order (no .rev() on the write side).
+        if let Some(arr) = json["history"].as_array() {
+            for item in arr {
+                let target = item["target"].as_str().unwrap_or_default();
+                if target.is_empty() {
+                    continue;
+                }
+                lc.history.push_back(CompletedResponse {
+                    id: item["id"].as_str().unwrap_or("").to_string(),
+                    response_type: parse_response_type(item["type"].as_str()),
+                    backend: parse_backend(item["backend"].as_str()),
+                    target: target.to_string(),
+                    incident_id: item["incident_id"].as_str().unwrap_or("").to_string(),
+                    created_at: item["created_at"]
+                        .as_str()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(now),
+                    reverted_at: item["reverted_at"]
+                        .as_str()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(now),
+                    reason: item["reason"].as_str().unwrap_or("expired").to_string(),
+                });
+            }
+        }
+
+        if let Some(totals) = json.get("totals") {
+            lc.total_registered = totals["registered"].as_u64().unwrap_or(0);
+            lc.total_expired = totals["expired"].as_u64().unwrap_or(0);
+            lc.total_reverted = totals["reverted"].as_u64().unwrap_or(0);
+            lc.total_revert_failures = totals["revert_failures"].as_u64().unwrap_or(0);
+            lc.total_already_absent = totals["already_absent"].as_u64().unwrap_or(0);
+            lc.total_orphaned = totals["orphaned"].as_u64().unwrap_or(0);
+        }
+        lc.next_id = json["next_id"].as_u64().unwrap_or(1);
+        Some(lc)
+    }
+
+    /// Reconciliation: pick up `block_ip` decisions from today's JSONL
+    /// that are not already tracked in `active`. Runs after either v1
+    /// or v2 load so code paths that bypass `ResponseLifecycle::register`
+    /// (always-on honeypot, dashboard manual actions) still show up on
+    /// the `/api/responses` dashboard after a restart.
+    fn hydrate_from_decisions_jsonl(lifecycle: &mut Self, data_dir: &std::path::Path) {
+        let now = Utc::now();
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let decisions_path = data_dir.join(format!("decisions-{today}.jsonl"));
+        let Ok(content) = std::fs::read_to_string(&decisions_path) else {
+            return;
+        };
+        let tracked_targets: std::collections::HashSet<String> =
+            lifecycle.active.iter().map(|r| r.target.clone()).collect();
+        let mut added = 0usize;
+        for line in content.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if entry["action_type"].as_str() != Some("block_ip") {
+                continue;
+            }
+            let Some(ip) = entry["target_ip"].as_str() else {
+                continue;
+            };
+            if ip.is_empty() || tracked_targets.contains(ip) {
+                continue;
+            }
+            if !crate::decision_block_ip::is_valid_block_target(ip) {
+                tracing::warn!(
+                    target = %ip,
+                    "skipping invalid target while hydrating from decisions JSONL"
+                );
+                continue;
+            }
+            if lifecycle.active.iter().any(|r| r.target == ip) {
+                continue;
+            }
+            let ts = entry["ts"]
+                .as_str()
+                .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+                .unwrap_or(now);
+            let ttl = 3600i64;
+            let expires_at = ts + chrono::Duration::seconds(ttl);
+            if expires_at <= now {
+                continue;
+            }
+            let skill_id = entry["skill_id"].as_str().unwrap_or("block-ip-ufw");
+            let backend = if skill_id.contains("xdp") {
+                ResponseBackend::Xdp
+            } else if skill_id.contains("iptables") {
+                ResponseBackend::Iptables
+            } else if skill_id.contains("nftables") {
+                ResponseBackend::Nftables
+            } else {
+                ResponseBackend::Ufw
+            };
+            let incident_id = entry["incident_id"].as_str().unwrap_or("").to_string();
+            let id = format!("resp-{}", lifecycle.next_id);
+            lifecycle.next_id += 1;
+            lifecycle.active.push(ActiveResponse {
+                id,
+                response_type: ResponseType::BlockIp,
+                backend,
+                target: ip.to_string(),
+                incident_id,
+                created_at: ts,
+                ttl_secs: ttl,
+                expires_at,
+                revert_handle: None,
+                state: LifecycleState::Active,
+            });
+            lifecycle.total_registered += 1;
+            added += 1;
+        }
+        if added > 0 {
+            info!(added, "hydrated response lifecycle from today's decisions");
+        }
     }
 
     /// Register a new response. Returns the response ID.
@@ -948,6 +1092,64 @@ impl ResponseLifecycle {
     }
 
     /// Serialize active responses as JSON (for /api/responses).
+    /// Canonical persistence snapshot (v2). Distinct from `to_json()`,
+    /// which is the dashboard view. `to_json()` reverses history for
+    /// "most recent first" display and caps at 50 entries, and silently
+    /// drops `revert_handle` and `next_id`; those choices are correct
+    /// for presentation but wrong for restart, which is why this
+    /// method exists.
+    pub fn to_snapshot(&self) -> serde_json::Value {
+        let active: Vec<serde_json::Value> = self
+            .active
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id,
+                    "type": r.response_type,
+                    "backend": r.backend,
+                    "target": r.target,
+                    "incident_id": r.incident_id,
+                    "created_at": r.created_at.to_rfc3339(),
+                    "expires_at": r.expires_at.to_rfc3339(),
+                    "ttl_secs": r.ttl_secs,
+                    "revert_handle": r.revert_handle,
+                    "state": r.state,
+                })
+            })
+            .collect();
+        // Natural push_back order, no truncation — full history round-trips.
+        let history: Vec<serde_json::Value> = self
+            .history
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id,
+                    "type": r.response_type,
+                    "backend": r.backend,
+                    "target": r.target,
+                    "incident_id": r.incident_id,
+                    "created_at": r.created_at.to_rfc3339(),
+                    "reverted_at": r.reverted_at.to_rfc3339(),
+                    "reason": r.reason,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "schema_version": 2,
+            "next_id": self.next_id,
+            "active": active,
+            "history": history,
+            "totals": {
+                "registered": self.total_registered,
+                "expired": self.total_expired,
+                "reverted": self.total_reverted,
+                "revert_failures": self.total_revert_failures,
+                "already_absent": self.total_already_absent,
+                "orphaned": self.total_orphaned,
+            },
+        })
+    }
+
     pub fn to_json(&self) -> serde_json::Value {
         let now = Utc::now();
         let active: Vec<serde_json::Value> = self
@@ -1009,6 +1211,30 @@ impl ResponseLifecycle {
                 "orphaned": self.total_orphaned,
             }
         })
+    }
+}
+
+fn parse_backend(s: Option<&str>) -> ResponseBackend {
+    match s.unwrap_or("ufw") {
+        "xdp" => ResponseBackend::Xdp,
+        "iptables" => ResponseBackend::Iptables,
+        "nftables" => ResponseBackend::Nftables,
+        "pf" => ResponseBackend::Pf,
+        "cloudflare" => ResponseBackend::Cloudflare,
+        "nginx" => ResponseBackend::Nginx,
+        "container" => ResponseBackend::Container,
+        "sudo" => ResponseBackend::Sudo,
+        _ => ResponseBackend::Ufw,
+    }
+}
+
+fn parse_response_type(s: Option<&str>) -> ResponseType {
+    match s.unwrap_or("block_ip") {
+        "block_container" => ResponseType::BlockContainer,
+        "suspend_sudo" => ResponseType::SuspendSudo,
+        "rate_limit_nginx" => ResponseType::RateLimitNginx,
+        "kill_process" => ResponseType::KillProcess,
+        _ => ResponseType::BlockIp,
     }
 }
 
@@ -1582,6 +1808,354 @@ mod tests {
             LifecycleState::Active
         ));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── Restart consistency anchors (spec 037 slice 4 PR-3) ──────────
+    //
+    // Four invariants the write → restart → load round-trip must hold:
+    //   1. SQLite blob is the canonical source: writing only to the blob
+    //      and loading with a store handle recovers full state.
+    //   2. JSON file is the legacy fallback: writing only to the file and
+    //      loading with a store handle (empty blob) still recovers state.
+    //   3. JSON-only path (store=None) still works for pre-migration dirs.
+    //   4. SQLite wins when both are present — guards against a stale
+    //      responses.json hiding a newer SQLite state after upgrade.
+    //
+    // The tests use fresh tempdirs with NO decisions-*.jsonl, so the
+    // JSONL rehydration path (which is the reconciliation logic and out
+    // of scope for this slice) stays dormant.
+
+    fn stateful_lifecycle_fixture() -> ResponseLifecycle {
+        // Build a lifecycle that exercises every persisted field: two
+        // active entries in distinct states, two history rows, and all
+        // six totals set to distinct non-zero values so a silent drop
+        // in any counter would surface as a mismatch.
+        //
+        // Timestamps are truncated to whole seconds so the
+        // rfc3339 → DateTime round-trip in the loader does not lose
+        // nanoseconds and produce spurious structural inequality.
+        use chrono::Timelike;
+        let created_at = Utc::now().with_nanosecond(0).unwrap();
+        let expires_at = created_at + chrono::Duration::seconds(3600);
+        let mut lc = ResponseLifecycle::new();
+        lc.active.push(ActiveResponse {
+            id: "resp-1".into(),
+            response_type: ResponseType::BlockIp,
+            backend: ResponseBackend::Ufw,
+            target: "203.0.113.10".into(),
+            incident_id: "inc-a".into(),
+            created_at,
+            ttl_secs: 3600,
+            expires_at,
+            revert_handle: None,
+            state: LifecycleState::Active,
+        });
+        lc.active.push(ActiveResponse {
+            id: "resp-2".into(),
+            response_type: ResponseType::BlockIp,
+            backend: ResponseBackend::Iptables,
+            target: "203.0.113.11".into(),
+            incident_id: "inc-b".into(),
+            created_at,
+            ttl_secs: 7200,
+            expires_at: created_at + chrono::Duration::seconds(7200),
+            revert_handle: None,
+            state: LifecycleState::Active,
+        });
+        lc.history.push_back(CompletedResponse {
+            id: "resp-0".into(),
+            response_type: ResponseType::BlockIp,
+            backend: ResponseBackend::Ufw,
+            target: "203.0.113.9".into(),
+            incident_id: "inc-h1".into(),
+            created_at,
+            reverted_at: created_at,
+            reason: "expired".into(),
+        });
+        lc.history.push_back(CompletedResponse {
+            id: "resp-h2".into(),
+            response_type: ResponseType::BlockIp,
+            backend: ResponseBackend::Nftables,
+            target: "203.0.113.8".into(),
+            incident_id: "inc-h2".into(),
+            created_at,
+            reverted_at: created_at,
+            reason: "manual".into(),
+        });
+        lc.next_id = 5;
+        lc.total_registered = 7;
+        lc.total_reverted = 2;
+        lc.total_expired = 1;
+        lc.total_revert_failures = 3;
+        lc.total_already_absent = 1;
+        lc.total_orphaned = 1;
+        lc
+    }
+
+    fn assert_state_matches(
+        expected: &ResponseLifecycle,
+        loaded: &ResponseLifecycle,
+        scenario: &str,
+    ) {
+        // Active — order-preserving compare on the fields that round-trip.
+        // `revert_handle` is intentionally dropped by `to_json`; not compared.
+        assert_eq!(
+            loaded.active.len(),
+            expected.active.len(),
+            "{scenario}: active length"
+        );
+        for (i, (e, l)) in expected.active.iter().zip(loaded.active.iter()).enumerate() {
+            assert_eq!(e.id, l.id, "{scenario}: active[{i}].id");
+            assert_eq!(e.target, l.target, "{scenario}: active[{i}].target");
+            assert_eq!(
+                e.incident_id, l.incident_id,
+                "{scenario}: active[{i}].incident_id"
+            );
+            assert_eq!(e.ttl_secs, l.ttl_secs, "{scenario}: active[{i}].ttl_secs");
+            assert_eq!(
+                e.response_type, l.response_type,
+                "{scenario}: active[{i}].response_type"
+            );
+            assert_eq!(e.backend, l.backend, "{scenario}: active[{i}].backend");
+        }
+
+        // History.
+        assert_eq!(
+            loaded.history.len(),
+            expected.history.len(),
+            "{scenario}: history length"
+        );
+        for (i, (e, l)) in expected
+            .history
+            .iter()
+            .zip(loaded.history.iter())
+            .enumerate()
+        {
+            assert_eq!(e.id, l.id, "{scenario}: history[{i}].id");
+            assert_eq!(e.target, l.target, "{scenario}: history[{i}].target");
+            assert_eq!(e.reason, l.reason, "{scenario}: history[{i}].reason");
+            assert_eq!(e.backend, l.backend, "{scenario}: history[{i}].backend");
+        }
+
+        // Totals — all six must survive.
+        assert_eq!(
+            expected.total_registered, loaded.total_registered,
+            "{scenario}: total_registered"
+        );
+        assert_eq!(
+            expected.total_reverted, loaded.total_reverted,
+            "{scenario}: total_reverted"
+        );
+        assert_eq!(
+            expected.total_expired, loaded.total_expired,
+            "{scenario}: total_expired"
+        );
+        assert_eq!(
+            expected.total_revert_failures, loaded.total_revert_failures,
+            "{scenario}: total_revert_failures"
+        );
+        assert_eq!(
+            expected.total_already_absent, loaded.total_already_absent,
+            "{scenario}: total_already_absent"
+        );
+        assert_eq!(
+            expected.total_orphaned, loaded.total_orphaned,
+            "{scenario}: total_orphaned"
+        );
+    }
+
+    #[test]
+    fn restart_round_trip_via_sqlite_blob_preserves_full_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = innerwarden_store::Store::open(dir.path()).expect("store");
+        let expected = stateful_lifecycle_fixture();
+
+        let serialized = serde_json::to_string(&expected.to_snapshot()).expect("serialize");
+        store
+            .set_blob("responses_snapshot", &serialized)
+            .expect("set_blob");
+        // Intentionally NO responses.snapshot.json on disk — proves the
+        // SQLite blob is a complete source on its own.
+
+        let loaded = ResponseLifecycle::load_snapshot(dir.path(), Some(&store));
+        assert_state_matches(&expected, &loaded, "sqlite-blob-only");
+    }
+
+    #[test]
+    fn restart_round_trip_via_json_fallback_when_blob_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Fresh store with no `responses_snapshot` blob — triggers the
+        // v2 JSON-file fallback.
+        let store = innerwarden_store::Store::open(dir.path()).expect("store");
+        let expected = stateful_lifecycle_fixture();
+
+        std::fs::write(
+            dir.path().join("responses.snapshot.json"),
+            serde_json::to_string(&expected.to_snapshot()).expect("serialize"),
+        )
+        .expect("write snapshot json");
+
+        let loaded = ResponseLifecycle::load_snapshot(dir.path(), Some(&store));
+        assert_state_matches(&expected, &loaded, "json-fallback-with-store");
+    }
+
+    #[test]
+    fn restart_round_trip_via_json_when_store_is_none() {
+        // Pre-SQLite deployments: no store handle, JSON file is the only
+        // source. Must still round-trip cleanly via the v2 snapshot file.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let expected = stateful_lifecycle_fixture();
+
+        std::fs::write(
+            dir.path().join("responses.snapshot.json"),
+            serde_json::to_string(&expected.to_snapshot()).expect("serialize"),
+        )
+        .expect("write snapshot json");
+
+        let loaded = ResponseLifecycle::load_snapshot(dir.path(), None);
+        assert_state_matches(&expected, &loaded, "json-only-no-store");
+    }
+
+    #[test]
+    fn restart_prefers_sqlite_blob_over_json_when_both_present() {
+        // Canonical-source invariant. If the snapshot JSON file is stale
+        // (e.g. operator restored a backup that predated a tick) and the
+        // SQLite blob has fresher state, load_snapshot MUST pick the
+        // blob. Otherwise state silently regresses on restart whenever
+        // the two sides disagree.
+        use chrono::Timelike;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = innerwarden_store::Store::open(dir.path()).expect("store");
+
+        let stale_at = Utc::now().with_nanosecond(0).unwrap();
+        let mut stale_json = ResponseLifecycle::new();
+        stale_json.active.push(ActiveResponse {
+            id: "stale-1".into(),
+            response_type: ResponseType::BlockIp,
+            backend: ResponseBackend::Ufw,
+            target: "198.51.100.50".into(),
+            incident_id: "inc-stale".into(),
+            created_at: stale_at,
+            ttl_secs: 3600,
+            expires_at: stale_at + chrono::Duration::seconds(3600),
+            revert_handle: None,
+            state: LifecycleState::Active,
+        });
+        stale_json.total_registered = 999;
+        std::fs::write(
+            dir.path().join("responses.snapshot.json"),
+            serde_json::to_string(&stale_json.to_snapshot()).expect("serialize stale"),
+        )
+        .expect("write stale json");
+
+        let expected = stateful_lifecycle_fixture();
+        store
+            .set_blob(
+                "responses_snapshot",
+                &serde_json::to_string(&expected.to_snapshot()).expect("serialize fresh"),
+            )
+            .expect("set_blob");
+
+        let loaded = ResponseLifecycle::load_snapshot(dir.path(), Some(&store));
+        assert_state_matches(&expected, &loaded, "sqlite-wins-over-json");
+        assert_ne!(
+            loaded.total_registered, 999,
+            "loaded state must NOT come from the stale JSON file"
+        );
+    }
+
+    #[test]
+    fn to_snapshot_preserves_history_order() {
+        // Inverse of the pre-PR bug. to_json() reversed history via .rev();
+        // to_snapshot() must preserve natural push_back order so the
+        // first-reverted entry stays first on restart.
+        let expected = stateful_lifecycle_fixture();
+        let snapshot = expected.to_snapshot();
+        let arr = snapshot["history"].as_array().expect("history array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["id"].as_str(), Some("resp-0"));
+        assert_eq!(arr[1]["id"].as_str(), Some("resp-h2"));
+        assert!(
+            snapshot["schema_version"].as_u64() == Some(2),
+            "snapshot must carry schema_version=2"
+        );
+    }
+
+    #[test]
+    fn to_snapshot_preserves_revert_handle_and_next_id() {
+        // Two fields to_json() silently dropped. revert_handle is needed
+        // to revert nftables rules after restart; next_id prevents ID
+        // collisions with history entries after a reload.
+        use chrono::Timelike;
+        let created_at = Utc::now().with_nanosecond(0).unwrap();
+        let mut lc = ResponseLifecycle::new();
+        lc.active.push(ActiveResponse {
+            id: "resp-42".into(),
+            response_type: ResponseType::BlockIp,
+            backend: ResponseBackend::Nftables,
+            target: "203.0.113.77".into(),
+            incident_id: "inc-nft".into(),
+            created_at,
+            ttl_secs: 3600,
+            expires_at: created_at + chrono::Duration::seconds(3600),
+            revert_handle: Some("nft-handle-42".into()),
+            state: LifecycleState::Active,
+        });
+        lc.next_id = 99;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("responses.snapshot.json"),
+            serde_json::to_string(&lc.to_snapshot()).expect("serialize"),
+        )
+        .expect("write");
+
+        let reloaded = ResponseLifecycle::load_snapshot(dir.path(), None);
+        assert_eq!(reloaded.active.len(), 1);
+        assert_eq!(
+            reloaded.active[0].revert_handle.as_deref(),
+            Some("nft-handle-42"),
+            "revert_handle must survive snapshot round-trip"
+        );
+        assert_eq!(reloaded.next_id, 99, "next_id must survive round-trip");
+    }
+
+    #[test]
+    fn load_v1_fallback_still_works_for_legacy_snapshots() {
+        // Upgrade path anchor: a dir that only has the old `responses.json`
+        // (v1 shape from to_json()) must still load so operators do not
+        // lose state after the first boot post-upgrade. The load goes
+        // through load_v1 — known to flip history order (pre-existing
+        // bug) — but counts and active entries must come back.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let expected = stateful_lifecycle_fixture();
+        // Emit v1 format (to_json) — no schema_version, reversed history,
+        // no next_id, no revert_handle.
+        std::fs::write(
+            dir.path().join("responses.json"),
+            serde_json::to_string(&expected.to_json()).expect("serialize"),
+        )
+        .expect("write v1 json");
+
+        let loaded = ResponseLifecycle::load_snapshot(dir.path(), None);
+        assert_eq!(
+            loaded.active.len(),
+            expected.active.len(),
+            "v1 fallback must recover active entries"
+        );
+        assert_eq!(
+            loaded.total_registered, expected.total_registered,
+            "v1 fallback must recover totals"
+        );
+        // Known v1 limitation: history order is reversed. Document rather
+        // than assert order here so the anchor does not mask the bug
+        // that motivated this PR. The fix only applies going forward —
+        // the first boot after upgrade still pays this one-time cost.
+        assert_eq!(
+            loaded.history.len(),
+            expected.history.len(),
+            "v1 history length must survive"
+        );
     }
 
     #[test]

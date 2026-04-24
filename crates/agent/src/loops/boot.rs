@@ -1577,17 +1577,34 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                                 "response lifecycle tick"
                             );
                         }
-                        // Persist snapshot for dashboard /api/responses endpoint.
-                        let json = state.response_lifecycle.to_json();
-                        let path = cli.data_dir.join("responses.json");
-                        if let Ok(data) = serde_json::to_string(&json) {
-                            // Dual-write: SQLite blob + JSON file
+                        // Two sinks, one struct-of-truth:
+                        //   1. dashboard view (`to_json`) — feeds `/metrics`
+                        //      and `/api/responses` which read `active_count`,
+                        //      `state_counts.*`, `totals.*` from this shape.
+                        //      History reversed + capped at 50 for display.
+                        //   2. canonical persistence snapshot (`to_snapshot`,
+                        //      v2) — feeds `load_snapshot` on the next boot.
+                        //      Natural order, full history, preserves
+                        //      `revert_handle` and `next_id`.
+                        let view = state.response_lifecycle.to_json();
+                        let view_path = cli.data_dir.join("responses.json");
+                        if let Ok(data) = serde_json::to_string(&view) {
                             if let Some(ref sq) = state.sqlite_store {
                                 if let Err(e) = sq.set_blob("responses", &data) {
                                     warn!("failed to write responses blob: {e}");
                                 }
                             }
-                            let _ = tokio::fs::write(&path, data).await;
+                            let _ = tokio::fs::write(&view_path, data).await;
+                        }
+                        let snapshot = state.response_lifecycle.to_snapshot();
+                        let snapshot_path = cli.data_dir.join("responses.snapshot.json");
+                        if let Ok(data) = serde_json::to_string(&snapshot) {
+                            if let Some(ref sq) = state.sqlite_store {
+                                if let Err(e) = sq.set_blob("responses_snapshot", &data) {
+                                    warn!("failed to write responses_snapshot blob: {e}");
+                                }
+                            }
+                            let _ = tokio::fs::write(&snapshot_path, data).await;
                         }
                     }
 
