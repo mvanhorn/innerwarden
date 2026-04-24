@@ -294,17 +294,27 @@ pub(crate) async fn process_narrative_tick(
             (bytes, metrics_json)
         };
 
-        // Scope 3: I/O outside any lock.
+        // Scope 3: I/O outside any lock. SQLite blob is now the only
+        // canonical write for the KG snapshot; `load_dated` remains as
+        // a read-side fallback (handled via `load_dated_sqlite_first`)
+        // so existing `graph-snapshot-YYYY-MM-DD.json` files on disk
+        // keep working until they age out under the 7-day retention
+        // policy (`cleanup_old_snapshots` below is untouched by this PR
+        // per the slice-5 plan). The Prometheus counter
+        // `innerwarden_kg_dated_load_total{source="json"}` must stay at
+        // zero after this change — any non-zero increment means a
+        // reader fell through to the fallback, which is a signal to
+        // investigate (not a silent degradation).
         let (snapshot_bytes, metrics_json) = serialised;
         if let Some(snap) = snapshot_bytes {
-            let path = knowledge_graph::KnowledgeGraph::dated_snapshot_path(data_dir);
-            if let Err(e) = knowledge_graph::KnowledgeGraph::write_snapshot_bytes(&path, &snap) {
-                warn!("knowledge graph snapshot write failed: {e:#}");
-            }
             if let Some(ref sq) = state.sqlite_store {
                 if let Err(e) = knowledge_graph::KnowledgeGraph::store_snapshot_bytes(sq, &snap) {
                     warn!("knowledge graph SQLite snapshot failed: {e:#}");
                 }
+            } else {
+                // SQLite store unavailable — no canonical sink for this
+                // tick. Surface rather than silently drop the snapshot.
+                warn!("knowledge graph snapshot skipped: sqlite store unavailable");
             }
         }
         if let Some(json) = metrics_json {
@@ -1162,13 +1172,15 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
 
     #[tokio::test]
     async fn process_narrative_tick_runs_snapshot_block_when_due() {
-        // Anchors the new 3-scope lock-split snapshot block in
-        // `process_narrative_tick`. Pre-fix the whole block ran under
-        // a single write lock; the test here just proves all three
-        // scopes execute without panicking when last_graph_snapshot is
-        // older than 60s and the file/SQLite paths run end-to-end.
+        // Anchors the 3-scope lock-split snapshot block in
+        // `process_narrative_tick`. Post slice-5 PR-3: the KG snapshot
+        // writes ONLY to SQLite; the dated JSON write was removed. This
+        // test wires a real `sqlite_store` (pre-PR-3 `triage_test_state`
+        // left it at `None`) so the SQLite write path is actually
+        // exercised and the assertion can confirm the blob landed.
         let dir = TempDir::new().expect("tempdir");
         let mut state = crate::tests::triage_test_state(dir.path());
+        state.sqlite_store = Some(crate::tests::test_sqlite_store(dir.path()));
         // Force snapshot tick to fire.
         state.last_graph_snapshot = std::time::Instant::now() - std::time::Duration::from_secs(90);
         let cfg = config::AgentConfig::default();
@@ -1181,16 +1193,80 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
         // Snapshot should have advanced last_graph_snapshot to "now",
         // proving Scope 3 (no-lock I/O) reached the end of the block.
         assert!(state.last_graph_snapshot.elapsed().as_secs() < 5);
-        // Dated snapshot file should exist on disk after the tick.
-        let snap_path = crate::knowledge_graph::KnowledgeGraph::dated_snapshot_path(dir.path());
+        // SQLite blob (canonical, post-PR-3) must exist for today.
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let blob = state
+            .sqlite_store
+            .as_ref()
+            .expect("store")
+            .load_graph_snapshot(&today)
+            .expect("load_graph_snapshot")
+            .expect("SQLite must hold today's snapshot after the tick");
         assert!(
-            snap_path.exists(),
-            "dated snapshot file must be written after the tick"
+            !blob.is_empty(),
+            "SQLite blob for today's snapshot must be non-empty"
         );
-        // graph-stats.json should also exist (metrics serialised).
+        // Dated JSON file must NOT be written by the slow_loop — the write
+        // side is SQLite-only now. Regression guard: any callback that
+        // re-introduces the JSON write will flip this to exists() == true.
+        let json_path = crate::knowledge_graph::KnowledgeGraph::dated_snapshot_path(dir.path());
+        assert!(
+            !json_path.exists(),
+            "slow_loop must NOT write the dated JSON snapshot after slice 5 PR-3"
+        );
+        // graph-stats.json (metrics view, separate from the KG snapshot
+        // canonical write) stays on disk — it's the dashboard's tile source
+        // and explicitly out of scope for this PR.
         assert!(
             dir.path().join("graph-stats.json").exists(),
-            "graph-stats.json must be written by the snapshot block"
+            "graph-stats.json must still be written by the snapshot block"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_narrative_tick_snapshot_block_warns_when_sqlite_unavailable() {
+        // Post slice-5 PR-3 anchor: when `sqlite_store` is `None` at tick
+        // time (recovered-to-None or unopenable), the KG snapshot is
+        // skipped with a WARN rather than silently dropped. Pre-PR-3 the
+        // JSON write still happened in that case — this test pins the
+        // new behavior so a future refactor cannot re-introduce silent
+        // loss by accident.
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        assert!(
+            state.sqlite_store.is_none(),
+            "fixture must leave store None"
+        );
+        // Block the in-tick `try_recover_sqlite_store` from refilling the
+        // slot — it would happily open a store against the tempdir and
+        // skip the `else` arm we need to exercise. The 60s back-off is
+        // the lock: set the last-attempt timestamp to "now" so recovery
+        // short-circuits and the tick runs with `sqlite_store = None`.
+        state.sqlite_reopen_last_attempt = Some(std::time::Instant::now());
+        state.last_graph_snapshot = std::time::Instant::now() - std::time::Duration::from_secs(90);
+        let cfg = config::AgentConfig::default();
+        let mut cursor = reader::AgentCursor::default();
+
+        let count = process_narrative_tick(dir.path(), &mut cursor, &cfg, &mut state)
+            .await
+            .expect("narrative tick must not fail when sqlite_store is None");
+        assert_eq!(count, 0);
+        assert!(
+            state.sqlite_store.is_none(),
+            "try_recover_sqlite_store back-off must have skipped; else arm requires store = None"
+        );
+        // Tick still advanced the snapshot timer — the snapshot block ran
+        // end-to-end, just without a canonical write (logged the WARN).
+        assert!(state.last_graph_snapshot.elapsed().as_secs() < 5);
+        // Neither sink was written: no SQLite store to touch, and the
+        // JSON write has been retired.
+        let json_path = crate::knowledge_graph::KnowledgeGraph::dated_snapshot_path(dir.path());
+        assert!(
+            !json_path.exists(),
+            "dated JSON file must NOT exist when sqlite_store is None — write path fully retired"
         );
     }
 
