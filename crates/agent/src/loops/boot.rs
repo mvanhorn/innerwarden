@@ -1109,10 +1109,13 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         crate::loops::slow_loop::backfill_graph_decisions(&cli.data_dir, &mut state);
 
         // Always-on honeypot: permanent SSH listener from startup.
-        // A watch channel is used to signal shutdown on SIGTERM/SIGINT.
-        let always_on_shutdown_tx = if cfg.honeypot.mode == "always_on" {
-            let (tx, rx) = tokio::sync::watch::channel(false);
-
+        // Spec 036 PR-4: cancellation flows through the agent's unified
+        // `state.task_group` — the listener observes
+        // `token.cancelled()` in its accept loop and exits cleanly
+        // when SIGTERM/SIGINT triggers `task_group.shutdown()`. The
+        // pre-PR-4 `tokio::sync::watch::Receiver<bool>` mechanism is
+        // gone; we no longer hold a sender at the caller level.
+        if cfg.honeypot.mode == "always_on" {
             // Build a filter blocklist pre-populated from today's + yesterday's decisions.
             let initial_blocked: std::collections::HashSet<String> = {
                 let (bl, _) = load_startup_decision_state(&cli.data_dir, false);
@@ -1151,33 +1154,33 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             let block_backend = cfg.responder.block_backend.clone();
             let allowed_skills = cfg.responder.allowed_skills.clone();
             let interaction = cfg.honeypot.interaction.clone();
+            let token = state.task_group.token();
 
-            tokio::spawn(async move {
-                honeypot_always_on::run_always_on_honeypot(
-                    port,
-                    bind_addr,
-                    max_auth,
-                    filter_bl,
-                    ai_clone,
-                    tg_clone,
-                    gate_counter,
-                    abuseipdb_client,
-                    abuseipdb_threshold,
-                    data_dir_clone,
-                    responder_enabled,
-                    dry_run,
-                    block_backend,
-                    allowed_skills,
-                    interaction,
-                    rx,
-                )
-                .await;
-            });
-
-            Some(tx)
-        } else {
-            None
-        };
+            state.task_group.spawn_or_log(
+                "honeypot-always-on",
+                Box::pin(async move {
+                    honeypot_always_on::run_always_on_honeypot(
+                        port,
+                        bind_addr,
+                        max_auth,
+                        filter_bl,
+                        ai_clone,
+                        tg_clone,
+                        gate_counter,
+                        abuseipdb_client,
+                        abuseipdb_threshold,
+                        data_dir_clone,
+                        responder_enabled,
+                        dry_run,
+                        block_backend,
+                        allowed_skills,
+                        interaction,
+                        token,
+                    )
+                    .await;
+                }),
+            );
+        }
 
         let ai_poll = cfg.ai.incident_poll_secs;
         info!(
@@ -2155,10 +2158,12 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             };
 
             if shutdown {
-                // Signal always-on honeypot listener to stop (if running).
-                if let Some(ref tx) = always_on_shutdown_tx {
-                    let _ = tx.send(true);
-                }
+                // Spec 036 PR-4: the honeypot listener is registered
+                // in `state.task_group`, so the `shutdown()` below
+                // cancels its token alongside every other migrated
+                // task. No separate watch-channel send is needed —
+                // the pre-PR-4 `always_on_shutdown_tx.send(true)`
+                // that used to live here is gone.
                 if let Some(w) = &mut state.decision_writer {
                     w.flush();
                 }

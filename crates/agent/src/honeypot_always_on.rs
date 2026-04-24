@@ -314,6 +314,15 @@ async fn handle_always_on_connection(
 ///
 /// `filter_blocklist` is a shared set of already-blocked IPs populated at startup
 /// from recent decisions and updated in-place when new IPs are blocked via the gate.
+///
+/// Spec 036 PR-4: `token` replaces the pre-existing
+/// `tokio::sync::watch::Receiver<bool>` parameter. Cancellation is
+/// now driven by the agent's unified `state.task_group` — when
+/// SIGTERM/SIGINT fires, `run_agent`'s shutdown path cancels the
+/// token and waits for every registered task (including this
+/// listener) to drain within the graceful deadline. Per-connection
+/// handlers spawned inside the loop remain raw `tokio::spawn` on
+/// purpose (bounded lifetime; out of scope for this PR).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_always_on_honeypot(
     port: u16,
@@ -331,7 +340,7 @@ pub(crate) async fn run_always_on_honeypot(
     block_backend: String,
     allowed_skills: Vec<String>,
     interaction: String,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    token: tokio_util::sync::CancellationToken,
 ) {
     use skills::builtin::honeypot::ssh_interact::build_ssh_config;
 
@@ -452,11 +461,9 @@ pub(crate) async fn run_always_on_honeypot(
                     }
                 });
             }
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
-                    info!("always-on honeypot listener shutting down");
-                    break;
-                }
+            _ = token.cancelled() => {
+                info!("always-on honeypot listener shutting down");
+                break;
             }
         }
     }
@@ -599,5 +606,86 @@ mod tests {
         // Precision path: whole-second durations must pass through unchanged.
         let started = std::time::Instant::now() - std::time::Duration::from_secs(3);
         assert!(elapsed_secs_for_report(started) >= 3);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Spec 036 PR-4 — CancellationToken shutdown contract
+    // ─────────────────────────────────────────────────────────────────
+    //
+    // PR-4 replaced `tokio::sync::watch::Receiver<bool>` with
+    // `tokio_util::sync::CancellationToken` as the shutdown signal
+    // for the always-on listener. The swap is a contract change —
+    // the listener used to observe a boolean-watch channel and only
+    // exit when the payload was `true`; it now exits unconditionally
+    // on `token.cancelled()`.
+    //
+    // These tests pin the NEW contract at two ends:
+    //   1. A fresh, uncancelled token keeps the listener RUNNING
+    //      (not spuriously-exiting the moment the loop starts).
+    //   2. Cancelling the token drains the listener within a
+    //      bounded deadline — the property the agent's
+    //      `state.task_group.shutdown()` relies on.
+
+    #[tokio::test]
+    async fn listener_exits_promptly_when_token_cancelled() {
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        let token = CancellationToken::new();
+        let token_for_task = token.clone();
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmpdir.path().to_path_buf();
+
+        // Bind to port 0 → kernel-assigned ephemeral port. No real
+        // SSH client connects in this test; we only care that the
+        // accept loop observes `token.cancelled()` and exits.
+        let listener_task = tokio::spawn(async move {
+            run_always_on_honeypot(
+                0,                                    // port (OS-assigned)
+                "127.0.0.1".to_string(),              // bind_addr
+                3,                                    // ssh_max_auth_attempts
+                Arc::new(Mutex::new(HashSet::new())), // filter_blocklist
+                None,                                 // ai_provider
+                None,                                 // telegram_client
+                Arc::new(AtomicU64::new(0)),          // gate_suppressed_counter
+                None,                                 // abuseipdb_client
+                0,                                    // abuseipdb_threshold
+                data_dir,
+                false,                // responder_enabled
+                true,                 // dry_run
+                "ufw".to_string(),    // block_backend
+                vec![],               // allowed_skills
+                "reject".to_string(), // interaction
+                token_for_task,
+            )
+            .await;
+        });
+
+        // Let the listener reach its accept loop. 100 ms is ample
+        // for binding + starting the select! on a dev laptop and CI.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !listener_task.is_finished(),
+            "listener must NOT exit on its own with an uncancelled token — \
+             a spurious-exit regression here would mean SIGTERM drain does \
+             nothing because the listener is already gone"
+        );
+
+        // Trigger the shutdown contract.
+        token.cancel();
+
+        // Listener must observe `cancelled()` and exit within a
+        // bounded window. 1 s is generous — the real select! arm
+        // fires on the very next poll.
+        let join_result = tokio::time::timeout(Duration::from_secs(1), listener_task).await;
+        assert!(
+            join_result.is_ok(),
+            "listener must exit within 1 s of token.cancel() — a timeout here \
+             means the shutdown contract regressed (the cancelled() arm is \
+             gone from the select!, or the loop swallowed the signal)"
+        );
+        join_result
+            .unwrap()
+            .expect("listener task completed without panic");
     }
 }
