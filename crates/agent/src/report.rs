@@ -915,7 +915,7 @@ fn compute_recent_window_at(
     // so the comparison is `chrono::DateTime`-typed, not string.
     let mut snapshots: Vec<(NaiveDate, crate::knowledge_graph::KnowledgeGraph)> = Vec::new();
     if let Some(today_g) =
-        crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, analyzed_date)
+        crate::knowledge_graph::KnowledgeGraph::load_dated_sqlite_first(data_dir, analyzed_date)
     {
         if let Ok(d) = NaiveDate::parse_from_str(analyzed_date, "%Y-%m-%d") {
             snapshots.push((d, today_g));
@@ -929,7 +929,7 @@ fn compute_recent_window_at(
         let (prev_d, prev_str) = prev_date_str;
         if cutoff.date_naive() <= prev_d {
             if let Some(prev_g) =
-                crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, &prev_str)
+                crate::knowledge_graph::KnowledgeGraph::load_dated_sqlite_first(data_dir, &prev_str)
             {
                 snapshots.push((prev_d, prev_g));
             }

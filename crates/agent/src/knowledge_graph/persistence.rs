@@ -442,6 +442,23 @@ impl KnowledgeGraph {
         Some(graph)
     }
 
+    /// SQLite-first loader with JSON fallback. Opens a short-lived `Store`
+    /// against `data_dir/innerwarden.db`, tries the SQLite blob first, falls
+    /// back to the dated JSON snapshot on miss. Callers that already hold a
+    /// live store should call `load_dated_from_store` directly.
+    ///
+    /// Priority matches the rule "if both sinks hold a snapshot for `date`,
+    /// SQLite wins and the JSON file is never consulted" — the fallback
+    /// cannot mask drift between the two.
+    pub fn load_dated_sqlite_first(data_dir: &Path, date: &str) -> Option<Self> {
+        if let Ok(store) = innerwarden_store::Store::open(data_dir) {
+            if let Some(g) = Self::load_dated_from_store(&store, date) {
+                return Some(g);
+            }
+        }
+        Self::load_dated(data_dir, date)
+    }
+
     /// Delete SQLite graph snapshots older than `keep_days` days.
     pub fn cleanup_store_snapshots(store: &innerwarden_store::Store, keep_days: u32) {
         let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(keep_days as i64))
@@ -1095,6 +1112,114 @@ mod tests {
         assert!(
             check.agrees(),
             "both sinks hold the same bytes for the same date; cross-check must agree: {check:?}"
+        );
+    }
+
+    // ── spec 037 slice 5 PR-2: load_dated_sqlite_first anchors ──────
+    //
+    // The helper is the idiom the 6 migrated callsites now use
+    // (neural_lifecycle × 3, report.rs × 2, threat_report.rs × 1).
+    // Four invariants matter:
+    //   1. SQLite populated, JSON missing → loads from SQLite.
+    //   2. JSON populated, SQLite empty → loads from JSON fallback.
+    //   3. Both present and identical → loads something; either
+    //      source is fine because they agree (PR-1 equivalence anchor
+    //      already proves structural equality for the same bytes).
+    //   4. Divergence: SQLite wins, JSON fallback does NOT run. This
+    //      is the load-bearing property — consumers that migrated
+    //      must see the canonical source, not stale JSON.
+
+    #[test]
+    fn load_dated_sqlite_first_reads_sqlite_when_json_missing() {
+        let dir = tempdir().unwrap();
+        let store = innerwarden_store::Store::open(dir.path()).expect("store");
+        let date = "2026-04-20";
+
+        let g = seed_graph_with_mixed_nodes();
+        let snap = g.serialize_snapshot_bytes().expect("serialize");
+        store
+            .save_graph_snapshot(date, &snap.bytes, snap.nodes_count, snap.edges_count)
+            .expect("save to store");
+        // No JSON file written.
+
+        let loaded = KnowledgeGraph::load_dated_sqlite_first(dir.path(), date)
+            .expect("sqlite-only must load");
+        assert_eq!(graph_summary(&loaded), graph_summary(&g));
+    }
+
+    #[test]
+    fn load_dated_sqlite_first_falls_back_to_json_when_sqlite_missing() {
+        let dir = tempdir().unwrap();
+        // Open+close a store so the innerwarden.db file exists but has no row.
+        {
+            let _ = innerwarden_store::Store::open(dir.path()).expect("store open");
+        }
+        let date = "2026-04-20";
+
+        let g = seed_graph_with_mixed_nodes();
+        let snap = g.serialize_snapshot_bytes().expect("serialize");
+        let safe_name = safe_snapshot_filename(date).unwrap();
+        KnowledgeGraph::write_snapshot_bytes(&dir.path().join(safe_name), &snap)
+            .expect("write json");
+        // No SQLite row for this date.
+
+        let loaded = KnowledgeGraph::load_dated_sqlite_first(dir.path(), date)
+            .expect("json fallback must load");
+        assert_eq!(graph_summary(&loaded), graph_summary(&g));
+    }
+
+    #[test]
+    fn load_dated_sqlite_first_prefers_sqlite_when_both_present_and_diverge() {
+        // Plant deliberately different graphs in the two sinks. The
+        // helper must return the SQLite graph — if the JSON fallback
+        // ever runs when SQLite had an answer, migrated consumers
+        // would silently read the wrong source.
+        let dir = tempdir().unwrap();
+        let store = innerwarden_store::Store::open(dir.path()).expect("store");
+        let date = "2026-04-20";
+
+        let mut sqlite_graph = KnowledgeGraph::new();
+        sqlite_graph.ensure_ip("203.0.113.77", Utc::now()); // unique to SQLite
+
+        let mut json_graph = KnowledgeGraph::new();
+        json_graph.ensure_ip("198.51.100.88", Utc::now()); // unique to JSON
+
+        let sq_snap = sqlite_graph.serialize_snapshot_bytes().unwrap();
+        store
+            .save_graph_snapshot(
+                date,
+                &sq_snap.bytes,
+                sq_snap.nodes_count,
+                sq_snap.edges_count,
+            )
+            .expect("save sqlite");
+
+        let json_snap = json_graph.serialize_snapshot_bytes().unwrap();
+        let safe_name = safe_snapshot_filename(date).unwrap();
+        KnowledgeGraph::write_snapshot_bytes(&dir.path().join(safe_name), &json_snap)
+            .expect("write json");
+
+        let loaded = KnowledgeGraph::load_dated_sqlite_first(dir.path(), date)
+            .expect("one of the two must load");
+        assert!(
+            loaded.find_by_ip("203.0.113.77").is_some(),
+            "SQLite IP must be present — SQLite wins"
+        );
+        assert!(
+            loaded.find_by_ip("198.51.100.88").is_none(),
+            "JSON IP must NOT be present — fallback was masked by SQLite hit"
+        );
+    }
+
+    #[test]
+    fn load_dated_sqlite_first_returns_none_when_neither_sink_has_date() {
+        let dir = tempdir().unwrap();
+        let _store = innerwarden_store::Store::open(dir.path()).expect("store");
+        // Empty store, no JSON file.
+
+        assert!(
+            KnowledgeGraph::load_dated_sqlite_first(dir.path(), "2026-04-20").is_none(),
+            "no data in either sink must return None, not panic"
         );
     }
 
