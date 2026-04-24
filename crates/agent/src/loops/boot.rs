@@ -1030,18 +1030,18 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             // site — `run_polling` itself is untouched, which keeps
             // its six existing test fixtures passing unchanged.
             let token = state.task_group.token();
-            if let Err(e) = state.task_group.spawn("telegram-polling", async move {
-                tokio::select! {
-                    _ = tg_clone.run_polling(approval_tx) => {}
-                    _ = token.cancelled() => {
-                        info!("telegram polling: shutdown signaled, exiting");
+            state.task_group.spawn_or_log(
+                "telegram-polling",
+                Box::pin(async move {
+                    tokio::select! {
+                        _ = tg_clone.run_polling(approval_tx) => {}
+                        _ = token.cancelled() => {
+                            info!("telegram polling: shutdown signaled, exiting");
+                        }
                     }
-                }
-            }) {
-                warn!(error = %e, "telegram-polling spawn rejected: TaskGroup closed");
-            } else {
-                info!("Telegram polling task started (T.2 approvals enabled)");
-            }
+                }),
+            );
+            info!("Telegram polling task started (T.2 approvals enabled)");
         }
 
         // Proactive startup suggestions (fail2ban detected but not integrated, etc.)

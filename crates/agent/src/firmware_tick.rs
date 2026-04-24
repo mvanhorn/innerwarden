@@ -260,19 +260,9 @@ pub(crate) async fn process_firmware_tick(
                         report.trust_score * 100.0,
                     );
                     let tg = tg.clone();
-                    // Spec 036 PR-2: register the alert in the
-                    // TaskGroup for graceful drain on shutdown. The
-                    // alert body does NOT observe `token.cancelled()`
-                    // — dropping a firmware alert mid-send loses the
-                    // notification silently, which is worse than
-                    // letting a short HTTP call complete within the
-                    // shutdown deadline.
-                    state.task_group.spawn_or_log(
-                        "firmware-alert",
-                        Box::pin(async move {
-                            let _ = tg.send_alert_html(&msg).await;
-                        }),
-                    );
+                    tokio::spawn(async move {
+                        let _ = tg.send_alert_html(&msg).await;
+                    });
                 }
                 crate::notification_gate::NotificationVerdict::DailyBriefingOnly => {
                     *state
@@ -388,12 +378,4 @@ mod tests {
             Severity::Medium
         ));
     }
-
-    // Spec 036 PR-2 note: the spawn-rejected-on-close invariant is
-    // anchored by `TaskGroup::spawn_or_log_*` tests in
-    // `crates/agent/src/task_group.rs::tests`. The migration at
-    // `process_firmware_tick` is a thin call to `spawn_or_log`,
-    // intentionally unit-test-free at this site — covering the spawn
-    // site here would duplicate the primitive-level tests without
-    // adding a distinct invariant.
 }
