@@ -155,11 +155,11 @@ mod slack;
 #[allow(dead_code)]
 mod soc_checks;
 mod state_store;
-// Spec 036 (audit I-04) PR-1: TaskGroup primitive. All items are
-// `pub(crate)` and unused during this PR; the `dead_code` allowance
-// goes away with the first migration (decision_writer / telegram
-// batcher / pcap_capture) in the follow-up PR.
-#[allow(dead_code)]
+// Spec 036 (audit I-04): TaskGroup primitive for graceful shutdown.
+// First migration (PR-2) wires firmware-alert spawns and the Telegram
+// polling loop through this group; honeypot listener migrates in a
+// dedicated PR (shutdown contract change). Call sites are free to
+// use `state.task_group.spawn(...)`.
 mod task_group;
 mod telegram;
 mod telemetry;
@@ -609,6 +609,16 @@ struct AgentState {
     feedback_tracker: notification_pipeline::FeedbackTracker,
     /// Last time the feedback tracker ticked 24h-old pendings into ignores.
     last_feedback_tick_at: Option<std::time::Instant>,
+    /// Spec 036 (audit I-04) PR-2: TaskGroup for graceful shutdown of
+    /// migrated spawn sites. Cheap `Arc`-wrapped type — cloning into
+    /// spawn call sites is trivial. This PR tracks firmware alert
+    /// spawns and the Telegram polling loop; subsequent PRs register
+    /// more sites. No SIGTERM handler is wired yet (that is a separate
+    /// PR under operator approval), so in production today the group
+    /// is tracked but `shutdown()` is never called — tasks keep
+    /// running until the process exits, same as before. The group
+    /// becomes load-bearing the moment the signal handler lands.
+    task_group: task_group::TaskGroup,
 }
 
 /// Tracks a deferred honeypot-or-block decision waiting for operator input via Telegram.

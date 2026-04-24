@@ -118,6 +118,11 @@ impl std::error::Error for TaskGroupError {}
 /// from the moment `shutdown` entered — tasks that finished AFTER
 /// the shutdown signal but BEFORE the deadline are `joined`; tasks
 /// that were still running when the deadline elapsed are `timed_out`.
+///
+/// Currently constructed only from the `shutdown` tests; the
+/// allowance drops with the SIGTERM-handler PR that calls
+/// `state.task_group.shutdown(...)` from the main loop.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ShutdownReport {
     /// Tasks alive at the moment `shutdown` was called.
@@ -217,6 +222,10 @@ impl TaskGroup {
     /// Calling `shutdown` twice is safe: the second call observes
     /// `closed == true` and the tracker already empty, so it returns
     /// an all-zero `ShutdownReport` immediately without re-cancelling.
+    ///
+    /// Currently invoked only by tests; the allowance drops with the
+    /// SIGTERM-handler PR that calls this from the main loop.
+    #[allow(dead_code)]
     pub(crate) async fn shutdown(&self, deadline: Duration) -> ShutdownReport {
         // Flip closed under the lock so in-flight spawns either beat
         // us (they succeed; we include them in `total`) or see

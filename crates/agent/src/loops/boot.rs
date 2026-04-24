@@ -896,6 +896,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         notification_burst_tracker: notification_gate::BurstTracker::new(),
         feedback_tracker: notification_pipeline::FeedbackTracker::new(),
         last_feedback_tick_at: None,
+        task_group: crate::task_group::TaskGroup::new(),
     };
 
     // Spec 005 Phase 7: replay persisted feedback so demotions survive
@@ -1021,8 +1022,26 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             // Register persistent command menu (fire-and-forget)
             tg.set_commands().await;
             let tg_clone = tg.clone();
-            tokio::spawn(async move { tg_clone.run_polling(approval_tx).await });
-            info!("Telegram polling task started (T.2 approvals enabled)");
+            // Spec 036 PR-2: register the long-lived Telegram polling
+            // loop in the agent's TaskGroup so SIGTERM-driven shutdown
+            // (wired in a later PR) cancels the long-poll and drains
+            // the task within the deadline. The wrapper races
+            // `run_polling` against `token.cancelled()` at the call
+            // site — `run_polling` itself is untouched, which keeps
+            // its six existing test fixtures passing unchanged.
+            let token = state.task_group.token();
+            if let Err(e) = state.task_group.spawn("telegram-polling", async move {
+                tokio::select! {
+                    _ = tg_clone.run_polling(approval_tx) => {}
+                    _ = token.cancelled() => {
+                        info!("telegram polling: shutdown signaled, exiting");
+                    }
+                }
+            }) {
+                warn!(error = %e, "telegram-polling spawn rejected: TaskGroup closed");
+            } else {
+                info!("Telegram polling task started (T.2 approvals enabled)");
+            }
         }
 
         // Proactive startup suggestions (fail2ban detected but not integrated, etc.)
@@ -2407,6 +2426,92 @@ url = "http://127.0.0.1:9/hooks"
         cfg.enabled = true;
         cfg.provider = "ollama".into();
         assert!(build_primary_provider(&cfg).is_some());
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Spec 036 PR-2 migration anchors — telegram-polling → TaskGroup
+    // ─────────────────────────────────────────────────────────────────
+    //
+    // These tests mirror the `tokio::select!` pattern at the migrated
+    // spawn site above (grep for `state.task_group.spawn("telegram-polling"`
+    // in the non-once branch of run_agent). They exercise the wrapper
+    // structure — NOT `TelegramClient::run_polling` itself, which has
+    // six dedicated tests in `crates/agent/src/telegram/client.rs` and
+    // must not be disturbed by this migration. The migration guarantee
+    // these tests anchor: the polling task (a) exits promptly when the
+    // TaskGroup's token is cancelled, and (b) exits naturally when
+    // `run_polling` returns on its own (error path / connection drop).
+
+    #[tokio::test]
+    async fn telegram_polling_wrapper_exits_promptly_on_token_cancel() {
+        use std::time::Duration;
+
+        let tg = crate::task_group::TaskGroup::new();
+        let token = tg.token();
+
+        // Stand-in for `tg_clone.run_polling(approval_tx)` — a future
+        // that would loop forever on its own. Observation of
+        // `token.cancelled()` at the wrapper level is what lets the
+        // outer task terminate without touching `run_polling`.
+        tg.spawn("telegram-polling", async move {
+            tokio::select! {
+                _ = std::future::pending::<()>() => {
+                    // `run_polling` substitute: never completes on its own.
+                    unreachable!("pending() must not resolve");
+                }
+                _ = token.cancelled() => {
+                    // Normal shutdown path.
+                }
+            }
+        })
+        .expect("spawn under fresh group");
+
+        // 50 ms of work followed by a shutdown with a generous deadline.
+        // The polling wrapper must exit via the `cancelled()` arm almost
+        // immediately — the test fails if shutdown times out.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let report = tg.shutdown(Duration::from_secs(1)).await;
+        assert_eq!(report.total, 1);
+        assert_eq!(
+            report.joined, 1,
+            "wrapper must observe cancellation and exit within deadline"
+        );
+        assert_eq!(report.timed_out, 0);
+    }
+
+    #[tokio::test]
+    async fn telegram_polling_wrapper_exits_when_inner_future_resolves() {
+        use std::time::Duration;
+
+        let tg = crate::task_group::TaskGroup::new();
+        let token = tg.token();
+
+        // Stand-in: `run_polling` returns on its own (e.g., the
+        // connection dropped and the polling loop bubbled an error).
+        // The wrapper must propagate that exit without needing a cancel.
+        tg.spawn("telegram-polling", async move {
+            tokio::select! {
+                _ = async { /* returns immediately */ } => {
+                    // `run_polling` substitute: resolves right away.
+                }
+                _ = token.cancelled() => {
+                    unreachable!("cancelled() arm must lose the race");
+                }
+            }
+        })
+        .expect("spawn under fresh group");
+
+        // Task should be gone almost instantly — no cancel was sent.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            tg.len(),
+            0,
+            "wrapper must have exited via the inner-future arm already"
+        );
+
+        // Shutdown on an empty group is a no-op and must not panic.
+        let report = tg.shutdown(Duration::from_millis(50)).await;
+        assert_eq!(report.total, 0);
     }
 }
 
