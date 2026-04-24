@@ -1226,6 +1226,40 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
         );
     }
 
+    #[tokio::test]
+    async fn process_narrative_tick_snapshot_block_warns_when_sqlite_unavailable() {
+        // Post slice-5 PR-3 anchor: when `sqlite_store` is `None` at tick
+        // time (recovered-to-None or unopenable), the KG snapshot is
+        // skipped with a WARN rather than silently dropped. Pre-PR-3 the
+        // JSON write still happened in that case — this test pins the
+        // new behavior so a future refactor cannot re-introduce silent
+        // loss by accident.
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        assert!(
+            state.sqlite_store.is_none(),
+            "fixture must leave store None"
+        );
+        state.last_graph_snapshot = std::time::Instant::now() - std::time::Duration::from_secs(90);
+        let cfg = config::AgentConfig::default();
+        let mut cursor = reader::AgentCursor::default();
+
+        let count = process_narrative_tick(dir.path(), &mut cursor, &cfg, &mut state)
+            .await
+            .expect("narrative tick must not fail when sqlite_store is None");
+        assert_eq!(count, 0);
+        // Tick still advanced the snapshot timer — the snapshot block ran
+        // end-to-end, just without a canonical write (logged the WARN).
+        assert!(state.last_graph_snapshot.elapsed().as_secs() < 5);
+        // Neither sink was written: no SQLite store to touch, and the
+        // JSON write has been retired.
+        let json_path = crate::knowledge_graph::KnowledgeGraph::dated_snapshot_path(dir.path());
+        assert!(
+            !json_path.exists(),
+            "dated JSON file must NOT exist when sqlite_store is None — write path fully retired"
+        );
+    }
+
     #[test]
     fn try_recover_sqlite_store_respects_60s_backoff() {
         let dir = tempfile::tempdir().expect("tempdir");
