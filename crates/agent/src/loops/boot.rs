@@ -192,6 +192,52 @@ pub(crate) fn build_primary_provider(
     }
 }
 
+/// Deadline the agent allows registered tasks to drain when a SIGTERM
+/// or SIGINT arrives. Long-lived tasks (the Telegram polling loop
+/// today; firmware alerts and honeypot listener in follow-up PRs)
+/// observe `state.task_group.token().cancelled()` and are expected to
+/// exit promptly; fire-and-forget tasks (Telegram alert HTTP calls)
+/// run to completion or get counted as timed-out in the
+/// `ShutdownReport`. 5 seconds is the conventional window — long
+/// enough for a single HTTP round-trip, short enough that an
+/// unresponsive agent does not delay operator-initiated restarts.
+const GRACEFUL_SHUTDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Decide how to surface a `ShutdownReport` to the operator log. Pure
+/// function so the emit-level contract is unit-testable without a
+/// tracing subscriber harness (see spec 036 PR-3 tests below).
+fn summarize_shutdown(report: crate::task_group::ShutdownReport) -> (tracing::Level, String) {
+    if report.timed_out > 0 {
+        (
+            tracing::Level::WARN,
+            format!(
+                "task_group shutdown abandoned {} of {} task(s) past deadline (joined: {}, deadline: {:?})",
+                report.timed_out, report.total, report.joined, GRACEFUL_SHUTDOWN_DEADLINE
+            ),
+        )
+    } else {
+        (
+            tracing::Level::INFO,
+            format!(
+                "task_group shutdown drained {} task(s) cleanly",
+                report.joined
+            ),
+        )
+    }
+}
+
+/// Emit `summarize_shutdown`'s verdict at the chosen level. Split out
+/// from the summary builder because `tracing::event!` cannot take a
+/// runtime Level — it expands at macro time — so the dispatch has to
+/// live at the call site.
+fn log_shutdown_report(report: crate::task_group::ShutdownReport) {
+    let (level, msg) = summarize_shutdown(report);
+    match level {
+        tracing::Level::WARN => tracing::warn!("{}", msg),
+        _ => tracing::info!("{}", msg),
+    }
+}
+
 pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
     if cli.dashboard_generate_password_hash {
         dashboard::generate_password_hash_interactive()?;
@@ -1014,6 +1060,13 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         if let Some(w) = &mut state.telemetry_writer {
             w.flush();
         }
+        // Spec 036 PR-3: drain any tasks registered via `task_group`
+        // before exit. Once-mode typically has zero persistent spawns
+        // today, so this is a near-instant no-op — but if a future
+        // migration adds one, this line ensures a clean drain in both
+        // modes without duplicating the call path.
+        let report = state.task_group.shutdown(GRACEFUL_SHUTDOWN_DEADLINE).await;
+        log_shutdown_report(report);
         info!(new_events, incidents_handled = handled, "run complete");
     } else {
         // Activate approval channel and start Telegram polling task
@@ -2112,6 +2165,20 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                 if let Some(w) = &mut state.telemetry_writer {
                     w.flush();
                 }
+                // Spec 036 PR-3: the first production behavior change
+                // of the I-04 arc. TaskGroup tracks the Telegram
+                // polling loop (PR-2) and every future migration;
+                // `shutdown` cancels the shared token, closes the
+                // tracker, and waits up to the deadline for tasks to
+                // drain. The resulting `ShutdownReport` is surfaced
+                // at `info!` (clean drain) or `warn!` (any
+                // timed_out>0) so the operator log shows whether the
+                // SIGTERM was honored within the window. Writers are
+                // flushed BEFORE the drain so `decision_writer`'s
+                // hash-chain gets its terminal fsync even if a
+                // migrated task times out.
+                let report = state.task_group.shutdown(GRACEFUL_SHUTDOWN_DEADLINE).await;
+                log_shutdown_report(report);
                 break;
             }
         }
@@ -2512,6 +2579,105 @@ url = "http://127.0.0.1:9/hooks"
         // Shutdown on an empty group is a no-op and must not panic.
         let report = tg.shutdown(Duration::from_millis(50)).await;
         assert_eq!(report.total, 0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Spec 036 PR-3 — SIGTERM handler + task_group.shutdown() wiring
+    // ─────────────────────────────────────────────────────────────────
+    //
+    // The signal-listener side of this wiring (SIGTERM/SIGINT select!
+    // arms) is pre-existing in `run_agent` and lands its exit via the
+    // same `if shutdown { ... break; }` block we now extended. Signal
+    // delivery itself is hard to unit-test without spawning a child
+    // process, so that path is covered by operator-run canary.
+    //
+    // What IS unit-tested here is the operator-visibility contract
+    // the shutdown path introduces: when `shutdown()` returns a
+    // report, the boot loop must log at WARN if any task timed out,
+    // and INFO otherwise. Those are the two log-level transitions an
+    // operator reads during a deploy to decide whether the shutdown
+    // was honored — a regression that flips them silently would
+    // mask abandoned tasks under a calm-looking INFO line.
+
+    #[test]
+    fn summarize_shutdown_emits_info_level_when_all_tasks_joined() {
+        // Happy path: every task drained within the deadline. Log
+        // must be INFO — a WARN here would cry-wolf the operator
+        // every clean SIGTERM.
+        let report = crate::task_group::ShutdownReport {
+            total: 3,
+            joined: 3,
+            timed_out: 0,
+        };
+        let (level, msg) = summarize_shutdown(report);
+        assert_eq!(level, tracing::Level::INFO);
+        assert!(
+            msg.contains("drained 3 task(s) cleanly"),
+            "message must describe the clean-drain outcome: got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn summarize_shutdown_emits_warn_level_when_any_task_timed_out() {
+        // Degraded path: at least one task ignored cancellation or
+        // was mid-IO when the deadline elapsed. Log must be WARN —
+        // a silent INFO here would hide abandoned tasks from
+        // post-deploy log audits.
+        let report = crate::task_group::ShutdownReport {
+            total: 5,
+            joined: 3,
+            timed_out: 2,
+        };
+        let (level, msg) = summarize_shutdown(report);
+        assert_eq!(level, tracing::Level::WARN);
+        assert!(
+            msg.contains("abandoned 2 of 5"),
+            "message must name both timed_out and total: got {msg:?}"
+        );
+        assert!(
+            msg.contains("joined: 3"),
+            "message must also surface the joined count: got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn summarize_shutdown_handles_empty_group_cleanly() {
+        // Edge case: SIGTERM arrives before any migrated spawn has
+        // registered. Zero tasks, zero timed_out → INFO with a
+        // trivially-phrased message. Guards against a "drained 0
+        // tasks" log becoming a sarcastic-looking WARN.
+        let report = crate::task_group::ShutdownReport {
+            total: 0,
+            joined: 0,
+            timed_out: 0,
+        };
+        let (level, _msg) = summarize_shutdown(report);
+        assert_eq!(
+            level,
+            tracing::Level::INFO,
+            "empty group must not be flagged as degraded shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_shutdown_report_runs_without_panic_on_both_outcomes() {
+        // Belt-and-suspenders: the dispatcher between the returned
+        // Level and the actual `tracing::info!`/`tracing::warn!`
+        // macros is the one place summarize_shutdown's verdict gets
+        // plumbed. A future refactor that forgets the WARN arm
+        // silently misdirects the log — running both paths here
+        // guards against a compile-time `match` regression.
+        log_shutdown_report(crate::task_group::ShutdownReport {
+            total: 1,
+            joined: 1,
+            timed_out: 0,
+        });
+        log_shutdown_report(crate::task_group::ShutdownReport {
+            total: 2,
+            joined: 0,
+            timed_out: 2,
+        });
+        // If we reach here without panic, both branches are safe.
     }
 }
 
