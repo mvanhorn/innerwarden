@@ -73,6 +73,19 @@ fuzz-quick:
 		(cd fuzz && cargo +nightly fuzz run $$target -- -max_total_time=$(FUZZ_DURATION)) || exit 1; \
 	done
 
+# Spec 035 PR-A2: heap-budget regression gate via DHAT-instrumented
+# allocator. Runs the three anchors in
+#   crates/agent/src/knowledge_graph/persistence.rs (save_to_store)
+#   crates/agent/src/loops/slow_loop.rs           (narrative tick)
+#   crates/agent/src/loops/boot.rs                (run_agent once-mode)
+# Each asserts cumulative allocation churn (DHAT total_bytes) stays
+# under a baseline-derived budget. `--test-threads=1` is MANDATORY —
+# DHAT's counter is process-global and concurrent tests contaminate
+# the delta (see module-level comments in each file for detail).
+.PHONY: heap-budget
+heap-budget:
+	cargo test -p innerwarden-agent --features dhat-heap heap_budget -- --test-threads=1
+
 # ─── Cross-compile for Linux arm64 ───────────────────────────────────────────
 
 .PHONY: build-linux

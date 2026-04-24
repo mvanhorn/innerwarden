@@ -1,0 +1,48 @@
+name: Heap Budget
+
+# Spec 035 PR-A2 phase 5: CI gate for the three DHAT heap-budget
+# anchors. Fails the PR if any of the following allocates more than
+# its baselined budget (baseline × 1.10, rounded up to 100 KiB):
+#
+#   - knowledge_graph::persistence::heap_budget
+#       ::save_to_store_allocates_under_budget
+#   - loops::slow_loop::heap_budget
+#       ::process_narrative_tick_allocates_under_budget
+#   - loops::boot::heap_budget
+#       ::run_agent_once_allocates_under_budget
+#
+# A deliberate raise requires updating the BUDGET_TOTAL_BYTES constant
+# in the relevant module AND the matching line in
+# `.claude-local/IMPACT.md` "Memory layout" in the same PR, with the
+# reason. See the module-level doc comments for the full policy.
+#
+# Runs ~45-60 s wall-clock in CI under DHAT instrumentation (DHAT is
+# ~6× slower than jemalloc). `--test-threads=1` is MANDATORY — DHAT's
+# HeapStats counter is process-global and concurrent tests contaminate
+# the delta.
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  heap-budget:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+
+      - name: Run heap-budget tests under DHAT
+        run: make heap-budget
