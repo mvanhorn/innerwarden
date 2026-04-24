@@ -1178,6 +1178,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             let tg_clone = state.telegram_client.clone();
             let gate_counter = state.telemetry.gate_suppressed_counter();
             let data_dir_clone = cli.data_dir.clone();
+            let store_clone = state.sqlite_store.clone();
             let responder_enabled = cfg.responder.enabled;
             let dry_run = cfg.responder.dry_run;
             let block_backend = cfg.responder.block_backend.clone();
@@ -1199,6 +1200,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                         abuseipdb_client,
                         abuseipdb_threshold,
                         data_dir_clone,
+                        store_clone,
                         responder_enabled,
                         dry_run,
                         block_backend,

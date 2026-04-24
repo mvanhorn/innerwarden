@@ -41,6 +41,7 @@ pub(crate) async fn execute_honeypot_decision(
             let post_ip = ip.to_string();
             let post_session_id = session_id.clone();
             let post_data_dir = data_dir.to_path_buf();
+            let post_store = state.sqlite_store.clone();
             let post_ai = state.ai_router.any_llm();
             let post_tg = state.telegram_client.clone();
             let post_gate_counter = state.telemetry.gate_suppressed_counter();
@@ -54,6 +55,7 @@ pub(crate) async fn execute_honeypot_decision(
                     &post_ip,
                     &post_session_id,
                     &post_data_dir,
+                    post_store,
                     post_ai,
                     post_tg,
                     post_gate_counter,

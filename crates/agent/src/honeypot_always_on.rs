@@ -50,6 +50,7 @@ async fn handle_always_on_connection(
     telegram_client: Option<Arc<telegram::TelegramClient>>,
     gate_suppressed_counter: Arc<AtomicU64>,
     data_dir: PathBuf,
+    sqlite_store: Option<Arc<innerwarden_store::Store>>,
     interaction: String,
     blocklist_already_has_ip: bool,
     responder_enabled: bool,
@@ -227,7 +228,8 @@ async fn handle_always_on_connection(
                     },
                     prev_hash: None,
                 };
-                if let Err(e) = decisions::append_chained(&data_dir, &entry) {
+                if let Err(e) = decisions::append_chained(&data_dir, &entry, sqlite_store.as_ref())
+                {
                     warn!("honeypot: failed to write decision: {e:#}");
                 }
                 true
@@ -335,6 +337,7 @@ pub(crate) async fn run_always_on_honeypot(
     abuseipdb_client: Option<Arc<abuseipdb::AbuseIpDbClient>>,
     abuseipdb_threshold: u8,
     data_dir: PathBuf,
+    sqlite_store: Option<Arc<innerwarden_store::Store>>,
     responder_enabled: bool,
     dry_run: bool,
     block_backend: String,
@@ -403,9 +406,11 @@ pub(crate) async fn run_always_on_honeypot(
                                 let threshold = abuseipdb_threshold;
                                 let re = responder_enabled;
                                 let dr = dry_run;
+                                let store_c = sqlite_store.clone();
                                 tokio::spawn(async move {
                                     always_on_abuseipdb_block(
-                                        &ip_c, score, threshold, &dd, re, dr, &bb, &sk,
+                                        &ip_c, score, threshold, &dd, store_c.as_ref(), re, dr,
+                                        &bb, &sk,
                                     )
                                     .await;
                                 });
@@ -426,6 +431,7 @@ pub(crate) async fn run_always_on_honeypot(
                 let tg_clone = telegram_client.clone();
                 let gate_counter = gate_suppressed_counter.clone();
                 let dd = data_dir.clone();
+                let store_c = sqlite_store.clone();
                 let ip_clone = ip.clone();
                 let intr = interaction.clone();
                 let bb = block_backend.clone();
@@ -443,6 +449,7 @@ pub(crate) async fn run_always_on_honeypot(
                         tg_clone,
                         gate_counter,
                         dd,
+                        store_c,
                         intr,
                         bl_has_ip,
                         re,
@@ -476,6 +483,7 @@ async fn always_on_abuseipdb_block(
     score: u8,
     threshold: u8,
     data_dir: &Path,
+    sqlite_store: Option<&Arc<innerwarden_store::Store>>,
     responder_enabled: bool,
     dry_run: bool,
     block_backend: &str,
@@ -507,7 +515,7 @@ async fn always_on_abuseipdb_block(
         prev_hash: None,
     };
 
-    if let Err(e) = decisions::append_chained(data_dir, &entry) {
+    if let Err(e) = decisions::append_chained(data_dir, &entry, sqlite_store) {
         warn!("honeypot abuseipdb gate: failed to write decision: {e:#}");
     }
 
@@ -651,6 +659,7 @@ mod tests {
                 None,                                 // abuseipdb_client
                 0,                                    // abuseipdb_threshold
                 data_dir,
+                None,                 // sqlite_store
                 false,                // responder_enabled
                 true,                 // dry_run
                 "ufw".to_string(),    // block_backend

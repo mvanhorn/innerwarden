@@ -196,6 +196,7 @@ pub(super) async fn api_action_block_ip(
 
     let result = execute_block_ip(
         &state.data_dir,
+        state.sqlite_store.as_ref(),
         &state.action_cfg,
         &ip,
         &body.reason,
@@ -273,6 +274,7 @@ pub(super) async fn api_action_suspend_user(
 
     let result = execute_suspend_user(
         &state.data_dir,
+        state.sqlite_store.as_ref(),
         &state.action_cfg,
         &user,
         &body.reason,
@@ -370,7 +372,9 @@ pub(super) async fn api_action_honeypot(
                 },
                 prev_hash: None,
             };
-            if let Err(e) = append_decision_entry(&state.data_dir, &entry) {
+            if let Err(e) =
+                append_decision_entry(&state.data_dir, &entry, state.sqlite_store.as_ref())
+            {
                 warn!("failed to write honeypot test decision entry: {e}");
             }
 
@@ -450,6 +454,7 @@ pub(super) fn validate_action_params(target: &str, reason: &str) -> Result<(), &
 /// Execute a block-ip skill and write the decision to the audit trail.
 pub(super) async fn execute_block_ip(
     data_dir: &Path,
+    store: Option<&std::sync::Arc<innerwarden_store::Store>>,
     cfg: &DashboardActionConfig,
     ip: &str,
     reason: &str,
@@ -512,7 +517,7 @@ pub(super) async fn execute_block_ip(
         prev_hash: None,
     };
 
-    append_decision_entry(data_dir, &entry)?;
+    append_decision_entry(data_dir, &entry, store)?;
 
     // Admin action audit trail
     let mut audit = AdminActionEntry {
@@ -550,6 +555,7 @@ pub(super) async fn execute_block_ip(
 /// Execute a suspend-user skill and write the decision to the audit trail.
 pub(super) async fn execute_suspend_user(
     data_dir: &Path,
+    store: Option<&std::sync::Arc<innerwarden_store::Store>>,
     cfg: &DashboardActionConfig,
     user: &str,
     reason: &str,
@@ -621,7 +627,7 @@ pub(super) async fn execute_suspend_user(
         prev_hash: None,
     };
 
-    append_decision_entry(data_dir, &entry)?;
+    append_decision_entry(data_dir, &entry, store)?;
 
     // Admin action audit trail
     let mut audit = AdminActionEntry {
@@ -678,9 +684,14 @@ pub(super) fn make_synthetic_incident(
     }
 }
 
-/// Append a single `DecisionEntry` to today's decisions JSONL file.
-pub(super) fn append_decision_entry(data_dir: &Path, entry: &DecisionEntry) -> anyhow::Result<()> {
-    crate::decisions::append_chained(data_dir, entry)
+/// Append a single `DecisionEntry` to today's decisions JSONL file and mirror
+/// to the SQLite `decisions` table when `store` is `Some`.
+pub(super) fn append_decision_entry(
+    data_dir: &Path,
+    entry: &DecisionEntry,
+    store: Option<&std::sync::Arc<innerwarden_store::Store>>,
+) -> anyhow::Result<()> {
+    crate::decisions::append_chained(data_dir, entry, store)
 }
 
 /// Inject a synthetic high-severity SSH brute-force incident so the agent's main

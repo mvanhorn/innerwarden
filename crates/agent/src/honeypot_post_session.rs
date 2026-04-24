@@ -111,6 +111,7 @@ pub(crate) async fn spawn_post_session_tasks(
     ip: &str,
     session_id: &str,
     data_dir: &Path,
+    sqlite_store: Option<Arc<innerwarden_store::Store>>,
     ai_provider: Option<Arc<dyn ai::AiProvider>>,
     telegram_client: Option<Arc<telegram::TelegramClient>>,
     gate_suppressed_counter: Arc<AtomicU64>,
@@ -249,7 +250,9 @@ pub(crate) async fn spawn_post_session_tasks(
                         },
                         prev_hash: None,
                     };
-                    if let Err(e) = decisions::append_chained(data_dir, &entry) {
+                    if let Err(e) =
+                        decisions::append_chained(data_dir, &entry, sqlite_store.as_ref())
+                    {
                         tracing::warn!("honeypot post-session: failed to write decision: {e:#}");
                     }
                     true

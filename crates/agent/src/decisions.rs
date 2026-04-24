@@ -154,29 +154,8 @@ impl DecisionWriter {
             .flush()
             .context("failed to flush decision entry")?;
 
-        // Dual-write to sqlite. Failure to persist the row mirrors up as a
-        // warning rather than an error: the JSONL write already succeeded
-        // (that is the audit trail of record), and a sqlite hiccup must not
-        // silently discard the whole decision.
         if let Some(ref store) = self.store {
-            let row = innerwarden_store::decisions::DecisionRow {
-                ts: entry.ts.to_rfc3339(),
-                incident_id: entry.incident_id.clone(),
-                action_type: entry.action_type.clone(),
-                target_ip: entry.target_ip.clone(),
-                target_user: entry.target_user.clone(),
-                confidence: entry.confidence as f64,
-                auto_executed: entry.auto_executed,
-                reason: Some(entry.reason.clone()),
-                data: line.clone(),
-            };
-            if let Err(e) = store.insert_decision(&row) {
-                warn!(
-                    incident_id = %entry.incident_id,
-                    error = %e,
-                    "decision written to JSONL but sqlite mirror failed"
-                );
-            }
+            mirror_to_sqlite(store, entry, &line);
         }
         Ok(())
     }
@@ -242,8 +221,15 @@ fn open_or_create(data_dir: &Path, date: &str) -> Result<File> {
 
 /// Standalone hash-chained append for code paths that don't own a `DecisionWriter`
 /// (e.g. the always-on honeypot task). Reads the last hash from the file, sets
-/// `prev_hash`, writes the entry, and flushes.
-pub fn append_chained(data_dir: &Path, entry: &DecisionEntry) -> Result<()> {
+/// `prev_hash`, writes the entry, flushes, and — when `store` is `Some` —
+/// mirrors the same canonical JSON line into the SQLite `decisions` table
+/// using the shared [`mirror_to_sqlite`] helper. Callers that pass `None`
+/// (tests) stay JSONL-only.
+pub fn append_chained(
+    data_dir: &Path,
+    entry: &DecisionEntry,
+    store: Option<&Arc<innerwarden_store::Store>>,
+) -> Result<()> {
     let today = chrono::Local::now()
         .date_naive()
         .format("%Y-%m-%d")
@@ -275,7 +261,38 @@ pub fn append_chained(data_dir: &Path, entry: &DecisionEntry) -> Result<()> {
         .with_context(|| format!("failed to open {}", path.display()))?;
     use std::io::Write;
     writeln!(f, "{line}").context("failed to write decision entry")?;
-    f.flush().context("failed to flush decision entry")
+    f.flush().context("failed to flush decision entry")?;
+
+    if let Some(store) = store {
+        mirror_to_sqlite(store, entry, &line);
+    }
+    Ok(())
+}
+
+/// Write a decision row to the SQLite `decisions` table. Shared by
+/// `DecisionWriter::write` and `append_chained` so the two writers can
+/// never drift in what they mirror. A mirror failure degrades to a `warn!`:
+/// the JSONL audit trail has already succeeded, and a transient SQLite
+/// error must not discard the whole decision.
+fn mirror_to_sqlite(store: &innerwarden_store::Store, entry: &DecisionEntry, line: &str) {
+    let row = innerwarden_store::decisions::DecisionRow {
+        ts: entry.ts.to_rfc3339(),
+        incident_id: entry.incident_id.clone(),
+        action_type: entry.action_type.clone(),
+        target_ip: entry.target_ip.clone(),
+        target_user: entry.target_user.clone(),
+        confidence: entry.confidence as f64,
+        auto_executed: entry.auto_executed,
+        reason: Some(entry.reason.clone()),
+        data: line.to_owned(),
+    };
+    if let Err(e) = store.insert_decision(&row) {
+        warn!(
+            incident_id = %entry.incident_id,
+            error = %e,
+            "decision written to JSONL but sqlite mirror failed"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -472,6 +489,156 @@ mod tests {
         assert_eq!(entry.target_user, Some("alice".to_string()));
         assert_eq!(entry.target_ip, None);
         assert_eq!(entry.dry_run, true);
+    }
+
+    fn burst_entry(incident: &str) -> DecisionEntry {
+        DecisionEntry {
+            ts: chrono::Utc::now(),
+            incident_id: incident.into(),
+            host: "h".into(),
+            ai_provider: "test".into(),
+            action_type: "block_ip".into(),
+            target_ip: Some("203.0.113.99".into()),
+            target_user: None,
+            skill_id: Some("block-ip-ufw".into()),
+            confidence: 0.9,
+            auto_executed: true,
+            dry_run: false,
+            reason: "synthetic".into(),
+            estimated_threat: "high".into(),
+            execution_result: "ok".into(),
+            prev_hash: None,
+        }
+    }
+
+    fn read_jsonl_lines(dir: &std::path::Path) -> Vec<String> {
+        let today = chrono::Local::now().date_naive().format("%Y-%m-%d");
+        let path = dir.join(format!("decisions-{today}.jsonl"));
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn append_chained_mirrors_to_sqlite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(innerwarden_store::Store::open(dir.path()).expect("store"));
+        let entry = burst_entry("inc-append-1");
+
+        append_chained(dir.path(), &entry, Some(&store)).expect("append_chained");
+
+        let jsonl = read_jsonl_lines(dir.path());
+        assert_eq!(jsonl.len(), 1, "JSONL must contain exactly the one entry");
+        assert!(jsonl[0].contains("inc-append-1"));
+
+        let count = store.decisions_count().expect("count");
+        assert_eq!(
+            count, 1,
+            "SQLite decisions table must receive the mirrored row"
+        );
+    }
+
+    #[test]
+    fn append_chained_with_none_skips_sqlite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(innerwarden_store::Store::open(dir.path()).expect("store"));
+        let entry = burst_entry("inc-append-none");
+
+        append_chained(dir.path(), &entry, None).expect("append_chained None");
+
+        let jsonl = read_jsonl_lines(dir.path());
+        assert_eq!(jsonl.len(), 1, "JSONL still writes when store is None");
+
+        let count = store.decisions_count().expect("count");
+        assert_eq!(count, 0, "SQLite must stay untouched when store is None");
+    }
+
+    #[test]
+    fn jsonl_and_sqlite_counts_match_under_mixed_writer_burst() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(innerwarden_store::Store::open(dir.path()).expect("store"));
+        let mut writer =
+            DecisionWriter::with_store(dir.path(), Some(store.clone())).expect("writer");
+
+        for i in 0..5 {
+            writer
+                .write(&burst_entry(&format!("inc-writer-{i}")))
+                .expect("writer.write");
+            append_chained(
+                dir.path(),
+                &burst_entry(&format!("inc-append-{i}")),
+                Some(&store),
+            )
+            .expect("append_chained");
+        }
+
+        let jsonl = read_jsonl_lines(dir.path());
+        let sqlite = store.decisions_count().expect("count") as usize;
+        assert_eq!(
+            jsonl.len(),
+            sqlite,
+            "JSONL and SQLite counts must match after mixed-writer burst"
+        );
+        assert_eq!(jsonl.len(), 10, "10 total entries (5 + 5) expected");
+    }
+
+    #[test]
+    fn hash_chain_stays_intact_across_mixed_writers() {
+        // Two invariants matter when DecisionWriter and append_chained interleave:
+        //   1. The SQLite hash chain remains self-consistent (its own scheme:
+        //      SHA-256(prev_hash || data)).
+        //   2. For each sequence position, the JSONL line and the SQLite
+        //      `data` column hold the same canonical JSON. Divergence here
+        //      means the two stores disagree on what actually happened.
+        // The two hash schemes differ by design (JSONL hashes the whole line
+        // including prev_hash; SQLite hashes prev_hash concatenated with
+        // data), so byte-equal chain comparison is not the right check —
+        // content correspondence plus self-consistency is.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(innerwarden_store::Store::open(dir.path()).expect("store"));
+        let mut writer =
+            DecisionWriter::with_store(dir.path(), Some(store.clone())).expect("writer");
+
+        writer
+            .write(&burst_entry("inc-mix-1"))
+            .expect("writer.write 1");
+        append_chained(dir.path(), &burst_entry("inc-mix-2"), Some(&store))
+            .expect("append_chained 2");
+        writer
+            .write(&burst_entry("inc-mix-3"))
+            .expect("writer.write 3");
+        append_chained(dir.path(), &burst_entry("inc-mix-4"), Some(&store))
+            .expect("append_chained 4");
+
+        let chain = store.verify_hash_chain().expect("verify");
+        assert!(
+            chain.intact,
+            "SQLite hash chain must remain intact, broken_at = {:?}",
+            chain.broken_at
+        );
+        assert_eq!(chain.verified, 4);
+
+        let jsonl = read_jsonl_lines(dir.path());
+        let sqlite_rows = store
+            .decisions_since(0, 100)
+            .expect("decisions_since")
+            .into_iter()
+            .map(|(_, data)| data)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            jsonl.len(),
+            sqlite_rows.len(),
+            "mixed-writer burst must keep JSONL and SQLite row counts aligned"
+        );
+        for (i, (j, s)) in jsonl.iter().zip(sqlite_rows.iter()).enumerate() {
+            assert_eq!(
+                j, s,
+                "row {i} diverges between JSONL line and SQLite data column"
+            );
+        }
     }
 
     #[test]

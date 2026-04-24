@@ -1564,7 +1564,7 @@ mod tests {
             prev_hash: None,
         };
 
-        append_decision_entry(dir.path(), &entry).unwrap();
+        append_decision_entry(dir.path(), &entry, None).unwrap();
 
         // File must exist and contain exactly one valid JSON line.
         let date = chrono::Local::now()
@@ -1582,7 +1582,7 @@ mod tests {
         assert_eq!(parsed.target_ip.as_deref(), Some("1.2.3.4"));
 
         // Appending a second entry should produce two lines.
-        append_decision_entry(dir.path(), &entry).unwrap();
+        append_decision_entry(dir.path(), &entry, None).unwrap();
         let contents2 = std::fs::read_to_string(&path).unwrap();
         assert_eq!(contents2.lines().count(), 2);
     }
