@@ -621,6 +621,18 @@ pub(super) fn build_prometheus_metrics_text(
         ));
     }
 
+    // Spec 037 slice 5: dated KG snapshot load provenance. `sqlite` should
+    // dominate once PR-2 has been in prod for a cycle; a rising `json`
+    // counter means the fallback is still load-bearing (block PR-3);
+    // `miss`/`error` are the operator-alarm signals.
+    out.push_str("# HELP innerwarden_kg_dated_load_total Dated KG snapshot loads by source\n");
+    out.push_str("# TYPE innerwarden_kg_dated_load_total counter\n");
+    for (source, count) in crate::knowledge_graph::persistence::load_dated_metrics_snapshot() {
+        out.push_str(&format!(
+            "innerwarden_kg_dated_load_total{{source=\"{source}\"}} {count}\n"
+        ));
+    }
+
     // Response lifecycle metrics (from responses blob/file snapshot).
     let responses_data = state
         .sqlite_store

@@ -1,10 +1,37 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::graph::KnowledgeGraph;
 use super::types::*;
 use tracing::warn;
+
+// ── Observability counters for `load_dated_sqlite_first` ──────────────
+//
+// Exposed via `/metrics` under `innerwarden_kg_dated_load_total{source=...}`
+// so operators can tell whether dated KG reads are being served from the
+// SQLite canonical source, the JSON fallback, or neither. These are
+// process-local (reset on agent restart); the Prometheus scraper
+// already handles that semantics for counter types.
+//
+// Labels are mutually exclusive — every call increments exactly one.
+static KG_DATED_LOAD_SQLITE: AtomicU64 = AtomicU64::new(0);
+static KG_DATED_LOAD_JSON: AtomicU64 = AtomicU64::new(0);
+static KG_DATED_LOAD_MISS: AtomicU64 = AtomicU64::new(0);
+static KG_DATED_LOAD_ERROR: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of the four `load_dated_sqlite_first` counters for the
+/// `/metrics` endpoint. Returned as a fixed-order array so the render
+/// site does not need to know about the `static` layout.
+pub(crate) fn load_dated_metrics_snapshot() -> [(&'static str, u64); 4] {
+    [
+        ("sqlite", KG_DATED_LOAD_SQLITE.load(Ordering::Relaxed)),
+        ("json", KG_DATED_LOAD_JSON.load(Ordering::Relaxed)),
+        ("miss", KG_DATED_LOAD_MISS.load(Ordering::Relaxed)),
+        ("error", KG_DATED_LOAD_ERROR.load(Ordering::Relaxed)),
+    ]
+}
 
 /// Gzip magic bytes — the first two bytes of any RFC 1952 gzip stream.
 /// Used to distinguish compressed snapshots (written by agents from the
@@ -450,13 +477,55 @@ impl KnowledgeGraph {
     /// Priority matches the rule "if both sinks hold a snapshot for `date`,
     /// SQLite wins and the JSON file is never consulted" — the fallback
     /// cannot mask drift between the two.
+    ///
+    /// Each call increments exactly one counter in [`load_dated_metrics_snapshot`]:
+    ///   - `sqlite` — SQLite hit (silent, no log).
+    ///   - `json` — SQLite miss (for any reason), JSON hit. INFO log so
+    ///     operators can see whether the dual-write is still load-bearing.
+    ///   - `miss` — neither sink has the snapshot (normal when the date
+    ///     falls outside the 7-day retention window).
+    ///   - `error` — `Store::open` failed AND JSON also missed. The agent
+    ///     cannot read either sink for this date — WARN so it surfaces.
     pub fn load_dated_sqlite_first(data_dir: &Path, date: &str) -> Option<Self> {
-        if let Ok(store) = innerwarden_store::Store::open(data_dir) {
-            if let Some(g) = Self::load_dated_from_store(&store, date) {
-                return Some(g);
+        let (store_opened, store_err) = match innerwarden_store::Store::open(data_dir) {
+            Ok(store) => {
+                if let Some(g) = Self::load_dated_from_store(&store, date) {
+                    KG_DATED_LOAD_SQLITE.fetch_add(1, Ordering::Relaxed);
+                    return Some(g);
+                }
+                (true, None)
+            }
+            Err(e) => (false, Some(format!("{e}"))),
+        };
+
+        match Self::load_dated(data_dir, date) {
+            Some(g) => {
+                KG_DATED_LOAD_JSON.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(
+                    date = %date,
+                    store_opened,
+                    "load_dated_sqlite_first: SQLite miss, served from JSON fallback"
+                );
+                Some(g)
+            }
+            None => {
+                if let Some(err) = store_err {
+                    KG_DATED_LOAD_ERROR.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        date = %date,
+                        error = %err,
+                        "load_dated_sqlite_first: Store::open failed and JSON missing"
+                    );
+                } else {
+                    KG_DATED_LOAD_MISS.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        date = %date,
+                        "load_dated_sqlite_first: neither sink had a snapshot for this date"
+                    );
+                }
+                None
             }
         }
-        Self::load_dated(data_dir, date)
     }
 
     /// Delete SQLite graph snapshots older than `keep_days` days.
@@ -1221,6 +1290,155 @@ mod tests {
             KnowledgeGraph::load_dated_sqlite_first(dir.path(), "2026-04-20").is_none(),
             "no data in either sink must return None, not panic"
         );
+    }
+
+    // ── spec 037 slice 5 PR-2.5: load_dated metrics anchors ─────────
+    //
+    // Verifies each invocation of `load_dated_sqlite_first` bumps
+    // exactly one of the four `innerwarden_kg_dated_load_total` counters
+    // (sqlite / json / miss / error). Tests use a module-local mutex
+    // so parallel test execution cannot race on the process-global
+    // static counters. Each test captures deltas, not absolute values,
+    // so the order tests run in does not matter.
+
+    static METRICS_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[derive(Copy, Clone)]
+    struct MetricsSnap {
+        sqlite: u64,
+        json: u64,
+        miss: u64,
+        error: u64,
+    }
+
+    fn snap_metrics() -> MetricsSnap {
+        let s = load_dated_metrics_snapshot();
+        MetricsSnap {
+            sqlite: s[0].1,
+            json: s[1].1,
+            miss: s[2].1,
+            error: s[3].1,
+        }
+    }
+
+    fn delta(before: MetricsSnap, after: MetricsSnap) -> (u64, u64, u64, u64) {
+        (
+            after.sqlite - before.sqlite,
+            after.json - before.json,
+            after.miss - before.miss,
+            after.error - before.error,
+        )
+    }
+
+    #[test]
+    fn load_dated_metric_sqlite_increments_on_sqlite_hit() {
+        let _guard = METRICS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let before = snap_metrics();
+
+        let dir = tempdir().unwrap();
+        let store = innerwarden_store::Store::open(dir.path()).expect("store");
+        let g = seed_graph_with_mixed_nodes();
+        let snap = g.serialize_snapshot_bytes().unwrap();
+        store
+            .save_graph_snapshot(
+                "2026-04-20",
+                &snap.bytes,
+                snap.nodes_count,
+                snap.edges_count,
+            )
+            .unwrap();
+
+        assert!(KnowledgeGraph::load_dated_sqlite_first(dir.path(), "2026-04-20").is_some());
+
+        let after = snap_metrics();
+        assert_eq!(
+            delta(before, after),
+            (1, 0, 0, 0),
+            "SQLite hit must bump only the sqlite counter"
+        );
+    }
+
+    #[test]
+    fn load_dated_metric_json_increments_on_fallback() {
+        let _guard = METRICS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let before = snap_metrics();
+
+        let dir = tempdir().unwrap();
+        let _store = innerwarden_store::Store::open(dir.path()).expect("store");
+        let g = seed_graph_with_mixed_nodes();
+        let snap = g.serialize_snapshot_bytes().unwrap();
+        let safe_name = safe_snapshot_filename("2026-04-20").unwrap();
+        KnowledgeGraph::write_snapshot_bytes(&dir.path().join(safe_name), &snap).unwrap();
+        // No SQLite row.
+
+        assert!(KnowledgeGraph::load_dated_sqlite_first(dir.path(), "2026-04-20").is_some());
+
+        let after = snap_metrics();
+        assert_eq!(
+            delta(before, after),
+            (0, 1, 0, 0),
+            "JSON fallback must bump only the json counter"
+        );
+    }
+
+    #[test]
+    fn load_dated_metric_miss_increments_when_neither_sink_has_date() {
+        let _guard = METRICS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let before = snap_metrics();
+
+        let dir = tempdir().unwrap();
+        let _store = innerwarden_store::Store::open(dir.path()).expect("store");
+        // Empty store, no JSON file.
+
+        assert!(KnowledgeGraph::load_dated_sqlite_first(dir.path(), "2026-04-20").is_none());
+
+        let after = snap_metrics();
+        assert_eq!(
+            delta(before, after),
+            (0, 0, 1, 0),
+            "neither-sink case must bump only the miss counter"
+        );
+    }
+
+    #[test]
+    fn load_dated_metric_error_increments_when_store_open_fails_and_json_missing() {
+        // `Store::open` against a path that cannot host a SQLite DB file
+        // (a regular file instead of a directory) fails with I/O error.
+        // JSON lookup then also fails (no directory to read from).
+        // The helper must bump `error`, not `miss` — they are distinct
+        // operational signals.
+        let _guard = METRICS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let before = snap_metrics();
+
+        let tmp_parent = tempdir().unwrap();
+        let file_path = tmp_parent.path().join("not-a-directory");
+        std::fs::write(&file_path, b"I am a regular file, not a directory").unwrap();
+
+        assert!(
+            KnowledgeGraph::load_dated_sqlite_first(&file_path, "2026-04-20").is_none(),
+            "bad data_dir must return None"
+        );
+
+        let after = snap_metrics();
+        let d = delta(before, after);
+        assert_eq!(
+            d.3, 1,
+            "Store::open error path must bump the error counter exactly once (got {d:?})"
+        );
+        assert_eq!(
+            (d.0, d.1, d.2),
+            (0, 0, 0),
+            "error path must not bump sqlite/json/miss"
+        );
+    }
+
+    #[test]
+    fn load_dated_metrics_snapshot_returns_expected_labels_in_order() {
+        let s = load_dated_metrics_snapshot();
+        assert_eq!(s[0].0, "sqlite");
+        assert_eq!(s[1].0, "json");
+        assert_eq!(s[2].0, "miss");
+        assert_eq!(s[3].0, "error");
     }
 
     #[test]
