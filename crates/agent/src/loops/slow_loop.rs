@@ -1240,6 +1240,12 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
             state.sqlite_store.is_none(),
             "fixture must leave store None"
         );
+        // Block the in-tick `try_recover_sqlite_store` from refilling the
+        // slot — it would happily open a store against the tempdir and
+        // skip the `else` arm we need to exercise. The 60s back-off is
+        // the lock: set the last-attempt timestamp to "now" so recovery
+        // short-circuits and the tick runs with `sqlite_store = None`.
+        state.sqlite_reopen_last_attempt = Some(std::time::Instant::now());
         state.last_graph_snapshot = std::time::Instant::now() - std::time::Duration::from_secs(90);
         let cfg = config::AgentConfig::default();
         let mut cursor = reader::AgentCursor::default();
@@ -1248,6 +1254,10 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
             .await
             .expect("narrative tick must not fail when sqlite_store is None");
         assert_eq!(count, 0);
+        assert!(
+            state.sqlite_store.is_none(),
+            "try_recover_sqlite_store back-off must have skipped; else arm requires store = None"
+        );
         // Tick still advanced the snapshot timer — the snapshot block ran
         // end-to-end, just without a canonical write (logged the WARN).
         assert!(state.last_graph_snapshot.elapsed().as_secs() < 5);
