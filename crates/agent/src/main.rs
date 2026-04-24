@@ -8,9 +8,33 @@
 // Use jemalloc on Linux - the default glibc allocator fragments memory and
 // never returns it to the OS, causing apparent "leaks" under sustained load.
 // jemalloc aggressively returns unused pages via madvise(MADV_DONTNEED).
-#[cfg(not(target_os = "macos"))]
+//
+// Spec 035 PR-A2 phase 1: this allocator is disabled when the
+// `dhat-heap` feature is active so DHAT's allocator can take its
+// place for heap-budget tests. The two `#[global_allocator]` statics
+// below are mutually exclusive by cfg construction:
+//   - jemalloc:  cfg(all(not(target_os = "macos"), not(feature = "dhat-heap")))
+//   - dhat:      cfg(feature = "dhat-heap")
+// These cfg gates cannot both match simultaneously, so only one
+// `#[global_allocator]` ever exists in a given build. If a future
+// refactor breaks this invariant Rust emits "duplicate lang item"
+// and the build fails — that diagnostic IS the compile-time guarantee
+// (an explicit `compile_error!` macro cannot observe the state of
+// another cfg-gated item without producing the same duplicate-lang
+// error first).
+#[cfg(all(not(target_os = "macos"), not(feature = "dhat-heap")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// Spec 035 PR-A2 phase 1: DHAT global allocator. Replaces jemalloc
+// (Linux) or the system allocator (macOS) when the `dhat-heap`
+// feature is active. DHAT records every allocation, so this binary
+// runs noticeably slower and MUST NOT ship to production. The feature
+// exists to drive heap-budget regression tests under
+// `cargo test -p innerwarden-agent --features dhat-heap ...`.
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static DHAT_ALLOC: dhat::Alloc = dhat::Alloc;
 
 // Spec 030: embed jemalloc runtime configuration in the binary so
 // operators do not need to set a MALLOC_CONF env var to get

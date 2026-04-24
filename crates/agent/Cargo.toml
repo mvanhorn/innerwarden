@@ -74,12 +74,27 @@ rustls-pki-types = "1"
 flate2 = "1"
 tempfile = "3"
 
+# Spec 035 PR-A2: DHAT heap profiler, only pulled in under the
+# `dhat-heap` feature (see [features] below). Replaces the global
+# allocator when enabled; must never ship in a production build.
+dhat = { version = "0.3", optional = true }
+
 [features]
 default = []
 # Enables the local ONNX classifier provider. Adds ~50 MB to the binary from
 # the ONNX runtime static link plus the tokenizer; off by default so users
 # without the classifier model installed don't pay the cost.
 local-classifier = ["tract-onnx", "tokenizers"]
+# Spec 035 PR-A2: swaps the global allocator to DHAT's heap profiler
+# for memory-budget tests. DHAT instruments every allocation and is
+# substantially slower than jemalloc; this feature MUST NOT be enabled
+# for production builds. The two `#[global_allocator]` statics in
+# `main.rs` are cfg-gated so that enabling this feature disables the
+# jemalloc allocator on Linux — Rust's "duplicate lang item" error is
+# the last-line compile-time guarantee that the two allocators cannot
+# be linked simultaneously. Invoke via
+# `cargo test -p innerwarden-agent --features dhat-heap ...`.
+dhat-heap = ["dep:dhat"]
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
