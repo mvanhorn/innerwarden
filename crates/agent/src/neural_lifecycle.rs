@@ -1317,7 +1317,8 @@ pub fn read_fp_report_detectors(data_dir: &Path, days: i64) -> HashSet<String> {
     for d in 0..days {
         let date = today - chrono::Duration::days(d);
         let date_str = date.format("%Y-%m-%d").to_string();
-        if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, &date_str)
+        if let Some(graph) =
+            crate::knowledge_graph::KnowledgeGraph::load_dated_sqlite_first(data_dir, &date_str)
         {
             use crate::knowledge_graph::types::{Node, NodeType};
             for id in graph.nodes_of_type(NodeType::Incident) {
@@ -1397,7 +1398,8 @@ pub fn read_fp_report_counts(data_dir: &Path, days: i64) -> Vec<(String, String,
     for d in 0..days {
         let date = today - chrono::Duration::days(d);
         let date_str = date.format("%Y-%m-%d").to_string();
-        if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, &date_str)
+        if let Some(graph) =
+            crate::knowledge_graph::KnowledgeGraph::load_dated_sqlite_first(data_dir, &date_str)
         {
             use crate::knowledge_graph::types::{Node, NodeType};
             for id in graph.nodes_of_type(NodeType::Incident) {
@@ -2328,7 +2330,8 @@ fn load_blocked_ips(data_dir: &Path) -> HashSet<String> {
     for days_ago in 0..7i64 {
         let date = today - chrono::Duration::days(days_ago);
         let date_str = date.format("%Y-%m-%d").to_string();
-        if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, &date_str)
+        if let Some(graph) =
+            crate::knowledge_graph::KnowledgeGraph::load_dated_sqlite_first(data_dir, &date_str)
         {
             use crate::knowledge_graph::types::{Node, NodeType};
             for id in graph.nodes_of_type(NodeType::Incident) {

@@ -272,8 +272,9 @@ pub fn generate_monthly(
         let date_str = date.format("%Y-%m-%d").to_string();
         let week_idx = (day_offset / 7).min(3) as usize;
 
-        // Try graph snapshot first
-        if let Some(graph) = crate::knowledge_graph::KnowledgeGraph::load_dated(data_dir, &date_str)
+        // Try graph snapshot first (SQLite canonical, JSON fallback).
+        if let Some(graph) =
+            crate::knowledge_graph::KnowledgeGraph::load_dated_sqlite_first(data_dir, &date_str)
         {
             use crate::knowledge_graph::types::{Node, NodeType, Relation};
             let event_count = graph.edge_count() as u64; // approximate: edges ≈ events
