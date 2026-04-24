@@ -260,8 +260,15 @@ pub(crate) async fn process_firmware_tick(
                         report.trust_score * 100.0,
                     );
                     let tg = tg.clone();
-                    try_spawn_firmware_alert(
-                        &state.task_group,
+                    // Spec 036 PR-2: register the alert in the
+                    // TaskGroup for graceful drain on shutdown. The
+                    // alert body does NOT observe `token.cancelled()`
+                    // — dropping a firmware alert mid-send loses the
+                    // notification silently, which is worse than
+                    // letting a short HTTP call complete within the
+                    // shutdown deadline.
+                    state.task_group.spawn_or_log(
+                        "firmware-alert",
                         Box::pin(async move {
                             let _ = tg.send_alert_html(&msg).await;
                         }),
@@ -314,38 +321,6 @@ fn classify_correlated_threat_severity(confidence: f64) -> innerwarden_core::eve
         innerwarden_core::event::Severity::High
     } else {
         innerwarden_core::event::Severity::Medium
-    }
-}
-
-/// Register a firmware alert task on the agent's TaskGroup.
-///
-/// Spec 036 PR-2: the alert is a single HTTP call (transactional) and
-/// deliberately does NOT observe `token.cancelled()` — dropping an
-/// alert mid-send loses the notification silently, which is worse
-/// than letting a short call complete within the shutdown deadline.
-/// The operator's knob is the deadline.
-///
-/// If the TaskGroup is already shut down, `spawn` returns
-/// `Err(TaskGroupError::Closed)`; we surface that via `tracing::warn!`
-/// so the operator sees the dropped alert. No silent drop — the
-/// primitive's explicit error is what lets us log here.
-///
-/// Accepts a type-erased boxed future on purpose: generic
-/// `impl Future` caused per-call-site monomorphization that split
-/// line-coverage reporting (the production monomorphization inside
-/// `process_firmware_tick` was treated as distinct from the tests'
-/// monomorphization and flagged as uncovered). The `Pin<Box<dyn …>>`
-/// boundary collapses every caller into a single monomorphization
-/// so the helper body is covered exactly once — see PR #274 for the
-/// codecov-driven diagnosis.
-type BoxedAlertFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
-
-fn try_spawn_firmware_alert(task_group: &crate::task_group::TaskGroup, alert: BoxedAlertFuture) {
-    if let Err(e) = task_group.spawn("firmware-alert", alert) {
-        tracing::warn!(
-            error = %e,
-            "firmware-alert spawn rejected: TaskGroup closed"
-        );
     }
 }
 
@@ -414,95 +389,11 @@ mod tests {
         ));
     }
 
-    // ─────────────────────────────────────────────────────────────────
-    // Spec 036 PR-2 migration anchors — try_spawn_firmware_alert
-    // ─────────────────────────────────────────────────────────────────
-    //
-    // The migration in `process_firmware_tick` now goes through
-    // `try_spawn_firmware_alert`. These tests drive that helper
-    // directly so both the Ok and Err branches are line-covered —
-    // previously the Err branch (the `tracing::warn!` for a closed
-    // TaskGroup) was unreachable from any fixture and codecov flagged
-    // it as uncovered. Driving the helper avoids fixturing a full
-    // firmware audit run and still anchors the real invariants:
-    //
-    //   - Ok path: alert future is registered in the TaskGroup and
-    //     runs to completion under `shutdown()`.
-    //   - Err path: a closed TaskGroup drops the alert with a
-    //     visible `warn!` — NEVER silently.
-
-    #[tokio::test]
-    async fn try_spawn_firmware_alert_registers_and_drains_the_alert() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-        use std::time::Duration;
-
-        let tg = crate::task_group::TaskGroup::new();
-        let sent = Arc::new(AtomicBool::new(false));
-        let sent_c = sent.clone();
-
-        // Stand-in for `tg.send_alert_html(&msg).await`. The helper
-        // takes a type-erased boxed future so callers (test + prod)
-        // share one monomorphization — see the helper's doc comment.
-        try_spawn_firmware_alert(
-            &tg,
-            Box::pin(async move {
-                tokio::time::sleep(Duration::from_millis(15)).await;
-                sent_c.store(true, Ordering::SeqCst);
-            }),
-        );
-
-        assert_eq!(tg.len(), 1, "alert must be tracked in the group");
-
-        let report = tg.shutdown(Duration::from_secs(1)).await;
-        assert_eq!(report.total, 1);
-        assert_eq!(
-            report.joined, 1,
-            "alert must complete within deadline, not be abandoned"
-        );
-        assert_eq!(report.timed_out, 0);
-        assert!(
-            sent.load(Ordering::SeqCst),
-            "alert body must have run — if this fails the helper dropped the future"
-        );
-    }
-
-    #[tokio::test]
-    async fn try_spawn_firmware_alert_warns_and_drops_when_group_closed() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-        use std::time::Duration;
-
-        let tg = crate::task_group::TaskGroup::new();
-        let _ = tg.shutdown(Duration::from_millis(50)).await;
-
-        // The alert future would set this to true — it must NOT run
-        // because the group is closed. Operator-visible evidence that
-        // the Err branch dropped the future intentionally (not by
-        // accident).
-        let ran = Arc::new(AtomicBool::new(false));
-        let ran_c = ran.clone();
-
-        // The helper returns `()` for both branches — the Err side
-        // logs `tracing::warn!` and returns, NEVER panics, NEVER
-        // silently spawns. This call exercises exactly that line.
-        try_spawn_firmware_alert(
-            &tg,
-            Box::pin(async move {
-                ran_c.store(true, Ordering::SeqCst);
-            }),
-        );
-
-        // Group must not have a tracked task — the spawn returned Err
-        // and the future was dropped.
-        assert_eq!(
-            tg.len(),
-            0,
-            "closed group must reject spawn, future must be dropped"
-        );
-        assert!(
-            !ran.load(Ordering::SeqCst),
-            "alert body must NOT have run — the future was dropped, not executed"
-        );
-    }
+    // Spec 036 PR-2 note: the spawn-rejected-on-close invariant is
+    // anchored by `TaskGroup::spawn_or_log_*` tests in
+    // `crates/agent/src/task_group.rs::tests`. The migration at
+    // `process_firmware_tick` is a thin call to `spawn_or_log`,
+    // intentionally unit-test-free at this site — covering the spawn
+    // site here would duplicate the primitive-level tests without
+    // adding a distinct invariant.
 }

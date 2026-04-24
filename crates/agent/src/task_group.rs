@@ -208,6 +208,33 @@ impl TaskGroup {
         Ok(handle)
     }
 
+    /// Convenience: spawn a task, and if the group is already closed
+    /// log via `tracing::warn!` instead of returning the `Err` to the
+    /// caller. Designed for fire-and-forget call sites that have
+    /// nothing better to do with a `Closed` error than log it — the
+    /// vast majority of the agent's migrated spawns.
+    ///
+    /// The future is type-erased as `Pin<Box<dyn Future + Send>>` so
+    /// every caller shares one monomorphization, which matters for
+    /// coverage reporting: tarpaulin attributes hits to the single
+    /// instance rather than fanning out per caller.
+    ///
+    /// **Not a replacement for `spawn` when the caller cares about
+    /// the Err.** Those call sites keep `spawn -> Result`.
+    pub(crate) fn spawn_or_log(
+        &self,
+        name: &'static str,
+        future: std::pin::Pin<Box<dyn Future<Output = ()> + Send>>,
+    ) {
+        if let Err(e) = self.spawn(name, future) {
+            tracing::warn!(
+                task = name,
+                error = %e,
+                "task spawn rejected: TaskGroup closed"
+            );
+        }
+    }
+
     /// Cancellation token shared by every task in the group. Tasks
     /// are expected to co-operate by polling this token in their
     /// event loops, typically via `tokio::select!`.
@@ -531,5 +558,57 @@ mod tests {
         assert_eq!(first.total, 0);
         assert_eq!(second.total, 0);
         assert_eq!(second.timed_out, 0);
+    }
+
+    // ─── spawn_or_log convenience method (PR-2) ─────────────────────
+
+    #[tokio::test]
+    async fn spawn_or_log_registers_task_when_group_open() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let tg = TaskGroup::new();
+        let counter = Arc::new(AtomicU32::new(0));
+        let c = counter.clone();
+
+        tg.spawn_or_log(
+            "convenience-task",
+            Box::pin(async move {
+                c.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        let report = tg.shutdown(Duration::from_secs(1)).await;
+        assert_eq!(report.total, 1, "spawn_or_log must register the task");
+        assert_eq!(report.joined, 1);
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "task body must run");
+    }
+
+    #[tokio::test]
+    async fn spawn_or_log_drops_future_and_logs_when_group_closed() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tg = TaskGroup::new();
+        let _ = tg.shutdown(Duration::from_millis(50)).await;
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let r = ran.clone();
+
+        // spawn_or_log MUST NOT panic and MUST NOT run the future.
+        // The `tracing::warn!` fires (verified at ERROR stream in
+        // manual runs; programmatic capture is out of scope here —
+        // the JoinHandle-based proof that panics are observable
+        // already covers the "no silent drop" invariant).
+        tg.spawn_or_log(
+            "convenience-task-after-close",
+            Box::pin(async move {
+                r.store(true, Ordering::SeqCst);
+            }),
+        );
+
+        assert_eq!(tg.len(), 0, "closed group must not track the task");
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "future body must NOT execute when group is closed"
+        );
     }
 }
