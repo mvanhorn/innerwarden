@@ -854,7 +854,28 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         },
         circuit_breaker_until: None,
         pending_honeypot_choices: HashMap::new(),
-        ip_reputations: load_ip_reputations(&cli.data_dir),
+        // SQLite is canonical; JSON fallback covers data dirs that predate
+        // the migration. The next persist tick syncs SQLite, so the fallback
+        // path is self-healing on subsequent boots.
+        ip_reputations: {
+            let from_store = ip_reputation::load_ip_reputations_from_store(&store);
+            if from_store.is_empty() {
+                let from_json = load_ip_reputations(&cli.data_dir);
+                if !from_json.is_empty() {
+                    info!(
+                        count = from_json.len(),
+                        "warm-cache: SQLite ip_reputations empty, loaded from legacy JSON (will sync to SQLite on next slow-loop tick)"
+                    );
+                }
+                from_json
+            } else {
+                info!(
+                    count = from_store.len(),
+                    "warm-cache: loaded ip_reputations from SQLite canonical"
+                );
+                from_store
+            }
+        },
         lsm_enabled: false,
         mesh: if cfg.mesh.enabled {
             match mesh::MeshIntegration::new(&cfg.mesh, &cli.data_dir) {
@@ -1406,7 +1427,11 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                         entries.truncate(5000);
                         state.ip_reputations = entries.into_iter().collect();
                     }
-                    persist_ip_reputations(&cli.data_dir, &state.ip_reputations);
+                    persist_ip_reputations(
+                        &cli.data_dir,
+                        &state.ip_reputations,
+                        Some(&state.store),
+                    );
 
                     // ── Safeguard: XDP TTL - expire old blocklist entries ──
                     //
@@ -2103,7 +2128,11 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                         entries.truncate(5000);
                         state.ip_reputations = entries.into_iter().collect();
                     }
-                    persist_ip_reputations(&cli.data_dir, &state.ip_reputations);
+                    persist_ip_reputations(
+                        &cli.data_dir,
+                        &state.ip_reputations,
+                        Some(&state.store),
+                    );
                     let removed = data_retention::cleanup(&cli.data_dir, &cfg.data);
                     if removed > 0 {
                         info!(removed, "data_retention: cleaned up old files");

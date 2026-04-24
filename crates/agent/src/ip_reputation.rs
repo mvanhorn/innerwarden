@@ -82,11 +82,14 @@ pub(crate) fn append_blocked_ip(data_dir: &Path, ip: &str) {
     }
 }
 
-/// Write the in-memory reputation map to `ip-reputation.json` so the dashboard
-/// (which runs in a separate task) can read it without shared state.
+/// Persist the in-memory reputation map. SQLite is canonical (warm-cache
+/// source on boot); the JSON file is a projection the dashboard reads
+/// directly. `store` is `Option` because the prune self-call in
+/// `load_ip_reputations` runs before a store handle exists.
 pub(crate) fn persist_ip_reputations(
     data_dir: &Path,
     reputations: &HashMap<String, LocalIpReputation>,
+    store: Option<&crate::state_store::StateStore>,
 ) {
     let path = data_dir.join("ip-reputation.json");
     match serde_json::to_string(reputations) {
@@ -97,6 +100,26 @@ pub(crate) fn persist_ip_reputations(
         }
         Err(e) => warn!("failed to serialize ip reputations: {e}"),
     }
+    if let Some(sq) = store {
+        for (ip, rep) in reputations {
+            if let Ok(val) = serde_json::to_value(rep) {
+                sq.set_ip_reputation(ip, &val);
+            }
+        }
+    }
+}
+
+/// Warm-cache loader from the SQLite canonical namespace. Returns an empty
+/// map on store-unavailable errors (already logged upstream); the caller
+/// falls back to the JSON loader when empty.
+pub(crate) fn load_ip_reputations_from_store(
+    store: &crate::state_store::StateStore,
+) -> HashMap<String, LocalIpReputation> {
+    store
+        .all_ip_reputations()
+        .into_iter()
+        .filter_map(|(ip, val)| serde_json::from_value(val).ok().map(|r| (ip, r)))
+        .collect()
 }
 
 /// Load the reputation map from `ip-reputation.json` at startup.
@@ -118,7 +141,9 @@ pub(crate) fn load_ip_reputations(data_dir: &Path) -> HashMap<String, LocalIpRep
             removed,
             "pruned invalid IP/CIDR entries from ip-reputation.json at startup"
         );
-        persist_ip_reputations(data_dir, &reputations);
+        // No store handle available yet at boot-prune time; the next
+        // slow-loop persist tick re-mirrors to SQLite.
+        persist_ip_reputations(data_dir, &reputations, None);
     }
     reputations
 }
@@ -372,13 +397,104 @@ mod tests {
         r2.record_block();
         reputations.insert("2.2.2.2".to_string(), r2);
 
-        persist_ip_reputations(tmp.path(), &reputations);
+        persist_ip_reputations(tmp.path(), &reputations, None);
 
         let loaded = load_ip_reputations(tmp.path());
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded["1.1.1.1"].total_incidents, 1);
         assert_eq!(loaded["2.2.2.2"].total_blocks, 1);
         assert_eq!(loaded["2.2.2.2"].reputation_score, 2.0);
+    }
+
+    #[test]
+    fn load_ip_reputations_from_store_is_empty_on_fresh_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::state_store::StateStore::open(tmp.path()).unwrap();
+
+        let loaded = load_ip_reputations_from_store(&store);
+        assert!(
+            loaded.is_empty(),
+            "fresh store MUST return an empty warm-cache — boot falls back to JSON"
+        );
+    }
+
+    #[test]
+    fn persist_ip_reputations_mirrors_to_store_and_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::state_store::StateStore::open(tmp.path()).unwrap();
+
+        let mut reputations = HashMap::new();
+        let mut r1 = rep();
+        r1.record_incident();
+        r1.record_block();
+        reputations.insert("198.51.100.5".to_string(), r1);
+        let mut r2 = rep();
+        r2.record_incident();
+        reputations.insert("198.51.100.6".to_string(), r2);
+
+        persist_ip_reputations(tmp.path(), &reputations, Some(&store));
+
+        // SQLite canonical round-trip.
+        let loaded = load_ip_reputations_from_store(&store);
+        assert_eq!(
+            loaded.len(),
+            2,
+            "both persisted entries must appear in the SQLite warm-cache"
+        );
+        assert_eq!(loaded["198.51.100.5"].total_incidents, 1);
+        assert_eq!(loaded["198.51.100.5"].total_blocks, 1);
+        assert_eq!(loaded["198.51.100.6"].total_incidents, 1);
+
+        // JSON projection still written (dashboard consumes it).
+        let json_loaded = load_ip_reputations(tmp.path());
+        assert_eq!(
+            json_loaded.len(),
+            2,
+            "JSON projection must stay in sync with SQLite for dashboard reads"
+        );
+    }
+
+    #[test]
+    fn persist_ip_reputations_skips_sqlite_when_store_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::state_store::StateStore::open(tmp.path()).unwrap();
+
+        let mut reputations = HashMap::new();
+        reputations.insert("203.0.113.7".to_string(), rep());
+
+        // Call with None — SQLite should remain empty.
+        persist_ip_reputations(tmp.path(), &reputations, None);
+
+        let sqlite_loaded = load_ip_reputations_from_store(&store);
+        assert!(
+            sqlite_loaded.is_empty(),
+            "persist_ip_reputations with store=None MUST NOT write to SQLite"
+        );
+
+        // JSON was still written.
+        let json_loaded = load_ip_reputations(tmp.path());
+        assert_eq!(json_loaded.len(), 1);
+    }
+
+    #[test]
+    fn load_ip_reputations_from_store_skips_corrupt_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::state_store::StateStore::open(tmp.path()).unwrap();
+
+        let mut reputations = HashMap::new();
+        reputations.insert("198.51.100.9".to_string(), rep());
+        persist_ip_reputations(tmp.path(), &reputations, Some(&store));
+
+        // Corrupt: an integer, not the expected object.
+        store.set_ip_reputation("198.51.100.10", &serde_json::json!(42));
+
+        let loaded = load_ip_reputations_from_store(&store);
+        assert_eq!(
+            loaded.len(),
+            1,
+            "corrupt row must be skipped, valid sibling must still load"
+        );
+        assert!(loaded.contains_key("198.51.100.9"));
     }
 
     #[test]
