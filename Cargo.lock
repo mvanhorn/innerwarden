@@ -2143,6 +2143,7 @@ dependencies = [
  "flate2",
  "fs2",
  "futures-core",
+ "futures-util",
  "hkdf 0.12.4",
  "hmac 0.12.1",
  "innerwarden-agent-guard",
@@ -2173,6 +2174,7 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "toml 1.1.2+spec-1.1.0",
  "tower",
  "tower-http",
@@ -4980,6 +4982,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

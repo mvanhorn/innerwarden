@@ -39,7 +39,17 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+# Spec 036 (I-04 graceful shutdown) — TaskTracker for joinable task
+# registration, CancellationToken for cooperative cancel. The "rt"
+# feature pulls in `task::TaskTracker`; the default features cover
+# `sync::CancellationToken`.
+tokio-util = { version = "0.7", features = ["rt"] }
 futures-core = "0.3"
+# Spec 036 — `FutureExt::catch_unwind` for per-task panic isolation
+# in `TaskGroup::spawn`. Used to log the panic via tracing::error!
+# with the task name before re-raising (preserves JoinError::is_panic
+# for explicit handlers).
+futures-util = "0.3"
 axum = { version = "0.7", features = ["json"] }
 tower-http = { version = "0.6", features = ["cors"] }
 argon2 = "0.5"

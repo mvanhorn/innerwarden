@@ -155,6 +155,12 @@ mod slack;
 #[allow(dead_code)]
 mod soc_checks;
 mod state_store;
+// Spec 036 (audit I-04) PR-1: TaskGroup primitive. All items are
+// `pub(crate)` and unused during this PR; the `dead_code` allowance
+// goes away with the first migration (decision_writer / telegram
+// batcher / pcap_capture) in the follow-up PR.
+#[allow(dead_code)]
+mod task_group;
 mod telegram;
 mod telemetry;
 mod telemetry_tick;
