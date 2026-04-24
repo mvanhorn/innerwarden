@@ -913,6 +913,216 @@ mod tests {
         assert!(KnowledgeGraph::load_dated_from_store(&store, "").is_none());
     }
 
+    // ── spec 037 slice 5 PR-1: JSON ↔ SQLite equivalence anchors ─────
+    //
+    // Before migrating any consumer of `load_dated` to the SQLite-first
+    // pattern, we need evidence that `load_dated_from_store` and
+    // `load_dated` produce structurally equivalent graphs for the same
+    // date. These anchors pin that equivalence so later PRs can migrate
+    // readers without risk of a silent shape mismatch.
+
+    fn seed_graph_with_mixed_nodes() -> KnowledgeGraph {
+        let mut g = KnowledgeGraph::new();
+        let now = Utc::now();
+        // Distinct node types so equivalence checks exercise multiple
+        // indexes (ip_index, pid_index, file_index, ...).
+        for i in 0..5 {
+            g.ensure_ip(&format!("203.0.113.{i}"), now);
+        }
+        let p1 = g.ensure_process(8801, 1, "nginx", 0, now);
+        let p2 = g.ensure_process(8802, 8801, "redis", 0, now);
+        let ip = g.ensure_ip("198.51.100.42", now);
+        // Two edges so adjacency reconstruction must run on load.
+        g.add_edge(Edge::new(p1, ip, Relation::ConnectedTo, now));
+        g.add_edge(Edge::new(p2, p1, Relation::SpawnedBy, now));
+        g
+    }
+
+    /// Returns a snapshot summary usable for structural equivalence
+    /// assertions across the two load paths. Stable field set, no
+    /// dependency on serde `Value` field ordering.
+    fn graph_summary(g: &KnowledgeGraph) -> (usize, usize, bool, bool, bool, bool) {
+        (
+            g.node_count(),
+            g.edge_count(),
+            g.find_by_ip("198.51.100.42").is_some(),
+            g.find_by_ip("203.0.113.3").is_some(),
+            g.find_by_pid(8801).is_some(),
+            g.find_by_pid(8802).is_some(),
+        )
+    }
+
+    #[test]
+    fn load_dated_from_store_matches_load_dated_when_both_present() {
+        // Arrange: serialize one graph and write identical bytes to both
+        // sinks for the same date. This eliminates "different input"
+        // as an explanation for any divergence the assertion might
+        // surface — any mismatch would be a real load-path bug.
+        let dir = tempdir().unwrap();
+        let store = innerwarden_store::Store::open_memory().unwrap();
+        let date = "2026-04-20";
+
+        let g = seed_graph_with_mixed_nodes();
+        let snap = g.serialize_snapshot_bytes().expect("serialize");
+
+        // JSON sink: write at the canonical dated filename.
+        let safe_name = safe_snapshot_filename(date).expect("safe name");
+        let json_path = dir.path().join(safe_name);
+        KnowledgeGraph::write_snapshot_bytes(&json_path, &snap).expect("write file");
+
+        // SQLite sink: same bytes, same date.
+        store
+            .save_graph_snapshot(date, &snap.bytes, snap.nodes_count, snap.edges_count)
+            .expect("save to store");
+
+        let from_json = KnowledgeGraph::load_dated(dir.path(), date).expect("json loads");
+        let from_sqlite =
+            KnowledgeGraph::load_dated_from_store(&store, date).expect("sqlite loads");
+
+        assert_eq!(
+            graph_summary(&from_json),
+            graph_summary(&from_sqlite),
+            "load_dated and load_dated_from_store must produce structurally equivalent graphs"
+        );
+        assert_eq!(from_json.node_count(), g.node_count());
+        assert_eq!(from_json.edge_count(), g.edge_count());
+    }
+
+    #[test]
+    fn load_dated_from_store_returns_none_when_date_missing() {
+        // Fresh store + valid-shape date that was never persisted.
+        let store = innerwarden_store::Store::open_memory().unwrap();
+        assert!(
+            KnowledgeGraph::load_dated_from_store(&store, "2026-04-20").is_none(),
+            "valid-shape date with no row must return None (not a panic)"
+        );
+    }
+
+    #[test]
+    fn load_dated_from_store_handles_gzip_and_raw_json() {
+        // Wire-format compatibility: the reader uses a magic-byte sniff
+        // in `maybe_decompress`, so historical raw-JSON blobs (pre-gzip
+        // deploy, 2026-04-23) still load. The SQLite load path goes
+        // through the same helper — assert both paths here so a future
+        // refactor cannot silently drop one of them.
+        let store = innerwarden_store::Store::open_memory().unwrap();
+
+        let g = seed_graph_with_mixed_nodes();
+        let snap = g.serialize_snapshot_bytes().expect("serialize");
+        assert!(
+            snap.bytes.len() >= 2 && snap.bytes[0] == 0x1f && snap.bytes[1] == 0x8b,
+            "serialize_snapshot_bytes must emit gzip today — test premise"
+        );
+
+        // Gzip date: write the gzip bytes as-is.
+        store
+            .save_graph_snapshot(
+                "2026-04-21",
+                &snap.bytes,
+                snap.nodes_count,
+                snap.edges_count,
+            )
+            .expect("save gzip");
+
+        // Raw-JSON date: re-encode the same snapshot without gzip
+        // wrapping, mimicking a pre-2026-04-23 blob sitting in the
+        // store after an upgrade.
+        let raw_bytes =
+            serde_json::to_vec(&GraphSnapshotRef::from_graph(&g)).expect("raw serialize");
+        assert_eq!(raw_bytes[0], b'{', "fixture must look like raw JSON");
+        store
+            .save_graph_snapshot("2026-04-22", &raw_bytes, snap.nodes_count, snap.edges_count)
+            .expect("save raw");
+
+        let from_gzip =
+            KnowledgeGraph::load_dated_from_store(&store, "2026-04-21").expect("gzip blob loads");
+        let from_raw =
+            KnowledgeGraph::load_dated_from_store(&store, "2026-04-22").expect("raw blob loads");
+
+        // Both must decode to the same graph — same source, different wire wrap.
+        assert_eq!(graph_summary(&from_gzip), graph_summary(&from_raw));
+        assert_eq!(from_gzip.node_count(), g.node_count());
+    }
+
+    /// Cross-check helper returned as a test-module utility. Mirrors the
+    /// shape of the compliance cross-check added in slice 4 PR-2: pure
+    /// diagnostic, no hard failure. Useful as a building block if we
+    /// later expose a compliance-tab field for KG drift; here it is
+    /// only wired to the equivalence anchor below so we have a single
+    /// call site that exercises it.
+    #[derive(Debug, PartialEq, Eq)]
+    struct DatedSnapshotCrossCheck {
+        json_present: bool,
+        sqlite_present: bool,
+        json_summary: Option<(usize, usize, bool, bool, bool, bool)>,
+        sqlite_summary: Option<(usize, usize, bool, bool, bool, bool)>,
+    }
+
+    impl DatedSnapshotCrossCheck {
+        fn run(data_dir: &std::path::Path, store: &innerwarden_store::Store, date: &str) -> Self {
+            let json = KnowledgeGraph::load_dated(data_dir, date);
+            let sqlite = KnowledgeGraph::load_dated_from_store(store, date);
+            Self {
+                json_present: json.is_some(),
+                sqlite_present: sqlite.is_some(),
+                json_summary: json.as_ref().map(graph_summary),
+                sqlite_summary: sqlite.as_ref().map(graph_summary),
+            }
+        }
+
+        fn agrees(&self) -> bool {
+            self.json_present == self.sqlite_present && self.json_summary == self.sqlite_summary
+        }
+    }
+
+    #[test]
+    fn cross_check_reports_agreement_when_both_sinks_hold_same_date() {
+        let dir = tempdir().unwrap();
+        let store = innerwarden_store::Store::open_memory().unwrap();
+        let date = "2026-04-20";
+
+        let g = seed_graph_with_mixed_nodes();
+        let snap = g.serialize_snapshot_bytes().unwrap();
+        let safe_name = safe_snapshot_filename(date).unwrap();
+        KnowledgeGraph::write_snapshot_bytes(&dir.path().join(safe_name), &snap).unwrap();
+        store
+            .save_graph_snapshot(date, &snap.bytes, snap.nodes_count, snap.edges_count)
+            .unwrap();
+
+        let check = DatedSnapshotCrossCheck::run(dir.path(), &store, date);
+        assert!(check.json_present);
+        assert!(check.sqlite_present);
+        assert!(
+            check.agrees(),
+            "both sinks hold the same bytes for the same date; cross-check must agree: {check:?}"
+        );
+    }
+
+    #[test]
+    fn cross_check_reports_disagreement_when_only_one_sink_populated() {
+        // Exactly the state a data dir lands in after PR-1 ships but
+        // before PR-2 migrates consumers: writer touches both sinks,
+        // but a freshly-restored backup (or the very first boot after
+        // the migration) could have only one side populated.
+        let dir = tempdir().unwrap();
+        let store = innerwarden_store::Store::open_memory().unwrap();
+        let date = "2026-04-20";
+
+        let g = seed_graph_with_mixed_nodes();
+        let snap = g.serialize_snapshot_bytes().unwrap();
+        let safe_name = safe_snapshot_filename(date).unwrap();
+        KnowledgeGraph::write_snapshot_bytes(&dir.path().join(safe_name), &snap).unwrap();
+        // SQLite intentionally untouched.
+
+        let check = DatedSnapshotCrossCheck::run(dir.path(), &store, date);
+        assert!(check.json_present);
+        assert!(!check.sqlite_present);
+        assert!(
+            !check.agrees(),
+            "only-JSON side populated MUST be flagged as disagreement"
+        );
+    }
+
     // ── lock-scope split tests ───────────────────────────────────────
     //
     // Anchors for the slow_loop refactor: serialize_snapshot_bytes runs
