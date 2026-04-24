@@ -275,9 +275,20 @@ fn notify_telegram(
                         trust_score * 100.0,
                     );
                     let tg = tg.clone();
-                    tokio::spawn(async move {
-                        let _ = tg.send_alert_html(&msg).await;
-                    });
+                    // Spec 036 PR-5: register the alert in the agent's
+                    // TaskGroup so SIGTERM drain waits for it. Same
+                    // design as PR-2's telegram-polling and PR-4's
+                    // honeypot listener. Body does NOT observe
+                    // `token.cancelled()` — dropping a hypervisor
+                    // alert mid-send loses the notification silently,
+                    // which is worse than letting a short HTTP call
+                    // complete within the shutdown deadline.
+                    state.task_group.spawn_or_log(
+                        "hypervisor-alert",
+                        Box::pin(async move {
+                            let _ = tg.send_alert_html(&msg).await;
+                        }),
+                    );
                 }
                 crate::notification_gate::NotificationVerdict::DailyBriefingOnly => {
                     *state
@@ -429,6 +440,130 @@ mod tests {
         assert_eq!(
             format_hypervisor_severity(&Severity::Medium),
             "\u{1f7e1} MEDIUM"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Spec 036 PR-5 migration anchors — notify_telegram (hypervisor)
+    // ─────────────────────────────────────────────────────────────────
+    //
+    // Mirrors the firmware_tick anchors. The migration at line ~265
+    // inside `notify_telegram` wires the hypervisor alert through
+    // `state.task_group.spawn_or_log("hypervisor-alert", ...)`.
+    // Verdict logic is shared with firmware (both use
+    // `NotificationContext::from_firmware_or_hypervisor`), so the
+    // SendNow path requires severity=Critical AND a compromise tag
+    // (rootkit / firmware_tampering / msr_write / spi_flash).
+
+    fn make_hypervisor_incident(
+        title: &str,
+        severity: Severity,
+        tags: Vec<&str>,
+    ) -> innerwarden_core::incident::Incident {
+        innerwarden_core::incident::Incident {
+            ts: chrono::Utc::now(),
+            host: "test-host".to_string(),
+            incident_id: format!("hypervisor:test:{title}").replace(' ', "_"),
+            severity,
+            title: title.to_string(),
+            summary: "fixture".to_string(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: tags.into_iter().map(String::from).collect(),
+            entities: vec![],
+        }
+    }
+
+    fn make_test_telegram_client() -> std::sync::Arc<crate::telegram::TelegramClient> {
+        std::sync::Arc::new(
+            crate::telegram::TelegramClient::new(
+                "test-bot-token",
+                "test-chat-id",
+                None, // dashboard_url
+            )
+            .expect("TelegramClient::new builds a stub client"),
+        )
+    }
+
+    #[tokio::test]
+    async fn notify_telegram_registers_hypervisor_alert_in_task_group_on_send_now() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        state.telegram_client = Some(make_test_telegram_client());
+
+        // Critical + rootkit tag → evaluates to SendNow.
+        let incident =
+            make_hypervisor_incident("Ring-0 hook detected", Severity::Critical, vec!["rootkit"]);
+
+        notify_telegram(&mut state, std::slice::from_ref(&incident), 0.4);
+
+        assert_eq!(
+            state.task_group.len(),
+            1,
+            "SendNow verdict MUST register a 'hypervisor-alert' task in the TaskGroup"
+        );
+
+        // Drain so the fire-and-forget HTTP call does not leak.
+        let report = state.task_group.shutdown(Duration::from_millis(100)).await;
+        assert_eq!(report.total, 1);
+    }
+
+    #[tokio::test]
+    async fn notify_telegram_defers_and_does_not_spawn_on_non_compromise_critical() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        state.telegram_client = Some(make_test_telegram_client());
+
+        // Critical but no compromise tag → DailyBriefingOnly.
+        let incident = make_hypervisor_incident(
+            "VM exit timing anomaly",
+            Severity::Critical,
+            vec!["hypervisor"],
+        );
+
+        notify_telegram(&mut state, std::slice::from_ref(&incident), 0.6);
+
+        assert_eq!(
+            state.task_group.len(),
+            0,
+            "DailyBriefingOnly MUST NOT spawn; incident is deferred"
+        );
+        assert_eq!(
+            state
+                .telegram_deferred
+                .get("hypervisor")
+                .copied()
+                .unwrap_or(0),
+            1,
+            "deferred counter must increment for the daily digest"
+        );
+
+        let report = state.task_group.shutdown(Duration::from_millis(50)).await;
+        assert_eq!(report.total, 0);
+    }
+
+    #[tokio::test]
+    async fn notify_telegram_is_noop_when_telegram_client_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        state.telegram_client = None;
+
+        let incident = make_hypervisor_incident(
+            "Should never reach the gate",
+            Severity::Critical,
+            vec!["rootkit"],
+        );
+
+        notify_telegram(&mut state, std::slice::from_ref(&incident), 0.2);
+
+        assert_eq!(state.task_group.len(), 0);
+        assert!(
+            state.telegram_deferred.is_empty(),
+            "deferred counter must NOT increment when Telegram is disabled"
         );
     }
 }

@@ -234,44 +234,70 @@ pub(crate) async fn process_firmware_tick(
     );
 
     // Telegram notification for firmware incidents (gated).
-    if let Some(ref tg) = state.telegram_client {
-        for inc in &incidents {
-            let ctx = crate::notification_gate::NotificationContext::from_firmware_or_hypervisor(
-                inc, "firmware",
-            );
-            let gate_counter = state.telemetry.gate_suppressed_counter();
-            let verdict =
-                crate::notification_gate::should_notify_with_counter(&ctx, gate_counter.as_ref());
-            match verdict {
-                crate::notification_gate::NotificationVerdict::SendNow => {
-                    let sev = match inc.severity {
-                        innerwarden_core::event::Severity::Critical => "\u{1f534} CRITICAL",
-                        innerwarden_core::event::Severity::High => "\u{1f7e0} HIGH",
-                        _ => "\u{1f7e1} MEDIUM",
-                    };
-                    let msg = format!(
-                        "\u{1f527} <b>Firmware Alert</b>\n\n\
-                         {sev}\n\
-                         <b>{}</b>\n\
-                         {}\n\n\
-                         Trust Score: {:.0}%",
-                        inc.title,
-                        inc.summary,
-                        report.trust_score * 100.0,
-                    );
-                    let tg = tg.clone();
-                    tokio::spawn(async move {
+    notify_telegram(state, &incidents, report.trust_score);
+}
+
+/// Dispatch Telegram notifications for a batch of firmware incidents
+/// according to the shared notification gate. Extracted from the
+/// inline loop in `process_firmware_tick` so the SendNow → spawn
+/// path is unit-testable without fixturing a full `innerwarden_smm`
+/// audit run — see spec 036 PR-5 and the `notify_telegram_*` tests
+/// below.
+fn notify_telegram(
+    state: &mut AgentState,
+    incidents: &[innerwarden_core::incident::Incident],
+    trust_score: f64,
+) {
+    let Some(tg) = state.telegram_client.clone() else {
+        return;
+    };
+    for inc in incidents {
+        let ctx = crate::notification_gate::NotificationContext::from_firmware_or_hypervisor(
+            inc, "firmware",
+        );
+        let gate_counter = state.telemetry.gate_suppressed_counter();
+        let verdict =
+            crate::notification_gate::should_notify_with_counter(&ctx, gate_counter.as_ref());
+        match verdict {
+            crate::notification_gate::NotificationVerdict::SendNow => {
+                let sev = match inc.severity {
+                    innerwarden_core::event::Severity::Critical => "\u{1f534} CRITICAL",
+                    innerwarden_core::event::Severity::High => "\u{1f7e0} HIGH",
+                    _ => "\u{1f7e1} MEDIUM",
+                };
+                let msg = format!(
+                    "\u{1f527} <b>Firmware Alert</b>\n\n\
+                     {sev}\n\
+                     <b>{}</b>\n\
+                     {}\n\n\
+                     Trust Score: {:.0}%",
+                    inc.title,
+                    inc.summary,
+                    trust_score * 100.0,
+                );
+                let tg = tg.clone();
+                // Spec 036 PR-5: register the alert in the agent's
+                // TaskGroup so SIGTERM drain waits for it. Same
+                // design as PR-2's telegram-polling and PR-4's
+                // honeypot listener. Body does NOT observe
+                // `token.cancelled()` — dropping a firmware alert
+                // mid-send loses the notification silently, which is
+                // worse than letting a short HTTP call complete
+                // within the shutdown deadline.
+                state.task_group.spawn_or_log(
+                    "firmware-alert",
+                    Box::pin(async move {
                         let _ = tg.send_alert_html(&msg).await;
-                    });
-                }
-                crate::notification_gate::NotificationVerdict::DailyBriefingOnly => {
-                    *state
-                        .telegram_deferred
-                        .entry("firmware".to_string())
-                        .or_insert(0) += 1;
-                }
-                crate::notification_gate::NotificationVerdict::Drop => {}
+                    }),
+                );
             }
+            crate::notification_gate::NotificationVerdict::DailyBriefingOnly => {
+                *state
+                    .telegram_deferred
+                    .entry("firmware".to_string())
+                    .or_insert(0) += 1;
+            }
+            crate::notification_gate::NotificationVerdict::Drop => {}
         }
     }
 }
@@ -377,5 +403,165 @@ mod tests {
             classify_correlated_threat_severity(0.50),
             Severity::Medium
         ));
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Spec 036 PR-5 migration anchors — notify_telegram
+    // ─────────────────────────────────────────────────────────────────
+    //
+    // The migration in `process_firmware_tick` now goes through
+    // `notify_telegram`. These tests drive that helper directly so
+    // the SendNow → `state.task_group.spawn_or_log(...)` path is
+    // line-covered without fixturing a full `innerwarden_smm`
+    // audit run.
+    //
+    // Verdict steering from `notification_gate::evaluate_verdict`:
+    //   - SendNow: severity=Critical AND tag is one of
+    //       {"rootkit", "firmware_tampering", "msr_write",
+    //        "spi_flash"} (the "is_compromise" path).
+    //   - DailyBriefingOnly: any other (default path for
+    //     firmware/hypervisor contexts, which set
+    //     is_active_intrusion=false and is_contained=false).
+    //   - Drop: not reachable for firmware-tick contexts.
+    //
+    // The Ok-path test also exercises PR-2's `spawn_or_log` primitive
+    // through its real caller — the same coverage-risk line that
+    // blocked PR-2 is now landed via this direct test on the
+    // extracted helper.
+
+    fn make_firmware_incident(
+        title: &str,
+        severity: innerwarden_core::event::Severity,
+        tags: Vec<&str>,
+    ) -> innerwarden_core::incident::Incident {
+        innerwarden_core::incident::Incident {
+            ts: chrono::Utc::now(),
+            host: "test-host".to_string(),
+            incident_id: format!("firmware:test:{title}").replace(' ', "_"),
+            severity,
+            title: title.to_string(),
+            summary: "fixture".to_string(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: tags.into_iter().map(String::from).collect(),
+            entities: vec![],
+        }
+    }
+
+    fn make_test_telegram_client() -> std::sync::Arc<crate::telegram::TelegramClient> {
+        // Invalid bot token → Telegram API responds with 401 quickly
+        // if the spawned future ever gets polled. The tests assert
+        // registration (tg.len()) and then call shutdown with a
+        // short deadline, so whether the HTTP call completes or
+        // gets abandoned is irrelevant to the assertion.
+        std::sync::Arc::new(
+            crate::telegram::TelegramClient::new(
+                "test-bot-token",
+                "test-chat-id",
+                None, // dashboard_url
+            )
+            .expect("TelegramClient::new builds a stub client"),
+        )
+    }
+
+    #[tokio::test]
+    async fn notify_telegram_registers_firmware_alert_in_task_group_on_send_now() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        state.telegram_client = Some(make_test_telegram_client());
+
+        // Critical + rootkit tag → evaluates to SendNow via
+        // `is_compromise` rule in notification_gate.
+        let incident = make_firmware_incident(
+            "Rootkit signature detected",
+            innerwarden_core::event::Severity::Critical,
+            vec!["rootkit"],
+        );
+
+        // Invoke the migrated helper. Internally calls
+        // `state.task_group.spawn_or_log("firmware-alert", ...)`.
+        notify_telegram(&mut state, std::slice::from_ref(&incident), 0.3);
+
+        assert_eq!(
+            state.task_group.len(),
+            1,
+            "SendNow verdict MUST register a 'firmware-alert' task in the TaskGroup"
+        );
+
+        // Drain the group so the fire-and-forget HTTP call is
+        // either completed or cleanly abandoned — don't leak a
+        // runtime task across test boundaries.
+        let report = state.task_group.shutdown(Duration::from_millis(100)).await;
+        assert_eq!(report.total, 1);
+        // Not asserted: joined vs timed_out. The HTTP call hitting
+        // api.telegram.org with a junk token may or may not complete
+        // within 100 ms; either outcome is valid for the contract
+        // under test (which is "spawn registered").
+    }
+
+    #[tokio::test]
+    async fn notify_telegram_defers_and_does_not_spawn_on_non_compromise_critical() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        state.telegram_client = Some(make_test_telegram_client());
+
+        // Critical severity but NO compromise tag → default rule:
+        // DailyBriefingOnly. Guards against a refactor that
+        // accidentally widened the SendNow predicate.
+        let incident = make_firmware_incident(
+            "Trust score degraded",
+            innerwarden_core::event::Severity::Critical,
+            vec!["firmware"], // not in the compromise tag set
+        );
+
+        notify_telegram(&mut state, std::slice::from_ref(&incident), 0.5);
+
+        assert_eq!(
+            state.task_group.len(),
+            0,
+            "DailyBriefingOnly MUST NOT spawn a task; incident is deferred to the daily digest"
+        );
+        assert_eq!(
+            state
+                .telegram_deferred
+                .get("firmware")
+                .copied()
+                .unwrap_or(0),
+            1,
+            "deferred counter must increment so the daily digest picks up this incident"
+        );
+
+        // Shutdown is a no-op on an empty group but keeps the test
+        // symmetric with the SendNow variant.
+        let report = state.task_group.shutdown(Duration::from_millis(50)).await;
+        assert_eq!(report.total, 0);
+    }
+
+    #[tokio::test]
+    async fn notify_telegram_is_noop_when_telegram_client_absent() {
+        // Guards the early-return: when the agent is configured
+        // without a Telegram client, the helper must not touch
+        // state flags or spawn anything.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        state.telegram_client = None;
+
+        let incident = make_firmware_incident(
+            "Should never reach the gate",
+            innerwarden_core::event::Severity::Critical,
+            vec!["rootkit"],
+        );
+
+        notify_telegram(&mut state, std::slice::from_ref(&incident), 0.1);
+
+        assert_eq!(state.task_group.len(), 0);
+        assert!(
+            state.telegram_deferred.is_empty(),
+            "deferred counter must NOT increment when Telegram is disabled"
+        );
     }
 }
