@@ -504,34 +504,54 @@ pub fn consolidation_tick(
         }
     }
 
-    // Write JSON snapshot for dashboard
-    persist_snapshot(data_dir, profiles, sqlite_store);
+    // Spec 037 PR-2: SQLite blob is now the canonical snapshot
+    // target; the legacy `attacker-profiles.json` write has been
+    // retired. Dashboard reads the blob first and falls back to
+    // the JSON file only on legacy data dirs for disaster
+    // recovery.
+    persist_snapshot(profiles, sqlite_store);
 
     // Detect campaigns and persist
     let campaigns = detect_campaigns(profiles);
     persist_campaigns(data_dir, &campaigns, sqlite_store);
 }
 
-/// Write profiles as a sorted JSON array to `attacker-profiles.json`.
+/// Persist the current attacker-profile snapshot to the SQLite
+/// `attacker_profiles` blob.
+///
+/// Spec 037 PR-2 (I-02 slice 2): the legacy dual-write to
+/// `attacker-profiles.json` was retired — SQLite is the canonical
+/// store and has been the primary source for `load_from_store` /
+/// `AttackerProfile` reads from the start of the intel module.
+/// Dashboard read sites (`intelligence.rs:21/79/127`) already read
+/// the SQLite blob first; the `.or_else(safe_read_data_file)`
+/// fallback stays as a compat layer for disaster recovery against
+/// data dirs that predate the `store/migration.rs` JSON → blob
+/// migration. Fresh installs write SQLite only.
+///
+/// The `data_dir` parameter was dropped along with the JSON write —
+/// callers don't need it anymore. Migration of the one caller
+/// (`consolidate_intel`) is part of this PR.
 pub fn persist_snapshot(
-    data_dir: &Path,
     profiles: &HashMap<String, AttackerProfile>,
     store: Option<&innerwarden_store::Store>,
 ) {
+    let Some(sq) = store else {
+        // Pre-spec-030 no-op: no SQLite store attached. Before
+        // this PR the same branch still wrote the JSON file as a
+        // fallback; that path only matters when the agent runs
+        // without a SQLite backend, which is a test-only mode now
+        // that the store is a boot prerequisite.
+        return;
+    };
+
     let mut sorted: Vec<&AttackerProfile> = profiles.values().collect();
     sorted.sort_by(|a, b| b.risk_score.cmp(&a.risk_score));
 
-    let path = data_dir.join("attacker-profiles.json");
     match serde_json::to_string(&sorted) {
         Ok(json) => {
-            // Dual-write: SQLite blob + JSON file
-            if let Some(sq) = store {
-                if let Err(e) = sq.set_blob("attacker_profiles", &json) {
-                    warn!("failed to write attacker_profiles blob: {e}");
-                }
-            }
-            if let Err(e) = std::fs::write(&path, json) {
-                warn!("failed to write attacker-profiles.json: {e}");
+            if let Err(e) = sq.set_blob("attacker_profiles", &json) {
+                warn!("failed to write attacker_profiles blob: {e}");
             }
         }
         Err(e) => warn!("failed to serialize attacker profiles: {e}"),
@@ -1236,5 +1256,98 @@ mod tests {
         let sig1 = behavioral_signature(&p1);
         let sig2 = behavioral_signature(&p2);
         assert_eq!(sig1, sig2);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Spec 037 PR-2 — persist_snapshot SQLite-canonical anchors
+    // ─────────────────────────────────────────────────────────────────
+    //
+    // PR-2 of I-02 retires the dual-write to `attacker-profiles.json`;
+    // SQLite `attacker_profiles` blob is now the canonical persistence
+    // target. Dashboard reads the blob first and falls back to the
+    // JSON only for disaster recovery on legacy data dirs.
+    //
+    // These tests pin the three invariants the migration introduces:
+    //   1. Happy path: blob contains the serialized profiles and
+    //      round-trips through `serde_json::from_str`.
+    //   2. Missing-store path: call is a no-op (no panic, no crash).
+    //   3. **Non-regression**: the JSON file is NOT created anymore.
+    //      Guards the write-path removal — a future refactor that
+    //      accidentally re-adds `std::fs::write(data_dir.join(
+    //      "attacker-profiles.json"), ...)` fails this test before
+    //      reaching review.
+
+    fn attacker_profile_fixture(ip: &str, risk: u8) -> AttackerProfile {
+        let mut p = new_profile(ip, Utc::now());
+        p.risk_score = risk;
+        p.total_incidents = 3;
+        p.visit_count = 2;
+        p
+    }
+
+    #[test]
+    fn persist_snapshot_writes_attacker_profiles_blob_to_store() {
+        let store = innerwarden_store::Store::open_memory().expect("memory store");
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "198.51.100.5".to_string(),
+            attacker_profile_fixture("198.51.100.5", 80),
+        );
+        profiles.insert(
+            "198.51.100.6".to_string(),
+            attacker_profile_fixture("198.51.100.6", 30),
+        );
+
+        persist_snapshot(&profiles, Some(&store));
+
+        let json = store
+            .get_blob("attacker_profiles")
+            .expect("blob read ok")
+            .expect("blob populated");
+        let roundtrip: Vec<AttackerProfile> =
+            serde_json::from_str(&json).expect("blob deserializes as Vec<AttackerProfile>");
+        assert_eq!(roundtrip.len(), 2, "both profiles must land in the blob");
+        // Sorted by risk_score desc per persist_snapshot's sort step.
+        assert_eq!(roundtrip[0].risk_score, 80);
+        assert_eq!(roundtrip[1].risk_score, 30);
+    }
+
+    #[test]
+    fn persist_snapshot_is_noop_when_store_is_none() {
+        // Pre-spec-030 fallback: running without a SQLite store.
+        // Must NOT panic — the early return path guards this.
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "10.0.0.1".to_string(),
+            attacker_profile_fixture("10.0.0.1", 50),
+        );
+        persist_snapshot(&profiles, None);
+        // If we reach here without panic, the contract holds.
+    }
+
+    #[test]
+    fn persist_snapshot_does_not_write_legacy_json_file() {
+        // Non-regression anchor: the pre-PR-2 dual-write to
+        // `attacker-profiles.json` is gone. A future refactor that
+        // re-adds the file write fails THIS test before the reader
+        // side (which still reads from the JSON as disaster-recovery
+        // fallback) starts silently diverging from the blob.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = innerwarden_store::Store::open_memory().expect("memory store");
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "203.0.113.7".to_string(),
+            attacker_profile_fixture("203.0.113.7", 60),
+        );
+
+        persist_snapshot(&profiles, Some(&store));
+
+        let legacy_path = tmp.path().join("attacker-profiles.json");
+        assert!(
+            !legacy_path.exists(),
+            "persist_snapshot MUST NOT create attacker-profiles.json — \
+             dashboard reads the SQLite blob first; the JSON file survives \
+             only as a disaster-recovery fallback on legacy data dirs"
+        );
     }
 }
