@@ -67,7 +67,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 serde_yaml = "0.9"
 russh = "0.60"
 regex = "1"
-p256 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8"] }
+p256 = { version = "0.14", features = ["ecdh", "ecdsa", "pkcs8"] }
 aes-gcm = "0.10"
 hkdf = "0.12"
 bytes = "1"
