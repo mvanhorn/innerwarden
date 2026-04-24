@@ -986,3 +986,169 @@ mod tests {
         assert!(loaded.find_by_ip("10.0.0.1").is_some());
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Spec 035 PR-A2 phase 2 — save_to_store heap-budget anchor
+// ─────────────────────────────────────────────────────────────────────
+//
+// Standing gate for the per-call allocation cost of KG snapshot
+// persistence. Historically the hottest allocator path in the slow_loop
+// (see `.claude-local/SESSION_LOG.md` 2026-04-22/23 entries about
+// `save_to_store` transients and gzip compression). A regression here
+// tends to show up as steadily-climbing agent RSS in production; this
+// anchor catches it at CI time.
+//
+// **What is measured**: `dhat::HeapStats::total_bytes` delta across a
+// single `save_to_store` call on a fixture graph (1000 IP nodes + 1000
+// Process nodes + 2000 ConnectedTo edges). This is *cumulative bytes
+// allocated during the window*, not live RSS. It is allocator-agnostic
+// and independent of runner hardware — the same code produces the same
+// delta on any machine.
+//
+// **What the budget means**: a *trend* gate. The constant is baselined
+// from the first green run + 10% headroom. DHAT numbers are not directly
+// comparable to production jemalloc RSS; they measure allocation churn.
+// A deliberate raise requires updating `BUDGET_TOTAL_BYTES` here AND the
+// matching line in `.claude-local/IMPACT.md` "Memory layout" with the
+// reason, in the same PR — enforced by operator review, not the test.
+//
+// **Why `total_bytes` not `max_bytes`**: `max_bytes` is peak live heap
+// at any single instant (sensitive to allocator interleaving with other
+// work running in the same test process). `total_bytes` is cumulative
+// new allocations in the window, which is the actual signal we care
+// about: "how many bytes did this call touch the allocator for?" It is
+// also monotonically reproducible across runs.
+//
+// **Fixture size**: 1000+1000 nodes / 2000 edges is ~7% of the prod
+// baseline (14k/145k). Proportional fixtures let the budget stay small
+// (single-test run finishes in <1 s under DHAT instrumentation, which
+// is ~10x slower than jemalloc) while still exercising the serialize →
+// gzip → sqlite-bind pipeline that carries the real regression risk.
+//
+// **Thread-safety / mandatory `--test-threads=1`**: DHAT's
+// `HeapStats::get()` reads a *process-global* allocation counter, not a
+// per-thread one. When other tests in the same binary run concurrently
+// under the DHAT allocator, their allocations leak into this test's
+// delta and the measurement becomes meaningless (empirically: standalone
+// 2.47 MiB → concurrent 5.56 MiB on the same fixture). Any invocation
+// that enables `--features dhat-heap` MUST also pass `--test-threads=1`
+// to force serial execution. The phase-5 CI job (still pending) will
+// encode this; the verification protocol today is:
+//
+//   cargo test -p innerwarden-agent --features dhat-heap \
+//       -- --test-threads=1
+//
+// Running without `--test-threads=1` may spuriously fail this test and
+// is a build-system bug, not a regression in `save_to_store`.
+
+#[cfg(all(test, feature = "dhat-heap"))]
+mod heap_budget {
+    use super::*;
+    use chrono::Utc;
+
+    /// Baselined on 2026-04-24 against the fixture below.
+    ///
+    /// First-run measurement: **2_589_677 bytes (2.47 MiB)** cumulative
+    /// new allocations per `save_to_store` call (measured after the
+    /// warm-up call; fresh fixture graph of 2000 nodes + 2000 edges;
+    /// `cargo test --features dhat-heap` on Apple Silicon, dev profile).
+    ///
+    /// Budget = ceil(measurement × 1.10 / 100 KiB) × 100 KiB
+    ///        = ceil(2_848_645 / 102_400) × 102_400
+    ///        = 28 × 102_400
+    ///        = 2_867_200 bytes (2.73 MiB, ~10.7 % headroom over baseline).
+    ///
+    /// A deliberate raise MUST update this constant AND the matching
+    /// line in `.claude-local/IMPACT.md` "Memory layout" in the same
+    /// PR, with the reason (e.g. "added N-byte field to Node, fixture
+    /// size × N = +M bytes, justified because …"). This is a trend
+    /// gate, not a prod-RSS target — DHAT's `total_bytes` metric is
+    /// cumulative allocation churn, not live heap. See the module-level
+    /// comment above for the full rationale.
+    const BUDGET_TOTAL_BYTES: u64 = 2_867_200;
+
+    fn build_fixture_graph() -> KnowledgeGraph {
+        let ts = Utc::now();
+        let mut g = KnowledgeGraph::new();
+
+        // 1000 IP nodes — a realistic prod mix includes attackers + local
+        // peers + cloud egress targets. Addresses span the RFC 5737
+        // documentation range 203.0.x.y so they can never collide with
+        // any real routable block.
+        let mut ip_ids = Vec::with_capacity(1000);
+        for i in 0..1000u32 {
+            let addr = format!("203.0.{}.{}", i / 256, i % 256);
+            ip_ids.push(g.ensure_ip(&addr, ts));
+        }
+
+        // 1000 Process nodes — varying comm strings to stress
+        // string-allocation paths in the serializer.
+        let mut proc_ids = Vec::with_capacity(1000);
+        for i in 0..1000u32 {
+            let comm = match i % 7 {
+                0 => "nginx",
+                1 => "sshd",
+                2 => "redis-server",
+                3 => "postgres",
+                4 => "python3.11",
+                5 => "innerwarden-agent",
+                _ => "bash",
+            };
+            proc_ids.push(g.ensure_process(i + 1000, 1, comm, 0, ts));
+        }
+
+        // 2000 ConnectedTo edges — every process talks to 2 IPs, wrapping.
+        for (i, &pid) in proc_ids.iter().enumerate() {
+            let ip_a = ip_ids[i % ip_ids.len()];
+            let ip_b = ip_ids[(i + 7) % ip_ids.len()];
+            g.add_edge(Edge::new(pid, ip_a, Relation::ConnectedTo, ts));
+            g.add_edge(Edge::new(pid, ip_b, Relation::ConnectedTo, ts));
+        }
+
+        g
+    }
+
+    #[test]
+    fn save_to_store_allocates_under_budget() {
+        // DHAT profiler — only one can be active per process. Test is
+        // the sole consumer in this binary (we gate on --features
+        // dhat-heap which also disables jemalloc, so other tests run
+        // against dhat::Alloc but don't instantiate their own Profiler).
+        let _profiler = dhat::Profiler::builder().testing().build();
+
+        let graph = build_fixture_graph();
+        let store = innerwarden_store::Store::open_memory().expect("memory store");
+
+        // Warm-up call: first save allocates sqlite statement cache,
+        // JSON serializer scratch, gzip dictionaries, etc. — those are
+        // amortised across the lifetime of the process and not the
+        // regression signal we want to anchor.
+        graph.save_to_store(&store).expect("warm-up save_to_store");
+
+        let before = dhat::HeapStats::get();
+        graph.save_to_store(&store).expect("measured save_to_store");
+        let after = dhat::HeapStats::get();
+
+        let delta_total = after.total_bytes - before.total_bytes;
+        let delta_max = after.max_bytes.saturating_sub(before.max_bytes);
+        eprintln!(
+            "save_to_store heap budget — total_bytes delta: {delta_total} bytes ({:.2} MiB), \
+             max_bytes delta: {delta_max} bytes ({:.2} MiB), nodes: {}, edges: {}",
+            delta_total as f64 / (1024.0 * 1024.0),
+            delta_max as f64 / (1024.0 * 1024.0),
+            graph.node_count(),
+            graph.edge_count(),
+        );
+
+        assert!(
+            delta_total <= BUDGET_TOTAL_BYTES,
+            "save_to_store allocated {delta_total} bytes per call ({:.2} MiB), \
+             budget is {BUDGET_TOTAL_BYTES} bytes ({:.2} MiB). \
+             If this is a deliberate raise, update BUDGET_TOTAL_BYTES here AND \
+             the matching line in .claude-local/IMPACT.md \"Memory layout\" in \
+             the same PR, with the reason.",
+            delta_total as f64 / (1024.0 * 1024.0),
+            BUDGET_TOTAL_BYTES as f64 / (1024.0 * 1024.0),
+        );
+    }
+}
