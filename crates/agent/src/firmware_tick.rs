@@ -260,9 +260,12 @@ pub(crate) async fn process_firmware_tick(
                         report.trust_score * 100.0,
                     );
                     let tg = tg.clone();
-                    try_spawn_firmware_alert(&state.task_group, async move {
-                        let _ = tg.send_alert_html(&msg).await;
-                    });
+                    try_spawn_firmware_alert(
+                        &state.task_group,
+                        Box::pin(async move {
+                            let _ = tg.send_alert_html(&msg).await;
+                        }),
+                    );
                 }
                 crate::notification_gate::NotificationVerdict::DailyBriefingOnly => {
                     *state
@@ -327,13 +330,17 @@ fn classify_correlated_threat_severity(confidence: f64) -> innerwarden_core::eve
 /// so the operator sees the dropped alert. No silent drop — the
 /// primitive's explicit error is what lets us log here.
 ///
-/// Extracted from the inline spawn in `process_firmware_tick` so the
-/// Ok/Err branches are directly unit-testable without fixturing a
-/// full firmware audit run.
-fn try_spawn_firmware_alert<F>(task_group: &crate::task_group::TaskGroup, alert: F)
-where
-    F: std::future::Future<Output = ()> + Send + 'static,
-{
+/// Accepts a type-erased boxed future on purpose: generic
+/// `impl Future` caused per-call-site monomorphization that split
+/// line-coverage reporting (the production monomorphization inside
+/// `process_firmware_tick` was treated as distinct from the tests'
+/// monomorphization and flagged as uncovered). The `Pin<Box<dyn …>>`
+/// boundary collapses every caller into a single monomorphization
+/// so the helper body is covered exactly once — see PR #274 for the
+/// codecov-driven diagnosis.
+type BoxedAlertFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+fn try_spawn_firmware_alert(task_group: &crate::task_group::TaskGroup, alert: BoxedAlertFuture) {
     if let Err(e) = task_group.spawn("firmware-alert", alert) {
         tracing::warn!(
             error = %e,
@@ -434,13 +441,16 @@ mod tests {
         let sent = Arc::new(AtomicBool::new(false));
         let sent_c = sent.clone();
 
-        // Stand-in for `tg.send_alert_html(&msg).await`. The helper is
-        // generic over the alert future so tests can pass a stub that
-        // observably completes.
-        try_spawn_firmware_alert(&tg, async move {
-            tokio::time::sleep(Duration::from_millis(15)).await;
-            sent_c.store(true, Ordering::SeqCst);
-        });
+        // Stand-in for `tg.send_alert_html(&msg).await`. The helper
+        // takes a type-erased boxed future so callers (test + prod)
+        // share one monomorphization — see the helper's doc comment.
+        try_spawn_firmware_alert(
+            &tg,
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(15)).await;
+                sent_c.store(true, Ordering::SeqCst);
+            }),
+        );
 
         assert_eq!(tg.len(), 1, "alert must be tracked in the group");
 
@@ -476,9 +486,12 @@ mod tests {
         // The helper returns `()` for both branches — the Err side
         // logs `tracing::warn!` and returns, NEVER panics, NEVER
         // silently spawns. This call exercises exactly that line.
-        try_spawn_firmware_alert(&tg, async move {
-            ran_c.store(true, Ordering::SeqCst);
-        });
+        try_spawn_firmware_alert(
+            &tg,
+            Box::pin(async move {
+                ran_c.store(true, Ordering::SeqCst);
+            }),
+        );
 
         // Group must not have a tracked task — the spawn returned Err
         // and the future was dropped.
