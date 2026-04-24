@@ -247,21 +247,53 @@ pub(super) async fn api_compliance(State(state): State<DashboardState>) -> Json<
     let cfg = &state.action_cfg;
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
-    // Hash chain verification: read the last few entries of today's decisions file
-    // and verify each entry's prev_hash matches the SHA-256 of the preceding entry.
+    // Read today's JSONL, verify its chain, and — when a sqlite store is
+    // attached — verify the SQLite chain and cross-check each JSONL line
+    // against the `decisions.data` column. The cross-check is pure
+    // visibility: operators see drift between the two persistence layers
+    // without the endpoint failing hard. Reconciliation is a separate PR.
     let decisions_path = state.data_dir.join(format!("decisions-{today}.jsonl"));
-    let (chain_intact, chain_length, last_hash) = tokio::task::spawn_blocking({
+    let store_handle = state.sqlite_store.clone();
+    let chain_report = tokio::task::spawn_blocking({
         let path = decisions_path;
-        move || -> (bool, usize, String) {
-            let content = match std::fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(_) => return (true, 0, "none".to_string()),
+        move || -> serde_json::Value {
+            let jsonl_content = std::fs::read_to_string(&path).unwrap_or_default();
+            let (intact, length, last_hash) = verify_hash_chain(&jsonl_content);
+            let jsonl = serde_json::json!({
+                "intact": intact,
+                "length": length,
+                "last_hash": last_hash,
+            });
+            let (sqlite, cross_check) = match store_handle {
+                Some(store) => (
+                    sqlite_chain_status(&store),
+                    cross_check_jsonl_vs_sqlite(&jsonl_content, &store),
+                ),
+                None => (
+                    serde_json::json!({ "available": false }),
+                    serde_json::json!({ "available": false }),
+                ),
             };
-            verify_hash_chain(&content)
+            serde_json::json!({
+                "jsonl": jsonl,
+                "sqlite": sqlite,
+                "cross_check": cross_check,
+            })
         }
     })
     .await
-    .unwrap_or((true, 0, "none".to_string()));
+    .unwrap_or_else(|_| serde_json::json!({}));
+
+    // Back-compat: flatten the JSONL fields at the top of `hash_chain` so
+    // existing dashboard JS that reads `intact`, `length`, and `last_hash`
+    // from the old shape keeps working. New fields (`sqlite`, `cross_check`)
+    // sit alongside.
+    let chain_intact = chain_report["jsonl"]["intact"].as_bool().unwrap_or(true);
+    let chain_length = chain_report["jsonl"]["length"].as_u64().unwrap_or(0) as usize;
+    let last_hash = chain_report["jsonl"]["last_hash"]
+        .as_str()
+        .unwrap_or("none")
+        .to_string();
 
     // Data retention config
     let retention = serde_json::json!({
@@ -289,6 +321,9 @@ pub(super) async fn api_compliance(State(state): State<DashboardState>) -> Json<
             "intact": chain_intact,
             "length": chain_length,
             "last_hash": last_hash,
+            "jsonl": chain_report["jsonl"],
+            "sqlite": chain_report["sqlite"],
+            "cross_check": chain_report["cross_check"],
         },
         "retention": retention,
         "iso_27001": {
@@ -323,6 +358,87 @@ pub(super) fn map_iso27001_controls(
         { "id": "A.18.1", "name": "Compliance", "met": cfg.retention_decisions_days >= 90, "reason": format!("Audit trail retained {}d (requirement: 90d)", cfg.retention_decisions_days) },
         { "id": "A.18.2", "name": "Information security reviews", "met": true, "reason": "Daily automated security reports with telemetry" },
     ])
+}
+
+/// Report SQLite-side chain status via `Store::verify_hash_chain`. Distinct
+/// from the JSONL chain — the two use different hash formulas by design
+/// (JSONL: SHA-256(line); SQLite: SHA-256(prev_hash || data)) so the
+/// byte-value of `last_hash` cannot be compared across the two sides.
+/// Each side is self-consistent; content correspondence lives in the
+/// cross-check helper.
+pub(super) fn sqlite_chain_status(store: &innerwarden_store::Store) -> serde_json::Value {
+    match store.verify_hash_chain() {
+        Ok(r) => {
+            let last_hash = store
+                .last_decision_hash()
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "none".to_string());
+            serde_json::json!({
+                "available": true,
+                "intact": r.intact,
+                "length": r.verified,
+                "broken_at": r.broken_at,
+                "last_hash": last_hash,
+            })
+        }
+        Err(e) => serde_json::json!({
+            "available": true,
+            "intact": false,
+            "length": 0,
+            "broken_at": null,
+            "last_hash": "none",
+            "error": e.to_string(),
+        }),
+    }
+}
+
+/// Cross-check: every line in today's JSONL must appear as a `data` row in
+/// SQLite. Reported as `(checked, matched, divergent, status)`. We use
+/// set-membership rather than positional order so pre-dual-write
+/// historical rows (only in JSONL, missing in SQLite) surface as `divergent`
+/// without needing a date filter on the SQLite side. A SQLite row with no
+/// JSONL counterpart is expected (prior-day history) and is not counted.
+pub(super) fn cross_check_jsonl_vs_sqlite(
+    jsonl_content: &str,
+    store: &innerwarden_store::Store,
+) -> serde_json::Value {
+    let jsonl_lines: Vec<&str> = jsonl_content.lines().filter(|l| !l.is_empty()).collect();
+    let sqlite_rows = match store.decisions_since(0, i64::MAX as usize) {
+        Ok(rows) => rows,
+        Err(e) => {
+            return serde_json::json!({
+                "available": true,
+                "checked": jsonl_lines.len(),
+                "matched": 0,
+                "divergent": jsonl_lines.len(),
+                "status": "error",
+                "error": e.to_string(),
+            });
+        }
+    };
+    let sqlite_set: std::collections::HashSet<String> =
+        sqlite_rows.into_iter().map(|(_, data)| data).collect();
+    let matched = jsonl_lines
+        .iter()
+        .filter(|line| sqlite_set.contains(**line))
+        .count();
+    let checked = jsonl_lines.len();
+    let divergent = checked.saturating_sub(matched);
+    let status = if checked == 0 {
+        "empty"
+    } else if divergent == 0 {
+        "ok"
+    } else {
+        "drift"
+    };
+    serde_json::json!({
+        "available": true,
+        "checked": checked,
+        "matched": matched,
+        "divergent": divergent,
+        "status": status,
+    })
 }
 
 pub(crate) fn verify_hash_chain(content: &str) -> (bool, usize, String) {
@@ -466,6 +582,110 @@ mod tests {
         assert!(intact);
         assert_eq!(len, 0);
         assert_eq!(last, "none");
+    }
+
+    // ── SQLite ↔ JSONL cross-check anchors ───────────────────────────
+    //
+    // Three invariants the compliance endpoint now surfaces:
+    //   1. SQLite chain self-consistency (`sqlite_chain_status` intact).
+    //   2. JSONL line ↔ SQLite `data` column content correspondence
+    //      (`cross_check_jsonl_vs_sqlite` matched == checked).
+    //   3. Divergence does not panic — it reports `status = "drift"` so
+    //      operators see it without the endpoint failing hard.
+
+    fn seed_dual_write(
+        dir: &std::path::Path,
+    ) -> (std::sync::Arc<innerwarden_store::Store>, Vec<String>) {
+        use std::sync::Arc;
+        let store = Arc::new(innerwarden_store::Store::open(dir).expect("store"));
+        let mut writer =
+            crate::decisions::DecisionWriter::with_store(dir, Some(store.clone())).expect("writer");
+        for i in 0..3 {
+            writer
+                .write(&crate::decisions::DecisionEntry {
+                    ts: chrono::Utc::now(),
+                    incident_id: format!("inc-cross-{i}"),
+                    host: "h".into(),
+                    ai_provider: "test".into(),
+                    action_type: "block_ip".into(),
+                    target_ip: Some("203.0.113.7".into()),
+                    target_user: None,
+                    skill_id: Some("block-ip-ufw".into()),
+                    confidence: 0.9,
+                    auto_executed: true,
+                    dry_run: false,
+                    reason: "synthetic".into(),
+                    estimated_threat: "high".into(),
+                    execution_result: "ok".into(),
+                    prev_hash: None,
+                })
+                .expect("write");
+        }
+        let today = chrono::Local::now().date_naive().format("%Y-%m-%d");
+        let jsonl =
+            std::fs::read_to_string(dir.join(format!("decisions-{today}.jsonl"))).expect("jsonl");
+        let lines = jsonl
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect();
+        (store, lines)
+    }
+
+    #[test]
+    fn sqlite_chain_status_reports_intact_length_and_last_hash() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (store, lines) = seed_dual_write(dir.path());
+
+        let status = sqlite_chain_status(&store);
+        assert_eq!(status["available"], serde_json::Value::Bool(true));
+        assert_eq!(status["intact"], serde_json::Value::Bool(true));
+        assert_eq!(status["length"].as_u64(), Some(lines.len() as u64));
+        assert_ne!(status["last_hash"].as_str(), Some("none"));
+    }
+
+    #[test]
+    fn cross_check_reports_ok_when_every_jsonl_line_exists_in_sqlite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (store, lines) = seed_dual_write(dir.path());
+        let jsonl_content = lines.join("\n");
+
+        let result = cross_check_jsonl_vs_sqlite(&jsonl_content, &store);
+        assert_eq!(result["status"], serde_json::Value::String("ok".into()));
+        assert_eq!(result["checked"].as_u64(), Some(lines.len() as u64));
+        assert_eq!(result["matched"].as_u64(), Some(lines.len() as u64));
+        assert_eq!(result["divergent"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn cross_check_reports_drift_when_jsonl_has_an_unmirrored_line() {
+        // Simulates the exact gap PR-1 closed: a line written only to the
+        // JSONL audit trail, never mirrored to SQLite (the pre-PR
+        // `append_chained` path). After this PR, operators see it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (store, mut lines) = seed_dual_write(dir.path());
+        lines.push(r#"{"ts":"2026-04-24T00:00:00Z","incident_id":"inc-jsonl-only","host":"h","ai_provider":"test","action_type":"block_ip","target_ip":"198.51.100.1","skill_id":"block-ip-ufw","confidence":0.9,"auto_executed":true,"dry_run":false,"reason":"pre-mirror","estimated_threat":"high","execution_result":"ok","prev_hash":null}"#.to_string());
+        let jsonl_content = lines.join("\n");
+
+        let result = cross_check_jsonl_vs_sqlite(&jsonl_content, &store);
+        assert_eq!(
+            result["status"],
+            serde_json::Value::String("drift".into()),
+            "JSONL line with no SQLite counterpart must surface as drift"
+        );
+        assert_eq!(result["divergent"].as_u64(), Some(1));
+        assert_eq!(result["matched"].as_u64(), Some((lines.len() - 1) as u64));
+    }
+
+    #[test]
+    fn cross_check_reports_empty_when_no_jsonl_today() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (store, _lines) = seed_dual_write(dir.path());
+
+        let result = cross_check_jsonl_vs_sqlite("", &store);
+        assert_eq!(result["status"], serde_json::Value::String("empty".into()));
+        assert_eq!(result["checked"].as_u64(), Some(0));
+        assert_eq!(result["divergent"].as_u64(), Some(0));
     }
 
     // ── api_honeypot_sessions (Finding 4 anchor) ─────────────────────
