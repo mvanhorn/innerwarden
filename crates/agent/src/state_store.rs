@@ -266,6 +266,26 @@ impl StateStore {
         }
     }
 
+    /// Warm-cache loader for `AgentState::xdp_block_times`.
+    ///
+    /// Spec 037 PR-1 (I-02 slice 1): SQLite `xdp_block_times` namespace
+    /// becomes the canonical persisted store. The in-memory HashMap
+    /// reverts to a runtime view rebuilt at boot from this method. A
+    /// failed read (corrupted row, KV backend unavailable) is already
+    /// swallowed by `all_xdp_block_times` with a `warn!` — this method
+    /// inherits that behaviour and returns an empty map in the
+    /// degraded case. Same semantic as pre-I-02 boot: no TTL
+    /// accounting, cleanup loop is a no-op, kernel rules continue
+    /// blocking until reinserted.
+    pub fn load_xdp_block_times(
+        &self,
+    ) -> std::collections::HashMap<String, (chrono::DateTime<chrono::Utc>, i64)> {
+        self.all_xdp_block_times()
+            .into_iter()
+            .map(|(ip, ts, ttl)| (ip, (ts, ttl)))
+            .collect()
+    }
+
     // ── Trust Rules ─────────────────────────────────────────────────
 
     pub fn has_trust_rule(&self, key: &str) -> bool {
@@ -437,6 +457,111 @@ mod tests {
         let (dt, ttl) = store.get_xdp_block_time("5.6.7.8").unwrap();
         assert_eq!(ttl, 3600);
         assert!((dt - now).num_seconds().abs() < 1);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Spec 037 PR-1 — `load_xdp_block_times` warm-cache anchors
+    // ─────────────────────────────────────────────────────────────────
+    //
+    // PR-1 of I-02 promotes SQLite `xdp_block_times` to the canonical
+    // persisted store and rebuilds `AgentState::xdp_block_times` as a
+    // warm-cache at boot via `load_xdp_block_times`. These tests pin
+    // the behaviours the boot path depends on:
+    //
+    //   1. Empty store → empty map (safe fallback; pre-PR behaviour).
+    //   2. Round-trip: persisted entries load back with matching TTL +
+    //      timestamp (modulo sub-second drift from ms precision).
+    //   3. Remove mirror: after a remove, the load result no longer
+    //      contains that IP. Guards the "resurrect-expired-block"
+    //      regression the operator flagged explicitly.
+    //   4. Corrupt row: a malformed payload is skipped, valid siblings
+    //      still load. The store never panics on boot.
+
+    #[test]
+    fn load_xdp_block_times_is_empty_on_fresh_store() {
+        let (_dir, store) = make_store();
+        let loaded = store.load_xdp_block_times();
+        assert!(
+            loaded.is_empty(),
+            "fresh store MUST return an empty warm-cache — pre-PR boot behaviour"
+        );
+    }
+
+    #[test]
+    fn load_xdp_block_times_returns_inserted_entries() {
+        let (_dir, store) = make_store();
+        let now = chrono::Utc::now();
+        store.set_xdp_block_time("10.0.0.1", now, 3600);
+        store.set_xdp_block_time("10.0.0.2", now, 900);
+        store.set_xdp_block_time("10.0.0.3", now, 60);
+
+        let loaded = store.load_xdp_block_times();
+        assert_eq!(
+            loaded.len(),
+            3,
+            "all persisted entries must appear in the warm-cache"
+        );
+
+        let (ts1, ttl1) = loaded.get("10.0.0.1").expect("10.0.0.1 must be in the map");
+        assert_eq!(*ttl1, 3600);
+        assert!(
+            (*ts1 - now).num_seconds().abs() < 1,
+            "round-tripped timestamp must be within sub-second drift (ms precision)"
+        );
+        assert_eq!(loaded.get("10.0.0.2").map(|(_, ttl)| *ttl), Some(900));
+        assert_eq!(loaded.get("10.0.0.3").map(|(_, ttl)| *ttl), Some(60));
+    }
+
+    #[test]
+    fn load_xdp_block_times_reflects_remove_mirror() {
+        // Anchors the "resurrect-expired-block" regression the
+        // operator flagged: if `boot.rs` cleanup removes an entry
+        // from `state.xdp_block_times` but NOT from SQLite, the
+        // warm-cache on the next restart puts it back.
+        let (_dir, store) = make_store();
+        let now = chrono::Utc::now();
+        store.set_xdp_block_time("192.0.2.10", now, 3600);
+        store.set_xdp_block_time("192.0.2.11", now, 3600);
+
+        // Simulate the `boot.rs` cleanup mirror: the live runtime
+        // path calls both the HashMap remove and `remove_xdp_block_time`.
+        store.remove_xdp_block_time("192.0.2.10");
+
+        let loaded = store.load_xdp_block_times();
+        assert_eq!(loaded.len(), 1);
+        assert!(
+            !loaded.contains_key("192.0.2.10"),
+            "a removed entry MUST NOT resurface in the warm-cache"
+        );
+        assert!(
+            loaded.contains_key("192.0.2.11"),
+            "sibling entries must remain available"
+        );
+    }
+
+    #[test]
+    fn load_xdp_block_times_skips_corrupt_rows() {
+        // Guards against a panic-on-boot regression: if a previous
+        // agent version wrote a row with a missing/typed field, the
+        // reader must skip it with no log-spam-at-boot (`all_xdp_block_times`
+        // already does this) and return the remaining valid entries.
+        let (_dir, store) = make_store();
+        let now = chrono::Utc::now();
+        store.set_xdp_block_time("198.51.100.5", now, 3600);
+
+        // Write a corrupt row via the raw KV API.
+        store
+            .store
+            .kv_set(NS_XDP_BLOCK_TIMES, "198.51.100.6", b"not-json")
+            .expect("raw kv_set");
+
+        let loaded = store.load_xdp_block_times();
+        assert_eq!(
+            loaded.len(),
+            1,
+            "corrupt row must be skipped, valid sibling must still load"
+        );
+        assert!(loaded.contains_key("198.51.100.5"));
     }
 
     #[test]

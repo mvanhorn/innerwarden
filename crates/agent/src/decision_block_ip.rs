@@ -106,9 +106,19 @@ pub(crate) async fn execute_block_ip_decision(
             Ok(()) => {
                 layers_applied.push("XDP");
                 any_success = true;
+                // Spec 037 PR-1: runtime first (immediate protection),
+                // persist second (SQLite canonical for warm-cache on
+                // restart). `set_xdp_block_time` already swallows
+                // errors with a `warn!` — a persistence failure
+                // degrades to pre-I-02 behaviour (TTL accounting lost
+                // on restart) but never derruba the block itself.
+                let blocked_at = chrono::Utc::now();
                 state
                     .xdp_block_times
-                    .insert(ip.to_string(), (chrono::Utc::now(), block_ttl_secs));
+                    .insert(ip.to_string(), (blocked_at, block_ttl_secs));
+                state
+                    .store
+                    .set_xdp_block_time(ip, blocked_at, block_ttl_secs);
                 true
             }
             Err(e) => {
@@ -126,9 +136,15 @@ pub(crate) async fn execute_block_ip_decision(
             if xdp_result.success {
                 layers_applied.push("XDP");
                 any_success = true;
+                // Spec 037 PR-1: same ordering as the shield path —
+                // runtime first, persist second with swallowed errors.
+                let blocked_at = chrono::Utc::now();
                 state
                     .xdp_block_times
-                    .insert(ip.to_string(), (chrono::Utc::now(), block_ttl_secs));
+                    .insert(ip.to_string(), (blocked_at, block_ttl_secs));
+                state
+                    .store
+                    .set_xdp_block_time(ip, blocked_at, block_ttl_secs);
             }
         }
     }

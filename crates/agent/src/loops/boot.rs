@@ -871,7 +871,15 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             None
         },
         recent_blocks: std::collections::VecDeque::new(),
-        xdp_block_times: HashMap::new(),
+        // Spec 037 PR-1 (I-02 slice 1): warm-cache from the SQLite
+        // `xdp_block_times` namespace so TTL accounting survives a
+        // restart. Pre-PR the map was reset on every boot; adaptive
+        // TTL expiration for previously-blocked IPs was lost and
+        // the cleanup loop would sit idle until fresh blocks landed.
+        // `load_xdp_block_times` degrades to an empty map on a store
+        // read error (logged `warn!`), matching pre-PR behaviour in
+        // the degraded case.
+        xdp_block_times: store.load_xdp_block_times(),
         response_lifecycle: response_lifecycle::ResponseLifecycle::load_snapshot(
             &cli.data_dir,
             sqlite_store.as_deref(),
@@ -1423,6 +1431,10 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                                 // poison entry; can't act on kernel anyway.
                                 warn!(ip, "XDP cleanup: unparseable IP in xdp_block_times, dropping local entry");
                                 state.xdp_block_times.remove(ip);
+                                // Spec 037 PR-1: mirror the remove in SQLite so
+                                // warm-cache on next boot does not resurrect the
+                                // poison entry.
+                                state.store.remove_xdp_block_time(ip);
                                 continue;
                             };
                             let b = addr.octets();
@@ -1436,6 +1448,10 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                             match output {
                                 Ok(out) if out.status.success() => {
                                     state.xdp_block_times.remove(ip);
+                                    // Spec 037 PR-1: mirror remove in SQLite so
+                                    // the warm-cache does not resurrect an
+                                    // already-expired block on next boot.
+                                    state.store.remove_xdp_block_time(ip);
                                     info!(ip, ttl_secs, "XDP adaptive TTL expired - removed from blocklist");
                                 }
                                 Ok(out) => {
@@ -1448,6 +1464,8 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                                         || lower.contains("does not exist");
                                     if already_absent {
                                         state.xdp_block_times.remove(ip);
+                                        // Spec 037 PR-1: same mirror reason.
+                                        state.store.remove_xdp_block_time(ip);
                                         info!(ip, ttl_secs, "XDP cleanup: entry already absent in kernel map, local state cleared");
                                     } else {
                                         warn!(
