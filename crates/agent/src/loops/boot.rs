@@ -2409,3 +2409,148 @@ url = "http://127.0.0.1:9/hooks"
         assert!(build_primary_provider(&cfg).is_some());
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Spec 035 PR-A2 phase 4 — run_agent boot heap-budget anchor
+// ─────────────────────────────────────────────────────────────────────
+//
+// Standing gate on the cumulative allocation cost of the agent boot
+// path. `run_agent` walks every first-run initialiser: config parse,
+// sqlite open, schema migrations, agent-cursor restore, attacker
+// profile / IP reputation / baseline warm-cache loads, AI router
+// build, decision writer open, telegram/slack/webhook clients,
+// honeypot bootstrap, dashboard option (here disabled), and the first
+// slow-loop tick. A regression in any of these surfaces here as boot
+// RSS growth in production — exactly the class the audit flagged as
+// RECURRING (see `.claude-local/RECURRING_BUGS.md` "Memory regressions
+// on follow-up PRs").
+//
+// **What is measured**: `dhat::HeapStats::total_bytes` delta across a
+// single `run_agent(cli).await` call with `cli.once = true`. Counts
+// cumulative new allocations during boot + first tick + graceful
+// shutdown. Same metric as phases 2 and 3.
+//
+// **No warm-up**: unlike the per-call anchors in phases 2 and 3, boot
+// is a once-per-process event. The measurement IS the first boot;
+// there is nothing to amortise.
+//
+// **Fixture**: `once_cli` is the minimal-config path already used by
+// `run_agent_once_boots_with_empty_data_dir`. No config file — all
+// defaults. This is the DETERMINISTIC floor; a feature-rich config
+// would load more subsystems and inflate the budget with
+// config-sensitive variance. The existing feature-rich test covers
+// the FAT boot path for correctness (not memory); the minimal path
+// is the right target for a trend gate.
+//
+// **Thread-safety / mandatory `--test-threads=1`**: identical
+// constraint to phases 2 and 3. DHAT's `HeapStats::get()` reads a
+// process-global counter; concurrent tests contaminate the delta.
+//
+// **Budget relationship to the spec's "500 MB" target**: the spec
+// 035 A2 draft named this test `boot_total_alloc_under_500MB`. That
+// number was an aspirational ceiling, not a measurement. The actual
+// minimal-boot allocation is orders of magnitude smaller (see
+// baseline below). Pinning the budget at 500 MB would fail to catch
+// the regressions the gate is meant to catch; the real-measurement +
+// 10 % formula from phases 2 and 3 applies here too.
+
+#[cfg(all(test, feature = "dhat-heap"))]
+mod heap_budget {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Baselined on 2026-04-24 against the minimal-config once-mode
+    /// boot path (`once_cli_for_heap_budget` below).
+    ///
+    /// First-run measurement: **1_686_513 bytes (1.61 MiB)** cumulative
+    /// new allocations during a single `run_agent(cli).await` where
+    /// `cli.once = true` — empty tempdir-backed data_dir, no config
+    /// file, all defaults. Peak live heap during the same window was
+    /// **1_621_294 bytes (1.55 MiB)**, i.e. very little of what gets
+    /// allocated is released before boot ends (AgentState and the
+    /// in-memory KG accumulate and remain until Drop).
+    ///
+    /// Budget = ceil(measurement × 1.10 / 100 KiB) × 100 KiB
+    ///        = ceil(1_855_164 / 102_400) × 102_400
+    ///        = 19 × 102_400
+    ///        = 1_945_600 bytes (1.86 MiB, ~15.4 % headroom over
+    ///          baseline — slightly above 10 % because the 100-KiB
+    ///          rounding lifts the nominal 10 % boundary).
+    ///
+    /// **Orders of magnitude below the spec's "500 MB" aspirational
+    /// target.** The spec 035 A2 draft named this test
+    /// `boot_total_alloc_under_500MB`, but that number came from a
+    /// top-of-envelope guess about prod RSS — not a real DHAT
+    /// measurement. Actual minimal boot allocates 1.6 MiB of new heap,
+    /// so pinning the budget at 500 MB would fail to catch a
+    /// 200× regression. Setting the budget at real-measurement × 1.10
+    /// means the gate actually catches the regressions it is meant to
+    /// catch.
+    ///
+    /// A deliberate raise requires updating this constant AND the
+    /// matching line in `.claude-local/IMPACT.md` "Memory layout"
+    /// (landing in phase 5) in the same PR, with the reason.
+    const BUDGET_TOTAL_BYTES: u64 = 1_945_600;
+
+    /// Minimal CLI fixture mirroring `once_cli` in the sibling `tests`
+    /// module. Kept local to this module so the DHAT test does not
+    /// reach across `#[cfg(test)]` visibility boundaries — the cost is
+    /// ~15 LOC of duplication that move in lockstep with the real
+    /// `crate::Cli` shape (if `Cli` gains a field, compilation fails
+    /// here and in `tests::once_cli` at the same time).
+    fn once_cli_for_heap_budget(data_dir: std::path::PathBuf) -> crate::Cli {
+        crate::Cli {
+            data_dir,
+            config: None,
+            once: true,
+            report: false,
+            report_dir: None,
+            dashboard: false,
+            dashboard_bind: "127.0.0.1:8787".to_string(),
+            tls_cert: None,
+            tls_key: None,
+            insecure_no_tls: false,
+            dashboard_generate_password_hash: false,
+            interval: 30,
+            honeypot_sandbox_runner: false,
+            honeypot_sandbox_spec: None,
+            honeypot_sandbox_result: None,
+            cleanup_015_graph_signal_quality: false,
+            backfill_015_research_only: false,
+            retrain_anomaly: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn run_agent_once_allocates_under_budget() {
+        let _profiler = dhat::Profiler::builder().testing().build();
+
+        let dir = TempDir::new().expect("tempdir");
+        let cli = once_cli_for_heap_budget(dir.path().to_path_buf());
+
+        let before = dhat::HeapStats::get();
+        run_agent(cli).await.expect("run_agent once-mode");
+        let after = dhat::HeapStats::get();
+
+        let delta_total = after.total_bytes - before.total_bytes;
+        let delta_max = after.max_bytes.saturating_sub(before.max_bytes);
+        eprintln!(
+            "run_agent once boot heap budget — total_bytes delta: \
+             {delta_total} bytes ({:.2} MiB), max_bytes delta: \
+             {delta_max} bytes ({:.2} MiB)",
+            delta_total as f64 / (1024.0 * 1024.0),
+            delta_max as f64 / (1024.0 * 1024.0),
+        );
+
+        assert!(
+            delta_total <= BUDGET_TOTAL_BYTES,
+            "run_agent once-mode allocated {delta_total} bytes during boot \
+             ({:.2} MiB), budget is {BUDGET_TOTAL_BYTES} bytes ({:.2} MiB). \
+             If this is a deliberate raise, update BUDGET_TOTAL_BYTES here \
+             AND the matching line in .claude-local/IMPACT.md \"Memory \
+             layout\" in the same PR, with the reason.",
+            delta_total as f64 / (1024.0 * 1024.0),
+            BUDGET_TOTAL_BYTES as f64 / (1024.0 * 1024.0),
+        );
+    }
+}
