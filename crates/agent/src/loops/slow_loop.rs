@@ -1212,3 +1212,263 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Spec 035 PR-A2 phase 3 — slow_loop tick heap-budget anchor
+// ─────────────────────────────────────────────────────────────────────
+//
+// Standing gate for the per-tick allocation cost of
+// `process_narrative_tick`. The slow loop runs this function every ~30 s
+// in production; each tick does a dozen unrelated jobs (narrative
+// generation, telemetry, DNA processing, kill-chain, firmware/hypervisor
+// ticks, correlation, baseline learning, src_ip backfill, ...). A
+// regression in any of them surfaces here as sustained RSS growth
+// between ticks.
+//
+// **What is measured**: `dhat::HeapStats::total_bytes` delta across a
+// single `process_narrative_tick` await. Counts cumulative new
+// allocations in the window (including tokio task polls, futures, and
+// every downstream ingest/write path). Same metric as phase 2.
+//
+// **Why `total_bytes` not `max_bytes`**: identical rationale to
+// phase 2's `save_to_store` anchor — `total_bytes` tracks churn, which
+// is what drives the operator-visible RSS trend. `max_bytes` is also
+// printed for diagnostics but not asserted.
+//
+// **Fixture**: a realistic "moderate-load" tick — 10 events inserted
+// into the SQLite store across a mix of kinds (ssh.login_success,
+// process.exec, network.outbound_connect, dns.query), plus the
+// deep_security_snapshot attachment and cooldown-reset pattern that the
+// existing `process_narrative_tick_reads_sqlite_events_and_updates_operator_ips`
+// test uses. Exercises the happy-path allocation surface.
+//
+// **Warm-up**: one tick runs before measurement. The first tick
+// initialises the telemetry writer, opens deferred SQLite statement
+// caches, and warms up tokio's internal allocators — those are
+// process-lifetime costs, not the per-tick regression signal.
+//
+// **Thread-safety / mandatory `--test-threads=1`**: identical constraint
+// to phase 2. DHAT's `HeapStats::get()` reads a process-global counter;
+// concurrent tests contaminate the delta. See the phase-2 module doc in
+// `knowledge_graph/persistence.rs` for the full rationale.
+//
+// **Baselining** follows the phase-2 convention:
+//   BUDGET = ceil(measurement × 1.10 / 100 KiB) × 100 KiB
+// Raises require updating this constant AND the matching line in
+// `.claude-local/IMPACT.md` "Memory layout" (landing in phase 5) in
+// the same PR, with the reason.
+
+#[cfg(all(test, feature = "dhat-heap"))]
+mod heap_budget {
+    use super::*;
+    use std::time::Duration as StdDuration;
+    use tempfile::TempDir;
+
+    /// Baselined on 2026-04-24 against the fixture below.
+    ///
+    /// First-run measurement: **485_617 bytes (0.46 MiB)** cumulative
+    /// new allocations per `process_narrative_tick` await, after a
+    /// warm-up tick (10 events pre-seeded, deep_security_snapshot
+    /// attached, cooldowns reset so every interval-gated branch fires).
+    ///
+    /// Budget = ceil(measurement × 1.10 / 100 KiB) × 100 KiB
+    ///        = ceil(534_179 / 102_400) × 102_400
+    ///        = 6 × 102_400
+    ///        = 614_400 bytes (0.586 MiB, ~26.5 % headroom over
+    ///          baseline — slightly above 10 % because the
+    ///          100 KiB-rounding lifts the nominal 10 % boundary).
+    ///
+    /// This is **much tighter than the spec's original 10 MiB
+    /// aspiration** — the spec target was a top-of-envelope guess
+    /// before DHAT was wired up. The real allocation cost of a tick
+    /// on this fixture is sub-megabyte, so pinning the budget at the
+    /// aspirational ceiling would fail to catch a 10× regression.
+    ///
+    /// A deliberate raise MUST update this constant AND the matching
+    /// line in `.claude-local/IMPACT.md` "Memory layout" (landing in
+    /// phase 5) in the same PR, with the reason.
+    const BUDGET_TOTAL_BYTES: u64 = 614_400;
+
+    fn seed_tick_fixture(state: &mut AgentState, store: &innerwarden_store::Store) {
+        // Ten events spanning the common dispatch branches that
+        // `process_narrative_tick` walks per tick. Kinds chosen so the
+        // downstream `KnowledgeGraph::ingest` hits process, network,
+        // DNS, and SSH login paths (the four heaviest-by-allocation
+        // branches in production).
+        let fixtures = [
+            (
+                "ssh.login_success",
+                serde_json::json!({
+                    "method": "publickey",
+                    "ip": "198.51.100.10",
+                    "user": "ubuntu",
+                    "pid": 12000,
+                    "comm": "sshd",
+                }),
+            ),
+            (
+                "ssh.login_success",
+                serde_json::json!({
+                    "method": "publickey",
+                    "ip": "198.51.100.11",
+                    "user": "ubuntu",
+                    "pid": 12001,
+                    "comm": "sshd",
+                }),
+            ),
+            (
+                "process.exec",
+                serde_json::json!({
+                    "pid": 13000,
+                    "ppid": 1,
+                    "comm": "nginx",
+                    "exe": "/usr/sbin/nginx",
+                    "uid": 33,
+                }),
+            ),
+            (
+                "process.exec",
+                serde_json::json!({
+                    "pid": 13001,
+                    "ppid": 1,
+                    "comm": "redis-server",
+                    "exe": "/usr/bin/redis-server",
+                    "uid": 999,
+                }),
+            ),
+            (
+                "network.outbound_connect",
+                serde_json::json!({
+                    "pid": 13000,
+                    "dest_ip": "203.0.113.42",
+                    "dest_port": 443,
+                    "comm": "nginx",
+                }),
+            ),
+            (
+                "network.outbound_connect",
+                serde_json::json!({
+                    "pid": 13001,
+                    "dest_ip": "203.0.113.43",
+                    "dest_port": 6379,
+                    "comm": "redis-server",
+                }),
+            ),
+            (
+                "dns.query",
+                serde_json::json!({
+                    "pid": 13000,
+                    "domain": "example.com",
+                    "query_type": "A",
+                }),
+            ),
+            (
+                "dns.query",
+                serde_json::json!({
+                    "pid": 13001,
+                    "domain": "redis.internal",
+                    "query_type": "A",
+                }),
+            ),
+            (
+                "file.write_access",
+                serde_json::json!({
+                    "pid": 13000,
+                    "path": "/var/log/nginx/access.log",
+                }),
+            ),
+            (
+                "process.exit",
+                serde_json::json!({
+                    "pid": 13000,
+                }),
+            ),
+        ];
+        for (kind, details) in fixtures {
+            let event =
+                crate::tests::test_event(kind, innerwarden_core::event::Severity::Info, details);
+            crate::tests::insert_test_event(store, &event);
+        }
+        let _ = state; // fixture currently seeds only the store; state is kept
+                       // in the signature so a future richer fixture (attacker
+                       // profiles, baseline) can land here without a call-site
+                       // change.
+    }
+
+    fn wire_cooldowns_so_every_branch_fires(state: &mut AgentState) {
+        // Push every interval-gated timer backward so the corresponding
+        // branch in `process_narrative_tick` fires this tick. Mirrors
+        // the pattern in
+        // `process_narrative_tick_reads_sqlite_events_and_updates_operator_ips`.
+        let now = std::time::Instant::now();
+        state.last_graph_snapshot = now - StdDuration::from_secs(90);
+        state.last_dna_save = now - StdDuration::from_secs(360);
+        state.last_killchain_cleanup = now - StdDuration::from_secs(90);
+        state.deep_security_snapshot = Some(std::sync::Arc::new(std::sync::RwLock::new(
+            crate::dashboard::DeepSecuritySnapshot::default(),
+        )));
+    }
+
+    #[tokio::test]
+    async fn process_narrative_tick_allocates_under_budget() {
+        let _profiler = dhat::Profiler::builder().testing().build();
+
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let store = crate::tests::test_sqlite_store(dir.path());
+        seed_tick_fixture(&mut state, &store);
+        state.sqlite_store = Some(store);
+        wire_cooldowns_so_every_branch_fires(&mut state);
+
+        let cfg = config::AgentConfig::default();
+        let mut cursor = reader::AgentCursor::default();
+
+        // Warm-up tick. Initialises telemetry writer, SQLite statement
+        // caches, tokio internal allocators. Cooldowns get updated to
+        // "just now" so the second (measured) tick is a *tick-without-
+        // work-overlap* — which is the realistic per-tick cost in prod
+        // where most ticks see only a handful of new events.
+        process_narrative_tick(dir.path(), &mut cursor, &cfg, &mut state)
+            .await
+            .expect("warm-up tick");
+
+        // Reset the cooldowns so the measured tick fires the same
+        // branches the warm-up did. Without this, the measured tick is
+        // artificially quiet.
+        wire_cooldowns_so_every_branch_fires(&mut state);
+
+        // Seed more events for the measured tick so the delta reflects
+        // "moderate-load" allocation, not a no-op. Uses a fresh
+        // crate::tests::test_event / insert_test_event roundtrip
+        // (same fixture helpers, new events beyond the warm-up window).
+        let refill_store = state.sqlite_store.as_ref().expect("store").clone();
+        seed_tick_fixture(&mut state, &refill_store);
+
+        let before = dhat::HeapStats::get();
+        process_narrative_tick(dir.path(), &mut cursor, &cfg, &mut state)
+            .await
+            .expect("measured tick");
+        let after = dhat::HeapStats::get();
+
+        let delta_total = after.total_bytes - before.total_bytes;
+        let delta_max = after.max_bytes.saturating_sub(before.max_bytes);
+        eprintln!(
+            "process_narrative_tick heap budget — total_bytes delta: \
+             {delta_total} bytes ({:.2} MiB), max_bytes delta: {delta_max} \
+             bytes ({:.2} MiB)",
+            delta_total as f64 / (1024.0 * 1024.0),
+            delta_max as f64 / (1024.0 * 1024.0),
+        );
+
+        assert!(
+            delta_total <= BUDGET_TOTAL_BYTES,
+            "process_narrative_tick allocated {delta_total} bytes per tick \
+             ({:.2} MiB), budget is {BUDGET_TOTAL_BYTES} bytes ({:.2} MiB). \
+             If this is a deliberate raise, update BUDGET_TOTAL_BYTES here \
+             AND the matching line in .claude-local/IMPACT.md \"Memory \
+             layout\" in the same PR, with the reason.",
+            delta_total as f64 / (1024.0 * 1024.0),
+            BUDGET_TOTAL_BYTES as f64 / (1024.0 * 1024.0),
+        );
+    }
+}
