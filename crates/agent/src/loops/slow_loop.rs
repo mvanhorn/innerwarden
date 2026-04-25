@@ -66,11 +66,19 @@ pub(crate) fn try_recover_sqlite_store(state: &mut AgentState) {
 /// when no rows remain.
 ///
 /// Spec 037 I-05a: the tick scheduler calls this via
-/// [`spawn_events_src_ip_backfill`] so the blocking SQLite transaction
-/// runs on a worker thread and does not block the async tick. The
-/// function itself stays synchronous; the `&Store` signature lets the
-/// spawn wrapper own a cloned `Arc<Store>` and pass a borrow into the
-/// blocking closure.
+/// [`run_events_src_ip_backfill_in_place`] which wraps the call in
+/// `tokio::task::block_in_place`, so the blocking SQLite transaction
+/// runs without blocking the tokio scheduler — but still serializes
+/// against the slow_loop's other SQLite operations in the same tick.
+/// The first attempt at this (PR #289) used `tokio::spawn` +
+/// `spawn_blocking`, which made the backfill run CONCURRENTLY with
+/// the rest of the tick's SQLite work and contended for the writer
+/// lock against `events_since`, KG snapshot saves, response_lifecycle
+/// persists. With `busy_timeout=5000ms` every backfill batch timed
+/// out — 100% failure rate on prod, migration progress dropped to
+/// zero. `block_in_place` keeps the inline-serialized semantics
+/// (one SQLite operation at a time within the tick) while preserving
+/// the original goal of not blocking the async runtime.
 const BACKFILL_BATCH_SIZE: usize = 1000;
 pub(crate) fn drive_events_src_ip_backfill(store: &innerwarden_store::Store) {
     let pending = match store.events_pending_src_ip_backfill() {
@@ -99,29 +107,48 @@ pub(crate) fn drive_events_src_ip_backfill(store: &innerwarden_store::Store) {
     }
 }
 
-/// Fire-and-forget wrapper around [`drive_events_src_ip_backfill`]. The
-/// backfill is best-effort and idempotent (safe to skip, safe to retry);
-/// the tick caller does not wait for completion. The blocking SQLite
-/// transaction runs on a tokio blocking worker, so the async tick is
-/// not held while the batch commits.
+/// Synchronous wrapper around [`drive_events_src_ip_backfill`] that uses
+/// `tokio::task::block_in_place` to release tokio workers during the
+/// blocking SQLite transaction without spawning a separate task. This
+/// matches the pattern used by `train_nightly_with_store` (PR #290) for
+/// CPU/IO-blocking work inside the async tick.
 ///
-/// Spec 037 I-05a (first slow_loop decomposition PR): moves the
-/// backfill out of the inline tick path without changing cadence or
-/// semantics. A JoinError (task panicked) is surfaced via WARN so a
-/// silent panic in the worker does not go unnoticed.
-fn spawn_events_src_ip_backfill(state: &AgentState) {
+/// Why not `tokio::spawn`: the previous version (PR #289) used
+/// `tokio::spawn` + `spawn_blocking` to make the backfill fully
+/// concurrent with the rest of the tick. In production this meant the
+/// backfill task contended with the tick's own SQLite work
+/// (`events_since`, KG snapshot save, response_lifecycle persist) for
+/// the writer lock through the same connection pool. With
+/// `busy_timeout=5000ms` every batch timed out — 100% failure rate,
+/// migration progress dropped to zero. `block_in_place` keeps the
+/// inline-serialized property of the original PR #262 design (one
+/// SQLite operation at a time within a tick) while preserving the
+/// original goal that motivated #289 (don't block the tokio scheduler).
+///
+/// The tick will spend ~5–50 ms here per batch when the backfill has
+/// rows to process; once `events_pending_src_ip_backfill` returns 0
+/// the call is a no-op (single SELECT).
+fn run_events_src_ip_backfill_in_place(state: &AgentState) {
     let Some(store) = state.sqlite_store.clone() else {
         return;
     };
-    tokio::spawn(async move {
-        let join_res = tokio::task::spawn_blocking(move || {
+    // `block_in_place` panics on the single-threaded runtime that
+    // `#[tokio::test]` and the heap-budget anchors use by default.
+    // Production runs `#[tokio::main]` which defaults to multi-thread,
+    // so the production path takes the wrapper. Test contexts (and
+    // any future caller on a current_thread runtime) take the direct
+    // synchronous call — same observable effect for the backfill, just
+    // without the worker-transfer hint.
+    let multi_thread = tokio::runtime::Handle::try_current()
+        .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+        .unwrap_or(false);
+    if multi_thread {
+        tokio::task::block_in_place(|| {
             drive_events_src_ip_backfill(&store);
-        })
-        .await;
-        if let Err(e) = join_res {
-            warn!("events.src_ip backfill task join failed: {e}");
-        }
-    });
+        });
+    } else {
+        drive_events_src_ip_backfill(&store);
+    }
 }
 
 /// Refresh operator IPs from active SSH sessions.
@@ -177,12 +204,14 @@ pub(crate) async fn process_narrative_tick(
     // `RECURRING_BUGS.md` "sqlite_store stuck at None after boot race".
     try_recover_sqlite_store(state);
 
-    // Drive the v2 src_ip backfill one batch per tick. Fire-and-forget
-    // on a blocking worker so the tick does not wait for the SQLite
-    // transaction to commit. No-op when the store is missing or no
-    // NULL rows remain. Spec 037 I-05a — first slow_loop decomposition
-    // extraction. Cadence and semantics unchanged from the inline call.
-    spawn_events_src_ip_backfill(state);
+    // Drive the v2 src_ip backfill one batch per tick. Synchronous
+    // within the tick (so the writer lock is held without contention
+    // from this tick's other SQLite operations), but wrapped in
+    // `block_in_place` so other tokio tasks on sibling workers keep
+    // making progress. No-op when the store is missing or no NULL
+    // rows remain. Spec 037 I-05a — see `run_events_src_ip_backfill_in_place`
+    // doc comment for the history of why this is not `tokio::spawn`.
+    run_events_src_ip_backfill_in_place(state);
 
     let today = chrono::Local::now()
         .date_naive()
@@ -1300,20 +1329,26 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
         );
     }
 
-    // ── Spec 037 I-05a — backfill spawn anchor ─────────────────────
+    // ── Spec 037 I-05a — backfill block_in_place anchor ────────────
     //
-    // `spawn_events_src_ip_backfill` replaced the inline call at the
-    // top of `process_narrative_tick`. Two invariants matter:
-    //   1. The spawn fires when a store is present and the function
-    //      actually drives one batch of backfill work (observable via
-    //      the store state, not the returned Future).
-    //   2. When `state.sqlite_store` is `None`, the spawn is a no-op —
-    //      no task is created and no panic is propagated.
+    // `run_events_src_ip_backfill_in_place` replaced the previous
+    // `tokio::spawn`-based wrapper after the spawn version regressed
+    // production (100% backfill failure due to writer-lock contention
+    // with the tick's own SQLite operations). Two invariants matter:
+    //   1. When a store is present, one call drives one batch of
+    //      backfill work synchronously (no spawning, no yield required
+    //      to observe the result).
+    //   2. When `state.sqlite_store` is `None`, the wrapper is a
+    //      no-op — no panic, no work attempted.
+    //
+    // Both tests use `#[tokio::test(flavor = "multi_thread")]` because
+    // `block_in_place` panics on the single-threaded runtime that
+    // `#[tokio::test]` defaults to.
 
-    #[tokio::test]
-    async fn spawn_events_src_ip_backfill_drives_one_batch_when_rows_are_pending() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_events_src_ip_backfill_in_place_drives_one_batch_when_rows_are_pending() {
         // Seed a SQLite store with a pending src_ip row (null) so the
-        // backfill has something to do. After the spawn + join-yield,
+        // backfill has something to do. After the synchronous call,
         // the row should have a non-null src_ip.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut state = crate::tests::triage_test_state(dir.path());
@@ -1353,12 +1388,10 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
             );
         }
 
-        spawn_events_src_ip_backfill(&state);
+        run_events_src_ip_backfill_in_place(&state);
 
-        // Yield back to the runtime long enough for the spawned task +
-        // blocking worker to run the one-batch backfill.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
+        // No sleep needed: block_in_place runs synchronously. The
+        // assertion can read the result immediately after return.
         let remaining = state
             .sqlite_store
             .as_ref()
@@ -1367,21 +1400,18 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
             .expect("pending query");
         assert_eq!(
             remaining, 0,
-            "spawn wrapper must drive one batch to completion (pending was 1, now {remaining})"
+            "wrapper must drive one batch to completion (pending was 1, now {remaining})"
         );
     }
 
-    #[tokio::test]
-    async fn spawn_events_src_ip_backfill_is_noop_when_store_is_none() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_events_src_ip_backfill_in_place_is_noop_when_store_is_none() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = crate::tests::triage_test_state(dir.path());
         assert!(state.sqlite_store.is_none());
 
-        // Must not panic, must not hang, must not create a task we'd
-        // leak. Simple smoke: call and yield; nothing observable
-        // happens, but we assert no JoinError surfaces in the next tick.
-        spawn_events_src_ip_backfill(&state);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Must not panic. Synchronous return, no task to leak.
+        run_events_src_ip_backfill_in_place(&state);
     }
 
     #[test]
