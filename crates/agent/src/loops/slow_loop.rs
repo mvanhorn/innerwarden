@@ -162,6 +162,21 @@ fn record_telemetry_observation(state: &mut AgentState, events: &[innerwarden_co
     state.telemetry.observe_events(events);
 }
 
+/// Roll the per-day narrative accumulator forward one tick: reset its
+/// internal counters if the calendar date changed since the last tick,
+/// then ingest the new events. Pure in-memory, no SQLite, no shared
+/// state with other tick jobs (the accumulator is owned exclusively by
+/// the daily summary path). Spec 037 I-05c — code organization, no
+/// behavior change vs. the inline call pair.
+fn update_narrative_accumulator(
+    state: &mut AgentState,
+    today: &str,
+    events: &[innerwarden_core::event::Event],
+) {
+    state.narrative_acc.reset_for_date(today);
+    state.narrative_acc.ingest_events(events);
+}
+
 /// Refresh operator IPs from active SSH sessions.
 /// Replaces the entire set - IPs whose sessions ended are automatically removed.
 pub(crate) fn refresh_operator_ips(state: &mut AgentState, allowlist: &config::AllowlistConfig) {
@@ -287,8 +302,7 @@ pub(crate) async fn process_narrative_tick(
     }
 
     // Feed new events into the narrative accumulator (incremental, no file re-read)
-    state.narrative_acc.reset_for_date(&today);
-    state.narrative_acc.ingest_events(&events_entries);
+    update_narrative_accumulator(state, &today, &events_entries);
 
     // Feed events into knowledge graph (in-memory attack context)
     let trigger_incidents = {
@@ -1469,6 +1483,82 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
         record_telemetry_observation(&mut state, &[]);
         let snap = state.telemetry.snapshot("test-tick");
         assert!(snap.events_by_collector.is_empty());
+    }
+
+    // ── Spec 037 I-05c — narrative accumulator extraction anchor ───
+    //
+    // `update_narrative_accumulator` wraps the two adjacent calls
+    // (`reset_for_date` + `ingest_events`) that were inline in
+    // `process_narrative_tick`. The anchor proves the wrapper:
+    //   1. Routes events through `ingest_events` (verified by reading
+    //      back the synthetic event view).
+    //   2. Honors the date reset semantics — a date change between
+    //      ticks clears the prior counts.
+
+    #[test]
+    fn update_narrative_accumulator_routes_events_to_ingest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+
+        let mk = |kind: &str| innerwarden_core::event::Event {
+            ts: chrono::Utc::now(),
+            host: "h".into(),
+            source: "auth.log".into(),
+            kind: kind.into(),
+            severity: innerwarden_core::event::Severity::Low,
+            summary: "seed".into(),
+            details: serde_json::json!({}),
+            tags: Vec::new(),
+            entities: Vec::new(),
+        };
+        let events = vec![
+            mk("ssh.login_failed"),
+            mk("ssh.login_failed"),
+            mk("auth.login_success"),
+        ];
+
+        update_narrative_accumulator(&mut state, "2026-04-25", &events);
+
+        // `synthetic_events` is the read-side view the narrative path
+        // uses; non-empty means ingest_events processed the input.
+        let synth = state.narrative_acc.synthetic_events();
+        assert!(
+            !synth.is_empty(),
+            "wrapper must drive ingest_events; synthetic view should not be empty"
+        );
+    }
+
+    #[test]
+    fn update_narrative_accumulator_resets_on_date_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+
+        let mk = || innerwarden_core::event::Event {
+            ts: chrono::Utc::now(),
+            host: "h".into(),
+            source: "auth.log".into(),
+            kind: "test.event".into(),
+            severity: innerwarden_core::event::Severity::Low,
+            summary: "seed".into(),
+            details: serde_json::json!({}),
+            tags: Vec::new(),
+            entities: Vec::new(),
+        };
+
+        // Day 1: ingest 5 events.
+        let events = vec![mk(), mk(), mk(), mk(), mk()];
+        update_narrative_accumulator(&mut state, "2026-04-25", &events);
+        let day1_synth = state.narrative_acc.synthetic_events();
+        assert!(!day1_synth.is_empty());
+
+        // Day 2: empty input + new date — wrapper must reset, leaving
+        // the synthetic view empty (no carry-over).
+        update_narrative_accumulator(&mut state, "2026-04-26", &[]);
+        let day2_synth = state.narrative_acc.synthetic_events();
+        assert!(
+            day2_synth.is_empty(),
+            "date change must reset accumulator; synthetic view should be empty after reset"
+        );
     }
 
     #[test]
