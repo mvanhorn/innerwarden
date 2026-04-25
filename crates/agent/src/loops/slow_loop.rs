@@ -151,6 +151,17 @@ fn run_events_src_ip_backfill_in_place(state: &AgentState) {
     }
 }
 
+/// Record per-collector event counts on the in-memory telemetry state.
+/// Reads-only over the events slice, writes only to `state.telemetry`
+/// (no SQLite, no shared lock with other tick jobs). Spec 037 I-05b
+/// extraction — pure code organization, no behavior change vs. the
+/// inline call that existed before; lifted into a named function so
+/// the tick body reads as a sequence of named jobs instead of a
+/// monolithic block.
+fn record_telemetry_observation(state: &mut AgentState, events: &[innerwarden_core::event::Event]) {
+    state.telemetry.observe_events(events);
+}
+
 /// Refresh operator IPs from active SSH sessions.
 /// Replaces the entire set - IPs whose sessions ended are automatically removed.
 pub(crate) fn refresh_operator_ips(state: &mut AgentState, allowlist: &config::AllowlistConfig) {
@@ -235,7 +246,7 @@ pub(crate) async fn process_narrative_tick(
         (Vec::new(), 0)
     };
 
-    state.telemetry.observe_events(&events_entries);
+    record_telemetry_observation(state, &events_entries);
 
     // Track operator IPs: any SSH login via publickey is an operator (has the private key).
     for ev in &events_entries {
@@ -1412,6 +1423,52 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
 
         // Must not panic. Synchronous return, no task to leak.
         run_events_src_ip_backfill_in_place(&state);
+    }
+
+    // ── Spec 037 I-05b — telemetry observation extraction anchor ───
+    //
+    // `record_telemetry_observation` is a thin wrapper around
+    // `state.telemetry.observe_events`. The wrapper exists so the tick
+    // body reads as a sequence of named jobs; this test pins that the
+    // wrapper still bumps the underlying counters so a future refactor
+    // (renaming, removing the wrapper, swapping in a different
+    // telemetry type) doesn't silently lose event observation.
+
+    #[test]
+    fn record_telemetry_observation_bumps_events_by_collector() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+
+        let mk = |source: &str| innerwarden_core::event::Event {
+            ts: chrono::Utc::now(),
+            host: "h".into(),
+            source: source.into(),
+            kind: "test.event".into(),
+            severity: innerwarden_core::event::Severity::Low,
+            summary: "seed".into(),
+            details: serde_json::json!({}),
+            tags: Vec::new(),
+            entities: Vec::new(),
+        };
+        let events = vec![mk("auth.log"), mk("auth.log"), mk("journald")];
+
+        record_telemetry_observation(&mut state, &events);
+
+        // `TelemetryState`'s internal counters are private; read them via
+        // the public `snapshot()` view that mirrors what `/metrics` and
+        // the on-disk telemetry snapshot consume.
+        let snap = state.telemetry.snapshot("test-tick");
+        assert_eq!(snap.events_by_collector.get("auth.log").copied(), Some(2));
+        assert_eq!(snap.events_by_collector.get("journald").copied(), Some(1));
+    }
+
+    #[test]
+    fn record_telemetry_observation_is_noop_on_empty_slice() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        record_telemetry_observation(&mut state, &[]);
+        let snap = state.telemetry.snapshot("test-tick");
+        assert!(snap.events_by_collector.is_empty());
     }
 
     #[test]
