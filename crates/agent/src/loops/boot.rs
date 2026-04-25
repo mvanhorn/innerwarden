@@ -1379,15 +1379,51 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                     }
 
                     // Autoencoder nightly training — at 3 AM UTC.
+                    //
+                    // The training routine is synchronous and CPU-heavy: it
+                    // reads tens of thousands of events from SQLite, builds
+                    // feature windows, runs N epochs of gradient descent on
+                    // the autoencoder, then writes the model. Production hang
+                    // observed on 2026-04-25 03:00 UTC: running this inline
+                    // in the async tick blocked the tokio main thread for
+                    // the entire training duration; meanwhile other tasks
+                    // (dashboard handlers holding `state.knowledge_graph`'s
+                    // `std::sync::RwLock`, mesh ticker holding its own
+                    // locks, the v2 src_ip backfill mid-transaction) all
+                    // ended up in `futex_wait` cycles — classic AB-BA
+                    // deadlock with no progress, 19 threads stuck.
+                    //
+                    // `block_in_place` tells the multi-thread tokio runtime
+                    // "I'm about to do CPU/blocking work; transfer my
+                    // workers." Other tokio tasks keep making progress on
+                    // sibling worker threads. The training future is
+                    // unchanged from the caller's view; only the runtime
+                    // scheduling property differs. Requires a multi-thread
+                    // runtime (we have one via `#[tokio::main]` default —
+                    // single-thread would panic).
                     {
                         let hour = chrono::Utc::now().hour();
-                        if hour == 3 {
+                        // Operator override for validation runs (tested 2026-04-25
+                        // after the AB-BA deadlock at 03:00 UTC). Default 3 keeps
+                        // production behavior unchanged. Setting to the current
+                        // hour, restarting the agent, and observing one cycle
+                        // proves the `block_in_place` wrapper above prevents the
+                        // hang without waiting 24h for the natural trigger.
+                        let trigger_hour: u32 = std::env::var("INNERWARDEN_AUTOENCODER_TRAIN_HOUR")
+                            .ok()
+                            .and_then(|s| s.parse::<u32>().ok())
+                            .filter(|h| *h <= 23)
+                            .unwrap_or(3);
+                        if hour == trigger_hour {
                             let today_key = format!("anomaly_train:{}", chrono::Utc::now().format("%Y-%m-%d"));
                             if !state.store.has_cooldown(state_store::CooldownTable::Decision, &today_key) {
-                                info!("autoencoder: triggering nightly training");
-                                match state.anomaly_engine.train_nightly_with_store(
-                                    state.sqlite_store.as_deref(),
-                                ) {
+                                info!(trigger_hour, "autoencoder: triggering nightly training");
+                                let result = tokio::task::block_in_place(|| {
+                                    state.anomaly_engine.train_nightly_with_store(
+                                        state.sqlite_store.as_deref(),
+                                    )
+                                });
+                                match result {
                                     Ok(()) => {
                                         info!(
                                             maturity = format!("{:.2}", state.anomaly_engine.maturity),
