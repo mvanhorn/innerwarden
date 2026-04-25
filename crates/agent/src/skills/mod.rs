@@ -295,6 +295,14 @@ pub struct SkillRegistry {
 }
 
 impl SkillRegistry {
+    /// Build an empty registry with no skills. Useful in tests that need
+    /// to exercise "no skill registered" code paths without relying on
+    /// `remove`-style mutation of `default_builtin()`.
+    #[cfg(test)]
+    pub fn empty() -> Self {
+        Self { skills: Vec::new() }
+    }
+
     /// Build the registry with all built-in skills.
     pub fn default_builtin() -> Self {
         use builtin::*;
