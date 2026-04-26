@@ -90,9 +90,10 @@ impl Store {
             .map_err(StoreError::Pool)?;
 
         // Ensure the schema on one connection after the pool is up.
-        // Wrapped in a small retry — even with `busy_timeout = 5000` set
-        // as the first pragma, the FIRST `pool.get()` after process
-        // startup races with the sensor's own boot-time PRAGMA setup
+        // Wrapped in a small retry — even with the long `busy_timeout`
+        // (PRAGMA_SETUP) as the first pragma, the FIRST `pool.get()`
+        // after process startup races with the sensor's own boot-time
+        // PRAGMA setup
         // (both processes set `journal_mode = WAL` at the same instant
         // when the database file is fresh-on-disk). Three attempts × 1 s
         // back-off is enough for any realistic startup race; longer
@@ -202,13 +203,24 @@ impl Store {
 // brief shared lock; if another process is mid-write at that instant the
 // call returns SQLITE_BUSY immediately. The SQLite default `busy_timeout`
 // is 0 — no wait. By setting it first we guarantee every subsequent pragma
-// (and every `ensure_schema` insert) honors the 5 s wait. Pre-2026-04-23
+// (and every `ensure_schema` insert) honors the wait. Pre-2026-04-23
 // `journal_mode = WAL` was first; on a host where the sensor opens the
 // same database concurrently with the agent, the agent's `Store::open`
 // failed at boot with "database is locked" and the agent ran for the
 // rest of the session without SQLite (see `RECURRING_BUGS.md` "sensor
 // holds DB lock during agent boot").
-const PRAGMA_SETUP: &str = "PRAGMA busy_timeout = 5000;
+//
+// 30 s (was 5 s) reduces "database is locked" failures under sustained
+// writer contention. Symptom on 2026-04-26: `events.src_ip` backfill
+// degraded to 100 % failure rate over a few hours of uptime — every
+// batch raced with a slow_loop SQLite operation (events_since, KG
+// snapshot save, response_lifecycle persist) and timed out at 5 s.
+// Backfill is best-effort and idempotent, so a longer wait per attempt
+// trades latency for success rate without any correctness risk. The
+// agent already logs `WARN ... database is locked` on legitimate
+// timeouts, so a stuck connection still surfaces — it just takes
+// longer to give up.
+const PRAGMA_SETUP: &str = "PRAGMA busy_timeout = 30000;
          PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
          PRAGMA foreign_keys = ON;
@@ -330,15 +342,38 @@ mod tests {
     #[test]
     fn pragma_busy_timeout_is_active_on_freshly_pooled_connection() {
         // After `Store::open`, every connection from the pool must report
-        // `busy_timeout = 5000`. Proves the with_init batch ran before any
-        // user code can call `pool.get()` — the very property that the
-        // PRAGMA_SETUP order fix relies on.
+        // a non-zero `busy_timeout`. Proves the with_init batch ran before
+        // any user code can call `pool.get()` — the very property that
+        // the PRAGMA_SETUP order fix relies on.
+        //
+        // The exact value (currently 30 000 ms) is asserted via the
+        // separate `pragma_setup_busy_timeout_is_at_least_30s` test below
+        // so this anchor stays focused on "the pragma actually applied"
+        // and doesn't churn whenever the budget is tuned.
         let store = Store::open_memory().unwrap();
         let conn = store.conn().unwrap();
         let busy = read_pragma(&conn, "busy_timeout");
-        assert_eq!(
-            busy, 5000,
-            "busy_timeout must be 5000 ms on every connection"
+        assert!(
+            busy >= 5000,
+            "busy_timeout must be at least 5000 ms on every connection (got {busy})"
+        );
+    }
+
+    #[test]
+    fn pragma_setup_busy_timeout_is_at_least_30s() {
+        // Pinned to 30 s after the 2026-04-26 backfill regression: under
+        // sustained writer-lock contention from concurrent slow_loop
+        // SQLite operations, 5 s timed out 100 % of attempts. 30 s is the
+        // value chosen to absorb that contention while still failing
+        // loudly if a connection is genuinely stuck. If a future tune
+        // wants to lower it, this anchor blocks the change so the
+        // operational tradeoff has to be re-justified.
+        let store = Store::open_memory().unwrap();
+        let conn = store.conn().unwrap();
+        let busy = read_pragma(&conn, "busy_timeout");
+        assert!(
+            busy >= 30_000,
+            "busy_timeout must be at least 30 000 ms (got {busy}); see PRAGMA_SETUP comment"
         );
     }
 
