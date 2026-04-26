@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use tracing::{info, warn};
@@ -10,6 +11,91 @@ use crate::{
     narrative_daily_summary, narrative_incident_ingest, narrative_observation_verify, reader,
     shield_inline, telemetry_tick, AgentState,
 };
+
+// ── Disk-low guard for SQLite blob writes ────────────────────────────
+//
+// Operational fix for the 2026-04-25 02:59 UTC class of hangs: when
+// `/var/lib/innerwarden` (the SQLite + JSONL data dir) drops below a
+// safe threshold, a blob write inside `process_narrative_tick` can
+// block on disk-full indefinitely while holding a writer lock from the
+// r2d2 pool. The held lock then cascades into the same tokio runtime
+// deadlock observed on the production agent (18-19 threads in
+// `futex_wait_queue`).
+//
+// Strategy: before the KG snapshot write (the largest blob, ~5 MB
+// gzipped, ~50 MB uncompressed in transit), call `df -B1 <data_dir>`
+// and skip if free space is dangerously low. Cheap to fork once per
+// 60 s tick; matches the pattern already used by
+// `neural_lifecycle::train_nightly_with_store`'s disk guard.
+//
+// Thresholds: skip if free < 5 % of total OR free < 500 MB absolute.
+// 5 % alone is too lenient for large disks; 500 MB alone is too
+// generous for small disks. The OR captures both extremes.
+//
+// Behavior under low disk:
+//   - skip the write (no retry, no buffer)
+//   - WARN log with avail/total/pct + path
+//   - bump `DISK_LOW_SKIPS_KG_SNAPSHOT` counter (Prometheus surface
+//     via `/metrics`)
+// Failure mode of the helper itself: if `df` fails to parse, the
+// guard returns `false` (fail-open). Better to attempt the write
+// than to skip writes forever on a parse-format change.
+
+/// Total skipped KG snapshot writes due to low disk. Exposed via
+/// `/metrics` as `innerwarden_disk_low_skips_total{operation="kg_snapshot"}`.
+static DISK_LOW_SKIPS_KG_SNAPSHOT: AtomicU64 = AtomicU64::new(0);
+
+/// Read-side accessor for the metrics renderer.
+pub(crate) fn disk_low_skips_kg_snapshot() -> u64 {
+    DISK_LOW_SKIPS_KG_SNAPSHOT.load(Ordering::Relaxed)
+}
+
+/// Pure threshold predicate. Disk is "critically low" if either the
+/// free fraction is below 5 % or the free absolute is below 500 MB.
+/// `total = 0` is treated as fail-open (returns false) so that a
+/// malformed disk-stat call cannot refuse all writes.
+pub(crate) fn disk_low_pct_or_bytes(avail_bytes: u64, total_bytes: u64) -> bool {
+    if total_bytes == 0 {
+        return false;
+    }
+    let pct_free = (avail_bytes as f64 / total_bytes as f64) * 100.0;
+    pct_free < 5.0 || avail_bytes < 500 * 1024 * 1024
+}
+
+/// Shell-out to `df -B1 <path>` and parse the avail/size columns
+/// (in bytes). Returns `None` on any error so the caller can fail-open.
+fn disk_avail_total_bytes(path: &Path) -> Option<(u64, u64)> {
+    let output = std::process::Command::new("df")
+        .arg("-B1")
+        .arg(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // Expected format on Linux GNU coreutils:
+    //   Filesystem  1B-blocks  Used  Available  Use%  Mounted on
+    //   /dev/sda1   48360873984 41812451328  4554420224  91%  /
+    // Skip the header line, take the last non-empty data line.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.lines().rfind(|l| !l.trim().is_empty())?;
+    let cols: Vec<&str> = line.split_whitespace().collect();
+    if cols.len() < 6 {
+        return None;
+    }
+    let total: u64 = cols[1].parse().ok()?;
+    let avail: u64 = cols[3].parse().ok()?;
+    Some((avail, total))
+}
+
+/// Returns true when the data_dir's filesystem is dangerously low and
+/// the caller should skip a critical SQLite write. Fails-open on stat
+/// errors (better to attempt a write than to silently halt all writes).
+fn disk_critically_low(path: &Path) -> bool {
+    disk_avail_total_bytes(path)
+        .map(|(avail, total)| disk_low_pct_or_bytes(avail, total))
+        .unwrap_or(false)
+}
 
 /// Lazy-reopen `sqlite_store` if a boot-time race left it as `None`.
 /// Throttled to one attempt per `STORE_REOPEN_BACKOFF_SECS` so a
@@ -391,7 +477,29 @@ pub(crate) async fn process_narrative_tick(
         // investigate (not a silent degradation).
         let (snapshot_bytes, metrics_json) = serialised;
         if let Some(snap) = snapshot_bytes {
-            if let Some(ref sq) = state.sqlite_store {
+            // Disk-low guard. Cheap fork-and-parse of `df -B1` once per
+            // 60 s tick. Three mutually exclusive outcomes:
+            //   1. disk_critically_low: skip + WARN + bump counter.
+            //   2. sqlite_store None: skip + WARN (separate signal).
+            //   3. healthy: write the blob.
+            if disk_critically_low(data_dir) {
+                DISK_LOW_SKIPS_KG_SNAPSHOT.fetch_add(1, Ordering::Relaxed);
+                if let Some((avail, total)) = disk_avail_total_bytes(data_dir) {
+                    let pct = (avail as f64 / total as f64) * 100.0;
+                    warn!(
+                        avail_mb = avail / 1_048_576,
+                        total_mb = total / 1_048_576,
+                        pct_free = format!("{pct:.1}"),
+                        path = %data_dir.display(),
+                        "disk-low guard: skipping KG snapshot save (avoids SQLite write hang)"
+                    );
+                } else {
+                    warn!(
+                        path = %data_dir.display(),
+                        "disk-low guard fired but disk-stat re-read failed; skipping KG snapshot save"
+                    );
+                }
+            } else if let Some(ref sq) = state.sqlite_store {
                 if let Err(e) = knowledge_graph::KnowledgeGraph::store_snapshot_bytes(sq, &snap) {
                     warn!("knowledge graph SQLite snapshot failed: {e:#}");
                 }
@@ -1559,6 +1667,59 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
             day2_synth.is_empty(),
             "date change must reset accumulator; synthetic view should be empty after reset"
         );
+    }
+
+    // ── Disk-low guard anchors ────────────────────────────────────
+    //
+    // Pure-function tests on `disk_low_pct_or_bytes`. The `df`-shellout
+    // path (`disk_avail_total_bytes`) is system-dependent and not
+    // unit-tested here; the boolean predicate IS, since that's where
+    // the threshold tradeoffs live.
+
+    #[test]
+    fn disk_low_pct_or_bytes_flags_below_5_percent() {
+        // 4% free on a 100 GB disk — should trip even though 4 GB is
+        // plenty in absolute terms.
+        let total = 100 * 1024 * 1024 * 1024_u64;
+        let avail = total * 4 / 100;
+        assert!(disk_low_pct_or_bytes(avail, total));
+    }
+
+    #[test]
+    fn disk_low_pct_or_bytes_flags_below_500mb_absolute() {
+        // 200 MB free on a 1 PB disk — 0.00002 % is way under 5 %, but
+        // also well under the 500 MB absolute floor. Either gate trips.
+        let total = 1024_u64 * 1024 * 1024 * 1024 * 1024; // 1 PB
+        let avail = 200 * 1024 * 1024;
+        assert!(disk_low_pct_or_bytes(avail, total));
+    }
+
+    #[test]
+    fn disk_low_pct_or_bytes_does_not_flag_healthy_disk() {
+        // 10 GB free on a 20 GB disk — 50 % free, way above threshold.
+        let total = 20 * 1024 * 1024 * 1024_u64;
+        let avail = 10 * 1024 * 1024 * 1024;
+        assert!(!disk_low_pct_or_bytes(avail, total));
+    }
+
+    #[test]
+    fn disk_low_pct_or_bytes_fails_open_on_zero_total() {
+        // Defensive: a stat call that returns total=0 must not flag
+        // every disk as low. Better to attempt the write than to halt
+        // all writes silently.
+        assert!(!disk_low_pct_or_bytes(0, 0));
+        assert!(!disk_low_pct_or_bytes(100, 0));
+    }
+
+    #[test]
+    fn disk_low_pct_or_bytes_boundary_at_exactly_5_percent_does_not_flag() {
+        // Exactly 5 % free should NOT flag (strict < 5.0). One byte less
+        // and it would. This pins the comparison direction so a future
+        // refactor can't silently flip <= to < or vice versa.
+        let total = 100 * 1024 * 1024 * 1024_u64;
+        let avail = total * 5 / 100; // 5.0 % exactly
+                                     // 5 GB > 500 MB so absolute gate also clears.
+        assert!(!disk_low_pct_or_bytes(avail, total));
     }
 
     #[test]

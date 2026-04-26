@@ -633,6 +633,17 @@ pub(super) fn build_prometheus_metrics_text(
         ));
     }
 
+    // Disk-low guard skips. A rising counter means the agent declined to
+    // write a critical SQLite blob because the data_dir filesystem fell
+    // below the safe threshold (5 % free or 500 MB). Operator alarm —
+    // disk needs cleanup.
+    out.push_str("# HELP innerwarden_disk_low_skips_total SQLite writes skipped due to low disk\n");
+    out.push_str("# TYPE innerwarden_disk_low_skips_total counter\n");
+    out.push_str(&format!(
+        "innerwarden_disk_low_skips_total{{operation=\"kg_snapshot\"}} {}\n",
+        crate::loops::slow_loop::disk_low_skips_kg_snapshot()
+    ));
+
     // Response lifecycle metrics (from responses blob/file snapshot).
     let responses_data = state
         .sqlite_store
