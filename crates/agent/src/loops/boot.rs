@@ -891,7 +891,15 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         } else {
             None
         },
-        recent_blocks: std::collections::VecDeque::new(),
+        // Spec 037 I-07 slice 2: warm-cache the rate-limiter window
+        // from the SQLite `recent_blocks` namespace. Pre-PR the
+        // `VecDeque` reset on every boot, letting a burst of
+        // `MAX_BLOCKS_PER_MINUTE` blocks land in the first second
+        // after a crash. The loader filters to the same 60s window
+        // that the runtime `retain` enforces, prunes stale rows
+        // during the read, and degrades to an empty deque on a store
+        // read error (matching pre-PR behaviour in that case).
+        recent_blocks: store.load_recent_blocks_within(60),
         // Spec 037 PR-1 (I-02 slice 1): warm-cache from the SQLite
         // `xdp_block_times` namespace so TTL accounting survives a
         // restart. Pre-PR the map was reset on every boot; adaptive

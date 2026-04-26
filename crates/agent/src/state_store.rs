@@ -9,6 +9,7 @@
 //!   - notification_cooldowns:  key → timestamp_ms (i64 LE bytes)
 //!   - block_counts:            IP → count (u32 LE bytes)
 //!   - xdp_block_times:         IP → JSON { blocked_at_ms, ttl_secs }
+//!   - recent_blocks:           timestamp_ms_str → [1u8] (rate-limiter window)
 //!   - trust_rules:             "detector:action" → [1u8]
 //!   - attacker_profiles:       IP → JSON (AttackerProfile)
 
@@ -23,6 +24,7 @@ const NS_DECISION_COOLDOWNS: &str = "decision_cooldowns";
 const NS_NOTIFICATION_COOLDOWNS: &str = "notification_cooldowns";
 const NS_BLOCK_COUNTS: &str = "block_counts";
 const NS_XDP_BLOCK_TIMES: &str = "xdp_block_times";
+const NS_RECENT_BLOCKS: &str = "recent_blocks";
 const NS_TRUST_RULES: &str = "trust_rules";
 const NS_ATTACKER_PROFILES: &str = "attacker_profiles";
 
@@ -284,6 +286,108 @@ impl StateStore {
             .into_iter()
             .map(|(ip, ts, ttl)| (ip, (ts, ttl)))
             .collect()
+    }
+
+    // ── Recent Blocks (rate-limiter warm cache) ─────────────────────
+    //
+    // Spec 037 I-07 slice 2: persists the rolling-window block-rate
+    // counter so a restart does not reset it to zero. Pre-PR the
+    // `AgentState::recent_blocks` `VecDeque` reset on every boot,
+    // letting a burst of `MAX_BLOCKS_PER_MINUTE` blocks land in the
+    // first second after a crash before the window refilled. The
+    // canonical store is now this namespace; the in-memory `VecDeque`
+    // is rebuilt at boot via `load_recent_blocks_within`.
+    //
+    // Storage shape: key = `timestamp_millis().to_string()`, value =
+    // sentinel `[1u8]`. Only the timestamp matters; the value is
+    // present so the row exists. Same semantic the audit recommends
+    // ("each cache rebuilt from SQLite at boot") and the same shape
+    // as XDP PR-1 minus the per-IP TTL (recent_blocks tracks events,
+    // not entities).
+
+    /// Append one block timestamp to the persisted rate-limit window.
+    /// Failure is logged at `warn!` and degrades to pre-PR behaviour
+    /// (the in-memory `VecDeque` still gets the entry; only the
+    /// restart-survival property is lost).
+    pub fn set_recent_block(&self, ts: chrono::DateTime<chrono::Utc>) {
+        let key = ts.timestamp_millis().to_string();
+        if let Err(e) = self.store.kv_set(NS_RECENT_BLOCKS, &key, &[1u8]) {
+            warn!(error = %e, "set_recent_block failed");
+        }
+    }
+
+    /// Delete every persisted block timestamp older than `cutoff_ms`.
+    /// Mirrors the in-memory `retain` so the namespace does not grow
+    /// without bound. Iterates `kv_list` and per-row deletes — fine
+    /// for the low-volume namespace (≤ MAX_BLOCKS_PER_MINUTE entries
+    /// in steady state).
+    pub fn prune_recent_blocks_before(&self, cutoff_ms: i64) {
+        let entries = match self.store.kv_list(NS_RECENT_BLOCKS) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, "prune_recent_blocks: kv_list failed");
+                return;
+            }
+        };
+        for (key, _) in entries {
+            let Ok(ts_ms) = key.parse::<i64>() else {
+                continue;
+            };
+            if ts_ms < cutoff_ms {
+                if let Err(e) = self.store.kv_delete(NS_RECENT_BLOCKS, &key) {
+                    warn!(error = %e, key, "prune_recent_blocks: kv_delete failed");
+                }
+            }
+        }
+    }
+
+    /// Warm-cache loader for `AgentState::recent_blocks`. Returns the
+    /// timestamps inside `window_secs` of `now`, sorted oldest-first
+    /// to match the `VecDeque` semantics of the rate-limiter (which
+    /// `push_back`s newest and reads `len()` to compare against
+    /// `MAX_BLOCKS_PER_MINUTE`). Entries OUTSIDE the window are
+    /// dropped from SQLite during this call so a long agent uptime
+    /// does not accumulate stale rows in the namespace.
+    pub fn load_recent_blocks_within(
+        &self,
+        window_secs: i64,
+    ) -> std::collections::VecDeque<chrono::DateTime<chrono::Utc>> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let cutoff_ms = now_ms - window_secs * 1000;
+
+        let entries = match self.store.kv_list(NS_RECENT_BLOCKS) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, "load_recent_blocks_within: kv_list failed");
+                return std::collections::VecDeque::new();
+            }
+        };
+
+        // Two passes: first prune stale rows, then collect surviving
+        // ones. `kv_list` already returns rows ordered by key (the
+        // millis-timestamp string), which is monotonic for keys of
+        // the same width — sufficient for VecDeque oldest-first
+        // ordering in practice (in-memory `push_back` would only see
+        // newer entries from this point on).
+        let mut out = std::collections::VecDeque::new();
+        for (key, _) in entries {
+            let Ok(ts_ms) = key.parse::<i64>() else {
+                // Malformed key — drop it; it cannot participate in
+                // the rate-limit window.
+                let _ = self.store.kv_delete(NS_RECENT_BLOCKS, &key);
+                continue;
+            };
+            if ts_ms < cutoff_ms {
+                if let Err(e) = self.store.kv_delete(NS_RECENT_BLOCKS, &key) {
+                    warn!(error = %e, key, "load_recent_blocks_within: prune kv_delete failed");
+                }
+                continue;
+            }
+            if let Some(dt) = chrono::DateTime::from_timestamp_millis(ts_ms) {
+                out.push_back(dt);
+            }
+        }
+        out
     }
 
     // ── Trust Rules ─────────────────────────────────────────────────
@@ -562,6 +666,137 @@ mod tests {
             "corrupt row must be skipped, valid sibling must still load"
         );
         assert!(loaded.contains_key("198.51.100.5"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Spec 037 I-07 slice 2 — `load_recent_blocks_within` warm-cache anchors
+    // ─────────────────────────────────────────────────────────────────
+    //
+    // I-07 slice 2 promotes SQLite `recent_blocks` to the canonical
+    // persisted store for the rate-limiter window and rebuilds
+    // `AgentState::recent_blocks` as a warm-cache at boot via
+    // `load_recent_blocks_within(60)`. Tests pin the boot-path
+    // contract:
+    //
+    //   1. Empty store → empty deque (degraded fallback; pre-PR
+    //      behaviour).
+    //   2. Round-trip: timestamps inside the window load back.
+    //   3. Stale entries (> window) are filtered AND deleted from
+    //      SQLite during the load — the regression anchor for the
+    //      audit's "burst can pass right after a crash" finding,
+    //      generalised to "stale rows from old uptimes do not
+    //      resurrect into the new window".
+    //   4. `prune_recent_blocks_before` is the runtime-side mirror of
+    //      the in-memory `retain`; deleting old entries must NOT
+    //      touch entries inside the window.
+
+    #[test]
+    fn load_recent_blocks_is_empty_on_fresh_store() {
+        let (_dir, store) = make_store();
+        let loaded = store.load_recent_blocks_within(60);
+        assert!(
+            loaded.is_empty(),
+            "fresh store MUST return an empty rate-limit window — pre-PR boot behaviour"
+        );
+    }
+
+    #[test]
+    fn load_recent_blocks_returns_inserted_entries_within_window() {
+        let (_dir, store) = make_store();
+        let now = chrono::Utc::now();
+        // Three timestamps inside the 60s window: 1s, 10s, 30s ago.
+        store.set_recent_block(now - chrono::Duration::seconds(1));
+        store.set_recent_block(now - chrono::Duration::seconds(10));
+        store.set_recent_block(now - chrono::Duration::seconds(30));
+
+        let loaded = store.load_recent_blocks_within(60);
+        assert_eq!(
+            loaded.len(),
+            3,
+            "all three persisted entries must appear in the warm-cache"
+        );
+    }
+
+    #[test]
+    fn load_recent_blocks_filters_entries_older_than_60s() {
+        // Regression anchor for the audit's "burst can pass right
+        // after a crash" finding. If a previous uptime left
+        // 60-second-old rows in SQLite, the warm-cache MUST drop
+        // them so the rate-limit count reflects only the current
+        // window.
+        let (_dir, store) = make_store();
+        let now = chrono::Utc::now();
+        store.set_recent_block(now - chrono::Duration::seconds(5)); // in window
+        store.set_recent_block(now - chrono::Duration::seconds(120)); // 2 min ago
+        store.set_recent_block(now - chrono::Duration::seconds(3600)); // 1 h ago
+
+        let loaded = store.load_recent_blocks_within(60);
+        assert_eq!(
+            loaded.len(),
+            1,
+            "only the in-window entry must survive the warm-cache load"
+        );
+
+        // The stale rows must ALSO be deleted from SQLite during the
+        // load so the namespace does not grow without bound across
+        // restarts.
+        let remaining = store
+            .store
+            .kv_count(NS_RECENT_BLOCKS)
+            .expect("kv_count after load");
+        assert_eq!(
+            remaining, 1,
+            "load_recent_blocks_within must prune stale rows from SQLite, not just filter them in memory"
+        );
+    }
+
+    #[test]
+    fn prune_recent_blocks_before_deletes_only_old_entries() {
+        // The runtime path calls `prune_recent_blocks_before` from
+        // every block decision so the namespace tracks the same
+        // window the in-memory `retain` enforces. Deletes must be
+        // bounded to entries strictly older than the cutoff.
+        let (_dir, store) = make_store();
+        let now = chrono::Utc::now();
+        store.set_recent_block(now - chrono::Duration::seconds(5)); // keep
+        store.set_recent_block(now - chrono::Duration::seconds(45)); // keep
+        store.set_recent_block(now - chrono::Duration::seconds(90)); // drop
+        store.set_recent_block(now - chrono::Duration::seconds(3600)); // drop
+
+        let cutoff_ms = (now - chrono::Duration::seconds(60)).timestamp_millis();
+        store.prune_recent_blocks_before(cutoff_ms);
+
+        // load_recent_blocks_within(60) confirms the keep/drop split
+        // by reading what survived.
+        let loaded = store.load_recent_blocks_within(60);
+        assert_eq!(
+            loaded.len(),
+            2,
+            "prune must delete entries older than cutoff and leave in-window entries intact"
+        );
+    }
+
+    #[test]
+    fn load_recent_blocks_skips_malformed_keys() {
+        // Mirrors the `load_xdp_block_times` corrupt-row anchor —
+        // a row written by a previous agent version with a
+        // non-millis-string key must not panic the boot loader.
+        let (_dir, store) = make_store();
+        let now = chrono::Utc::now();
+        store.set_recent_block(now - chrono::Duration::seconds(5));
+
+        // Inject a malformed key via the raw KV API.
+        store
+            .store
+            .kv_set(NS_RECENT_BLOCKS, "not-a-timestamp", &[1u8])
+            .expect("raw kv_set");
+
+        let loaded = store.load_recent_blocks_within(60);
+        assert_eq!(
+            loaded.len(),
+            1,
+            "malformed key must be skipped, valid sibling must still load"
+        );
     }
 
     #[test]

@@ -23,6 +23,13 @@ pub(crate) async fn execute_block_ip_decision(
     state
         .recent_blocks
         .retain(|ts| *ts > now_utc - chrono::Duration::seconds(60));
+    // Spec 037 I-07 slice 2: mirror the in-memory retain to SQLite so
+    // the persisted namespace tracks the same window. Failure is
+    // logged at `warn!` inside the helper and never blocks the
+    // decision path.
+    state
+        .store
+        .prune_recent_blocks_before((now_utc - chrono::Duration::seconds(60)).timestamp_millis());
 
     // Circuit breaker: hard ceiling on auto-blocks per UTC hour. Catches
     // the CL-008 *class* of regression — any future correlation rule that
@@ -72,6 +79,11 @@ pub(crate) async fn execute_block_ip_decision(
     }
 
     state.recent_blocks.push_back(now_utc);
+    // Spec 037 I-07 slice 2: persist for warm-cache on next boot so a
+    // restart does not let a `MAX_BLOCKS_PER_MINUTE` burst land in the
+    // first second after recovery. Mirror runs after the in-memory
+    // push_back so a SQLite failure cannot drop the rate-limit count.
+    state.store.set_recent_block(now_utc);
 
     // Adaptive TTL: use local IP reputation to escalate block duration.
     let block_ttl_secs = {
