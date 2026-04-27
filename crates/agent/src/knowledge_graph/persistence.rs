@@ -647,6 +647,42 @@ impl KnowledgeGraph {
     }
 }
 
+/// Atomically rename a snapshot file inside the rotation chain,
+/// surfacing real failures via `warn!` while staying silent on the
+/// expected case where the source does not yet exist (Spec 037 I-13
+/// PR-5).
+///
+/// Why the existence pre-check: `rotate_snapshots` walks the rotation
+/// chain unconditionally on every call. A fresh agent has only the
+/// current `graph-snapshot.json` on disk — the `.json.{1,2,3}`
+/// backups do not exist yet. Naively warning on every rename failure
+/// would emit ~3 spurious warns per rotation until the chain fills,
+/// which would itself become noise that drowns out genuine failures
+/// (permission denied, cross-device rename, FS corruption).
+///
+/// The pre-check filters `ErrorKind::NotFound` cleanly: if `from`
+/// does not exist, the rename is a no-op and stays silent. The warn
+/// arm only fires when `from` exists but the rename still fails —
+/// which is unambiguously a real failure that breaks the rotation
+/// chain invariant and the operator should see.
+///
+/// Failure mode: the rename did not happen. The chain is left in
+/// whatever state the partial rotation produced — the caller does
+/// not retry (matches the prior `let _ =` behaviour exactly).
+fn rename_snapshot_or_warn(from: &Path, to: &Path) {
+    if !from.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::rename(from, to) {
+        warn!(
+            from = %from.display(),
+            to = %to.display(),
+            error = %e,
+            "snapshot rotation rename failed (rotation chain may be inconsistent)"
+        );
+    }
+}
+
 /// T029: Rotate snapshot files — keep last `max_backups` copies.
 /// graph-snapshot.json → .json.1 → .json.2 → .json.3 (oldest deleted)
 fn rotate_snapshots(path: &Path, max_backups: u32) {
@@ -658,12 +694,12 @@ fn rotate_snapshots(path: &Path, max_backups: u32) {
     for i in (1..max_backups).rev() {
         let from = path.with_extension(format!("json.{i}"));
         let to = path.with_extension(format!("json.{}", i + 1));
-        let _ = std::fs::rename(&from, &to);
+        rename_snapshot_or_warn(&from, &to);
     }
 
     // Current → .1
     let backup = path.with_extension("json.1");
-    let _ = std::fs::rename(path, &backup);
+    rename_snapshot_or_warn(path, &backup);
 }
 
 #[cfg(test)]
@@ -1544,6 +1580,215 @@ mod tests {
 
         let loaded = KnowledgeGraph::load_snapshot(&path);
         assert!(loaded.find_by_ip("10.0.0.1").is_some());
+    }
+
+    // ── Spec 037 I-13 PR-5 — rotation rename warn anchors ─────────
+    //
+    // PR-5 of I-13 converts the two `let _ = std::fs::rename(..)`
+    // sites in `rotate_snapshots` into a `warn!`-on-failure pattern
+    // via the `rename_snapshot_or_warn` helper. The rotation chain
+    // is the back-compat read fallback — silent rename failure breaks
+    // the chain invariant so a future restore picks the wrong file.
+    //
+    // The helper carries a load-bearing pre-check: NotFound is the
+    // *expected* common case during the first few rotations before
+    // `.json.{1,2,3}` are populated. A naive warn on every rename
+    // failure would emit ~3 spurious warns per rotation on a fresh
+    // agent. The pre-check filters that case so the warn arm fires
+    // only on genuine failures (permission denied, cross-device,
+    // corrupt FS).
+    //
+    // Tests pin three contracts:
+    //   1. Source missing → no rename, no warn (fresh-rotation case).
+    //   2. Source exists + target unwritable → warn fires with
+    //      from + to + error.
+    //   3. Source exists + target writable → rename succeeds,
+    //      no warn.
+
+    use std::sync::{Arc, Mutex};
+
+    /// Capture-then-replay tracing output. Same shape as the helper
+    /// in `dashboard::auth::tests` (PR-1), `dashboard::tests` (PR-2),
+    /// `loops::slow_loop::tests` (PR-3) — each I-13 batch defines a
+    /// private copy rather than surfacing a public test util.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogs;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn rename_snapshot_or_warn_is_silent_when_source_missing() {
+        // Fresh-agent case: rotation walks a chain that doesn't exist
+        // yet. Each call must be a no-op AND must not emit a warn so
+        // the boot-time logs stay clean.
+        let captured = CapturedLogs::default();
+        let buf_handle = captured.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured)
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        let dir = tempdir().expect("tempdir");
+        let from = dir.path().join("graph-snapshot.json.2");
+        let to = dir.path().join("graph-snapshot.json.3");
+        // `from` deliberately not created — the no-existence path.
+
+        tracing::subscriber::with_default(subscriber, || {
+            rename_snapshot_or_warn(&from, &to);
+        });
+
+        let captured_str =
+            String::from_utf8(buf_handle.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .expect("captured logs are utf8");
+        assert!(
+            !captured_str.contains("snapshot rotation rename failed"),
+            "missing source MUST NOT emit a warn (NotFound is the expected fresh-rotation case) — got: {captured_str}"
+        );
+        // Target also must not have been created.
+        assert!(
+            !to.exists(),
+            "no-op path must not somehow create the target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_snapshot_or_warn_emits_warn_on_real_failure() {
+        // Real failure case: `from` exists but the rename can't
+        // complete. Force the failure by making the target
+        // directory unwritable (chmod 0o500 = read+exec but no
+        // write). The rename returns PermissionDenied, the helper
+        // emits a warn carrying from + to + error, and the file
+        // is left where it was.
+        use std::os::unix::fs::PermissionsExt;
+
+        let captured = CapturedLogs::default();
+        let buf_handle = captured.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured)
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        let dir = tempdir().expect("tempdir");
+        let target_dir = dir.path().join("locked");
+        std::fs::create_dir(&target_dir).expect("create locked dir");
+
+        let from = dir.path().join("graph-snapshot.json.1");
+        std::fs::write(&from, b"placeholder").expect("seed from");
+
+        // Move into the locked dir to force PermissionDenied. Save
+        // the previous mode so we can restore it before tempdir drop
+        // (otherwise cleanup itself fails with PermissionDenied).
+        let original_mode = std::fs::metadata(&target_dir)
+            .expect("stat target_dir")
+            .permissions()
+            .mode()
+            & 0o7777;
+        std::fs::set_permissions(&target_dir, std::fs::Permissions::from_mode(0o500))
+            .expect("chmod 500");
+
+        let to = target_dir.join("graph-snapshot.json.2");
+
+        tracing::subscriber::with_default(subscriber, || {
+            rename_snapshot_or_warn(&from, &to);
+        });
+
+        // Restore writable mode so TempDir::drop can clean up.
+        std::fs::set_permissions(&target_dir, std::fs::Permissions::from_mode(original_mode))
+            .expect("restore mode");
+
+        let captured_str =
+            String::from_utf8(buf_handle.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .expect("captured logs are utf8");
+
+        assert!(
+            captured_str.contains("snapshot rotation rename failed"),
+            "warn message missing on real rename failure — got: {captured_str}"
+        );
+        // Both endpoints must be present so the operator can
+        // identify which rotation step broke.
+        assert!(
+            captured_str.contains("graph-snapshot.json.1"),
+            "from field missing — got: {captured_str}"
+        );
+        assert!(
+            captured_str.contains("graph-snapshot.json.2"),
+            "to field missing — got: {captured_str}"
+        );
+        assert!(
+            captured_str.contains("error="),
+            "error field missing — got: {captured_str}"
+        );
+        // The original file must still be where it was — the helper
+        // never claims to roll back a partial state, but the rename
+        // failed so `from` should still exist.
+        assert!(
+            from.exists(),
+            "from must remain on disk after a failed rename"
+        );
+    }
+
+    #[test]
+    fn rename_snapshot_or_warn_performs_rename_silently_on_happy_path() {
+        // Happy path: source exists, target writable. Helper must
+        // perform the rename AND NOT emit a warn.
+        let captured = CapturedLogs::default();
+        let buf_handle = captured.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured)
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        let dir = tempdir().expect("tempdir");
+        let from = dir.path().join("graph-snapshot.json.1");
+        let to = dir.path().join("graph-snapshot.json.2");
+        let payload = b"placeholder-bytes";
+        std::fs::write(&from, payload).expect("seed from");
+
+        tracing::subscriber::with_default(subscriber, || {
+            rename_snapshot_or_warn(&from, &to);
+        });
+
+        // Side effect: the rename actually moved the bytes.
+        assert!(
+            !from.exists(),
+            "from must be gone after a successful rename"
+        );
+        let moved = std::fs::read(&to).expect("read target");
+        assert_eq!(
+            moved.as_slice(),
+            payload,
+            "bytes must arrive at target intact"
+        );
+
+        let captured_str =
+            String::from_utf8(buf_handle.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .expect("captured logs are utf8");
+        assert!(
+            !captured_str.contains("snapshot rotation rename failed"),
+            "successful rename must not emit the failure warn — got: {captured_str}"
+        );
     }
 }
 
