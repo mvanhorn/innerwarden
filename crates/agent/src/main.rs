@@ -663,6 +663,47 @@ pub(crate) use process::post_decision::{
     append_honeypot_marker_event, execute_decision, honeypot_runtime,
 };
 
+// ---------------------------------------------------------------------------
+// Tracing-capture test serialization (Spec 037 I-13 follow-up #3)
+// ---------------------------------------------------------------------------
+//
+// The I-13 sweep (PR-1 #302 through PR-7 #309) introduced tests that
+// install a per-test `tracing_subscriber::fmt` via
+// `tracing::subscriber::with_default(...)` to capture warn output.
+// Although `with_default` documents thread-local scope, in practice
+// concurrent tests that each install their own subscriber race on
+// the global default dispatcher fallback path: events fire on a
+// thread without a thread-local subscriber set and fall through to
+// a (sometimes-stale) global default, dropping the captured warns.
+//
+// Local repro rate during PR-6 (#308): ~33 % per `make test`. The
+// failing test was usually `dashboard::auth::tests::write_admin_audit_or_warn_emits_warn_with_context_on_failure`
+// but any of the nine sibling capture tests in PR-1/2/3/5 could be
+// the victim.
+//
+// Fix: serialize the with_default test bodies via a single
+// crate-level `Mutex<()>`. Each capture test takes the lock at the
+// top, runs while holding it, and releases on drop. No new
+// dev-dependency (avoids the `chore(deps)` consolidation queue);
+// no public API surface (gated `#[cfg(test)]` and `pub(crate)`);
+// no production code change.
+//
+// **Use in a test**:
+//
+// ```ignore
+// let _guard = crate::TRACING_CAPTURE_LOCK
+//     .lock()
+//     .unwrap_or_else(|e| e.into_inner());
+// // ... existing test code that calls with_default(subscriber, || ...)
+// ```
+//
+// `unwrap_or_else(|e| e.into_inner())` is the standard "ignore
+// poisoned" recovery — if a previous test panicked while holding
+// the lock, recover the inner state rather than poisoning every
+// subsequent test.
+#[cfg(test)]
+pub(crate) static TRACING_CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load .env file if present (fail-silent - production uses real env vars)

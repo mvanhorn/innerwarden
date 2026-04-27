@@ -2008,6 +2008,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn set_file_mode_or_warn_emits_warn_with_context_on_failure() {
+        // Spec 037 I-13 follow-up #3: serialize against sibling
+        // capture tests (see `crate::TRACING_CAPTURE_LOCK` rustdoc).
+        let _capture_guard = crate::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         let captured = CapturedLogs::default();
         let buf_handle = captured.0.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -2104,6 +2110,12 @@ mod tests {
     #[test]
     fn set_file_mode_or_warn_applies_mode_silently_on_writable_file() {
         use std::os::unix::fs::PermissionsExt;
+
+        // Spec 037 I-13 follow-up #3: serialize against sibling
+        // capture tests (see `crate::TRACING_CAPTURE_LOCK` rustdoc).
+        let _capture_guard = crate::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         // Inverse anchor: on a real, writable file the wrapper
         // applies the requested mode AND does NOT emit a warn.

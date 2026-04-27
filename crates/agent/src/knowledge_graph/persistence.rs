@@ -1659,6 +1659,12 @@ mod tests {
 
     #[test]
     fn rename_snapshot_or_warn_is_silent_when_source_missing() {
+        // Spec 037 I-13 follow-up #3: serialize against sibling
+        // capture tests (see `crate::TRACING_CAPTURE_LOCK` rustdoc).
+        let _capture_guard = crate::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         // Fresh-agent case: rotation walks a chain that doesn't exist
         // yet. Each call must be a no-op AND must not emit a warn so
         // the boot-time logs stay clean.
@@ -1703,6 +1709,12 @@ mod tests {
         // emits a warn carrying from + to + error, and the file
         // is left where it was.
         use std::os::unix::fs::PermissionsExt;
+
+        // Spec 037 I-13 follow-up #3: serialize against sibling
+        // capture tests (see `crate::TRACING_CAPTURE_LOCK` rustdoc).
+        let _capture_guard = crate::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let captured = CapturedLogs::default();
         let buf_handle = captured.0.clone();
@@ -1773,6 +1785,12 @@ mod tests {
 
     #[test]
     fn rename_snapshot_or_warn_performs_rename_silently_on_happy_path() {
+        // Spec 037 I-13 follow-up #3: serialize against sibling
+        // capture tests (see `crate::TRACING_CAPTURE_LOCK` rustdoc).
+        let _capture_guard = crate::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         // Happy path: source exists, target writable. Helper must
         // perform the rename AND NOT emit a warn.
         let captured = CapturedLogs::default();

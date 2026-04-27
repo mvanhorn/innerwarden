@@ -2091,6 +2091,12 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
 
     #[test]
     fn write_graph_stats_or_warn_emits_warn_with_context_on_failure() {
+        // Spec 037 I-13 follow-up #3: serialize against sibling
+        // capture tests (see `crate::TRACING_CAPTURE_LOCK` rustdoc).
+        let _capture_guard = crate::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         let captured = CapturedLogs::default();
         let buf_handle = captured.0.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -2128,6 +2134,12 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
 
     #[test]
     fn write_graph_stats_or_warn_writes_json_silently_on_writable_dir() {
+        // Spec 037 I-13 follow-up #3: serialize against sibling
+        // capture tests (see `crate::TRACING_CAPTURE_LOCK` rustdoc).
+        let _capture_guard = crate::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         // Inverse anchor: on a real, writable directory the wrapper
         // writes the bytes AND does NOT emit a warn. Pins both halves
         // of the contract — the side effect happens AND no spurious
