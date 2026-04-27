@@ -32,16 +32,60 @@ impl DnaState {
         session_timeout_secs: i64,
     ) -> Self {
         std::fs::create_dir_all(dna_dir).ok();
+        let store = DnaStore::load(dna_dir).expect("dna: failed to initialize store");
+        // Spec 037 I-07 slice 4: rebuild `dna_ip_index` from the
+        // already-persisted `DnaStore` instead of resetting to empty.
+        // Pre-PR every restart wiped cross-IP rotation memory, so an
+        // attacker pivoting IPs during a restart window escaped the
+        // `dna.ip_rotation` correlation event. The rebuild is purely
+        // derived (no new persistence) — `ThreatDna.source_ip` +
+        // `ThreatDna.fuzzy_hash` are already on disk; we just group
+        // them at boot.
+        let dna_ip_index = rebuild_ip_index(&store);
         Self {
-            store: DnaStore::load(dna_dir).expect("dna: failed to initialize store"),
+            store,
             anomaly_detector: AnomalyDetector::with_config(dna_dir, 100, anomaly_threshold),
             chain_tracker: AttackChainTracker::load(dna_dir),
             sessions: std::collections::HashMap::new(),
             min_sequence,
             session_timeout_secs,
-            dna_ip_index: std::collections::HashMap::new(),
+            dna_ip_index,
         }
     }
+}
+
+/// Rebuild the `fuzzy_hash → [source_ip]` inverted index from the
+/// persisted `DnaStore`. Spec 037 I-07 slice 4 — purely derived warm
+/// cache; no new storage path is added.
+///
+/// Cap behaviour: the runtime path in `process_events` enforces a
+/// 50-IPs-per-fuzzy-hash cap via a front-drain. The rebuild does NOT
+/// re-enforce that cap — `DnaStore` is bounded at 10_000 entries, so
+/// the worst-case rebuilt index is bounded too, and the runtime path
+/// will evict on the next growth event for any over-cap bucket. The
+/// alternative (apply the cap at rebuild) would require an arbitrary
+/// "which 50?" choice since `DnaStore::all()` returns a HashMap
+/// iteration with no insertion-order guarantee — accepting temporary
+/// over-cap is simpler and converges to the same steady state.
+///
+/// Empty `source_ip` entries are skipped: the runtime path only
+/// builds `BehaviorSequence`s for events that resolved a source IP
+/// (`dna_inline.rs` line ~95), so on disk this should be vanishingly
+/// rare, but the defensive skip keeps a stale row from a previous
+/// agent version from polluting the index with a blank-string key.
+pub(crate) fn rebuild_ip_index(store: &DnaStore) -> std::collections::HashMap<String, Vec<String>> {
+    let mut index: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for dna in store.all() {
+        if dna.source_ip.is_empty() {
+            continue;
+        }
+        let ips = index.entry(dna.fuzzy_hash.clone()).or_default();
+        if !ips.contains(&dna.source_ip) {
+            ips.push(dna.source_ip.clone());
+        }
+    }
+    index
 }
 
 /// Process sensor events through the DNA engine.
@@ -346,4 +390,147 @@ fn event_to_atom(
     };
 
     Some((source_ip, atom, atom_key, comm))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use innerwarden_dna::fingerprint::ThreatDna;
+    use tempfile::TempDir;
+
+    fn dna_store_with_entries(entries: Vec<ThreatDna>) -> (TempDir, DnaStore) {
+        let dir = TempDir::new().expect("tempdir");
+        let mut store = DnaStore::load(dir.path()).expect("load fresh store");
+        for dna in entries {
+            store.insert(dna);
+        }
+        (dir, store)
+    }
+
+    fn mk_dna(fuzzy: &str, source_ip: &str, exact_suffix: &str) -> ThreatDna {
+        let now = chrono::Utc::now();
+        ThreatDna {
+            // `exact_hash` is the HashMap key inside DnaStore — must
+            // be unique per row or `insert` will treat the row as a
+            // duplicate update.
+            exact_hash: format!("{fuzzy}-{source_ip}-{exact_suffix}"),
+            fuzzy_hash: fuzzy.to_string(),
+            length: 5,
+            atoms: Vec::new(),
+            source_ip: source_ip.to_string(),
+            first_seen: now,
+            last_seen: now,
+            seen_count: 1,
+            classification: None,
+        }
+    }
+
+    // ── Spec 037 I-07 slice 4 — `rebuild_ip_index` warm-cache anchors ──
+    //
+    // Slice 4 makes `dna_ip_index` survive a restart by deriving it
+    // from the already-persisted `DnaStore` at boot, instead of
+    // adding a new persistence path. These anchors pin the rebuild
+    // contract:
+    //
+    //   1. Empty store → empty index (degraded fallback; pre-PR
+    //      behaviour preserved).
+    //   2. Multiple ThreatDna entries with the same fuzzy_hash but
+    //      different source_ips group together — this is the property
+    //      the cross-IP rotation detection relies on.
+    //   3. Repeated source_ip across multiple ThreatDna rows is
+    //      deduped in the resulting Vec — the runtime `process_events`
+    //      contract is "each IP appears at most once per fuzzy hash".
+    //   4. ThreatDna with empty `source_ip` is skipped — defensive
+    //      against a stale row from a previous agent version
+    //      polluting the index with a blank-string key.
+
+    #[test]
+    fn rebuild_dna_ip_index_is_empty_on_fresh_store() {
+        let (_dir, store) = dna_store_with_entries(Vec::new());
+        let index = rebuild_ip_index(&store);
+        assert!(
+            index.is_empty(),
+            "fresh store MUST yield an empty rebuilt index — pre-PR boot behaviour"
+        );
+    }
+
+    #[test]
+    fn rebuild_dna_ip_index_groups_ips_by_fuzzy_hash() {
+        // Two ThreatDna entries share fuzzy_hash "fhA" but came from
+        // different IPs — the cross-IP rotation case the runtime
+        // path is built to detect. After rebuild, both IPs MUST sit
+        // in the same Vec under "fhA".
+        let entries = vec![
+            mk_dna("fhA", "203.0.113.1", "ex1"),
+            mk_dna("fhA", "203.0.113.2", "ex2"),
+            mk_dna("fhB", "198.51.100.5", "ex3"),
+        ];
+        let (_dir, store) = dna_store_with_entries(entries);
+        let index = rebuild_ip_index(&store);
+
+        let fha_ips = index.get("fhA").expect("fhA bucket must exist");
+        assert_eq!(
+            fha_ips.len(),
+            2,
+            "both IPs sharing fuzzy_hash fhA must land in the same bucket"
+        );
+        assert!(fha_ips.contains(&"203.0.113.1".to_string()));
+        assert!(fha_ips.contains(&"203.0.113.2".to_string()));
+
+        let fhb_ips = index.get("fhB").expect("fhB bucket must exist");
+        assert_eq!(fhb_ips.len(), 1);
+        assert_eq!(fhb_ips[0], "198.51.100.5");
+    }
+
+    #[test]
+    fn rebuild_dna_ip_index_dedupes_repeated_source_ip() {
+        // Same IP can appear in multiple ThreatDna rows for the same
+        // fuzzy_hash (e.g. behaviour repeated across sessions and
+        // re-fingerprinted). The rebuilt Vec MUST list it once,
+        // matching the runtime `process_events` contract that uses
+        // `if !known_ips.contains(&ip) { known_ips.push(ip) }` to
+        // dedupe at insertion time.
+        let entries = vec![
+            mk_dna("fhDup", "203.0.113.42", "ex1"),
+            mk_dna("fhDup", "203.0.113.42", "ex2"),
+            mk_dna("fhDup", "203.0.113.42", "ex3"),
+        ];
+        let (_dir, store) = dna_store_with_entries(entries);
+        let index = rebuild_ip_index(&store);
+
+        let ips = index.get("fhDup").expect("fhDup bucket must exist");
+        assert_eq!(
+            ips.len(),
+            1,
+            "repeated source_ip across rows must dedupe to a single Vec entry"
+        );
+        assert_eq!(ips[0], "203.0.113.42");
+    }
+
+    #[test]
+    fn rebuild_dna_ip_index_skips_empty_source_ip() {
+        // A stale row from a previous agent version with an empty
+        // source_ip MUST NOT pollute the index with a blank-string
+        // entry. Defensive: today's runtime path filters such rows
+        // before they reach the store, but rebuild reads whatever
+        // is on disk.
+        let entries = vec![
+            mk_dna("fhA", "", "blank"),
+            mk_dna("fhA", "203.0.113.7", "valid"),
+        ];
+        let (_dir, store) = dna_store_with_entries(entries);
+        let index = rebuild_ip_index(&store);
+
+        let ips = index.get("fhA").expect("fhA bucket must exist");
+        assert_eq!(
+            ips.len(),
+            1,
+            "empty source_ip row must be skipped, valid sibling must still load"
+        );
+        assert_eq!(ips[0], "203.0.113.7");
+        assert!(
+            !ips.contains(&String::new()),
+            "blank-string IP must NEVER appear in the rebuilt Vec"
+        );
+    }
 }
