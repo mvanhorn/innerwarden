@@ -342,6 +342,14 @@ pub(super) fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Vec<T> {
         match std::fs::File::open(path) {
             Ok(mut f) => {
                 use std::io::{Read, Seek, SeekFrom};
+                // Spec 037 I-13 PR-7 (K-class): pre-checked by the
+                // `file_size > MAX_READ_BYTES` branch above —
+                // seeking back MAX_READ_BYTES from end is valid by
+                // construction. The only way this fails is a race
+                // with file truncation between the metadata stat
+                // and this seek; the empty-buf fall-through below
+                // is the correct response (return whatever
+                // surviving lines we got). Intentionally silent.
                 let _ = f.seek(SeekFrom::End(-(MAX_READ_BYTES as i64)));
                 let mut buf = String::with_capacity(MAX_READ_BYTES as usize);
                 let _ = f.read_to_string(&mut buf);

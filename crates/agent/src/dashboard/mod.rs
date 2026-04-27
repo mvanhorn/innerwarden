@@ -496,6 +496,11 @@ pub async fn serve(
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             interval.tick().await;
+            // Spec 037 I-13 PR-7 (K-class): broadcast `send` returns
+            // `Err` only when there are zero subscribers — the
+            // expected steady state when no operator is viewing the
+            // dashboard. Heartbeat to nobody is fine; intentionally
+            // silent. Same rationale as `dashboard/sse.rs` sends.
             let _ = event_tx.send(SsePayload {
                 kind: "heartbeat".to_string(),
                 data: None,
@@ -590,7 +595,12 @@ async fn build_tls_config(
 ) -> Result<axum_server::tls_rustls::RustlsConfig> {
     use axum_server::tls_rustls::RustlsConfig;
 
-    // Ensure a crypto provider is installed (required by rustls 0.23+)
+    // Ensure a crypto provider is installed (required by rustls 0.23+).
+    // Spec 037 I-13 PR-7 (K-class): `install_default()` is
+    // idempotent — `Err` means "another provider is already
+    // installed", which is the steady state on hot reload or when
+    // the test runner has set one up before us. Intentionally
+    // silent.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     if let (Some(cert), Some(key)) = (cert_path, key_path) {

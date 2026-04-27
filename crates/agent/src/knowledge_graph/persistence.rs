@@ -360,8 +360,23 @@ impl KnowledgeGraph {
             }
             if let Ok(date) = chrono::NaiveDate::parse_from_str(date_part, "%Y-%m-%d") {
                 if date < cutoff {
+                    // Spec 037 I-13 PR-7 (K-class): best-effort cleanup.
+                    // The dated snapshot may have been removed by a
+                    // prior run, by an external operator, or via the
+                    // rotation chain. Failure modes: NotFound (common
+                    // — pre-existing absence) or PermissionDenied
+                    // (rare). Either way the file lingers harmlessly
+                    // and the next cleanup run retries; the surrounding
+                    // `info!` below logs success on the dated row.
                     let _ = std::fs::remove_file(entry.path());
-                    // Also remove rotation backups
+                    // Same K-class rationale: rotation backups
+                    // `.json.{1,2,3}` are absent on most days
+                    // (rotation only fills slots when snapshots are
+                    // saved repeatedly within a day). NotFound is the
+                    // expected steady-state outcome for the majority
+                    // of these calls — converting to debug! would
+                    // spam every cleanup tick without diagnostic
+                    // value.
                     for i in 1..=3 {
                         let backup = entry.path().with_extension(format!("json.{i}"));
                         let _ = std::fs::remove_file(&backup);
@@ -686,7 +701,15 @@ fn rename_snapshot_or_warn(from: &Path, to: &Path) {
 /// T029: Rotate snapshot files — keep last `max_backups` copies.
 /// graph-snapshot.json → .json.1 → .json.2 → .json.3 (oldest deleted)
 fn rotate_snapshots(path: &Path, max_backups: u32) {
-    // Delete oldest backup
+    // Delete oldest backup. Spec 037 I-13 PR-7 (K-class):
+    // best-effort cleanup. On a fresh chain (rotation slot
+    // `.json.{max_backups}` not yet populated), `remove_file`
+    // returns NotFound — that is the expected case until the
+    // rotation has cycled `max_backups` times. PermissionDenied
+    // would also be silent here, but `rotate_snapshots` is now
+    // off the hot path post spec 037 PR-3 (called only by
+    // operator-triggered CLI migrations) so any real failure is
+    // visible in the migration command output one way or another.
     let oldest = path.with_extension(format!("json.{max_backups}"));
     let _ = std::fs::remove_file(&oldest);
 
