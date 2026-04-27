@@ -38,6 +38,52 @@ fn elapsed_secs_for_report(started_at: std::time::Instant) -> u64 {
     }
 }
 
+/// Ensure the honeypot evidence directory exists, surfacing creation
+/// failures via `warn!` with structured context. Replaces the prior
+/// `let _ = tokio::fs::create_dir_all(..)` at the head of the
+/// session-evidence write path (Spec 037 I-13 PR-6). `create_dir_all`
+/// is idempotent on success — failure (perms, FS read-only) cascades
+/// into a silent skip of the entire evidence write downstream.
+/// Surfacing it pins the head of that cascade so the operator gets
+/// one signal per failed connection instead of zero.
+async fn ensure_honeypot_dir_or_warn(dir: &Path) {
+    if let Err(e) = tokio::fs::create_dir_all(dir).await {
+        warn!(
+            path = %dir.display(),
+            error = %e,
+            "honeypot evidence dir creation failed (session evidence will be lost)"
+        );
+    }
+}
+
+/// Append one JSONL line to an already-open evidence file, surfacing
+/// write failures via `warn!` with structured context. Replaces the
+/// prior `let _ = f.write_all(..)` (Spec 037 I-13 PR-6). The file is
+/// the session-specific JSONL that forensic analysis reads after the
+/// session — silent loss of any line directly defeats the honeypot's
+/// purpose.
+///
+/// Takes `&mut File` rather than the path because the open is still
+/// the caller's concern (the wrapping `if let Ok(mut f) = ..open()`
+/// in `handle_always_on_connection` is out of scope for this PR — it
+/// is a different shape from `let _ =`).
+async fn write_evidence_line_or_warn(
+    file: &mut tokio::fs::File,
+    path: &Path,
+    session_id: &str,
+    line: &[u8],
+) {
+    use tokio::io::AsyncWriteExt;
+    if let Err(e) = file.write_all(line).await {
+        warn!(
+            path = %path.display(),
+            session_id = %session_id,
+            error = %e,
+            "honeypot evidence write failed (session JSONL line lost)"
+        );
+    }
+}
+
 /// Handle a single always-on honeypot connection end-to-end:
 /// SSH key exchange, credential capture, optional LLM shell, evidence write,
 /// IOC extraction, AI verdict, auto-block, Telegram T.5 report.
@@ -90,7 +136,7 @@ async fn handle_always_on_connection(
 
     // Write evidence to honeypot dir (append-only JSONL).
     let honeypot_dir = data_dir.join("honeypot");
-    let _ = tokio::fs::create_dir_all(&honeypot_dir).await;
+    ensure_honeypot_dir_or_warn(&honeypot_dir).await;
     let evidence_path = honeypot_dir.join(format!("listener-session-{session_id}.jsonl"));
     if let Ok(json) = serde_json::to_string(&serde_json::json!({
         "ts": chrono::Utc::now().to_rfc3339(),
@@ -109,8 +155,7 @@ async fn handle_always_on_connection(
             .open(&evidence_path)
             .await
         {
-            use tokio::io::AsyncWriteExt;
-            let _ = f.write_all(line.as_bytes()).await;
+            write_evidence_line_or_warn(&mut f, &evidence_path, &session_id, line.as_bytes()).await;
         }
     }
 
@@ -696,5 +741,119 @@ mod tests {
         join_result
             .unwrap()
             .expect("listener task completed without panic");
+    }
+
+    // ── Spec 037 I-13 PR-6 — evidence-write helper anchors ────────
+    //
+    // PR-6 of I-13 converts the two `let _ =` swallows in the
+    // honeypot session evidence path into `warn!`-on-failure helpers
+    // (`ensure_honeypot_dir_or_warn`, `write_evidence_line_or_warn`).
+    // These tests anchor the warn-vs-silent contract for each helper.
+    // Added as a fix-after-fail measure: the first push hit
+    // `codecov/patch` 0.00% because the call sites in
+    // `handle_always_on_connection` are not exercised by any unit
+    // test (only by replay-qa / scenario-qa, which do not contribute
+    // to codecov/patch). Helper-level coverage carries the patch
+    // ratio over 70%.
+
+    #[tokio::test]
+    async fn ensure_honeypot_dir_or_warn_creates_dir_silently_when_writable() {
+        // Happy path: writable parent → dir is created, no panic.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("honeypot");
+        assert!(!target.exists(), "fixture must start with target absent");
+
+        ensure_honeypot_dir_or_warn(&target).await;
+
+        assert!(
+            target.exists(),
+            "create_dir_all must have produced the directory on the happy path"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_honeypot_dir_or_warn_does_not_panic_on_unwritable_parent() {
+        // Failure path: parent is a regular file, not a directory.
+        // `create_dir_all` fails with `NotADirectory`/`AlreadyExists`
+        // and the helper must absorb the error so the calling
+        // session handler proceeds (matches the prior `let _ =`
+        // no-panic property).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocking_file = dir.path().join("blocker");
+        std::fs::write(&blocking_file, b"i am a file").expect("seed blocker");
+
+        // `blocker/honeypot` cannot be created because `blocker` is a file.
+        let target = blocking_file.join("honeypot");
+
+        // Must not panic.
+        ensure_honeypot_dir_or_warn(&target).await;
+    }
+
+    #[tokio::test]
+    async fn write_evidence_line_or_warn_appends_line_silently_on_writable_file() {
+        // Happy path: bytes land at the end of the file, no panic.
+        // Note: tokio's File::drop does NOT synchronously flush
+        // pending writes — we MUST `flush + sync_data` explicitly
+        // before reading back via `std::fs::read`, or the read can
+        // race the in-flight write and observe an empty file. This
+        // is what the first CI run hit.
+        use tokio::io::AsyncWriteExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("evidence.jsonl");
+
+        let mut f = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+            .expect("open writable");
+
+        let line = b"{\"sid\":\"alpha\"}\n";
+        write_evidence_line_or_warn(&mut f, &path, "alpha", line).await;
+        // Force the bytes to disk before the synchronous read.
+        f.flush().await.expect("flush");
+        f.sync_data().await.expect("sync_data");
+        drop(f);
+
+        let on_disk = std::fs::read(&path).expect("read evidence file");
+        assert_eq!(
+            on_disk.as_slice(),
+            line,
+            "the helper must write the JSONL line verbatim on the happy path"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_evidence_line_or_warn_does_not_panic_on_read_only_file() {
+        // Failure path: open the file in read-only mode and pass it
+        // to the helper. `write_all` returns
+        // `io::ErrorKind::Unsupported` / `InvalidInput` (platform-
+        // dependent), the helper must absorb it without panic and
+        // leave the file untouched. Matches the prior `let _ =`
+        // no-panic property.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("evidence.jsonl");
+        // Seed a non-empty file so we can also assert it was NOT
+        // mutated by the failed write.
+        let pre = b"untouched";
+        std::fs::write(&path, pre).expect("seed");
+
+        let mut f = tokio::fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .await
+            .expect("open read-only");
+
+        // Must not panic.
+        write_evidence_line_or_warn(&mut f, &path, "alpha", b"hello\n").await;
+        drop(f);
+
+        let after = std::fs::read(&path).expect("read after");
+        assert_eq!(
+            after.as_slice(),
+            pre,
+            "a failed write must not somehow mutate the file"
+        );
     }
 }
