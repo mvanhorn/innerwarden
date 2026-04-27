@@ -183,3 +183,132 @@ pub fn format_simple_status(
         last_threat_ago = escape_html(last_threat_ago),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_pipeline() -> PipelineDigestStats {
+        PipelineDigestStats {
+            suppressed_count: 0,
+            auto_resolved_groups: 0,
+            needs_review_groups: 0,
+            deferred: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn format_daily_digest_simple_zero_incidents_is_all_clear() {
+        let msg = format_daily_digest(0, 0, 0, 0, "n/a", 0, true);
+        assert!(msg.contains("Good morning"));
+        assert!(msg.contains("0 attacks blocked"));
+        assert!(msg.contains("0 critical threats"));
+        assert!(msg.contains("Health: 100/100"));
+        assert!(msg.contains("All clear"));
+    }
+
+    #[test]
+    fn format_daily_digest_simple_with_threats_lowers_score() {
+        // 2 critical (-40) + 4 high (-20) -> score 40, yellow then red threshold
+        let msg = format_daily_digest(10, 5, 2, 4, "rule_A", 7, true);
+        assert!(msg.contains("5 attacks blocked"));
+        assert!(msg.contains("2 critical threats"));
+        // 100 - 2*20 - 4*5 = 40, falls below the yellow >=50 threshold -> red emoji.
+        assert!(msg.contains("Health: 40/100"));
+    }
+
+    #[test]
+    fn format_daily_digest_simple_floors_score_at_zero() {
+        // 100 critical * 20 = -1900 raw; clamp to 0.
+        let msg = format_daily_digest(0, 0, 100, 0, "n/a", 0, true);
+        assert!(msg.contains("Health: 0/100"));
+    }
+
+    #[test]
+    fn format_daily_digest_technical_includes_counts_and_top_detector() {
+        let msg = format_daily_digest(7, 3, 1, 2, "WAF/cve-2025-1234", 4, false);
+        assert!(msg.contains("Daily digest"));
+        assert!(msg.contains("Total: 7 incidents, 3 blocks"));
+        assert!(msg.contains("WAF/cve-2025-1234: 4"));
+        assert!(msg.contains("Critical: 1 | High: 2"));
+        // Technical mode does NOT include the simple-mode greeting.
+        assert!(!msg.contains("Good morning"));
+    }
+
+    #[test]
+    fn format_daily_digest_simple_vs_technical_differs() {
+        let simple = format_daily_digest(5, 2, 1, 0, "rule_X", 1, true);
+        let technical = format_daily_digest(5, 2, 1, 0, "rule_X", 1, false);
+        assert_ne!(simple, technical);
+        assert!(simple.contains("Good morning"));
+        assert!(technical.contains("Daily digest"));
+    }
+
+    #[test]
+    fn format_daily_digest_technical_html_escapes_top_detector() {
+        let msg = format_daily_digest(0, 0, 0, 0, "evil<script>&", 0, false);
+        assert!(msg.contains("evil&lt;script&gt;&amp;"));
+        assert!(!msg.contains("evil<script>&:"));
+    }
+
+    #[test]
+    fn format_daily_digest_enriched_zero_state_does_not_panic() {
+        let msg = format_daily_digest_enriched(0, 0, 0, 0, "n/a", 0, true, &empty_pipeline());
+        // Empty deferred + zero auto-resolved + zero needs-review -> ends with "All clear".
+        assert!(msg.contains("Daily Security Briefing"));
+        assert!(msg.contains("All clear. Nothing needs you."));
+        assert!(!msg.contains("Handled silently:"));
+        assert!(!msg.contains("threat groups auto-resolved"));
+        assert!(!msg.contains("groups need your review"));
+    }
+
+    #[test]
+    fn format_daily_digest_enriched_renders_deferred_entries() {
+        let pipeline = PipelineDigestStats {
+            suppressed_count: 4,
+            auto_resolved_groups: 2,
+            needs_review_groups: 0,
+            deferred: vec![
+                ("waf.path_traversal".to_string(), 12),
+                ("waf.sql_injection".to_string(), 5),
+            ],
+        };
+
+        let simple = format_daily_digest_enriched(20, 17, 0, 1, "waf", 12, true, &pipeline);
+        assert!(simple.contains("Handled silently:"));
+        // friendly_detector_name is exercised here; both counts must appear.
+        assert!(simple.contains("12"));
+        assert!(simple.contains("5"));
+        assert!(simple.contains("2 threat groups auto-resolved"));
+        assert!(simple.contains("All clear. Nothing needs you."));
+
+        let technical = format_daily_digest_enriched(20, 17, 0, 1, "waf", 12, false, &pipeline);
+        assert!(technical.contains("Daily Digest"));
+        assert!(technical.contains("Pipeline: 4 grouped, 2 auto-resolved, 0 need review"));
+        assert!(technical.contains("Deferred:"));
+        assert!(technical.contains("waf.path_traversal=12"));
+        assert!(technical.contains("waf.sql_injection=5"));
+    }
+
+    #[test]
+    fn format_daily_digest_enriched_simple_renders_needs_review_warning() {
+        let pipeline = PipelineDigestStats {
+            suppressed_count: 0,
+            auto_resolved_groups: 0,
+            needs_review_groups: 3,
+            deferred: Vec::new(),
+        };
+
+        let msg = format_daily_digest_enriched(2, 1, 1, 0, "n/a", 0, true, &pipeline);
+        assert!(msg.contains("3 groups need your review"));
+        // "All clear" is replaced by the review warning when needs_review_groups > 0.
+        assert!(!msg.contains("All clear. Nothing needs you."));
+    }
+
+    #[test]
+    fn format_daily_digest_enriched_technical_html_escapes_top_detector() {
+        let pipeline = empty_pipeline();
+        let msg = format_daily_digest_enriched(1, 0, 0, 0, "evil<script>&", 1, false, &pipeline);
+        assert!(msg.contains("evil&lt;script&gt;&amp;"));
+    }
+}
