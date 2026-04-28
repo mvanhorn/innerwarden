@@ -26,6 +26,31 @@ fn warm_jsonl_patterns() -> &'static [(&'static str, &'static str)] {
     ]
 }
 
+/// Read the data directory for the monthly-file cleanup pass, surfacing
+/// genuine I/O failure via `warn!` while staying silent on `NotFound`
+/// (steady state on a fresh install before the data dir is created).
+/// Replaces the silent `if let Ok(entries) = fs::read_dir(data_dir)`
+/// site in the monthly cleanup branch (Spec 037 I-13 follow-up #2).
+///
+/// On a real I/O error (perms, FS error) the operator's monthly-file
+/// retention pass is skipped silently and old reports accumulate on
+/// disk indefinitely. The warn carries path + error so the operator
+/// can fix permissions and restore retention.
+fn read_data_dir_for_monthly_cleanup_or_warn(data_dir: &Path) -> Option<fs::ReadDir> {
+    match fs::read_dir(data_dir) {
+        Ok(it) => Some(it),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            warn!(
+                path = %data_dir.display(),
+                error = %e,
+                "data retention monthly cleanup read_dir failed (old reports not pruned)"
+            );
+            None
+        }
+    }
+}
+
 /// Remove old data files from `data_dir` according to retention config.
 ///
 /// Runs on agent startup and in the slow loop (once per day).
@@ -111,7 +136,7 @@ pub fn cleanup(data_dir: &Path, cfg: &DataRetentionConfig) -> usize {
     }
 
     // Monthly file cleanup: monthly-report-YYYY-MM.{json,md}
-    if let Ok(entries) = fs::read_dir(data_dir) {
+    if let Some(entries) = read_data_dir_for_monthly_cleanup_or_warn(data_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
@@ -907,5 +932,45 @@ mod tests {
         let (removed, _) = cleanup_filestore(tmp.path(), &cfg);
         assert_eq!(removed, 0);
         assert!(root.join("aa").join("ancient.bin").exists());
+    }
+
+    // Spec 037 I-13 follow-up #2: read_data_dir_for_monthly_cleanup_or_warn
+
+    #[test]
+    fn read_data_dir_for_monthly_cleanup_or_warn_returns_some_silently_on_real_dir() {
+        let _guard = crate::test_util::arm_capture();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = read_data_dir_for_monthly_cleanup_or_warn(dir.path());
+        assert!(result.is_some(), "real directory must yield Some");
+
+        let captured = crate::test_util::drain_capture();
+        assert!(
+            !captured.contains("data retention monthly cleanup read_dir failed"),
+            "happy path must not emit warn, got: {captured}"
+        );
+    }
+
+    #[test]
+    fn read_data_dir_for_monthly_cleanup_or_warn_returns_none_and_warns_on_io_failure() {
+        let _guard = crate::test_util::arm_capture();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocking_file = dir.path().join("blocker");
+        std::fs::write(&blocking_file, b"i am a regular file").expect("seed blocker");
+        // read_dir on a regular file path returns NotADirectory (Linux)
+        // which is non-NotFound and triggers the warn arm.
+        let result = read_data_dir_for_monthly_cleanup_or_warn(&blocking_file);
+        assert!(result.is_none(), "io-failure must yield None");
+
+        let captured = crate::test_util::drain_capture();
+        assert!(
+            captured.contains("data retention monthly cleanup read_dir failed"),
+            "io-failure warn missing, got: {captured}"
+        );
+        assert!(
+            captured.contains("error="),
+            "error field missing, got: {captured}"
+        );
     }
 }

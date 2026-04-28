@@ -567,6 +567,36 @@ fn kg_tick(state: &mut AgentState, data_dir: &Path, events: &[innerwarden_core::
     }
 }
 
+/// Run a session-listing command (default `who -i`) to capture stdout,
+/// surfacing genuine spawn/exec failures via `warn!` while staying
+/// silent on `NotFound` (some minimal containers ship without the
+/// binary). Replaces the silent
+/// `if let Ok(output) = Command::new("who").arg("-i").output()` site
+/// in `refresh_operator_ips` (Spec 037 I-13 follow-up #2).
+///
+/// `program` is parameterised so tests can inject a path that exists
+/// but is not executable (forcing the warn branch) or a NotFound
+/// path (verifying silent fallthrough). Production passes "who".
+///
+/// On a real spawn failure (perms, exec error) the operator-IP
+/// enrichment is skipped: the agent loses the signal that protects
+/// active SSH sessions from automated blocks. The warn carries
+/// program + error so the operator can investigate the regression.
+fn run_session_command_or_warn(program: &str, arg: &str) -> Option<String> {
+    match std::process::Command::new(program).arg(arg).output() {
+        Ok(output) => Some(String::from_utf8_lossy(&output.stdout).into_owned()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            warn!(
+                program,
+                error = %e,
+                "session-listing invocation failed (operator IP enrichment skipped)"
+            );
+            None
+        }
+    }
+}
+
 /// Refresh operator IPs from active SSH sessions.
 /// Replaces the entire set - IPs whose sessions ended are automatically removed.
 pub(crate) fn refresh_operator_ips(state: &mut AgentState, allowlist: &config::AllowlistConfig) {
@@ -574,8 +604,7 @@ pub(crate) fn refresh_operator_ips(state: &mut AgentState, allowlist: &config::A
     let mut active_ips = std::collections::HashMap::new();
 
     // Check active sessions via `who -i`
-    if let Ok(output) = std::process::Command::new("who").arg("-i").output() {
-        let who_out = String::from_utf8_lossy(&output.stdout);
+    if let Some(who_out) = run_session_command_or_warn("who", "-i") {
         active_ips = operator_ips_from_who_output(&who_out, &allowlist.trusted_users, now);
     }
 
@@ -2171,6 +2200,52 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
         assert!(
             state.sqlite_store.is_none(),
             "back-off must skip the reopen call"
+        );
+    }
+
+    // Spec 037 I-13 follow-up #2: run_session_command_or_warn
+
+    #[test]
+    fn run_session_command_or_warn_returns_none_silently_on_not_found() {
+        // Pointing at a binary that does not exist surfaces NotFound,
+        // which is the steady state for stripped containers without
+        // `who`. The helper must return None and emit no warn.
+        let _guard = crate::test_util::arm_capture();
+
+        let result =
+            run_session_command_or_warn("/this/path/never/ever/exists/innerwarden-i13-who", "-i");
+        assert!(result.is_none(), "missing binary must yield None");
+
+        let captured = crate::test_util::drain_capture();
+        assert!(
+            !captured.contains("session-listing invocation failed"),
+            "NotFound must NOT emit warn, got: {captured}"
+        );
+    }
+
+    #[test]
+    fn run_session_command_or_warn_returns_none_and_warns_on_io_failure() {
+        // Pointing at a real, non-executable file surfaces
+        // PermissionDenied (Linux) or similar non-NotFound error.
+        // The helper must emit the warn carrying program + error.
+        let _guard = crate::test_util::arm_capture();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let non_exec = dir.path().join("not-executable");
+        std::fs::write(&non_exec, b"i am not executable").expect("seed file");
+        let non_exec_str = non_exec.to_str().expect("utf-8 path");
+
+        let result = run_session_command_or_warn(non_exec_str, "-i");
+        assert!(result.is_none(), "non-executable must yield None");
+
+        let captured = crate::test_util::drain_capture();
+        assert!(
+            captured.contains("session-listing invocation failed"),
+            "io-failure warn missing, got: {captured}"
+        );
+        assert!(
+            captured.contains("error="),
+            "error field missing, got: {captured}"
         );
     }
 }
