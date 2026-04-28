@@ -3,6 +3,81 @@
 use super::*;
 
 // ---------------------------------------------------------------------------
+// Agent-guard alert drop counters (Spec 037 I-13 follow-up #5)
+// ---------------------------------------------------------------------------
+//
+// `run_analysis` below sends alerts into a bounded `mpsc::channel(64)`
+// via `try_send`. Pre-PR the failure path was a silent `let _ = ..`,
+// so a backlogged channel (downstream notification I/O stalled) or a
+// crashed receiver task was completely invisible to the operator —
+// alerts just disappeared.
+//
+// These counters surface the two `TrySendError` variants:
+//
+//   - `full`: 64 alerts pending, receiver alive but slow to drain.
+//     Recoverable; counter-only signal so the operator can spot
+//     sustained backlogs via `/metrics`.
+//   - `closed`: receiver task dropped (panic or early exit). Severe
+//     — all subsequent alerts are permanently lost until process
+//     restart. One-shot `warn!` on first occurrence per process so
+//     the operator gets an immediate log signal, plus the counter
+//     for post-hoc accounting. Subsequent drops increment the
+//     counter silently to avoid log-spam if check-command is
+//     called repeatedly while the receiver is gone.
+//
+// Both counters surface via `/metrics` as
+// `innerwarden_agent_alert_drops_total{reason="full"|"closed"}`.
+// Cardinality is fixed (2 series); no per-agent label to avoid
+// operator-controlled cardinality explosion.
+
+static AGENT_ALERT_DROPS_FULL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static AGENT_ALERT_DROPS_CLOSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static CLOSED_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Read-side accessor for the metrics renderer.
+pub(crate) fn agent_alert_drops_full() -> u64 {
+    AGENT_ALERT_DROPS_FULL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Read-side accessor for the metrics renderer.
+pub(crate) fn agent_alert_drops_closed() -> u64 {
+    AGENT_ALERT_DROPS_CLOSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Record a `try_send` failure on the agent-alert channel. Bumps the
+/// counter for the matched `TrySendError` variant; on `Closed`, also
+/// emits a one-shot `warn!` per process (subsequent Closed drops
+/// increment the counter silently).
+///
+/// Returns `()` so the call site stays one-line and the
+/// downstream-decision flow in `run_analysis` continues regardless
+/// of the drop outcome (matches the prior `let _ =` no-propagate
+/// behaviour).
+fn record_agent_alert_drop(err: tokio::sync::mpsc::error::TrySendError<AgentGuardAlert>) {
+    use std::sync::atomic::Ordering;
+    use tokio::sync::mpsc::error::TrySendError;
+    match err {
+        TrySendError::Full(_) => {
+            AGENT_ALERT_DROPS_FULL.fetch_add(1, Ordering::Relaxed);
+        }
+        TrySendError::Closed(_) => {
+            AGENT_ALERT_DROPS_CLOSED.fetch_add(1, Ordering::Relaxed);
+            // `swap(true, Relaxed)` returns the previous value. On
+            // the first Closed of the process the swap returns
+            // `false` and we warn; on every subsequent Closed it
+            // returns `true` and we stay silent.
+            if !CLOSED_WARNED.swap(true, Ordering::Relaxed) {
+                warn!(
+                    "agent_alert channel CLOSED — receiver task is gone, \
+                     alerts permanently lost until restart"
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 pub(super) fn parse_disabled_detectors(content: &str) -> std::collections::HashSet<&'static str> {
     let mut disabled = std::collections::HashSet::new();
@@ -348,7 +423,15 @@ pub(super) fn run_analysis(
                 .collect(),
             explanation: analysis.explanation.clone(),
         };
-        let _ = state.agent_alert_tx.try_send(alert);
+        // Spec 037 I-13 follow-up #5: surface drop counts via
+        // `innerwarden_agent_alert_drops_total{reason="full"|"closed"}`
+        // on `/metrics`. `try_send` is intentionally non-blocking
+        // here — the calling HTTP handler must not stall on a
+        // backlogged channel — but the failure path is now visible
+        // instead of silently throwing alerts away.
+        if let Err(e) = state.agent_alert_tx.try_send(alert) {
+            record_agent_alert_drop(e);
+        }
     }
 
     // Serialize to the same JSON shape as the old analyze_command for backward compat.
@@ -643,6 +726,44 @@ pub(super) fn build_prometheus_metrics_text(
         "innerwarden_disk_low_skips_total{{operation=\"kg_snapshot\"}} {}\n",
         crate::loops::slow_loop::disk_low_skips_kg_snapshot()
     ));
+
+    // Agent-guard alert drop counts. A rising `full` counter means
+    // the alert channel is backlogged (downstream notification I/O
+    // stalled). A non-zero `closed` counter means the receiver task
+    // is dead and alerts are permanently lost until process restart
+    // — the `warn!` at first occurrence is the immediate signal,
+    // this metric carries the post-hoc count.
+    out.push_str(
+        "# HELP innerwarden_agent_alert_drops_total Agent guard alerts dropped (channel send failed)\n",
+    );
+    out.push_str("# TYPE innerwarden_agent_alert_drops_total counter\n");
+    out.push_str(&format!(
+        "innerwarden_agent_alert_drops_total{{reason=\"full\"}} {}\n",
+        agent_alert_drops_full()
+    ));
+    out.push_str(&format!(
+        "innerwarden_agent_alert_drops_total{{reason=\"closed\"}} {}\n",
+        agent_alert_drops_closed()
+    ));
+
+    // JSONL tail-read failures by file kind. A non-zero counter
+    // means a dashboard render path tried to read a JSONL file
+    // (events / incidents / decisions / admin-actions) and the
+    // read failed (permission flip, race with rotation, IO error).
+    // Symptom: dashboard list renders empty when data is on disk.
+    // The first failure of each kind also fires a `warn!` with
+    // path + error; subsequent failures of the same kind bump the
+    // counter silently to avoid log-spam under sustained failure.
+    out.push_str(
+        "# HELP innerwarden_tail_read_failures_total JSONL tail-read failures by file kind\n",
+    );
+    out.push_str("# TYPE innerwarden_tail_read_failures_total counter\n");
+    for kind in ["events", "incidents", "decisions", "admin_actions", "other"] {
+        out.push_str(&format!(
+            "innerwarden_tail_read_failures_total{{kind=\"{kind}\"}} {}\n",
+            crate::dashboard::helpers::tail_read_failures(kind)
+        ));
+    }
 
     // Response lifecycle metrics (from responses blob/file snapshot).
     let responses_data = state
@@ -2115,6 +2236,164 @@ enabled = false
         assert_eq!(
             read_telemetry_error_count(td.path(), date, "nonexistent"),
             0
+        );
+    }
+
+    // ── Spec 037 I-13 follow-up #5 — alert drop counter anchors ────
+    //
+    // `record_agent_alert_drop` records `try_send` failures into two
+    // process-global counters and (for `Closed` only) emits a
+    // one-shot warn. Tests pin three contracts:
+    //
+    //   1. `Full` increments the full counter, no warn fires.
+    //   2. `Closed` increments the closed counter.
+    //   3. `Closed` emits the warn EXACTLY ONCE per process — first
+    //      Closed warns, subsequent Closed drops are silent (the
+    //      counter still increments but no log spam).
+    //
+    // Cross-test interference: counters are process-global, so
+    // tests serialize via the same `crate::TRACING_CAPTURE_LOCK`
+    // used by the I-13 sweep (PR-1...PR-5 + #310 follow-up). Each
+    // test takes the lock + resets `CLOSED_WARNED` + reads the
+    // counters via delta-from-baseline rather than absolute
+    // equality, so other tests bumping the same counters in
+    // parallel cannot poison the assertion.
+
+    fn make_alert() -> AgentGuardAlert {
+        AgentGuardAlert {
+            ts: Utc::now(),
+            agent_name: "test-agent".to_string(),
+            command: "ls /".to_string(),
+            risk_score: 0,
+            severity: "low".to_string(),
+            recommendation: "review".to_string(),
+            signals: Vec::new(),
+            atr_rule_ids: Vec::new(),
+            explanation: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn record_agent_alert_drop_increments_full_counter() {
+        use std::sync::atomic::Ordering;
+        use tokio::sync::mpsc::error::TrySendError;
+
+        let _guard = crate::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let before_full = AGENT_ALERT_DROPS_FULL.load(Ordering::Relaxed);
+        let before_closed = AGENT_ALERT_DROPS_CLOSED.load(Ordering::Relaxed);
+
+        record_agent_alert_drop(TrySendError::Full(make_alert()));
+
+        let after_full = AGENT_ALERT_DROPS_FULL.load(Ordering::Relaxed);
+        let after_closed = AGENT_ALERT_DROPS_CLOSED.load(Ordering::Relaxed);
+
+        assert!(
+            after_full > before_full,
+            "full counter must increment — before={before_full} after={after_full}"
+        );
+        assert_eq!(
+            after_closed, before_closed,
+            "closed counter must NOT change on Full — before={before_closed} after={after_closed}"
+        );
+    }
+
+    #[test]
+    fn record_agent_alert_drop_increments_closed_counter() {
+        use std::sync::atomic::Ordering;
+        use tokio::sync::mpsc::error::TrySendError;
+
+        let _guard = crate::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let before_full = AGENT_ALERT_DROPS_FULL.load(Ordering::Relaxed);
+        let before_closed = AGENT_ALERT_DROPS_CLOSED.load(Ordering::Relaxed);
+
+        record_agent_alert_drop(TrySendError::Closed(make_alert()));
+
+        let after_full = AGENT_ALERT_DROPS_FULL.load(Ordering::Relaxed);
+        let after_closed = AGENT_ALERT_DROPS_CLOSED.load(Ordering::Relaxed);
+
+        assert!(
+            after_closed > before_closed,
+            "closed counter must increment — before={before_closed} after={after_closed}"
+        );
+        assert_eq!(
+            after_full, before_full,
+            "full counter must NOT change on Closed — before={before_full} after={after_full}"
+        );
+    }
+
+    #[test]
+    fn record_agent_alert_drop_warns_once_on_closed_then_silent() {
+        // Pin the one-shot warn semantic: first Closed of the
+        // process emits a warn; every subsequent Closed bumps the
+        // counter silently. The capture buffer should contain the
+        // warn message exactly once across two consecutive Closed
+        // drops.
+        use std::sync::atomic::Ordering;
+        use std::sync::{Arc, Mutex};
+        use tokio::sync::mpsc::error::TrySendError;
+
+        #[derive(Clone, Default)]
+        struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+            type Writer = CapturedLogs;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        impl std::io::Write for CapturedLogs {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let _guard = crate::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Reset the one-shot flag — other tests may have flipped it.
+        // Holding `TRACING_CAPTURE_LOCK` ensures no concurrent
+        // observer sees the partial state.
+        CLOSED_WARNED.store(false, Ordering::Relaxed);
+
+        let captured = CapturedLogs::default();
+        let buf_handle = captured.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured)
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            record_agent_alert_drop(TrySendError::Closed(make_alert()));
+            record_agent_alert_drop(TrySendError::Closed(make_alert()));
+        });
+
+        let captured_str =
+            String::from_utf8(buf_handle.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .expect("captured logs are utf8");
+
+        // The warn message must appear EXACTLY ONCE. Two
+        // occurrences means the one-shot flag isn't gating
+        // subsequent calls — log spam under sustained Closed.
+        let occurrences = captured_str.matches("agent_alert channel CLOSED").count();
+        assert_eq!(
+            occurrences, 1,
+            "one-shot warn must fire exactly once across two Closed drops — got {occurrences} occurrences in: {captured_str}"
         );
     }
 }

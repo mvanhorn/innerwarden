@@ -12,22 +12,36 @@ pub(crate) fn ingest_new_incidents(
     state: &mut AgentState,
 ) -> Result<()> {
     // Read new incidents from SQLite store
-    let new_incidents: Vec<innerwarden_core::incident::Incident> =
-        if let Some(ref sq) = state.sqlite_store {
-            let cursor_key = "narrative_incidents";
-            let cval = sq.get_agent_cursor(cursor_key).unwrap_or(0);
-            match sq.incidents_since(cval, 5000) {
-                Ok(rows) if !rows.is_empty() => {
-                    let (entries, max_id) = split_incident_rows(rows);
-                    let _ = sq.set_agent_cursor(cursor_key, max_id);
-                    entries
+    let new_incidents: Vec<innerwarden_core::incident::Incident> = if let Some(ref sq) =
+        state.sqlite_store
+    {
+        let cursor_key = "narrative_incidents";
+        let cval = sq.get_agent_cursor(cursor_key).unwrap_or(0);
+        match sq.incidents_since(cval, 5000) {
+            Ok(rows) if !rows.is_empty() => {
+                let (entries, max_id) = split_incident_rows(rows);
+                // Spec 037 I-13 PR-4: surface persistent SQLite
+                // degradation. A cursor-write failure is safe
+                // (next tick re-reads the same incidents), but
+                // re-processing duplicates chain notifications
+                // until the cursor catches up. Sibling of the
+                // events-cursor warn at slow_loop.rs (PR-3).
+                if let Err(e) = sq.set_agent_cursor(cursor_key, max_id) {
+                    warn!(
+                        cursor = cursor_key,
+                        max_id,
+                        error = %e,
+                        "agent cursor advance failed; incidents will be re-read next tick (chain notifications may duplicate)"
+                    );
                 }
-                _ => Vec::new(),
+                entries
             }
-        } else {
-            warn!("sqlite_store not available — cannot read narrative incidents");
-            return Ok(());
-        };
+            _ => Vec::new(),
+        }
+    } else {
+        warn!("sqlite_store not available — cannot read narrative incidents");
+        return Ok(());
+    };
     let _ = data_dir; // silence unused warning
     if should_process_new_incidents(new_incidents.len()) {
         state.narrative_acc.ingest_incidents(&new_incidents);

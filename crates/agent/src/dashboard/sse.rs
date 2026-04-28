@@ -41,6 +41,12 @@ pub(super) async fn watch_for_new_entries(data_dir: PathBuf, tx: EventTx) {
             }
         }
         if changed {
+            // Spec 037 I-13 PR-7 (K-class): broadcast `send` returns
+            // `Err` only when there are zero subscribers — the
+            // expected steady state when no operator is viewing the
+            // dashboard. Logging this failure would amount to a
+            // periodic "no clients connected" message; intentionally
+            // silent.
             let _ = tx.send(SsePayload {
                 kind: "refresh".to_string(),
                 data: None,
@@ -56,6 +62,14 @@ pub(super) async fn watch_for_new_entries(data_dir: PathBuf, tx: EventTx) {
         if let Ok(mut f) = std::fs::File::open(&inc_path) {
             let file_len = f.seek(SeekFrom::End(0)).unwrap_or(0);
             if file_len > *alert_offset {
+                // Spec 037 I-13 PR-7 (K-class): the seek is paired
+                // with the `read_to_string(..).is_ok()` check on the
+                // very next statement — the read's `is_ok` branch
+                // gate IS the cascade guard. If the seek silently
+                // fails (race with file rotation, malformed offset),
+                // the read either fails too (skipped via `is_ok`) or
+                // reads from the file's current cursor (graceful
+                // fall-through). Intentionally silent.
                 let _ = f.seek(SeekFrom::Start(*alert_offset));
                 let mut buf = String::new();
                 if f.read_to_string(&mut buf).is_ok() {
@@ -71,6 +85,11 @@ pub(super) async fn watch_for_new_entries(data_dir: PathBuf, tx: EventTx) {
                                     "entity_type":  etype,
                                     "entity_value": evalue,
                                 });
+                                // Spec 037 I-13 PR-7 (K-class):
+                                // same broadcast `send` semantics as
+                                // the refresh send above — `Err`
+                                // only when there are zero
+                                // subscribers. Intentionally silent.
                                 let _ = tx.send(SsePayload {
                                     kind: "alert".to_string(),
                                     data: Some(payload),

@@ -111,7 +111,21 @@ pub(crate) async fn process_incidents(
             Ok(rows) if !rows.is_empty() => {
                 let max_id = rows.last().unwrap().0;
                 let entries = rows.into_iter().map(|(_, inc)| inc).collect();
-                let _ = sq.set_agent_cursor("incidents", max_id);
+                // Spec 037 I-13 PR-4: surface persistent SQLite
+                // degradation. A cursor-write failure is safe (next
+                // tick re-reads the same incidents); downstream AI
+                // triage + skill executor dedupe via cooldowns and
+                // the decision audit hash chain, but re-processing
+                // is operator-visible noise. Same pattern as
+                // narrative_incident_ingest.rs and slow_loop.rs.
+                if let Err(e) = sq.set_agent_cursor("incidents", max_id) {
+                    warn!(
+                        cursor = "incidents",
+                        max_id,
+                        error = %e,
+                        "agent cursor advance failed; incidents will be re-read next tick"
+                    );
+                }
                 reader::ReadResult {
                     entries,
                     new_offset: 0,

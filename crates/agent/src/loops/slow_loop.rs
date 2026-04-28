@@ -320,6 +320,29 @@ fn update_narrative_accumulator(
     state.narrative_acc.ingest_events(events);
 }
 
+/// Write the dashboard metrics tile (`graph-stats.json`) and surface
+/// failures via `warn!` with structured context. Replaces the prior
+/// `let _ = std::fs::write(..)` pattern at the kg_tick snapshot block
+/// (Spec 037 I-13 PR-3). Silent failure went unnoticed: the dashboard
+/// tile is what `/api/dashboard/metrics` and the Home KPI panel
+/// consume; on a failed write, the operator saw stale numbers with
+/// no signal at all. The warn restores the signal — the tile is
+/// still stale, but the operator log + journald carry the cause.
+///
+/// Returns `()` (infallible). Called once per 60s tick from the
+/// snapshot block, never in a hot loop, so the warn is not a
+/// log-spam vector.
+fn write_graph_stats_or_warn(data_dir: &Path, json: &[u8]) {
+    let path = data_dir.join("graph-stats.json");
+    if let Err(e) = std::fs::write(&path, json) {
+        warn!(
+            path = %path.display(),
+            error = %e,
+            "graph-stats.json write failed (dashboard metrics tile may go stale)"
+        );
+    }
+}
+
 /// Bundle the knowledge-graph-touching jobs of a single slow_loop tick:
 /// event ingest, real-time trigger drain, periodic snapshot/maintenance,
 /// graph-derived neural feature extraction, and graph detector run.
@@ -482,7 +505,9 @@ fn kg_tick(state: &mut AgentState, data_dir: &Path, events: &[innerwarden_core::
             }
         }
         if let Some(json) = metrics_json {
-            let _ = std::fs::write(data_dir.join("graph-stats.json"), json);
+            // Spec 037 I-13 PR-3: surface write failures rather than
+            // letting the dashboard tile go stale silently.
+            write_graph_stats_or_warn(data_dir, &json);
         }
         // Phase 7: cleanup old snapshots (keep 7 days). File-system scan
         // and unlink — also lock-free.
@@ -616,7 +641,21 @@ pub(crate) async fn process_narrative_tick(
                 let max_id = rows.last().unwrap().0;
                 let entries: Vec<_> = rows.into_iter().map(|(_, ev)| ev).collect();
                 let count = entries.len();
-                let _ = sq.set_agent_cursor("events", max_id);
+                // Spec 037 I-13 PR-3: surface persistent SQLite
+                // degradation. A cursor-write failure is safe (next
+                // tick re-reads the same events; baseline absorbs
+                // the duplicates), so the operation continues —
+                // but the warn tells the operator something is off
+                // with the store before the symptom (re-processing,
+                // baseline drift) becomes visible.
+                if let Err(e) = sq.set_agent_cursor("events", max_id) {
+                    warn!(
+                        cursor = "events",
+                        max_id,
+                        error = %e,
+                        "agent cursor advance failed; events will be re-read next tick"
+                    );
+                }
                 (entries, count)
             }
             _ => (Vec::new(), 0),
@@ -676,8 +715,16 @@ pub(crate) async fn process_narrative_tick(
                 .any(|tp| ev_comm.starts_with(tp.as_str()));
 
         if is_own_tree || is_trusted_comm {
-            // Still feed to baseline (we want to learn their normal patterns)
-            let _ = state.baseline.observe_event(ev);
+            // Still feed to baseline (we want to learn their normal
+            // patterns). Spec 037 I-13 PR-3: the returned
+            // `Vec<AnomalyReport>` is intentionally discarded — for
+            // trusted/own-tree events we deliberately do NOT raise
+            // correlation incidents from anomalies (that would
+            // false-positive on the agent's own activity and known
+            // system services). Bare-expression form replaces the
+            // prior `let _ =` so the discard is documentary, not
+            // accidental.
+            state.baseline.observe_event(ev);
             continue;
         }
         let corr_event = correlation_engine::CorrelationEngine::classify_event(ev);
@@ -1981,6 +2028,150 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
         assert!(
             !dir.path().join("graph-stats.json").exists(),
             "fresh snapshot timer must not write graph-stats.json"
+        );
+    }
+
+    // ── Spec 037 I-13 PR-3 — graph-stats.json warn anchors ────────
+    //
+    // PR-3 of I-13 converts the `let _ = std::fs::write(graph-stats.json, ..)`
+    // site inside `kg_tick`'s 60s snapshot block into a `warn!`-on-failure
+    // pattern via the `write_graph_stats_or_warn` helper. Silent failure
+    // left the dashboard metrics tile stale with no operator-visible
+    // signal; the warn restores the signal. Tests pin three contracts:
+    //
+    //   1. The wrapper does NOT panic on an unwritable parent (matches
+    //      the prior `let _ =` no-panic property).
+    //   2. The wrapper EMITS a `warn!` carrying path + error context
+    //      when the underlying `fs::write` fails. Captured via a
+    //      scoped `tracing_subscriber::fmt::MakeWriter`.
+    //   3. The wrapper writes the JSON AND emits NO warn on the happy
+    //      path (the bytes land on disk and nothing is logged at warn
+    //      level).
+    //
+    // The `CapturedLogs` MakeWriter pattern is duplicated from the
+    // `dashboard::auth::tests` (PR-1) and `dashboard::tests` (PR-2)
+    // copies on purpose — surfacing it as a public test util just for
+    // I-13 reuse would cost more than three private copies.
+
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedLogs;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_graph_stats_or_warn_does_not_panic_on_missing_parent() {
+        // Force `std::fs::write` to fail by handing it a data_dir
+        // whose parent does not exist. The wrapper must absorb the
+        // error and return `()` so kg_tick's snapshot block proceeds
+        // — same observable shape as the prior `let _ =`.
+        let bad_dir =
+            std::path::PathBuf::from("/this/path/never/ever/exists/innerwarden-i13-stats");
+        write_graph_stats_or_warn(&bad_dir, b"{}");
+    }
+
+    #[test]
+    fn write_graph_stats_or_warn_emits_warn_with_context_on_failure() {
+        // Spec 037 I-13 follow-up #3: serialize against sibling
+        // capture tests (see `crate::TRACING_CAPTURE_LOCK` rustdoc).
+        let _capture_guard = crate::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let captured = CapturedLogs::default();
+        let buf_handle = captured.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured)
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        let bad_dir =
+            std::path::PathBuf::from("/this/path/never/ever/exists/innerwarden-i13-stats-warn");
+
+        tracing::subscriber::with_default(subscriber, || {
+            write_graph_stats_or_warn(&bad_dir, b"{}");
+        });
+
+        let captured_bytes = buf_handle.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let captured_str = String::from_utf8(captured_bytes).expect("captured logs are utf8");
+
+        assert!(
+            captured_str.contains("graph-stats.json write failed"),
+            "warn message missing — got: {captured_str}"
+        );
+        // The path field must end in `graph-stats.json` so the operator
+        // can identify what failed (vs. some sibling write in the same
+        // tick).
+        assert!(
+            captured_str.contains("graph-stats.json"),
+            "path field missing graph-stats.json suffix — got: {captured_str}"
+        );
+        assert!(
+            captured_str.contains("error="),
+            "error field missing — got: {captured_str}"
+        );
+    }
+
+    #[test]
+    fn write_graph_stats_or_warn_writes_json_silently_on_writable_dir() {
+        // Spec 037 I-13 follow-up #3: serialize against sibling
+        // capture tests (see `crate::TRACING_CAPTURE_LOCK` rustdoc).
+        let _capture_guard = crate::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Inverse anchor: on a real, writable directory the wrapper
+        // writes the bytes AND does NOT emit a warn. Pins both halves
+        // of the contract — the side effect happens AND no spurious
+        // warn fires on the happy path.
+        let captured = CapturedLogs::default();
+        let buf_handle = captured.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured)
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let payload = br#"{"node_count":42}"#;
+
+        tracing::subscriber::with_default(subscriber, || {
+            write_graph_stats_or_warn(dir.path(), payload);
+        });
+
+        let written = std::fs::read(dir.path().join("graph-stats.json"))
+            .expect("graph-stats.json must exist after a successful write");
+        assert_eq!(
+            written.as_slice(),
+            payload,
+            "wrapper must write the JSON bytes verbatim"
+        );
+
+        let captured_bytes = buf_handle.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let captured_str = String::from_utf8(captured_bytes).expect("captured logs are utf8");
+        assert!(
+            !captured_str.contains("graph-stats.json write failed"),
+            "successful write must not emit the failure warn — got: {captured_str}"
         );
     }
 

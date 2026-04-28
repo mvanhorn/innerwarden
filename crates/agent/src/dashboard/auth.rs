@@ -699,6 +699,12 @@ mod tests {
 
     #[test]
     fn write_admin_audit_or_warn_emits_warn_with_context_on_failure() {
+        // Spec 037 I-13 follow-up #3: serialize against sibling
+        // capture tests (see `crate::TRACING_CAPTURE_LOCK` rustdoc).
+        let _capture_guard = crate::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         // Capture-then-replay: install a scoped fmt subscriber that
         // writes into an in-memory buffer, drive the failing path
         // inside the scope, then assert the captured output carries
@@ -755,6 +761,12 @@ mod tests {
 
     #[test]
     fn write_admin_audit_or_warn_succeeds_silently_on_writable_path() {
+        // Spec 037 I-13 follow-up #3: serialize against sibling
+        // capture tests (see `crate::TRACING_CAPTURE_LOCK` rustdoc).
+        let _capture_guard = crate::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         // Inverse anchor: when the append succeeds, the wrapper
         // must NOT emit a warn — silent success is the steady-state
         // behaviour. Captures via the same subscriber pattern so a
