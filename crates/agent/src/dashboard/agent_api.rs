@@ -746,6 +746,25 @@ pub(super) fn build_prometheus_metrics_text(
         agent_alert_drops_closed()
     ));
 
+    // JSONL tail-read failures by file kind. A non-zero counter
+    // means a dashboard render path tried to read a JSONL file
+    // (events / incidents / decisions / admin-actions) and the
+    // read failed (permission flip, race with rotation, IO error).
+    // Symptom: dashboard list renders empty when data is on disk.
+    // The first failure of each kind also fires a `warn!` with
+    // path + error; subsequent failures of the same kind bump the
+    // counter silently to avoid log-spam under sustained failure.
+    out.push_str(
+        "# HELP innerwarden_tail_read_failures_total JSONL tail-read failures by file kind\n",
+    );
+    out.push_str("# TYPE innerwarden_tail_read_failures_total counter\n");
+    for kind in ["events", "incidents", "decisions", "admin_actions", "other"] {
+        out.push_str(&format!(
+            "innerwarden_tail_read_failures_total{{kind=\"{kind}\"}} {}\n",
+            crate::dashboard::helpers::tail_read_failures(kind)
+        ));
+    }
+
     // Response lifecycle metrics (from responses blob/file snapshot).
     let responses_data = state
         .sqlite_store

@@ -28,6 +28,120 @@ pub(super) fn safe_read_data_file(data_dir: &Path, filename: &str) -> Option<Str
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tail-read failure counters (Spec 037 I-13 follow-up #4)
+// ---------------------------------------------------------------------------
+//
+// `read_jsonl` below has three silent fail-empty paths (the inner
+// `read_to_string` of the tail branch, and two `Err(_) => return
+// Vec::new()` arms). Pre-PR each one swallowed `io::Error` and let
+// the dashboard render an empty list with no operator-visible
+// signal — the operator sees "Threats tab is empty" while incidents
+// are landing in journald, with no log or metric to debug.
+//
+// These counters surface tail-read failures by file `kind` (events,
+// incidents, decisions, admin_actions, other). Cardinality is
+// fixed at 5 — `kind` is derived from the JSONL filename prefix,
+// not the full path, so daily file rotation does not produce new
+// series. `path` was deliberately rejected as a label because
+// rotation would unbound the cardinality over weeks.
+//
+// Hybrid signal shape (mirrors PR #311 alerts_dropped_total):
+//   - First failure of each kind per process emits a `warn!` with
+//     kind + path + error so the operator gets an immediate signal.
+//   - Subsequent failures of the same kind silently bump the
+//     counter — no log spam if the failure persists, but the
+//     `/metrics` query still tells the operator how many reads
+//     have failed.
+//
+// Surfaced via `/metrics` as
+// `innerwarden_tail_read_failures_total{kind="..."}`.
+
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+static TAIL_READ_FAILURES_EVENTS: AtomicU64 = AtomicU64::new(0);
+static TAIL_READ_FAILURES_INCIDENTS: AtomicU64 = AtomicU64::new(0);
+static TAIL_READ_FAILURES_DECISIONS: AtomicU64 = AtomicU64::new(0);
+static TAIL_READ_FAILURES_ADMIN_ACTIONS: AtomicU64 = AtomicU64::new(0);
+static TAIL_READ_FAILURES_OTHER: AtomicU64 = AtomicU64::new(0);
+
+// Per-kind one-shot warn flags. `swap(true, Relaxed)` returns the
+// previous value: first observation flips false → true and warns;
+// every subsequent observation sees true and stays silent.
+static WARNED_EVENTS: AtomicBool = AtomicBool::new(false);
+static WARNED_INCIDENTS: AtomicBool = AtomicBool::new(false);
+static WARNED_DECISIONS: AtomicBool = AtomicBool::new(false);
+static WARNED_ADMIN_ACTIONS: AtomicBool = AtomicBool::new(false);
+static WARNED_OTHER: AtomicBool = AtomicBool::new(false);
+
+/// Classify a JSONL path into a bounded `kind` label by filename
+/// prefix. Returns one of `events`, `incidents`, `decisions`,
+/// `admin_actions`, or `other`. The `other` bucket catches future
+/// JSONL kinds without breaking the metric cardinality contract;
+/// any non-zero `other` count signals a missing prefix arm in
+/// this classifier.
+pub(super) fn classify_jsonl_kind(path: &Path) -> &'static str {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name.starts_with("events-") {
+        "events"
+    } else if name.starts_with("incidents-") {
+        "incidents"
+    } else if name.starts_with("decisions-") {
+        "decisions"
+    } else if name.starts_with("admin-actions-") {
+        "admin_actions"
+    } else {
+        "other"
+    }
+}
+
+fn counter_for(kind: &str) -> &'static AtomicU64 {
+    match kind {
+        "events" => &TAIL_READ_FAILURES_EVENTS,
+        "incidents" => &TAIL_READ_FAILURES_INCIDENTS,
+        "decisions" => &TAIL_READ_FAILURES_DECISIONS,
+        "admin_actions" => &TAIL_READ_FAILURES_ADMIN_ACTIONS,
+        _ => &TAIL_READ_FAILURES_OTHER,
+    }
+}
+
+fn warned_flag_for(kind: &str) -> &'static AtomicBool {
+    match kind {
+        "events" => &WARNED_EVENTS,
+        "incidents" => &WARNED_INCIDENTS,
+        "decisions" => &WARNED_DECISIONS,
+        "admin_actions" => &WARNED_ADMIN_ACTIONS,
+        _ => &WARNED_OTHER,
+    }
+}
+
+/// Record a tail-read failure for a JSONL `path`. Bumps the
+/// per-kind counter; on the first failure per kind per process,
+/// also emits a `warn!` carrying kind + path + error. Subsequent
+/// failures of the same kind bump the counter silently.
+///
+/// Returns `()` so the call site can chain into a fall-through
+/// (e.g. `return Vec::new()`).
+pub(super) fn record_tail_read_failure(path: &Path, error: &std::io::Error) {
+    let kind = classify_jsonl_kind(path);
+    counter_for(kind).fetch_add(1, Ordering::Relaxed);
+    if !warned_flag_for(kind).swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            kind,
+            path = %path.display(),
+            error = %error,
+            "JSONL tail-read failed (dashboard list may render empty); subsequent failures of this kind will increment the counter silently"
+        );
+    }
+}
+
+/// Read accessor for the metrics renderer. Returns the current
+/// counter value for the named kind (`events`, `incidents`,
+/// `decisions`, `admin_actions`, `other`).
+pub(crate) fn tail_read_failures(kind: &str) -> u64 {
+    counter_for(kind).load(Ordering::Relaxed)
+}
+
 /// Write a file safely inside data_dir (prevents path traversal).
 pub(super) fn safe_write_data_file(data_dir: &Path, filename: &str, contents: &str) -> bool {
     // Only allow simple filenames (no slashes, no ..)
@@ -352,19 +466,31 @@ pub(super) fn read_jsonl<T: DeserializeOwned>(path: &Path) -> Vec<T> {
                 // surviving lines we got). Intentionally silent.
                 let _ = f.seek(SeekFrom::End(-(MAX_READ_BYTES as i64)));
                 let mut buf = String::with_capacity(MAX_READ_BYTES as usize);
-                let _ = f.read_to_string(&mut buf);
+                // Spec 037 I-13 follow-up #4: surface tail-read
+                // failures via `innerwarden_tail_read_failures_total`.
+                // The empty-buf fall-through is preserved exactly —
+                // the helper just records the failure.
+                if let Err(e) = f.read_to_string(&mut buf) {
+                    record_tail_read_failure(path, &e);
+                }
                 // Drop the first (possibly partial) line
                 if let Some(pos) = buf.find('\n') {
                     buf.drain(..=pos);
                 }
                 buf
             }
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                record_tail_read_failure(path, &e);
+                return Vec::new();
+            }
         }
     } else {
         match std::fs::read_to_string(path) {
             Ok(v) => v,
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                record_tail_read_failure(path, &e);
+                return Vec::new();
+            }
         }
     };
 
@@ -720,5 +846,165 @@ mod tests {
         assert_eq!(format_duration(59), "59s");
         assert_eq!(format_duration(61), "1m 1s");
         assert_eq!(format_duration(3601), "1h 0m");
+    }
+
+    // ── Spec 037 I-13 follow-up #4 — tail-read failure counter anchors ──
+    //
+    // `record_tail_read_failure` records JSONL tail-read failures
+    // by file kind (events / incidents / decisions / admin_actions
+    // / other) into process-global `AtomicU64` counters and emits a
+    // one-shot `warn!` per kind per process. Tests pin three
+    // contracts:
+    //
+    //   1. The counter for the matched kind increments; other kinds
+    //      do not.
+    //   2. The warn for a given kind fires EXACTLY ONCE across two
+    //      consecutive failures of the same kind.
+    //   3. `read_jsonl(non_existent)` returns an empty Vec AND
+    //      bumps the counter via the small-file `read_to_string`
+    //      Err arm — exercises the recording call site end-to-end.
+    //
+    // Tests serialize via `crate::TRACING_CAPTURE_LOCK` (PR #310)
+    // because the counters and one-shot flags are process-global;
+    // parallel tests bumping the same atomics or flipping the same
+    // flag could otherwise poison the assertions. Counter
+    // assertions use delta-from-baseline rather than absolute
+    // equality, and the third test resets the relevant `WARNED_*`
+    // flag while holding the lock.
+
+    use std::sync::atomic::Ordering;
+
+    fn make_io_error() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::Other, "test failure")
+    }
+
+    #[test]
+    fn record_tail_read_failure_increments_kind_counter() {
+        let _guard = crate::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let before_events = TAIL_READ_FAILURES_EVENTS.load(Ordering::Relaxed);
+        let before_decisions = TAIL_READ_FAILURES_DECISIONS.load(Ordering::Relaxed);
+
+        let path = std::path::PathBuf::from("/var/lib/innerwarden/events-2026-04-27.jsonl");
+        record_tail_read_failure(&path, &make_io_error());
+
+        let after_events = TAIL_READ_FAILURES_EVENTS.load(Ordering::Relaxed);
+        let after_decisions = TAIL_READ_FAILURES_DECISIONS.load(Ordering::Relaxed);
+
+        assert!(
+            after_events > before_events,
+            "events counter must increment when an events-* file fails — before={before_events} after={after_events}"
+        );
+        assert_eq!(
+            after_decisions, before_decisions,
+            "non-matched kinds must NOT change — decisions before={before_decisions} after={after_decisions}"
+        );
+    }
+
+    #[test]
+    fn record_tail_read_failure_warns_once_per_kind() {
+        // Pin the one-shot warn semantic: first incidents-* failure
+        // of the process emits a warn; every subsequent incidents-*
+        // failure bumps the counter silently. The capture buffer
+        // must contain the warn message exactly once across two
+        // consecutive Closed-equivalent calls.
+        use std::io::Write as _;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+            type Writer = CapturedLogs;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        impl std::io::Write for CapturedLogs {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let _guard = crate::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Reset the WARNED_INCIDENTS flag — other tests may have
+        // flipped it. Holding `TRACING_CAPTURE_LOCK` ensures no
+        // concurrent observer sees the partial state.
+        WARNED_INCIDENTS.store(false, Ordering::Relaxed);
+
+        let captured = CapturedLogs::default();
+        let buf_handle = captured.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured)
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        let path = std::path::PathBuf::from("/var/lib/innerwarden/incidents-2026-04-27.jsonl");
+
+        tracing::subscriber::with_default(subscriber, || {
+            record_tail_read_failure(&path, &make_io_error());
+            record_tail_read_failure(&path, &make_io_error());
+        });
+
+        let captured_str =
+            String::from_utf8(buf_handle.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .expect("captured logs are utf8");
+
+        let occurrences = captured_str.matches("JSONL tail-read failed").count();
+        assert_eq!(
+            occurrences, 1,
+            "one-shot warn must fire exactly once across two same-kind failures — got {occurrences} occurrences in: {captured_str}"
+        );
+        // `let _ = ...` to avoid the unused-import warning if the
+        // helper trait import gets dropped by a future refactor.
+        let _ = std::io::sink().write(&[]);
+    }
+
+    #[test]
+    fn read_jsonl_returns_empty_and_records_failure_when_file_missing() {
+        // End-to-end: pass a non-existent path to `read_jsonl`. The
+        // metadata stat returns None → file_size = 0 → small-file
+        // branch → `std::fs::read_to_string` returns NotFound →
+        // `record_tail_read_failure` is invoked → return Vec::new().
+        // Path filename is `decisions-XXX.jsonl` so the decisions
+        // counter takes the bump and other kinds stay flat.
+        let _guard = crate::TRACING_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let before_decisions = TAIL_READ_FAILURES_DECISIONS.load(Ordering::Relaxed);
+
+        // A path that cannot exist (parent dir is itself a file
+        // path that does not exist), guaranteeing `metadata` and
+        // `read_to_string` both fail.
+        let path = std::path::PathBuf::from(
+            "/this/path/never/ever/exists/innerwarden-i13-tail/decisions-2026-04-27.jsonl",
+        );
+
+        let result = read_jsonl::<serde_json::Value>(&path);
+        assert!(
+            result.is_empty(),
+            "read_jsonl on a missing path must return an empty Vec"
+        );
+
+        let after_decisions = TAIL_READ_FAILURES_DECISIONS.load(Ordering::Relaxed);
+        assert!(
+            after_decisions > before_decisions,
+            "decisions counter must bump on the small-file read_to_string Err arm — before={before_decisions} after={after_decisions}"
+        );
     }
 }
