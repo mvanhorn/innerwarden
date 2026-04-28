@@ -920,8 +920,10 @@ mod tests {
     //      dry_run + reason.
     //
     // No mock skill needed — `BlockIpUfw` is deterministic in dry-run.
-    // Tests serialize via `crate::TRACING_CAPTURE_LOCK` (PR #310) so
-    // sibling capture tests cannot poison the assertions.
+    // Capture is via `crate::test_util` (global subscriber +
+    // thread-local buffer) — see that module's rustdoc for why the
+    // earlier per-test `set_default` + `MakeWriter` pattern was
+    // flaky on CI.
 
     fn make_block_skill_ctx(target_ip: Option<&str>) -> skills::SkillContext {
         skills::SkillContext {
@@ -948,66 +950,18 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Default)]
-    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
-        type Writer = CapturedLogs;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    impl std::io::Write for CapturedLogs {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
     #[tokio::test]
     async fn execute_block_skill_or_warn_silent_on_success() {
         // Happy path: BlockIpUfw + valid target_ip + dry_run=true
         // → success=true → helper must NOT emit the failure warn.
-        //
-        // Uses `tracing::subscriber::set_default` (returns a thread-
-        // local guard that resets on drop) rather than the closure-
-        // form `with_default`, because we need to `.await` inside
-        // the dispatcher scope and the closure form does not allow
-        // suspending across await points. `#[tokio::test]` defaults
-        // to a current-thread runtime so the dispatcher
-        // thread-local stays in scope across the await.
-        let _capture_guard = crate::TRACING_CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        let captured = CapturedLogs::default();
-        let buf_handle = captured.0.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured)
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
-        let _dispatch_guard = tracing::subscriber::set_default(subscriber);
+        let _guard = crate::test_util::arm_capture();
 
         let ctx = make_block_skill_ctx(Some("203.0.113.42"));
         let skill = skills::builtin::BlockIpUfw;
 
         execute_block_skill_or_warn(&skill, &ctx, true, "203.0.113.42", "block-ip-ufw").await;
 
-        // Drop the dispatcher guard before reading the buffer so any
-        // tail flush lands.
-        drop(_dispatch_guard);
-
-        let captured_str =
-            String::from_utf8(buf_handle.lock().unwrap_or_else(|e| e.into_inner()).clone())
-                .expect("captured logs are utf8");
+        let captured_str = crate::test_util::drain_capture();
         assert!(
             !captured_str.contains("block skill execution failed"),
             "successful skill execution must not emit the failure warn — got: {captured_str}"
@@ -1020,32 +974,14 @@ mod tests {
         // success=false ("block-ip-ufw: no target IP in context").
         // Helper must emit the warn carrying ip + skill_id +
         // dry_run + reason.
-        //
-        // See sibling test for why we use `set_default` instead of
-        // `with_default` here.
-        let _capture_guard = crate::TRACING_CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        let captured = CapturedLogs::default();
-        let buf_handle = captured.0.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured)
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
-        let _dispatch_guard = tracing::subscriber::set_default(subscriber);
+        let _guard = crate::test_util::arm_capture();
 
         let ctx = make_block_skill_ctx(None);
         let skill = skills::builtin::BlockIpUfw;
 
         execute_block_skill_or_warn(&skill, &ctx, true, "198.51.100.1", "block-ip-ufw").await;
 
-        drop(_dispatch_guard);
-
-        let captured_str =
-            String::from_utf8(buf_handle.lock().unwrap_or_else(|e| e.into_inner()).clone())
-                .expect("captured logs are utf8");
+        let captured_str = crate::test_util::drain_capture();
 
         assert!(
             captured_str.contains("block skill execution failed"),

@@ -880,9 +880,7 @@ mod tests {
 
     #[test]
     fn record_tail_read_failure_increments_kind_counter() {
-        let _guard = crate::TRACING_CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_util::arm_capture();
 
         let before_events = TAIL_READ_FAILURES_EVENTS.load(Ordering::Relaxed);
         let before_decisions = TAIL_READ_FAILURES_DECISIONS.load(Ordering::Relaxed);
@@ -909,69 +907,26 @@ mod tests {
         // of the process emits a warn; every subsequent incidents-*
         // failure bumps the counter silently. The capture buffer
         // must contain the warn message exactly once across two
-        // consecutive Closed-equivalent calls.
-        use std::io::Write as _;
-        use std::sync::{Arc, Mutex};
-
-        #[derive(Clone, Default)]
-        struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
-
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
-            type Writer = CapturedLogs;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        impl std::io::Write for CapturedLogs {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let _guard = crate::TRACING_CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        // consecutive failures of the same kind.
+        let _guard = crate::test_util::arm_capture();
 
         // Reset the WARNED_INCIDENTS flag — other tests may have
-        // flipped it. Holding `TRACING_CAPTURE_LOCK` ensures no
-        // concurrent observer sees the partial state.
+        // flipped it. The capture lock ensures no concurrent
+        // observer sees the partial state.
         WARNED_INCIDENTS.store(false, Ordering::Relaxed);
-
-        let captured = CapturedLogs::default();
-        let buf_handle = captured.0.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured)
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
 
         let path = std::path::PathBuf::from("/var/lib/innerwarden/incidents-2026-04-27.jsonl");
 
-        tracing::subscriber::with_default(subscriber, || {
-            record_tail_read_failure(&path, &make_io_error());
-            record_tail_read_failure(&path, &make_io_error());
-        });
+        record_tail_read_failure(&path, &make_io_error());
+        record_tail_read_failure(&path, &make_io_error());
 
-        let captured_str =
-            String::from_utf8(buf_handle.lock().unwrap_or_else(|e| e.into_inner()).clone())
-                .expect("captured logs are utf8");
+        let captured_str = crate::test_util::drain_capture();
 
         let occurrences = captured_str.matches("JSONL tail-read failed").count();
         assert_eq!(
             occurrences, 1,
             "one-shot warn must fire exactly once across two same-kind failures — got {occurrences} occurrences in: {captured_str}"
         );
-        // `let _ = ...` to avoid the unused-import warning if the
-        // helper trait import gets dropped by a future refactor.
-        let _ = std::io::sink().write(&[]);
     }
 
     #[test]
@@ -982,9 +937,7 @@ mod tests {
         // `record_tail_read_failure` is invoked → return Vec::new().
         // Path filename is `decisions-XXX.jsonl` so the decisions
         // counter takes the bump and other kinds stay flat.
-        let _guard = crate::TRACING_CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_util::arm_capture();
 
         let before_decisions = TAIL_READ_FAILURES_DECISIONS.load(Ordering::Relaxed);
 

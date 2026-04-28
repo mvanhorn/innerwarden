@@ -1628,66 +1628,26 @@ mod tests {
     //   3. Source exists + target writable → rename succeeds,
     //      no warn.
 
-    use std::sync::{Arc, Mutex};
-
-    /// Capture-then-replay tracing output. Same shape as the helper
-    /// in `dashboard::auth::tests` (PR-1), `dashboard::tests` (PR-2),
-    /// `loops::slow_loop::tests` (PR-3) — each I-13 batch defines a
-    /// private copy rather than surfacing a public test util.
-    #[derive(Clone, Default)]
-    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
-        type Writer = CapturedLogs;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    impl std::io::Write for CapturedLogs {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
+    // Capture is via `crate::test_util` (global subscriber +
+    // thread-local buffer). Tests pin three contracts: silent on
+    // missing source (fresh-rotation NotFound case), warn on real
+    // failure, silent rename on happy path.
 
     #[test]
     fn rename_snapshot_or_warn_is_silent_when_source_missing() {
-        // Spec 037 I-13 follow-up #3: serialize against sibling
-        // capture tests (see `crate::TRACING_CAPTURE_LOCK` rustdoc).
-        let _capture_guard = crate::TRACING_CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_util::arm_capture();
 
         // Fresh-agent case: rotation walks a chain that doesn't exist
         // yet. Each call must be a no-op AND must not emit a warn so
         // the boot-time logs stay clean.
-        let captured = CapturedLogs::default();
-        let buf_handle = captured.0.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured)
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
-
         let dir = tempdir().expect("tempdir");
         let from = dir.path().join("graph-snapshot.json.2");
         let to = dir.path().join("graph-snapshot.json.3");
         // `from` deliberately not created — the no-existence path.
 
-        tracing::subscriber::with_default(subscriber, || {
-            rename_snapshot_or_warn(&from, &to);
-        });
+        rename_snapshot_or_warn(&from, &to);
 
-        let captured_str =
-            String::from_utf8(buf_handle.lock().unwrap_or_else(|e| e.into_inner()).clone())
-                .expect("captured logs are utf8");
+        let captured_str = crate::test_util::drain_capture();
         assert!(
             !captured_str.contains("snapshot rotation rename failed"),
             "missing source MUST NOT emit a warn (NotFound is the expected fresh-rotation case) — got: {captured_str}"
@@ -1710,19 +1670,7 @@ mod tests {
         // is left where it was.
         use std::os::unix::fs::PermissionsExt;
 
-        // Spec 037 I-13 follow-up #3: serialize against sibling
-        // capture tests (see `crate::TRACING_CAPTURE_LOCK` rustdoc).
-        let _capture_guard = crate::TRACING_CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        let captured = CapturedLogs::default();
-        let buf_handle = captured.0.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured)
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
+        let _guard = crate::test_util::arm_capture();
 
         let dir = tempdir().expect("tempdir");
         let target_dir = dir.path().join("locked");
@@ -1744,17 +1692,13 @@ mod tests {
 
         let to = target_dir.join("graph-snapshot.json.2");
 
-        tracing::subscriber::with_default(subscriber, || {
-            rename_snapshot_or_warn(&from, &to);
-        });
+        rename_snapshot_or_warn(&from, &to);
 
         // Restore writable mode so TempDir::drop can clean up.
         std::fs::set_permissions(&target_dir, std::fs::Permissions::from_mode(original_mode))
             .expect("restore mode");
 
-        let captured_str =
-            String::from_utf8(buf_handle.lock().unwrap_or_else(|e| e.into_inner()).clone())
-                .expect("captured logs are utf8");
+        let captured_str = crate::test_util::drain_capture();
 
         assert!(
             captured_str.contains("snapshot rotation rename failed"),
@@ -1785,31 +1729,17 @@ mod tests {
 
     #[test]
     fn rename_snapshot_or_warn_performs_rename_silently_on_happy_path() {
-        // Spec 037 I-13 follow-up #3: serialize against sibling
-        // capture tests (see `crate::TRACING_CAPTURE_LOCK` rustdoc).
-        let _capture_guard = crate::TRACING_CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_util::arm_capture();
 
         // Happy path: source exists, target writable. Helper must
         // perform the rename AND NOT emit a warn.
-        let captured = CapturedLogs::default();
-        let buf_handle = captured.0.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured)
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
-
         let dir = tempdir().expect("tempdir");
         let from = dir.path().join("graph-snapshot.json.1");
         let to = dir.path().join("graph-snapshot.json.2");
         let payload = b"placeholder-bytes";
         std::fs::write(&from, payload).expect("seed from");
 
-        tracing::subscriber::with_default(subscriber, || {
-            rename_snapshot_or_warn(&from, &to);
-        });
+        rename_snapshot_or_warn(&from, &to);
 
         // Side effect: the rename actually moved the bytes.
         assert!(
@@ -1823,9 +1753,7 @@ mod tests {
             "bytes must arrive at target intact"
         );
 
-        let captured_str =
-            String::from_utf8(buf_handle.lock().unwrap_or_else(|e| e.into_inner()).clone())
-                .expect("captured logs are utf8");
+        let captured_str = crate::test_util::drain_capture();
         assert!(
             !captured_str.contains("snapshot rotation rename failed"),
             "successful rename must not emit the failure warn — got: {captured_str}"

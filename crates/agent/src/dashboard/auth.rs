@@ -627,48 +627,19 @@ mod tests {
     //
     // PR-1 of I-13 converts the two `let _ = append_admin_action(..)`
     // sites in this file into a `warn!`-on-failure pattern via the
-    // shared `write_admin_audit_or_warn` helper. The original silent
-    // swallow would drop a compliance-relevant audit row with no
-    // operator-visible signal. Tests pin two contracts:
+    // shared `write_admin_audit_or_warn` helper. Tests pin two
+    // contracts:
     //
     //   1. The wrapper does NOT panic when the underlying append
-    //      fails (matches the prior `let _ =` no-panic property —
-    //      the calling handler must continue regardless of audit
-    //      sink health).
+    //      fails.
     //   2. The wrapper EMITS a `warn!` carrying operator + action +
-    //      target + error context when the append fails (the
-    //      property that the prior `let _ =` lacked). The test
-    //      captures tracing output via a custom `MakeWriter` and
-    //      asserts the emitted line carries each piece of context.
-
-    use std::sync::{Arc, Mutex};
-
-    /// Minimal `tracing_subscriber::fmt::MakeWriter` impl that
-    /// captures all writes into a shared buffer. Scoped via
-    /// `tracing::subscriber::with_default` so the subscriber is
-    /// active only during the closure body.
-    #[derive(Clone, Default)]
-    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
-        type Writer = CapturedLogs;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    impl std::io::Write for CapturedLogs {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
+    //      target + error context when the append fails.
+    //
+    // Capture is via the global subscriber + thread-local buffer in
+    // `crate::test_util` (follow-up #3 PR-replacement). The earlier
+    // per-test `with_default` + `CapturedLogs` MakeWriter pattern
+    // was flaky on CI even with cross-test serialisation — see
+    // `crate::test_util` rustdoc for the root cause.
 
     fn make_login_entry() -> AdminActionEntry {
         AdminActionEntry {
@@ -699,35 +670,14 @@ mod tests {
 
     #[test]
     fn write_admin_audit_or_warn_emits_warn_with_context_on_failure() {
-        // Spec 037 I-13 follow-up #3: serialize against sibling
-        // capture tests (see `crate::TRACING_CAPTURE_LOCK` rustdoc).
-        let _capture_guard = crate::TRACING_CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        // Capture-then-replay: install a scoped fmt subscriber that
-        // writes into an in-memory buffer, drive the failing path
-        // inside the scope, then assert the captured output carries
-        // every piece of structured context we promised in the
-        // helper rustdoc (operator + action + target + error).
-        let captured = CapturedLogs::default();
-        let buf_handle = captured.0.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured)
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
+        let _guard = crate::test_util::arm_capture();
 
         let bad_path =
             std::path::PathBuf::from("/this/path/never/ever/exists/innerwarden-i13-warn");
         let mut entry = make_login_entry();
+        write_admin_audit_or_warn(&bad_path, &mut entry);
 
-        tracing::subscriber::with_default(subscriber, || {
-            write_admin_audit_or_warn(&bad_path, &mut entry);
-        });
-
-        let captured_bytes = buf_handle.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let captured_str = String::from_utf8(captured_bytes).expect("captured logs are utf8");
+        let captured_str = crate::test_util::drain_capture();
 
         // The message itself must be present so a future refactor
         // that drops the message string is detected.
@@ -761,33 +711,15 @@ mod tests {
 
     #[test]
     fn write_admin_audit_or_warn_succeeds_silently_on_writable_path() {
-        // Spec 037 I-13 follow-up #3: serialize against sibling
-        // capture tests (see `crate::TRACING_CAPTURE_LOCK` rustdoc).
-        let _capture_guard = crate::TRACING_CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
         // Inverse anchor: when the append succeeds, the wrapper
-        // must NOT emit a warn — silent success is the steady-state
-        // behaviour. Captures via the same subscriber pattern so a
-        // future regression that always-warns is caught.
-        let captured = CapturedLogs::default();
-        let buf_handle = captured.0.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured)
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
+        // must NOT emit a warn — silent success is the steady-state.
+        let _guard = crate::test_util::arm_capture();
 
         let dir = tempfile::tempdir().expect("tempdir");
         let mut entry = make_login_entry();
+        write_admin_audit_or_warn(dir.path(), &mut entry);
 
-        tracing::subscriber::with_default(subscriber, || {
-            write_admin_audit_or_warn(dir.path(), &mut entry);
-        });
-
-        let captured_bytes = buf_handle.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let captured_str = String::from_utf8(captured_bytes).expect("captured logs are utf8");
+        let captured_str = crate::test_util::drain_capture();
         assert!(
             !captured_str.contains("audit trail write failed"),
             "successful write must not emit the failure warn — got: {captured_str}"

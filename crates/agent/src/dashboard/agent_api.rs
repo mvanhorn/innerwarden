@@ -2278,9 +2278,7 @@ enabled = false
         use std::sync::atomic::Ordering;
         use tokio::sync::mpsc::error::TrySendError;
 
-        let _guard = crate::TRACING_CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_util::arm_capture();
 
         let before_full = AGENT_ALERT_DROPS_FULL.load(Ordering::Relaxed);
         let before_closed = AGENT_ALERT_DROPS_CLOSED.load(Ordering::Relaxed);
@@ -2305,9 +2303,7 @@ enabled = false
         use std::sync::atomic::Ordering;
         use tokio::sync::mpsc::error::TrySendError;
 
-        let _guard = crate::TRACING_CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_util::arm_capture();
 
         let before_full = AGENT_ALERT_DROPS_FULL.load(Ordering::Relaxed);
         let before_closed = AGENT_ALERT_DROPS_CLOSED.load(Ordering::Relaxed);
@@ -2335,57 +2331,19 @@ enabled = false
         // warn message exactly once across two consecutive Closed
         // drops.
         use std::sync::atomic::Ordering;
-        use std::sync::{Arc, Mutex};
         use tokio::sync::mpsc::error::TrySendError;
 
-        #[derive(Clone, Default)]
-        struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
-
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
-            type Writer = CapturedLogs;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        impl std::io::Write for CapturedLogs {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let _guard = crate::TRACING_CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_util::arm_capture();
 
         // Reset the one-shot flag — other tests may have flipped it.
-        // Holding `TRACING_CAPTURE_LOCK` ensures no concurrent
-        // observer sees the partial state.
+        // The capture lock ensures no concurrent observer sees the
+        // partial state.
         CLOSED_WARNED.store(false, Ordering::Relaxed);
 
-        let captured = CapturedLogs::default();
-        let buf_handle = captured.0.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured)
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
+        record_agent_alert_drop(TrySendError::Closed(make_alert()));
+        record_agent_alert_drop(TrySendError::Closed(make_alert()));
 
-        tracing::subscriber::with_default(subscriber, || {
-            record_agent_alert_drop(TrySendError::Closed(make_alert()));
-            record_agent_alert_drop(TrySendError::Closed(make_alert()));
-        });
-
-        let captured_str =
-            String::from_utf8(buf_handle.lock().unwrap_or_else(|e| e.into_inner()).clone())
-                .expect("captured logs are utf8");
+        let captured_str = crate::test_util::drain_capture();
 
         // The warn message must appear EXACTLY ONCE. Two
         // occurrences means the one-shot flag isn't gating

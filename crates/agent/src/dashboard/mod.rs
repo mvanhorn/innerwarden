@@ -1962,39 +1962,11 @@ mod tests {
     //   3. The wrapper applies the requested mode AND emits NO warn
     //      on the happy path (real file, accessible).
 
-    #[cfg(unix)]
-    use std::sync::{Arc, Mutex};
-
-    /// Minimal `tracing_subscriber::fmt::MakeWriter` impl used to
-    /// capture warn output during the failure-path test. Same shape
-    /// as the helper used in `dashboard::auth::tests` (PR-1) — kept
-    /// scoped to this mod so PR-1 does not need to surface a public
-    /// test helper just for I-13's reuse.
-    #[cfg(unix)]
-    #[derive(Clone, Default)]
-    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
-
-    #[cfg(unix)]
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
-        type Writer = CapturedLogs;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    #[cfg(unix)]
-    impl std::io::Write for CapturedLogs {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
+    // Capture is via `crate::test_util::arm_capture` /
+    // `drain_capture` — global subscriber + thread-local buffer.
+    // See `crate::test_util` rustdoc for why the prior per-test
+    // `with_default` + `MakeWriter` pattern (PR #310) was flaky on
+    // CI.
 
     #[cfg(unix)]
     #[test]
@@ -2008,29 +1980,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn set_file_mode_or_warn_emits_warn_with_context_on_failure() {
-        // Spec 037 I-13 follow-up #3: serialize against sibling
-        // capture tests (see `crate::TRACING_CAPTURE_LOCK` rustdoc).
-        let _capture_guard = crate::TRACING_CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        let captured = CapturedLogs::default();
-        let buf_handle = captured.0.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured)
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
+        let _guard = crate::test_util::arm_capture();
 
         let bad_path =
             std::path::PathBuf::from("/this/path/never/ever/exists/innerwarden-i13-tls-warn");
+        set_file_mode_or_warn(&bad_path, 0o600);
 
-        tracing::subscriber::with_default(subscriber, || {
-            set_file_mode_or_warn(&bad_path, 0o600);
-        });
-
-        let captured_bytes = buf_handle.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let captured_str = String::from_utf8(captured_bytes).expect("captured logs are utf8");
+        let captured_str = crate::test_util::drain_capture();
 
         assert!(
             captured_str.contains("failed to set TLS file permissions"),
@@ -2111,23 +2067,9 @@ mod tests {
     fn set_file_mode_or_warn_applies_mode_silently_on_writable_file() {
         use std::os::unix::fs::PermissionsExt;
 
-        // Spec 037 I-13 follow-up #3: serialize against sibling
-        // capture tests (see `crate::TRACING_CAPTURE_LOCK` rustdoc).
-        let _capture_guard = crate::TRACING_CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
         // Inverse anchor: on a real, writable file the wrapper
         // applies the requested mode AND does NOT emit a warn.
-        // Captures via the same subscriber pattern so a future
-        // regression that always-warns is caught.
-        let captured = CapturedLogs::default();
-        let buf_handle = captured.0.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured)
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
+        let _guard = crate::test_util::arm_capture();
 
         let dir = tempfile::tempdir().expect("tempdir");
         let target = dir.path().join("fake-key.pem");
@@ -2137,9 +2079,7 @@ mod tests {
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644))
             .expect("seed perms");
 
-        tracing::subscriber::with_default(subscriber, || {
-            set_file_mode_or_warn(&target, 0o600);
-        });
+        set_file_mode_or_warn(&target, 0o600);
 
         // The mode must be exactly 0o600 after the helper runs. The
         // `& 0o7777` mask drops the file-type bits (S_IFREG etc.)
@@ -2156,8 +2096,7 @@ mod tests {
             "set_file_mode_or_warn must apply the requested mode on the happy path"
         );
 
-        let captured_bytes = buf_handle.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let captured_str = String::from_utf8(captured_bytes).expect("captured logs are utf8");
+        let captured_str = crate::test_util::drain_capture();
         assert!(
             !captured_str.contains("failed to set TLS file permissions"),
             "successful chmod must not emit the failure warn — got: {captured_str}"

@@ -2033,50 +2033,12 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
 
     // ── Spec 037 I-13 PR-3 — graph-stats.json warn anchors ────────
     //
-    // PR-3 of I-13 converts the `let _ = std::fs::write(graph-stats.json, ..)`
-    // site inside `kg_tick`'s 60s snapshot block into a `warn!`-on-failure
-    // pattern via the `write_graph_stats_or_warn` helper. Silent failure
-    // left the dashboard metrics tile stale with no operator-visible
-    // signal; the warn restores the signal. Tests pin three contracts:
-    //
-    //   1. The wrapper does NOT panic on an unwritable parent (matches
-    //      the prior `let _ =` no-panic property).
-    //   2. The wrapper EMITS a `warn!` carrying path + error context
-    //      when the underlying `fs::write` fails. Captured via a
-    //      scoped `tracing_subscriber::fmt::MakeWriter`.
-    //   3. The wrapper writes the JSON AND emits NO warn on the happy
-    //      path (the bytes land on disk and nothing is logged at warn
-    //      level).
-    //
-    // The `CapturedLogs` MakeWriter pattern is duplicated from the
-    // `dashboard::auth::tests` (PR-1) and `dashboard::tests` (PR-2)
-    // copies on purpose — surfacing it as a public test util just for
-    // I-13 reuse would cost more than three private copies.
-
-    use std::sync::{Arc, Mutex};
-
-    #[derive(Clone, Default)]
-    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
-        type Writer = CapturedLogs;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    impl std::io::Write for CapturedLogs {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
+    // PR-3 converts the `let _ = std::fs::write(graph-stats.json, ..)`
+    // site inside `kg_tick`'s 60s snapshot block into a
+    // `warn!`-on-failure via `write_graph_stats_or_warn`. Tests pin
+    // three contracts: no-panic on bad path, warn emitted with
+    // path + error on failure, silent on writable. Capture is via
+    // `crate::test_util` (global subscriber + thread-local buffer).
 
     #[test]
     fn write_graph_stats_or_warn_does_not_panic_on_missing_parent() {
@@ -2091,29 +2053,13 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
 
     #[test]
     fn write_graph_stats_or_warn_emits_warn_with_context_on_failure() {
-        // Spec 037 I-13 follow-up #3: serialize against sibling
-        // capture tests (see `crate::TRACING_CAPTURE_LOCK` rustdoc).
-        let _capture_guard = crate::TRACING_CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        let captured = CapturedLogs::default();
-        let buf_handle = captured.0.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured)
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
+        let _guard = crate::test_util::arm_capture();
 
         let bad_dir =
             std::path::PathBuf::from("/this/path/never/ever/exists/innerwarden-i13-stats-warn");
+        write_graph_stats_or_warn(&bad_dir, b"{}");
 
-        tracing::subscriber::with_default(subscriber, || {
-            write_graph_stats_or_warn(&bad_dir, b"{}");
-        });
-
-        let captured_bytes = buf_handle.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let captured_str = String::from_utf8(captured_bytes).expect("captured logs are utf8");
+        let captured_str = crate::test_util::drain_capture();
 
         assert!(
             captured_str.contains("graph-stats.json write failed"),
@@ -2134,30 +2080,13 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
 
     #[test]
     fn write_graph_stats_or_warn_writes_json_silently_on_writable_dir() {
-        // Spec 037 I-13 follow-up #3: serialize against sibling
-        // capture tests (see `crate::TRACING_CAPTURE_LOCK` rustdoc).
-        let _capture_guard = crate::TRACING_CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
         // Inverse anchor: on a real, writable directory the wrapper
-        // writes the bytes AND does NOT emit a warn. Pins both halves
-        // of the contract — the side effect happens AND no spurious
-        // warn fires on the happy path.
-        let captured = CapturedLogs::default();
-        let buf_handle = captured.0.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured)
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
+        // writes the bytes AND does NOT emit a warn.
+        let _guard = crate::test_util::arm_capture();
 
         let dir = tempfile::tempdir().expect("tempdir");
         let payload = br#"{"node_count":42}"#;
-
-        tracing::subscriber::with_default(subscriber, || {
-            write_graph_stats_or_warn(dir.path(), payload);
-        });
+        write_graph_stats_or_warn(dir.path(), payload);
 
         let written = std::fs::read(dir.path().join("graph-stats.json"))
             .expect("graph-stats.json must exist after a successful write");
@@ -2167,8 +2096,7 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
             "wrapper must write the JSON bytes verbatim"
         );
 
-        let captured_bytes = buf_handle.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let captured_str = String::from_utf8(captured_bytes).expect("captured logs are utf8");
+        let captured_str = crate::test_util::drain_capture();
         assert!(
             !captured_str.contains("graph-stats.json write failed"),
             "successful write must not emit the failure warn — got: {captured_str}"
