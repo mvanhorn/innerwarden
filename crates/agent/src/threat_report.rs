@@ -9,6 +9,34 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+use tracing::warn;
+
+/// Open a monthly incidents JSONL file for the threat-report scan,
+/// surfacing genuine I/O failure via `warn!` while staying silent on
+/// `NotFound` (steady state for dates with no incidents recorded;
+/// the call site already guards with `path.exists()` but keeps
+/// NotFound silent for the rare TOCTOU race). Replaces the silent
+/// `if let Ok(file) = File::open(&incidents_path)` site
+/// (Spec 037 I-13 follow-up #2).
+///
+/// On a real I/O error the operator loses every incident from that
+/// day in the monthly executive report. The warn carries path +
+/// error so the operator can recover the file or fix permissions.
+fn open_monthly_incident_jsonl_or_warn(path: &Path) -> Option<std::fs::File> {
+    match std::fs::File::open(path) {
+        Ok(f) => Some(f),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "monthly incident JSONL open failed (one day of incidents lost from threat report)"
+            );
+            None
+        }
+    }
+}
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use serde::Serialize;
@@ -332,7 +360,7 @@ pub fn generate_monthly(
 
         let incidents_path = data_dir.join(format!("incidents-{date_str}.jsonl"));
         if incidents_path.exists() {
-            if let Ok(file) = std::fs::File::open(&incidents_path) {
+            if let Some(file) = open_monthly_incident_jsonl_or_warn(&incidents_path) {
                 let reader = BufReader::new(file);
                 for line in reader.lines().map_while(Result::ok) {
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
@@ -1258,5 +1286,48 @@ mod tests {
         );
         let thousand = generate_monthly(dir.path(), "2026-03", &HashMap::new()).unwrap();
         assert_eq!(thousand.executive_summary.total_incidents, 1001);
+    }
+
+    // Spec 037 I-13 follow-up #2: open_monthly_incident_jsonl_or_warn
+
+    #[test]
+    fn open_monthly_incident_jsonl_or_warn_returns_some_silently_on_existing_file() {
+        let _guard = crate::test_util::arm_capture();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("incidents-2026-04-01.jsonl");
+        std::fs::write(&path, b"{}\n").expect("seed file");
+
+        let result = open_monthly_incident_jsonl_or_warn(&path);
+        assert!(result.is_some(), "existing file must yield Some");
+
+        let captured = crate::test_util::drain_capture();
+        assert!(
+            !captured.contains("monthly incident JSONL"),
+            "happy path must not emit warn, got: {captured}"
+        );
+    }
+
+    #[test]
+    fn open_monthly_incident_jsonl_or_warn_returns_none_and_warns_on_io_failure() {
+        let _guard = crate::test_util::arm_capture();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocking_file = dir.path().join("blocker");
+        std::fs::write(&blocking_file, b"i am a regular file").expect("seed blocker");
+        let path = blocking_file.join("incidents-2026-04-01.jsonl");
+
+        let result = open_monthly_incident_jsonl_or_warn(&path);
+        assert!(result.is_none(), "io-failure must yield None");
+
+        let captured = crate::test_util::drain_capture();
+        assert!(
+            captured.contains("monthly incident JSONL open failed"),
+            "io-failure warn missing, got: {captured}"
+        );
+        assert!(
+            captured.contains("error="),
+            "error field missing, got: {captured}"
+        );
     }
 }

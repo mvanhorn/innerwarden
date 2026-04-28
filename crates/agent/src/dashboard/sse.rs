@@ -2,6 +2,33 @@
 
 use super::*;
 use std::sync::atomic::Ordering;
+use tracing::warn;
+
+/// Open today's incidents JSONL for the SSE live-tail loop,
+/// surfacing genuine I/O failure via `warn!` while staying silent on
+/// `NotFound` (steady state at the start of a day before any incident
+/// has fired and the file has not yet been created). Replaces the
+/// silent `if let Ok(mut f) = File::open(&inc_path)` site in the
+/// SSE polling loop (Spec 037 I-13 follow-up #2).
+///
+/// On a real I/O error the operator's live SSE stream silently stops
+/// emitting alerts -- High/Critical incidents reach the dashboard
+/// only via the next page reload. The warn carries path + error so
+/// the operator can recover the file or fix permissions.
+fn open_live_incident_jsonl_or_warn(path: &std::path::Path) -> Option<std::fs::File> {
+    match std::fs::File::open(path) {
+        Ok(f) => Some(f),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "live incident JSONL open failed (SSE alert stream stalled)"
+            );
+            None
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // D6 - SSE file watcher and stream handler
@@ -59,7 +86,7 @@ pub(super) async fn watch_for_new_entries(data_dir: PathBuf, tx: EventTx) {
         let alert_key = format!("alert:{inc_name}");
         let alert_offset = offsets.entry(alert_key.clone()).or_insert(0);
 
-        if let Ok(mut f) = std::fs::File::open(&inc_path) {
+        if let Some(mut f) = open_live_incident_jsonl_or_warn(&inc_path) {
             let file_len = f.seek(SeekFrom::End(0)).unwrap_or(0);
             if file_len > *alert_offset {
                 // Spec 037 I-13 PR-7 (K-class): the seek is paired
@@ -237,5 +264,48 @@ mod tests {
     fn test_sse_connection_count_starts_at_zero() {
         // The global SSE connection counter should be initialized to zero.
         assert_eq!(SSE_CONNECTIONS.load(Ordering::Relaxed), 0);
+    }
+
+    // Spec 037 I-13 follow-up #2: open_live_incident_jsonl_or_warn
+
+    #[test]
+    fn open_live_incident_jsonl_or_warn_returns_some_silently_on_existing_file() {
+        let _guard = crate::test_util::arm_capture();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("incidents-today.jsonl");
+        std::fs::write(&path, b"{}\n").expect("seed file");
+
+        let result = open_live_incident_jsonl_or_warn(&path);
+        assert!(result.is_some(), "existing file must yield Some");
+
+        let captured = crate::test_util::drain_capture();
+        assert!(
+            !captured.contains("live incident JSONL"),
+            "happy path must not emit warn, got: {captured}"
+        );
+    }
+
+    #[test]
+    fn open_live_incident_jsonl_or_warn_returns_none_and_warns_on_io_failure() {
+        let _guard = crate::test_util::arm_capture();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocking_file = dir.path().join("blocker");
+        std::fs::write(&blocking_file, b"i am a regular file").expect("seed blocker");
+        let path = blocking_file.join("incidents-today.jsonl");
+
+        let result = open_live_incident_jsonl_or_warn(&path);
+        assert!(result.is_none(), "io-failure must yield None");
+
+        let captured = crate::test_util::drain_capture();
+        assert!(
+            captured.contains("live incident JSONL open failed"),
+            "io-failure warn missing, got: {captured}"
+        );
+        assert!(
+            captured.contains("error="),
+            "error field missing, got: {captured}"
+        );
     }
 }
