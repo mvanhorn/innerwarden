@@ -84,6 +84,50 @@ async fn write_evidence_line_or_warn(
     }
 }
 
+/// Open the honeypot session evidence file in append+create mode,
+/// surfacing failure via `warn!` with structured context. Replaces
+/// the prior `if let Ok(mut f) = OpenOptions::new()...open(..)`
+/// silent skip at the second level of the honeypot evidence write
+/// cascade (Spec 037 I-13 follow-up #1, smallest slice).
+///
+/// The cascade was three silent levels deep before I-13:
+///   1. `ensure_honeypot_dir_or_warn`: fixed in PR-6 (#308).
+///   2. `open_evidence_file_or_warn`: fixed here.
+///   3. `write_evidence_line_or_warn`: fixed in PR-6 (#308).
+///
+/// Returns `Some(File)` on success so the caller can pass it to
+/// `write_evidence_line_or_warn`; returns `None` on failure (after
+/// warning). Failure here means the entire session evidence is
+/// silently dropped: the operator gets nothing back from the
+/// trapped attacker on this connection.
+///
+/// `session_id` and `ip` are carried in the warn so the operator
+/// can correlate the lost evidence with the trapped session.
+async fn open_evidence_file_or_warn(
+    path: &Path,
+    session_id: &str,
+    ip: &str,
+) -> Option<tokio::fs::File> {
+    match tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+    {
+        Ok(f) => Some(f),
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                session_id,
+                ip,
+                error = %e,
+                "honeypot evidence file open failed (session JSONL line lost)"
+            );
+            None
+        }
+    }
+}
+
 /// Execute a `ResponseSkill` and surface failure outcomes via `warn!`
 /// with structured context. Replaces the prior
 /// `let _ = skill.execute(&ctx, dry_run).await;` value-discard at the
@@ -192,12 +236,7 @@ async fn handle_always_on_connection(
         "shell_commands_count": evidence.shell_commands.len(),
     })) {
         let line = format!("{json}\n");
-        if let Ok(mut f) = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&evidence_path)
-            .await
-        {
+        if let Some(mut f) = open_evidence_file_or_warn(&evidence_path, &session_id, &ip).await {
             write_evidence_line_or_warn(&mut f, &evidence_path, &session_id, line.as_bytes()).await;
         }
     }
@@ -1009,6 +1048,94 @@ mod tests {
         assert!(
             captured_str.contains("no target IP in context"),
             "reason field missing skill-provided message — got: {captured_str}"
+        );
+    }
+
+    // ── Spec 037 I-13 follow-up #1 (smallest slice): open_evidence_file_or_warn ──
+    //
+    // Wraps the second silent level of the honeypot evidence write
+    // cascade (file open). The other two levels were fixed in PR-6
+    // (#308). Two anchors:
+    //   1. happy path: writable parent => returns Some, no warn
+    //   2. failure path: parent is a regular file (not a dir) so
+    //      `OpenOptions::open` cannot create the evidence file =>
+    //      returns None and emits a warn carrying path + session_id
+    //      + ip + error.
+    //
+    // The serde_json::to_string at L184 is left as-is (bucket B:
+    // serializing a fixed-shape JSON struct with primitive values
+    // does not realistically fail; a forced-failure test would need
+    // contrived input the production cascade never produces).
+
+    #[tokio::test]
+    async fn open_evidence_file_or_warn_returns_some_silently_on_writable_path() {
+        let _guard = crate::test_util::arm_capture();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("listener-session-test.jsonl");
+
+        let result = open_evidence_file_or_warn(&path, "always-on-test", "203.0.113.7").await;
+
+        assert!(
+            result.is_some(),
+            "writable parent dir must yield Some(File)"
+        );
+        // The file must have been created on disk by `OpenOptions`
+        // with `create(true)`.
+        assert!(
+            path.exists(),
+            "OpenOptions(create=true) must produce the file on disk"
+        );
+
+        let captured_str = crate::test_util::drain_capture();
+        assert!(
+            !captured_str.contains("honeypot evidence file open failed"),
+            "happy path must not emit the failure warn, got: {captured_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_evidence_file_or_warn_returns_none_and_warns_on_failure() {
+        // Force `OpenOptions::open` to fail by parking the target
+        // path beneath a regular file. `OpenOptions(create=true)`
+        // returns `NotADirectory` (Linux) / `NotFound` (macOS) /
+        // similar; either way, Err.
+        let _guard = crate::test_util::arm_capture();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocking_file = dir.path().join("blocker");
+        std::fs::write(&blocking_file, b"i am a regular file").expect("seed blocker");
+        // `blocker/listener-session-X.jsonl` cannot be created
+        // because `blocker` is a file, not a directory.
+        let path = blocking_file.join("listener-session-test.jsonl");
+
+        let result = open_evidence_file_or_warn(&path, "always-on-failwarn", "198.51.100.5").await;
+
+        assert!(
+            result.is_none(),
+            "open under a regular-file parent must yield None"
+        );
+
+        let captured_str = crate::test_util::drain_capture();
+        assert!(
+            captured_str.contains("honeypot evidence file open failed"),
+            "failure path must emit the warn, got: {captured_str}"
+        );
+        // session_id + ip must be in the warn so the operator can
+        // correlate the lost evidence with the trapped session.
+        assert!(
+            captured_str.contains("session_id=\"always-on-failwarn\"")
+                || captured_str.contains("session_id=always-on-failwarn"),
+            "session_id field missing, got: {captured_str}"
+        );
+        assert!(
+            captured_str.contains("ip=\"198.51.100.5\"")
+                || captured_str.contains("ip=198.51.100.5"),
+            "ip field missing, got: {captured_str}"
+        );
+        assert!(
+            captured_str.contains("error="),
+            "error field missing, got: {captured_str}"
         );
     }
 }
