@@ -275,11 +275,37 @@ fn detect_services() -> Vec<String> {
 // Cron detection
 // ---------------------------------------------------------------------------
 
+/// Read a system crontab file for the cron-baseline scan, surfacing
+/// genuine I/O failure via `warn!` while staying silent on `NotFound`
+/// (some hosts do not ship a /etc/crontab; the cron.d scan still picks
+/// up user cron jobs). Replaces the silent
+/// `if let Ok(content) = read_to_string("/etc/crontab")` site
+/// (Spec 037 I-13 follow-up #2).
+///
+/// On a real I/O error the operator's environment baseline misses
+/// every system-cron entry, weakening the cron-based persistence
+/// detection signal. The warn carries path + error so the operator
+/// can recover the file or fix permissions.
+fn read_crontab_file_or_warn(path: &Path) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(c) => Some(c),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "system crontab read failed (system-cron entries missing from environment baseline)"
+            );
+            None
+        }
+    }
+}
+
 fn detect_crons() -> Vec<String> {
     let mut crons = Vec::new();
 
     // System crontab
-    if let Ok(content) = std::fs::read_to_string("/etc/crontab") {
+    if let Some(content) = read_crontab_file_or_warn(Path::new("/etc/crontab")) {
         for line in content.lines() {
             let trimmed = line.trim();
             if !trimmed.is_empty() && !trimmed.starts_with('#') {
@@ -791,5 +817,48 @@ mod tests {
         assert!(outcome.incidents.is_empty());
         assert!(outcome.changes.is_empty());
         assert!(outcome.new_profile.is_none());
+    }
+
+    // Spec 037 I-13 follow-up #2: read_crontab_file_or_warn
+
+    #[test]
+    fn read_crontab_file_or_warn_returns_some_silently_on_existing_file() {
+        let _guard = crate::test_util::arm_capture();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crontab-fixture");
+        std::fs::write(&path, b"* * * * * root /usr/bin/true\n").expect("seed crontab");
+
+        let result = read_crontab_file_or_warn(&path);
+        assert!(result.is_some(), "existing file must yield Some");
+
+        let captured = crate::test_util::drain_capture();
+        assert!(
+            !captured.contains("system crontab read failed"),
+            "happy path must not emit warn, got: {captured}"
+        );
+    }
+
+    #[test]
+    fn read_crontab_file_or_warn_returns_none_and_warns_on_io_failure() {
+        let _guard = crate::test_util::arm_capture();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocking_file = dir.path().join("blocker");
+        std::fs::write(&blocking_file, b"i am a regular file").expect("seed blocker");
+        let path = blocking_file.join("crontab-fixture");
+
+        let result = read_crontab_file_or_warn(&path);
+        assert!(result.is_none(), "io-failure must yield None");
+
+        let captured = crate::test_util::drain_capture();
+        assert!(
+            captured.contains("system crontab read failed"),
+            "io-failure warn missing, got: {captured}"
+        );
+        assert!(
+            captured.contains("error="),
+            "error field missing, got: {captured}"
+        );
     }
 }

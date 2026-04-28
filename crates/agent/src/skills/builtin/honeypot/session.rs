@@ -2642,12 +2642,38 @@ impl Drop for SessionLock {
     }
 }
 
+/// Read the honeypot lock file content, surfacing genuine I/O failure
+/// via `warn!` while staying silent on `NotFound` (no lock held is the
+/// steady state). Replaces the silent
+/// `if let Ok(content) = tokio::fs::read_to_string(path).await` site in
+/// `is_lock_stale` (Spec 037 I-13 follow-up #2).
+///
+/// On a real I/O error (perms, FS error) the function loses its
+/// preferred staleness signal (the embedded `ts` field) and falls
+/// through to the `mtime` heuristic below. The fallback works but is
+/// less precise; the warn lets the operator notice the perms
+/// regression that forced the agent onto the weaker code path.
+async fn read_lock_file_or_warn(path: &Path) -> Option<String> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(c) => Some(c),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "honeypot lock file read failed (falling back to mtime staleness check)"
+            );
+            None
+        }
+    }
+}
+
 async fn is_lock_stale(path: &Path, stale_secs: u64) -> bool {
     if stale_secs == 0 {
         return false;
     }
 
-    if let Ok(content) = tokio::fs::read_to_string(path).await {
+    if let Some(content) = read_lock_file_or_warn(path).await {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
             if let Some(ts) = value.get("ts").and_then(|v| v.as_str()) {
                 if let Ok(parsed) = DateTime::parse_from_rfc3339(ts) {
@@ -4332,5 +4358,52 @@ exit 0
         assert!(lock_path.exists());
         drop(stale_lock);
         assert!(!lock_path.exists());
+    }
+
+    // Spec 037 I-13 follow-up #2: read_lock_file_or_warn
+
+    #[tokio::test]
+    async fn read_lock_file_or_warn_returns_some_silently_on_existing_file() {
+        let _guard = crate::test_util::arm_capture();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("session.lock");
+        tokio::fs::write(&path, b"{\"ts\":\"2026-04-28T08:00:00Z\"}\n")
+            .await
+            .expect("seed lock");
+
+        let result = read_lock_file_or_warn(&path).await;
+        assert!(result.is_some(), "existing lock file must yield Some");
+
+        let captured = crate::test_util::drain_capture();
+        assert!(
+            !captured.contains("honeypot lock file read failed"),
+            "happy path must not emit warn, got: {captured}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_lock_file_or_warn_returns_none_and_warns_on_io_failure() {
+        let _guard = crate::test_util::arm_capture();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocking_file = dir.path().join("blocker");
+        tokio::fs::write(&blocking_file, b"i am a regular file")
+            .await
+            .expect("seed blocker");
+        let path = blocking_file.join("session.lock");
+
+        let result = read_lock_file_or_warn(&path).await;
+        assert!(result.is_none(), "io-failure must yield None");
+
+        let captured = crate::test_util::drain_capture();
+        assert!(
+            captured.contains("honeypot lock file read failed"),
+            "io-failure warn missing, got: {captured}"
+        );
+        assert!(
+            captured.contains("error="),
+            "error field missing, got: {captured}"
+        );
     }
 }
