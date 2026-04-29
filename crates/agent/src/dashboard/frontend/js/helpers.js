@@ -252,34 +252,17 @@ function isIncidentTrusted(inc) {
 }
 
 
-// ── E2 - Home state (Threats right-panel) ────────────────────────────────
-async function loadHomeState() {
-  try {
-    const [overview, decisions, pivots] = await Promise.all([
-      loadJson('/api/overview'),
-      loadJson('/api/decisions?limit=5'),
-      loadJson('/api/pivots?group_by=ip&limit=5')
-    ]);
-
-    // Update status hero and activity feed
-    const incidentList = await loadJson('/api/incidents?limit=30');
-    updateStatusHero(incidentList.items || [], decisions.items || []);
-    buildActivityFeed(incidentList.items || [], decisions.items || []);
-
-    // KPI strip in left panel
-    setHomeKpi('h-events', overview.events_count ?? 0);
-    setHomeKpi('h-incidents', overview.incidents_count ?? 0);
-    setHomeKpi('h-decisions', overview.decisions_count ?? 0);
-    setHomeKpi('h-blocks', (decisions.items || []).filter(d => d.action_type === 'block_ip' && d.auto_executed).length);
-  } catch(e) {
-    console.warn('Home state load error:', e);
-  }
-}
-
-function setHomeKpi(id, val) {
-  const el = document.getElementById(id);
-  if (el) { el.textContent = val; }
-}
+// 2026-04-29 (audit Phase 2): `loadHomeState`, `setHomeKpi`,
+// `updateStatusHero`, and `buildActivityFeed` were dead code.
+// They wrote to DOM IDs that no longer exist in `index.html`
+// (`h-events`, `h-incidents`, `h-decisions`, `h-blocks`,
+// `statusHero`, `heroIcon`, `heroTitle`, `heroSub`, `activityFeed`)
+// and the only call site (`loadHomeState`) was orphaned (no
+// trigger ever invoked it). The Home tab is now driven entirely by
+// `home.js::loadHome` which writes to the actual `homeHero`/
+// `homeHeroIcon`/etc IDs. Removing the dead functions kept this
+// file from misleading future readers; the single point of truth
+// for Home rendering is `home.js`.
 
 function timeAgo(ts) {
   if (!ts) return '';

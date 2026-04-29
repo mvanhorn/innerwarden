@@ -23,14 +23,40 @@ var OUTCOME_META = {
 };
 
 function outcomeOf(item) {
+  // 2026-04-29 (audit Phase 2): mirror the backend's
+  // `threat_contract::classify_decision` so the front-end no longer
+  // disagrees with the row's actual classification when only
+  // `item.decision` is populated (a freshly-blocked IP arrives with
+  // `decision="block_ip", outcome=null` from the SSE stream and the
+  // pre-fix code classified it as "monitoring" instead of "blocked").
+  // Backend now emits canonical strings; the legacy fallbacks
+  // (`monitored`, `ignored`, `noise`, `active`) are kept so a
+  // not-yet-deployed agent does not regress.
   var o = (item.outcome || '').toLowerCase();
   if (o === 'blocked') return 'blocked';
   if (o === 'honeypot') return 'honeypot';
-  if (o === 'monitoring') return 'monitoring';
+  if (o === 'monitoring' || o === 'monitored') return 'monitoring';
+  if (o === 'open') {
+    // Operator-centric: open means "no decision yet".
+    var modeOpen = (window._agentMode || 'guard');
+    if (modeOpen === 'guard') return 'monitoring';
+    return 'needs_attention';
+  }
   if (o === 'ignored' || o === 'noise' || o === 'dismissed') return 'dismissed';
-  // 'active', 'open', '' → depends on operational mode:
-  //   Guard ON:  AI is processing autonomously → 'monitoring' (observing)
-  //   Guard OFF: AI detected but CANNOT act    → 'needs_attention' (operator must decide)
+
+  // No outcome string -- fall back to decision-driven classification.
+  // Mirrors the backend's contract for the (decision, exec_result=None) path.
+  var dec = (item.decision || item.action_taken || '').toLowerCase();
+  if (dec === 'block_ip' || dec === 'kill_process' || dec === 'suspend_user_sudo' || dec === 'block_container') {
+    return 'blocked';
+  }
+  if (dec === 'honeypot') return 'honeypot';
+  if (dec === 'monitor') return 'monitoring';
+  if (dec === 'ignore' || dec === 'dismiss') return 'dismissed';
+
+  // 'active', '', escalate, request_confirmation, unknown → depends on mode:
+  //   Guard ON:  AI processing autonomously → 'monitoring' (observing)
+  //   Guard OFF: AI detected but CANNOT act → 'needs_attention'
   var mode = (window._agentMode || 'guard');
   if (mode === 'guard') return 'monitoring';
   return 'needs_attention';
@@ -268,120 +294,16 @@ async function downloadSnapshot(format) {
 // D7 - update a KPI span; flash on change
 
 
-function updateStatusHero(incidents, decisions) {
-  const hero = document.getElementById('statusHero');
-  const icon = document.getElementById('heroIcon');
-  const title = document.getElementById('heroTitle');
-  const sub = document.getElementById('heroSub');
-  if (!hero || !icon || !title || !sub) return;
-
-  const ov = window._lastOverview || {};
-  const noise = ov.ai_ignored || 0;
-
-  // Count items by outcome from the current entity list
-  var items = (window._lastEntityItems || []);
-  var needsAttention = 0, observing = 0, totalBlocked = 0, totalHoneypot = 0;
-  items.forEach(function(item) {
-    var o = outcomeOf(item);
-    if (o === 'needs_attention') needsAttention++;
-    else if (o === 'monitoring') observing++;
-    else if (o === 'blocked') totalBlocked++;
-    else if (o === 'honeypot') totalHoneypot++;
-  });
-
-  var isGuard = (window._agentMode || 'guard') === 'guard';
-
-  if (!isGuard) {
-    // Detection-only mode (watch / read_only): AI sees threats but cannot act.
-    // Everything unresolved is the operator's responsibility.
-    var detected = needsAttention + observing;
-    hero.className = detected > 0 ? 'status-hero danger' : 'status-hero safe';
-    icon.textContent = '\uD83D\uDC41\uFE0F';
-    title.textContent = 'Detection Mode';
-    sub.textContent = detected > 0
-      ? detected + ' threat' + (detected > 1 ? 's' : '') + ' detected. AI is monitoring only \u2014 enable Guard mode for automatic response.'
-      : 'No threats detected. AI is monitoring only.';
-  } else if (needsAttention > 0) {
-    hero.className = 'status-hero danger';
-    icon.textContent = '\u26A0\uFE0F';
-    title.textContent = needsAttention + ' item' + (needsAttention > 1 ? 's need' : ' needs') + ' your attention';
-    sub.textContent = 'The AI could not resolve ' + (needsAttention > 1 ? 'these' : 'this') + ' automatically. Review below.';
-  } else if (observing > 0) {
-    hero.className = 'status-hero safe';
-    icon.textContent = '\uD83D\uDEE1\uFE0F';
-    title.textContent = 'AI Protection Active';
-    sub.textContent = totalBlocked + ' blocked \u00B7 ' + totalHoneypot + ' honeypot \u00B7 ' + observing + ' observing \u00B7 ' + noise + ' dismissed';
-  } else {
-    hero.className = 'status-hero safe';
-    icon.textContent = '\u2705';
-    title.textContent = 'All Handled';
-    sub.textContent = totalBlocked + ' blocked \u00B7 ' + totalHoneypot + ' honeypot \u00B7 ' + noise + ' dismissed. Nothing requires attention.';
-  }
-}
-
-function buildActivityFeed(incidents, decisions) {
-  const feedEl = document.getElementById('activityFeed');
-  if (!feedEl) return;
-
-  const actionMap = {};
-  (decisions || []).forEach(d => {
-    const key = d.target_ip || d.incident_id || '';
-    if (key) actionMap[key] = d;
-  });
-
-  const detectorLabels = {
-    ssh_bruteforce: 'SSH password guessing',
-    credential_stuffing: 'credential stuffing attack',
-    port_scan: 'port scan',
-    sudo_abuse: 'suspicious sudo commands',
-    search_abuse: 'search abuse',
-    web_scan: 'web scanner detected',
-    user_agent_scanner: 'automated scanner',
-    execution_guard: 'suspicious command execution',
-  };
-
-  const rows = (incidents || []).slice(0, 12).map(inc => {
-    const sev = (inc.severity || '').toLowerCase();
-    const ip = (inc.entities || []).find(e => e.type === 'Ip' || e.type === 'ip')?.value || '';
-    const dec = ip ? actionMap[ip] : null;
-    const detectorSlug = (inc.incident_id || '').split(':')[0] || '';
-    const label = detectorLabels[detectorSlug] || inc.title || detectorSlug;
-    const ago = timeAgo(inc.ts);
-
-    const outcome = inc.outcome || 'open';
-    const isResolved = outcome !== 'open';
-    let icon, actionText, rowStyle;
-
-    if (isResolved && outcome === 'blocked') {
-      icon = '🛡️'; actionText = 'Blocked ' + (ip || ''); rowStyle = 'opacity:0.7';
-    } else if (isResolved && outcome === 'suspended') {
-      icon = '🔒'; actionText = 'Sudo suspended' + (ip ? ' for ' + ip : ''); rowStyle = 'opacity:0.7';
-    } else if (isResolved && outcome === 'ignored') {
-      icon = '✓'; actionText = 'Reviewed - no action needed'; rowStyle = 'opacity:0.5';
-    } else if (isResolved) {
-      icon = '✓'; actionText = 'Contained' + (ip ? ' ' + ip : ''); rowStyle = 'opacity:0.7';
-    } else if (sev === 'critical' || sev === 'high') {
-      icon = '⚠️'; actionText = ip ? 'Investigating ' + ip : 'Active threat';  rowStyle = '';
-    } else {
-      icon = '•'; actionText = ip ? 'Monitoring ' + ip : 'Monitoring'; rowStyle = 'opacity:0.8';
-    }
-
-    return '<div class="activity-row" style="' + rowStyle + '" onclick="handleCardClickByValue(\'ip\',\'' + esc(ip) + '\')">' +
-      '<div class="activity-icon">' + icon + '</div>' +
-      '<div class="activity-body">' +
-        '<div class="activity-title">' + esc(actionText) + '</div>' +
-        '<div class="activity-meta">' + esc(label) + (isResolved ? ' · ' + outcome : '') + '</div>' +
-      '</div>' +
-      '<div class="activity-time">' + esc(ago) + '</div>' +
-      '</div>';
-  });
-
-  if (rows.length === 0) {
-    feedEl.innerHTML = '<div class="empty" style="padding:20px 0;text-align:center;color:var(--ok)">✅ Nothing suspicious today</div>';
-  } else {
-    feedEl.innerHTML = '<div class="activity-feed">' + rows.join('') + '</div>';
-  }
-}
+// 2026-04-29 (audit Phase 2): `updateStatusHero` and
+// `buildActivityFeed` removed -- both wrote to DOM IDs no
+// longer in `index.html` (`statusHero`, `heroIcon`,
+// `heroTitle`, `heroSub`, `activityFeed`) and were only
+// called from the orphaned `loadHomeState` in helpers.js.
+// The Home tab is now driven entirely by `home.js::loadHome`
+// writing to `homeHero`/`homeHeroIcon`/`homeHeroTitle`/
+// `homeHeroSub`. Removing the dead writes also retired the
+// last front-end uses of stale outcome strings
+// (`suspended`, `ignored`) that disagreed with the contract.
 
 
 function updateKpi(id, newVal) {
@@ -499,20 +421,18 @@ async function refreshLeftLive() {
     window._lastOverview = ov;
     window._lastEntityItems = items;
 
-    // Outcome-first KPIs (same logic as refreshLeft)
-    var kpiBlocked = 0, kpiObserving = 0, kpiAttention = 0;
-    items.forEach(function(item) {
-      var o = outcomeOf(item);
-      if (o === 'blocked' || o === 'honeypot') kpiBlocked++;
-      else if (o === 'needs_attention') kpiAttention++;
-      else if (o === 'monitoring') kpiObserving++;
-    });
+    // 2026-04-29 (audit Phase 2): KPIs read from `/api/overview`
+    // backend-computed fields, identical to `refreshLeft`. The live
+    // SSE path used to derive counts locally from `items.outcome`,
+    // which gave different totals from the next manual refresh
+    // (different filter scope, no research_only normalisation, no
+    // execution_result honour). Backend is the single source.
+    var kpiBlocked   = ov.blocked_count   != null ? ov.blocked_count   : 0;
+    var kpiObserving = ov.observing_count != null ? ov.observing_count : 0;
+    var kpiAttention = ov.attention_count != null ? ov.attention_count : 0;
     updateKpi('kpi-confirmed', kpiBlocked);
     updateKpi('kpi-responded', kpiObserving);
     updateKpi('kpi-noise',     kpiAttention);
-    updateKpi('kpi-events',    ov.events_count);
-    updateKpi('kpi-incidents', ov.incidents_count);
-    updateKpi('kpi-attackers', items.length);
 
     const list = document.getElementById('attackerList');
     const newItems = items.filter(it => !state.knownItemValues.has(it.value));
