@@ -113,6 +113,48 @@ impl Store {
         )?;
         Ok(n)
     }
+
+    /// Phase 7B (audit RC-2 / 2026-04-29): find incidents older than
+    /// `before_ts` that have no decision row joined and are not
+    /// flagged is_allowlisted. The agent's slow_loop runs this every
+    /// 10 minutes and writes a `dismiss` decision for each, so the
+    /// dashboard's "Stuck >1h" pending bucket trends down across
+    /// ticks instead of accumulating dead-weight forever.
+    ///
+    /// Returns up to `limit` rows of `(incident_id, ts_iso, data_json)`
+    /// ordered oldest-first. The agent caller writes the dismiss
+    /// decision via the standard `decisions::append_chained` so the
+    /// hash chain stays intact and the audit log is honest about
+    /// which provider made the call (`ai_provider="orphan-recovery"`).
+    pub fn find_orphan_incidents(
+        &self,
+        before_ts: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String, String)>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT i.incident_id, i.ts, i.data \
+             FROM incidents i \
+             LEFT JOIN decisions d ON d.incident_id = i.incident_id \
+             WHERE d.id IS NULL \
+               AND i.ts < ?1 \
+               AND i.is_allowlisted = 0 \
+             ORDER BY i.ts ASC \
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![before_ts, limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
 }
 
 /// Extension trait for optional query results.

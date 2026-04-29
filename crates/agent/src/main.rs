@@ -140,6 +140,7 @@ mod neural_lifecycle;
 mod notification_gate;
 mod notification_pipeline;
 mod observation_verify;
+mod orphan_recovery;
 mod pcap_capture;
 mod playbook;
 mod process;
@@ -574,6 +575,14 @@ struct AgentState {
         Option<std::sync::Arc<std::sync::RwLock<dashboard::DeepSecuritySnapshot>>>,
     /// Timestamp of last DNA state persistence.
     last_dna_save: std::time::Instant,
+    /// Phase 7B (audit RC-2 / 2026-04-29): timestamp of the last
+    /// orphan-recovery sweep. Slow_loop runs the sweep every 10
+    /// minutes — finds incidents >1h old with no decision (deploy
+    /// orphans, AI skips, provider outages) and writes a final
+    /// `dismiss` decision so they leave the operator-visible
+    /// "Stuck" bucket. Without this the dashboard accumulates
+    /// dead-weight stuck count forever.
+    last_orphan_recovery: std::time::Instant,
     /// Dynamic allowlist loaded from /etc/innerwarden/allowlist.toml.
     /// Hot-reloaded every 60s. Merged with static config allowlist at check time.
     dynamic_trusted_ips: Vec<String>,

@@ -148,6 +148,24 @@ pub(super) fn compute_overview_counts_from_sqlite(
     use super::types::{BucketStats, OutcomeBuckets, OverviewSnapshot, PendingBreakdown};
 
     let conn = store.conn().ok()?;
+    // Phase 7B: last-decision freshness query first, on the SAME
+    // connection. The connection pool for in-memory test stores has
+    // max_size=1, so opening a second conn here deadlocks. Reuse the
+    // one we'll hold for the JOIN below.
+    let last_decision_secs_ago: Option<i64> = (|| -> Option<i64> {
+        let last_ts: String = conn
+            .query_row(
+                "SELECT ts FROM decisions ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .ok()?;
+        let parsed = chrono::DateTime::parse_from_rfc3339(&last_ts).ok()?;
+        let secs = (now - parsed.with_timezone(&chrono::Utc))
+            .num_seconds()
+            .max(0);
+        Some(secs)
+    })();
     let pattern = format!("{date}%");
     let mut stmt = conn
         .prepare_cached(
@@ -433,7 +451,7 @@ pub(super) fn compute_overview_counts_from_sqlite(
     top_detectors.sort_by(|a, b| b.count.cmp(&a.count).then(a.detector.cmp(&b.detector)));
     top_detectors.truncate(6);
 
-    let health = derive_system_health(&pending);
+    let health = derive_system_health(&pending, last_decision_secs_ago);
 
     let events_today = 0; // backfilled below from telemetry by the caller
     counts.snapshot = Some(OverviewSnapshot {
@@ -449,23 +467,53 @@ pub(super) fn compute_overview_counts_from_sqlite(
 }
 
 /// Derive the operator-visible health verb from the pending
-/// breakdown. Thresholds documented here in one place so a future UX
-/// tune (e.g. raising "backed up" from 50 to 100) doesn't require
-/// hunting through frontend code.
+/// breakdown plus the freshness of the most recent decision.
+///
+/// Phase 7B (2026-04-29 refinement): the prior version emitted
+/// `AiNotResponding` whenever `stuck > 0`, which generated false
+/// alarms whenever earlier-day incidents got abandoned even though
+/// the AI was processing the steady stream normally. The fix: when
+/// the latest decision is fresh (≤5 min), stuck incidents become
+/// `AbandonedBacklog` (yellow soft signal — operator can ignore or
+/// trigger recovery); only when the latest decision is also stale
+/// do we escalate to `AiNotResponding` red.
+///
+/// Thresholds:
+/// - `STUCK_AGE_THRESHOLD_MS = 1h` (incidents older than this with
+///   no decision count as stuck — see compute_overview_counts_*)
+/// - `AI_DOWN_THRESHOLD_SECS = 300` (5 minutes of no decision activity
+///   = AI is genuinely down)
+/// - `BACKED_UP_IN_FLIGHT_THRESHOLD = 50`
 pub(super) fn derive_system_health(
     pending: &super::types::PendingBreakdown,
+    last_decision_secs_ago: Option<i64>,
 ) -> super::types::SystemHealth {
     use super::types::SystemHealth;
+    const AI_DOWN_THRESHOLD_SECS: i64 = 300;
+    const BACKED_UP_IN_FLIGHT_THRESHOLD: usize = 50;
+
+    let ai_is_down_now = match last_decision_secs_ago {
+        // No decision ever recorded: treat as AI down only if there
+        // are also stuck incidents (i.e., something to decide on but
+        // nothing decided). An empty day with 0 stuck is legitimately
+        // OperatingNormally.
+        None => pending.stuck > 0,
+        Some(secs) => secs > AI_DOWN_THRESHOLD_SECS,
+    };
+
     if pending.stuck > 0 {
-        return SystemHealth::AiNotResponding {
+        if ai_is_down_now {
+            return SystemHealth::AiNotResponding {
+                stuck_count: pending.stuck,
+                last_decision_secs_ago,
+            };
+        }
+        return SystemHealth::AbandonedBacklog {
             stuck_count: pending.stuck,
+            last_decision_secs_ago: last_decision_secs_ago.unwrap_or(0),
         };
     }
-    // "Backed up" = significantly more in-flight than the steady
-    // state. 50 is an empirical threshold; on prod 2026-04-29 with
-    // ~290 incidents/day this corresponds to ~1 hour of bursty
-    // activity. Adjust if operator feedback says it's too sensitive.
-    if pending.in_flight > 50 {
+    if pending.in_flight > BACKED_UP_IN_FLIGHT_THRESHOLD {
         return SystemHealth::BackedUp {
             pending_in_flight: pending.in_flight,
         };
@@ -2214,12 +2262,88 @@ mod tests {
             snap.pending.declined_by_ai, 1,
             "escalated:1 has escalate decision"
         );
-        // Health verb derived from breakdown.
+        // Health verb derived from breakdown. The escalated:1
+        // incident has a recent (60s old) decision, so even with a
+        // stuck incident present, we get AbandonedBacklog (yellow
+        // soft signal: AI is alive, but had abandoned-orphan
+        // backlog) rather than AiNotResponding (red: AI down). This
+        // is the Phase 7B refinement.
         match snap.health {
-            super::super::types::SystemHealth::AiNotResponding { stuck_count } => {
+            super::super::types::SystemHealth::AbandonedBacklog {
+                stuck_count,
+                last_decision_secs_ago,
+            } => {
                 assert_eq!(stuck_count, 1);
+                assert!(last_decision_secs_ago < 300);
             }
-            other => panic!("expected AiNotResponding, got {other:?}"),
+            other => panic!("expected AbandonedBacklog, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sqlite_overview_snapshot_health_distinguishes_recent_from_stale_decisions() {
+        // Phase 7B refinement: when stuck > 0 but a recent decision
+        // exists (≤5min ago), health verb is AbandonedBacklog (yellow
+        // soft signal), not AiNotResponding (red alarm). This is the
+        // operator-visible fix: previously the dashboard cried "AI
+        // pipeline may be wedged" whenever any incident from earlier
+        // in the day failed to get a decision, even though the AI was
+        // actively processing the steady stream.
+        let store = make_overview_test_store();
+        let now = chrono::Utc::now();
+        let date = now.date_naive().to_string();
+
+        // 1 stuck incident from 2 hours ago.
+        let stuck_ts =
+            (now - chrono::Duration::hours(2)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        insert_test_incident(
+            &store,
+            "stuck:1",
+            &stuck_ts,
+            "ssh_bruteforce",
+            "high",
+            "brute",
+            Some("203.0.113.10"),
+        );
+
+        // 1 fresh incident with a recent decision (60 seconds ago) —
+        // proves the AI is alive even though the stuck:1 above never
+        // got decided.
+        let fresh_ts = (now - chrono::Duration::seconds(60))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        insert_test_incident(
+            &store,
+            "fresh:1",
+            &fresh_ts,
+            "ssh_bruteforce",
+            "high",
+            "brute",
+            Some("203.0.113.20"),
+        );
+        insert_test_decision(
+            &store,
+            "fresh:1",
+            &fresh_ts,
+            "block_ip",
+            Some("203.0.113.20"),
+        );
+
+        let counts =
+            compute_overview_counts_from_sqlite(&store, &date, 0, None, now).expect("counts");
+        let snap = counts.snapshot.expect("snapshot");
+        assert_eq!(snap.pending.stuck, 1);
+        match snap.health {
+            super::super::types::SystemHealth::AbandonedBacklog {
+                stuck_count,
+                last_decision_secs_ago,
+            } => {
+                assert_eq!(stuck_count, 1);
+                assert!(
+                    last_decision_secs_ago < 300,
+                    "recent decision must drive AbandonedBacklog, got {last_decision_secs_ago}s"
+                );
+            }
+            other => panic!("expected AbandonedBacklog, got {other:?}"),
         }
     }
 

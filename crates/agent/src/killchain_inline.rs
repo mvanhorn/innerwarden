@@ -142,6 +142,84 @@ pub(crate) fn write_incidents(
     }
 }
 
+/// Phase 7B (audit RC-2 — Slice C): for each kill chain incident
+/// whose target IP belongs to an active operator SSH session, write a
+/// `dismiss` decision through the standard hash-chained audit path.
+/// The operator running `cat /etc/passwd` from their SSH shell is not
+/// an attacker, but the eBPF detector legitimately fires on the
+/// `socket + sensitive_read` co-occurrence. Pre-7B these incidents
+/// stayed decisionless and accumulated in the dashboard's "Stuck >1h"
+/// bucket as a false-positive alarm. The dismiss decision carries
+/// `ai_provider="operator-session-fp"` and a reason explaining the
+/// session match so the audit log makes the call visible.
+pub(crate) fn dismiss_operator_session_incidents(
+    data_dir: &Path,
+    sqlite_store: Option<&std::sync::Arc<innerwarden_store::Store>>,
+    incidents: &[serde_json::Value],
+    operator_ips: &std::collections::HashMap<String, std::time::Instant>,
+) {
+    if incidents.is_empty() || operator_ips.is_empty() {
+        return;
+    }
+    for inc in incidents {
+        // Pull the c2_ip from the killchain evidence (the "target"
+        // remote IP of the suspected exfil). If it's not in the
+        // operator session map, leave the incident alone — the
+        // standard pipeline will handle it.
+        let target_ip = inc
+            .get("evidence")
+            .and_then(|e| e.get("c2_ip"))
+            .and_then(|v| v.as_str());
+        let Some(target_ip) = target_ip else { continue };
+        if !operator_ips.contains_key(target_ip) {
+            continue;
+        }
+        // Match — write the dismiss decision inline.
+        let incident_id = inc
+            .get("incident_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if incident_id.is_empty() {
+            continue;
+        }
+        let pattern = inc
+            .get("evidence")
+            .and_then(|e| e.get("pattern"))
+            .and_then(|p| p.as_str())
+            .unwrap_or("?");
+        let entry = crate::decisions::DecisionEntry {
+            ts: chrono::Utc::now(),
+            incident_id: incident_id.to_string(),
+            host: std::env::var("HOSTNAME")
+                .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()))
+                .unwrap_or_else(|_| "unknown".to_string()),
+            ai_provider: "operator-session-fp".to_string(),
+            action_type: "dismiss".to_string(),
+            target_ip: Some(target_ip.to_string()),
+            target_user: None,
+            skill_id: None,
+            confidence: 1.0,
+            auto_executed: true,
+            dry_run: false,
+            reason: format!(
+                "Auto-dismissed: kill chain {pattern} target IP matches an active operator SSH \
+                 session ({target_ip}). The operator's own shell tripped the socket+sensitive_read \
+                 pattern; this is a known false positive on operator-initiated activity."
+            ),
+            estimated_threat: "none".to_string(),
+            execution_result: "dismissed".to_string(),
+            prev_hash: None,
+        };
+        if let Err(e) = crate::decisions::append_chained(data_dir, &entry, sqlite_store) {
+            warn!(
+                incident_id = %incident_id,
+                error = %e,
+                "killchain: failed to write operator-session-fp dismiss decision"
+            );
+        }
+    }
+}
+
 /// Notify via Telegram for critical kill chain detections.
 /// Gated through the centralized notification gate.
 pub(crate) fn notify_telegram(
@@ -266,6 +344,79 @@ pub(crate) fn stats(tracker: &PidTracker) -> (usize, usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Phase 7B Slice C anchors ────────────────────────────────────
+    //
+    // dismiss_operator_session_incidents must (1) skip non-operator
+    // IPs entirely, (2) write a dismiss decision when c2_ip matches an
+    // active operator session, and (3) be a no-op on empty inputs.
+
+    #[test]
+    fn dismiss_operator_session_skips_non_operator_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let incidents = vec![serde_json::json!({
+            "incident_id": "kill_chain:detected:DATA_EXFIL:2026-04-29T10:00Z",
+            "evidence": {
+                "c2_ip": "203.0.113.99",
+                "pattern": "DATA_EXFIL",
+            }
+        })];
+        // operator_ips is empty — c2_ip 203.0.113.99 must NOT match.
+        let operator_ips: std::collections::HashMap<String, std::time::Instant> =
+            std::collections::HashMap::new();
+        dismiss_operator_session_incidents(tmp.path(), Some(&store), &incidents, &operator_ips);
+        assert_eq!(store.decisions_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn dismiss_operator_session_writes_dismiss_when_target_is_operator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let incidents = vec![serde_json::json!({
+            "incident_id": "kill_chain:detected:DATA_EXFIL:2026-04-29T10:00Z",
+            "evidence": {
+                "c2_ip": "203.0.113.99",
+                "pattern": "DATA_EXFIL",
+            }
+        })];
+        let mut operator_ips = std::collections::HashMap::new();
+        operator_ips.insert("203.0.113.99".to_string(), std::time::Instant::now());
+        dismiss_operator_session_incidents(tmp.path(), Some(&store), &incidents, &operator_ips);
+        assert_eq!(store.decisions_count().unwrap(), 1);
+        let decisions = store
+            .decisions_for_incident("kill_chain:detected:DATA_EXFIL:2026-04-29T10:00Z")
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        // The decision JSON line must encode the auto-dismiss
+        // explanation the operator can audit later.
+        let decoded: serde_json::Value = serde_json::from_str(&decisions[0]).unwrap();
+        assert_eq!(decoded["action_type"], "dismiss");
+        assert_eq!(decoded["ai_provider"], "operator-session-fp");
+    }
+
+    #[test]
+    fn dismiss_operator_session_is_noop_when_inputs_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let mut operator_ips = std::collections::HashMap::new();
+        operator_ips.insert("10.0.0.5".to_string(), std::time::Instant::now());
+        // Empty incidents.
+        dismiss_operator_session_incidents(tmp.path(), Some(&store), &[], &operator_ips);
+        assert_eq!(store.decisions_count().unwrap(), 0);
+        // Empty operator_ips, with incidents.
+        let incidents = vec![serde_json::json!({
+            "incident_id": "x:y",
+            "evidence": {"c2_ip": "1.2.3.4"}
+        })];
+        let empty_ops: std::collections::HashMap<String, std::time::Instant> =
+            std::collections::HashMap::new();
+        dismiss_operator_session_incidents(tmp.path(), Some(&store), &incidents, &empty_ops);
+        assert_eq!(store.decisions_count().unwrap(), 0);
+    }
 
     // event_to_tracker_json preserves key fields
     #[test]

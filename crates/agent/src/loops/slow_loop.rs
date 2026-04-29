@@ -822,6 +822,22 @@ pub(crate) async fn process_narrative_tick(
             &mut state.correlation_engine,
         );
         killchain_inline::write_incidents(data_dir, state.sqlite_store.as_deref(), &kc_incidents);
+        // Phase 7B (audit RC-2 — Slice C): kill chain detections fire
+        // on operator SSH sessions (operator runs `cat /etc/passwd`,
+        // sensor sees socket+sensitive_read in same window, classifies
+        // as DATA_EXFIL). The operator is not the attacker. Pre-7B
+        // these incidents were written without a decision and showed
+        // up in the dashboard's "Stuck >1h" bucket as false-positive
+        // alarm. Now: when the kill chain target IP matches a current
+        // operator session, write a dismiss decision inline so the
+        // incident leaves the operator-visible stuck bucket as soon
+        // as it's surfaced.
+        crate::killchain_inline::dismiss_operator_session_incidents(
+            data_dir,
+            state.sqlite_store.as_ref(),
+            &kc_incidents,
+            &state.operator_ips,
+        );
         let gate_counter = state.telemetry.gate_suppressed_counter();
         killchain_inline::notify_telegram(
             &state.telegram_client,
@@ -836,6 +852,28 @@ pub(crate) async fn process_narrative_tick(
             killchain_inline::cleanup_stale(&mut state.killchain_tracker);
             state.last_killchain_cleanup = std::time::Instant::now();
         }
+    }
+
+    // Phase 7B (audit RC-2): orphan-incident recovery sweep.
+    // Every 10 minutes, walk SQLite for incidents that fired >1h ago
+    // and never received a decision (deploy orphans, AI provider
+    // skips, classifier failures). Each gets a `dismiss` decision
+    // with `ai_provider="orphan-recovery"` written through the
+    // standard hash-chained audit path. The dashboard's "Stuck >1h"
+    // pending bucket then trends down naturally instead of growing
+    // unboundedly. The 200-row cap per sweep means a freshly-deployed
+    // agent with hundreds of historical orphans sees the count
+    // decrease across ticks — the operator sees a cleanup pass
+    // running, not a number that vanishes mysteriously.
+    if state.last_orphan_recovery.elapsed().as_secs() >= 600 {
+        let written = crate::orphan_recovery::run_sweep(state, data_dir);
+        if written > 0 {
+            tracing::info!(
+                written,
+                "slow_loop: orphan-recovery sweep dismissed {written} abandoned incidents"
+            );
+        }
+        state.last_orphan_recovery = std::time::Instant::now();
     }
 
     // Feed events through threat DNA engine (behavioral fingerprinting + anomaly detection).

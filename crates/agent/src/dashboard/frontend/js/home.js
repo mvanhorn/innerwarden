@@ -105,18 +105,29 @@ function computeHomeState(payload) {
     reasons.push(recentOrphans + ' response' + (recentOrphans === 1 ? '' : 's') + ' orphaned in the last 24 hours. AI gave up retrying.');
   }
 
-  // Phase 7 (audit RC-2): T4 — backend SystemHealth verb says
-  // AiNotResponding (>=1 incident pending with no decision >1h, no
-  // cooldown row covering it). This is the loudest "AI is wedged"
-  // signal we have. Goes at the top of `reasons` so it dominates
-  // any pre-existing T1-T3 reason.
+  // Phase 7 / 7B (audit RC-2): T4 — backend SystemHealth verb. The
+  // distinction between AiNotResponding (red: no recent decisions
+  // AND stuck>0) and AbandonedBacklog (yellow: stuck>0 BUT recent
+  // decisions still flowing) was added in Phase 7B after the live
+  // dashboard cried "AI pipeline may be wedged" while the AI was
+  // healthily processing the steady stream — earlier-day orphans
+  // are an audit signal, not an ongoing-outage signal.
+  //
+  // AiNotResponding -> health_alert (red, top-priority reason).
+  // AbandonedBacklog is handled below outside the health_alert
+  // gate as a softer signal (medium-severity hero with a recovery
+  // hint, not an ALERT).
   var phase7Health = overview && overview.snapshot && overview.snapshot.health;
   if (phase7Health && phase7Health.kind === 'ai_not_responding') {
     var stuckN = phase7Health.stuck_count || 0;
+    var lastSecs = phase7Health.last_decision_secs_ago;
+    var lastDecisionPart = (lastSecs == null)
+      ? 'No decisions recorded today'
+      : 'Last decision ' + Math.floor(lastSecs / 60) + ' min ago';
     reasons.unshift(
       stuckN + ' incident' + (stuckN === 1 ? '' : 's') +
-      ' pending >1h with no decision. AI pipeline may be wedged — ' +
-      'investigate provider/classifier health.'
+      ' pending >1h with no decision. ' + lastDecisionPart + ' — ' +
+      'AI provider/classifier is likely down.'
     );
   }
 
@@ -148,6 +159,28 @@ function computeHomeState(payload) {
       heroTitle: 'AI catching up',
       heroSub: (healthVerb.pending_in_flight || 0) +
         ' incidents in flight. Decisions arriving with delay.',
+      healthAlertReasons: []
+    };
+  }
+
+  // Phase 7B: "Abandoned backlog" — AI is fine right now, but earlier
+  // incidents got abandoned (no decision within 1h, but recent
+  // decisions are flowing). Soft yellow signal: orphan-recovery
+  // slow_loop pass will sweep them automatically; operator gets a
+  // heads-up rather than a false "AI is wedged" alarm.
+  if (healthVerb && healthVerb.kind === 'abandoned_backlog') {
+    var abN = healthVerb.stuck_count || 0;
+    var abLastSecs = healthVerb.last_decision_secs_ago || 0;
+    var lastMin = Math.max(1, Math.floor(abLastSecs / 60));
+    return {
+      state: 'abandoned_backlog',
+      maxSeverity: 'medium',
+      heroClass: 'status-hero alert-medium',
+      heroIcon: '🧹',
+      heroTitle: 'AI Protection Active',
+      heroSub: abN + ' earlier incident' + (abN === 1 ? '' : 's') +
+        ' abandoned without decision. Recovery pass will sweep them shortly. ' +
+        'AI is currently processing — last decision ' + lastMin + ' min ago.',
       healthAlertReasons: []
     };
   }
@@ -390,12 +423,25 @@ function updatePendingPanel(snap) {
   setText('homePendingCooldown', pending.cooldown_suppressed || 0);
   setText('homePendingStuck', pending.stuck || 0);
 
-  // Hint line summarises the concern in one sentence so the
-  // operator doesn't have to interpret 4 numbers themselves.
+  // Phase 7B hint line. Branches on the snapshot's health verb so
+  // the copy reflects whether the AI is actually wedged or whether
+  // it's just earlier-day backlog (which the orphan-recovery pass
+  // will clear). Pre-7B this said "AI pipeline may be wedged" any
+  // time stuck>0, which gave false alarms whenever the AI was
+  // healthily processing the steady stream.
   var hint = '';
-  if (pending.stuck > 0) {
+  var hintHealth = snap && snap.health;
+  if (hintHealth && hintHealth.kind === 'ai_not_responding') {
+    var hintLast = hintHealth.last_decision_secs_ago;
+    var hintLastPart = (hintLast == null)
+      ? 'no decisions today'
+      : 'last decision ' + Math.floor(hintLast / 60) + ' min ago';
     hint = pending.stuck + ' incident' + (pending.stuck === 1 ? '' : 's') +
-      ' stuck >1h with no decision — AI pipeline may be wedged.';
+      ' stuck >1h, ' + hintLastPart + ' — AI provider/classifier likely down.';
+  } else if (hintHealth && hintHealth.kind === 'abandoned_backlog') {
+    hint = pending.stuck + ' incident' + (pending.stuck === 1 ? '' : 's') +
+      ' abandoned earlier (deploy-orphan or AI skip). Orphan recovery pass ' +
+      'will auto-dismiss them shortly. AI is processing normally.';
   } else if (pending.declined_by_ai > 0) {
     hint = pending.declined_by_ai + ' incident' +
       (pending.declined_by_ai === 1 ? '' : 's') +

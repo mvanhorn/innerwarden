@@ -179,8 +179,17 @@ pub(crate) struct OverviewSnapshot {
 
 /// Operator-readable verb. The front-end maps each variant to a
 /// colour and a one-line headline. Derived in the backend so the
-/// thresholds for "Backed up" / "Not responding" are testable in one
-/// place and not duplicated across UI surfaces.
+/// thresholds for each state are testable in one place and not
+/// duplicated across UI surfaces.
+///
+/// Phase 7B (2026-04-29) refined the verbs to distinguish "AI is
+/// down right now" (no recent decisions in the past 5 minutes) from
+/// "AI is fine but has accumulated abandoned incidents from earlier"
+/// (recent decisions are flowing, but old incidents are still
+/// undecided). The pre-7B path lumped both into AiNotResponding,
+/// which generated false-positive system-health alerts whenever a
+/// past hour had any decisionless incident even though the AI was
+/// processing normally.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum SystemHealth {
@@ -190,12 +199,24 @@ pub(crate) enum SystemHealth {
     /// Pending incidents are accumulating but the AI is still
     /// answering — likely a burst of activity. Yellow.
     BackedUp { pending_in_flight: usize },
-    /// One or more incidents have been pending more than 1h with no
-    /// decision and no cooldown row covering them. Either the AI
-    /// provider is down, the classifier failed to load, or the
-    /// pipeline is wedged on a config error. Red — operator must
-    /// look. Carries the count for the headline.
-    AiNotResponding { stuck_count: usize },
+    /// **AI is fine right now**, but earlier-day incidents got
+    /// abandoned (no decision within 1h). The orphan recovery pass
+    /// will sweep them; operator gets a soft signal rather than a
+    /// false alarm. Yellow.
+    AbandonedBacklog {
+        stuck_count: usize,
+        last_decision_secs_ago: i64,
+    },
+    /// **AI is genuinely not responding** — no decision has been
+    /// written in the last 5 minutes despite incidents accumulating
+    /// for over 1h. Either provider is down, classifier failed to
+    /// load, or pipeline is wedged on a config error. Red — operator
+    /// must look. Carries the count and last-decision age for the
+    /// headline.
+    AiNotResponding {
+        stuck_count: usize,
+        last_decision_secs_ago: Option<i64>,
+    },
 }
 
 /// One pair of counters per outcome. The pair (`incidents`,
