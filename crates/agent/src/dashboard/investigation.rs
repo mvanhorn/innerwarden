@@ -35,148 +35,187 @@ pub(super) async fn api_threats_diagnostic(
     State(state): State<DashboardState>,
     Query(query): Query<EntitiesQuery>,
 ) -> Json<ThreatsDiagnostic> {
-    let display_date = resolve_date(query.date.as_deref());
-    let explicit_date = explicit_date_filter(query.date.as_deref());
-    let filters =
-        InvestigationFilters::from_query(query.severity_min.as_deref(), query.detector.as_deref());
+    // Audit I-06: the body opens SQLite (graph_for_date snapshot read +
+    // separate available_dates query) and runs three pivot builders.
+    // All sync. spawn_blocking moves it off the async worker.
+    let response = tokio::task::spawn_blocking(move || {
+        let display_date = resolve_date(query.date.as_deref());
+        let explicit_date = explicit_date_filter(query.date.as_deref()).map(|s| s.to_string());
+        let filters = InvestigationFilters::from_query(
+            query.severity_min.as_deref(),
+            query.detector.as_deref(),
+        );
 
-    // Reuse the production builder so the diagnostic agrees by
-    // construction with what /api/entities + /api/pivots returns
-    // (including the historical-date snapshot swap).
-    let graph = graph_for_date(&state, explicit_date);
-    let ip_count =
-        build_pivots_from_graph(&graph, PivotKind::Ip, 500, &filters, explicit_date).len();
-    let user_count =
-        build_pivots_from_graph(&graph, PivotKind::User, 500, &filters, explicit_date).len();
-    let det_count =
-        build_pivots_from_graph(&graph, PivotKind::Detector, 500, &filters, explicit_date).len();
-    let total_pivot = ip_count + user_count + det_count;
+        let graph = graph_for_date(&state, explicit_date.as_deref());
+        let ip_count = build_pivots_from_graph(
+            &graph,
+            PivotKind::Ip,
+            500,
+            &filters,
+            explicit_date.as_deref(),
+        )
+        .len();
+        let user_count = build_pivots_from_graph(
+            &graph,
+            PivotKind::User,
+            500,
+            &filters,
+            explicit_date.as_deref(),
+        )
+        .len();
+        let det_count = build_pivots_from_graph(
+            &graph,
+            PivotKind::Detector,
+            500,
+            &filters,
+            explicit_date.as_deref(),
+        )
+        .len();
+        let total_pivot = ip_count + user_count + det_count;
 
-    // "Incidents in scope" = the qualifying-incidents count under the
-    // same filter the pivots use. Pulled from the Detector pivot's
-    // total since that pivot keeps one row per detector, summed.
-    let incidents_in_scope =
-        build_pivots_from_graph(&graph, PivotKind::Detector, 500, &filters, explicit_date)
-            .iter()
-            .map(|p| p.incident_count)
-            .sum();
+        let incidents_in_scope = build_pivots_from_graph(
+            &graph,
+            PivotKind::Detector,
+            500,
+            &filters,
+            explicit_date.as_deref(),
+        )
+        .iter()
+        .map(|p| p.incident_count)
+        .sum();
 
-    let has_incidents = incidents_in_scope > 0;
-    let has_entities = (ip_count + user_count) > 0;
+        let has_incidents = incidents_in_scope > 0;
+        let has_entities = (ip_count + user_count) > 0;
 
-    // Scope mismatch: graph has Incident nodes overall, but none for
-    // this date. Only meaningful when the operator picked an explicit
-    // date filter; checks the LIVE graph (not the swapped one) since
-    // "the snapshot for that date is empty / missing" is the
-    // operator-visible state.
-    let scope_mismatch = if has_incidents || explicit_date.is_none() {
-        false
-    } else {
-        use crate::knowledge_graph::types::NodeType;
-        let live = state.knowledge_graph.read().unwrap();
-        !live.nodes_of_type(NodeType::Incident).is_empty()
-    };
+        let scope_mismatch = if has_incidents || explicit_date.is_none() {
+            false
+        } else {
+            use crate::knowledge_graph::types::NodeType;
+            let live = state.knowledge_graph.read().unwrap();
+            !live.nodes_of_type(NodeType::Incident).is_empty()
+        };
 
-    // Suggested pivots: which non-empty pivot the operator could try.
-    // Order is deterministic so the front-end can render the first
-    // suggestion as the primary CTA.
-    let mut suggested_pivots = Vec::new();
-    if ip_count > 0 {
-        suggested_pivots.push("ip".to_string());
-    }
-    if user_count > 0 {
-        suggested_pivots.push("user".to_string());
-    }
-    if det_count > 0 && total_pivot > ip_count + user_count {
-        suggested_pivots.push("detector".to_string());
-    }
+        let mut suggested_pivots = Vec::new();
+        if ip_count > 0 {
+            suggested_pivots.push("ip".to_string());
+        }
+        if user_count > 0 {
+            suggested_pivots.push("user".to_string());
+        }
+        if det_count > 0 && total_pivot > ip_count + user_count {
+            suggested_pivots.push("detector".to_string());
+        }
 
-    // Available historical dates: scan the SQLite store for
-    // `graph_snapshots` rows, return the last 7 dates the operator
-    // can drill into. Surfaces in the empty-state UI as clickable
-    // chips so the operator stops typing the wrong date.
-    let mut available_dates: Vec<String> = Vec::new();
-    if let Ok(store) = innerwarden_store::Store::open(&state.data_dir) {
-        if let Ok(conn) = store.conn() {
-            if let Ok(mut stmt) =
-                conn.prepare("SELECT date FROM graph_snapshots ORDER BY date DESC LIMIT 7")
-            {
-                if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
-                    for row in rows.flatten() {
-                        available_dates.push(row);
+        let mut available_dates: Vec<String> = Vec::new();
+        if let Ok(store) = innerwarden_store::Store::open(&state.data_dir) {
+            if let Ok(conn) = store.conn() {
+                if let Ok(mut stmt) =
+                    conn.prepare("SELECT date FROM graph_snapshots ORDER BY date DESC LIMIT 7")
+                {
+                    if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+                        for row in rows.flatten() {
+                            available_dates.push(row);
+                        }
                     }
                 }
             }
         }
-    }
 
-    Json(ThreatsDiagnostic {
-        date: display_date,
-        has_incidents,
-        has_entities,
-        scope_mismatch,
-        suggested_pivots,
-        incidents_in_scope,
-        ip_pivot_count: ip_count,
-        user_pivot_count: user_count,
-        detector_pivot_count: det_count,
-        available_dates,
+        ThreatsDiagnostic {
+            date: display_date,
+            has_incidents,
+            has_entities,
+            scope_mismatch,
+            suggested_pivots,
+            incidents_in_scope,
+            ip_pivot_count: ip_count,
+            user_pivot_count: user_count,
+            detector_pivot_count: det_count,
+            available_dates,
+        }
     })
+    .await
+    .unwrap_or_else(|_| ThreatsDiagnostic {
+        date: String::new(),
+        has_incidents: false,
+        has_entities: false,
+        scope_mismatch: false,
+        suggested_pivots: Vec::new(),
+        incidents_in_scope: 0,
+        ip_pivot_count: 0,
+        user_pivot_count: 0,
+        detector_pivot_count: 0,
+        available_dates: Vec::new(),
+    });
+    Json(response)
 }
 
 pub(super) async fn api_entities(
     State(state): State<DashboardState>,
     Query(query): Query<EntitiesQuery>,
 ) -> Json<EntitiesResponse> {
-    // Spec 037 Threats UX hotfix: date is an OPTIONAL filter, not a
-    // mandatory scope. When the operator hasn't explicitly selected a
-    // date, `query.date` is empty and `explicit_date_filter` returns
-    // `None` so the builder sees the full graph. The earlier behaviour
-    // (resolve to today by default) emptied the page on hosts where
-    // today had only self-traffic incidents -- the operator landed on
-    // an empty Threats tab and changing the date didn't help because
-    // each switch still imposed a hard one-day filter on a graph whose
-    // qualifying incidents happened to span other dates. The response
-    // still echoes a stable date string for the UI label.
-    let display_date = resolve_date(query.date.as_deref());
-    let explicit_date = explicit_date_filter(query.date.as_deref());
-    let limit = normalize_limit(query.limit);
-    let filters =
-        InvestigationFilters::from_query(query.severity_min.as_deref(), query.detector.as_deref());
-
-    // Spec 037 Threats UX (2026-04-29): when the explicit date is not
-    // today, swap to that day's snapshot so historical-date selections
-    // actually return data instead of always seeing the live (today-only)
-    // graph.
-    let graph = graph_for_date(&state, explicit_date);
-    let attackers = build_attackers_from_graph(&graph, limit, &filters, explicit_date);
-    Json(EntitiesResponse {
-        date: display_date,
-        attackers,
+    // Audit I-06 (2026-04-29): the body opens SQLite (via `graph_for_date`
+    // when the operator picked a historical date), decompresses + parses
+    // a ~3 MB gzipped snapshot, and runs the pivot builder. Doing this on
+    // the async worker stalls every other dashboard request handled by
+    // the same worker under WAL contention. `spawn_blocking` moves the
+    // sync work to the blocking pool so async workers stay responsive.
+    let response = tokio::task::spawn_blocking(move || {
+        let display_date = resolve_date(query.date.as_deref());
+        let explicit_date = explicit_date_filter(query.date.as_deref()).map(|s| s.to_string());
+        let limit = normalize_limit(query.limit);
+        let filters = InvestigationFilters::from_query(
+            query.severity_min.as_deref(),
+            query.detector.as_deref(),
+        );
+        let graph = graph_for_date(&state, explicit_date.as_deref());
+        let attackers =
+            build_attackers_from_graph(&graph, limit, &filters, explicit_date.as_deref());
+        EntitiesResponse {
+            date: display_date,
+            attackers,
+        }
     })
+    .await
+    .unwrap_or_else(|_| EntitiesResponse {
+        date: String::new(),
+        attackers: Vec::new(),
+    });
+    Json(response)
 }
 
 pub(super) async fn api_pivots(
     State(state): State<DashboardState>,
     Query(query): Query<EntitiesQuery>,
 ) -> Json<PivotResponse> {
-    // Same date semantics as `api_entities`: explicit historical date
-    // pulls that day's snapshot from SQLite via `graph_for_date`.
-    let display_date = resolve_date(query.date.as_deref());
-    let explicit_date = explicit_date_filter(query.date.as_deref());
-    let limit = normalize_limit(query.limit);
-    let group_by = PivotKind::parse(query.group_by.as_deref());
-    let filters =
-        InvestigationFilters::from_query(query.severity_min.as_deref(), query.detector.as_deref());
-
-    let graph = graph_for_date(&state, explicit_date);
-    let items = build_pivots_from_graph(&graph, group_by, limit, &filters, explicit_date);
-    Json(PivotResponse {
-        date: display_date,
-        group_by: group_by.as_str().to_string(),
-        total: items.len(),
-        items,
+    // Audit I-06: same blocking-pool treatment as api_entities.
+    let response = tokio::task::spawn_blocking(move || {
+        let display_date = resolve_date(query.date.as_deref());
+        let explicit_date = explicit_date_filter(query.date.as_deref()).map(|s| s.to_string());
+        let limit = normalize_limit(query.limit);
+        let group_by = PivotKind::parse(query.group_by.as_deref());
+        let filters = InvestigationFilters::from_query(
+            query.severity_min.as_deref(),
+            query.detector.as_deref(),
+        );
+        let graph = graph_for_date(&state, explicit_date.as_deref());
+        let items =
+            build_pivots_from_graph(&graph, group_by, limit, &filters, explicit_date.as_deref());
+        PivotResponse {
+            date: display_date,
+            group_by: group_by.as_str().to_string(),
+            total: items.len(),
+            items,
+        }
     })
+    .await
+    .unwrap_or_else(|_| PivotResponse {
+        date: String::new(),
+        group_by: "ip".to_string(),
+        total: 0,
+        items: Vec::new(),
+    });
+    Json(response)
 }
 
 /// Returns `Some(date_str)` only when the caller passed a parseable
@@ -238,18 +277,28 @@ pub(super) async fn api_clusters(
     State(state): State<DashboardState>,
     Query(query): Query<ClusterQuery>,
 ) -> Json<ClusterResponse> {
+    // Audit I-06: same blocking-pool treatment as api_entities. Cluster
+    // computation iterates every Incident node, walks edges, and (when
+    // the operator picks a historical date) reads a fresh ~3 MB snapshot
+    // off SQLite via `graph_for_date`.
+    let response = tokio::task::spawn_blocking(move || compute_clusters_blocking(&state, query))
+        .await
+        .unwrap_or_else(|_| ClusterResponse {
+            date: String::new(),
+            total: 0,
+            items: Vec::new(),
+        });
+    Json(response)
+}
+
+fn compute_clusters_blocking(state: &DashboardState, query: ClusterQuery) -> ClusterResponse {
     let date = resolve_date(query.date.as_deref());
     let explicit_date = explicit_date_filter(query.date.as_deref());
     let limit = normalize_limit(query.limit);
     let window_seconds = query.window_seconds.unwrap_or(300).clamp(30, 3600);
 
-    // Build clusters from graph Incident nodes.
-    // 2026-04-29: respect the explicit date filter (was previously
-    // iterating ALL Incident nodes regardless of date) and pull a
-    // historical day's snapshot when the operator drills into
-    // yesterday's clusters.
     use crate::knowledge_graph::types::{Node, NodeType, Relation};
-    let arc_graph = graph_for_date(&state, explicit_date);
+    let arc_graph = graph_for_date(state, explicit_date);
     let graph = arc_graph.read().unwrap();
 
     let date_filter: Option<chrono::NaiveDate> =
@@ -356,11 +405,11 @@ pub(super) async fn api_clusters(
     items.sort_by(|a, b| b.incident_count.cmp(&a.incident_count));
     items.truncate(limit);
 
-    Json(ClusterResponse {
+    ClusterResponse {
         date,
         total: items.len(),
         items,
-    })
+    }
 }
 pub(super) async fn api_journey(
     State(state): State<DashboardState>,

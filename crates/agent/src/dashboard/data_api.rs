@@ -277,16 +277,29 @@ pub(super) async fn api_incidents(
     State(state): State<DashboardState>,
     Query(query): Query<ListQuery>,
 ) -> Json<IncidentListResponse> {
+    // Audit I-06: this body opens SQLite via `graph_for_date` (when the
+    // operator picks a historical date) and walks every Incident node
+    // plus its TriggeredBy edges. Doing that on the async worker stalls
+    // every other dashboard request under WAL contention. spawn_blocking
+    // moves the sync work to the blocking pool.
+    let response = tokio::task::spawn_blocking(move || compute_incidents_blocking(&state, query))
+        .await
+        .unwrap_or_else(|_| IncidentListResponse {
+            date: String::new(),
+            total: 0,
+            items: Vec::new(),
+        });
+    Json(response)
+}
+
+fn compute_incidents_blocking(state: &DashboardState, query: ListQuery) -> IncidentListResponse {
     let date = resolve_date(query.date.as_deref());
-    // 2026-04-29: respect the explicit date filter the operator sets
-    // in the Threats date input + load that day's snapshot from
-    // SQLite when it differs from today.
     let explicit_date =
         crate::dashboard::investigation::explicit_date_filter(query.date.as_deref());
     let limit = normalize_limit(query.limit);
 
     use crate::knowledge_graph::types::{Node, NodeType};
-    let arc_graph = crate::dashboard::investigation::graph_for_date(&state, explicit_date);
+    let arc_graph = crate::dashboard::investigation::graph_for_date(state, explicit_date);
     let graph = arc_graph.read().unwrap();
 
     let date_filter: Option<chrono::NaiveDate> =
@@ -371,7 +384,7 @@ pub(super) async fn api_incidents(
     let total = incident_views.len();
     let items: Vec<IncidentView> = incident_views.into_iter().take(limit).collect();
 
-    Json(IncidentListResponse { date, total, items })
+    IncidentListResponse { date, total, items }
 }
 pub(super) async fn api_decisions(
     State(state): State<DashboardState>,
