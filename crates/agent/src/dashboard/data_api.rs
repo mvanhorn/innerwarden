@@ -65,6 +65,189 @@ pub(super) fn explain_system_prompt(personality: &str) -> String {
         format!("{}\n\n{simplifier}", personality.trim_end())
     }
 }
+/// 2026-04-29 (audit Phase 5 / RC-2 deeper close): aggregated counters
+/// the Home tiles display. The pre-Phase-5 path computed these by
+/// iterating the in-memory knowledge graph, which is lossy: the slow
+/// loop's TTL eviction culls nodes older than ~12h, so today's
+/// 06:00-UTC incidents disappear from the graph by 18:00 UTC even
+/// though they are still in `incidents-YYYY-MM-DD.jsonl` and the
+/// SQLite `incidents` table. The operator saw this as the Home tile
+/// "Handled Today" decaying from N to 0 over the course of a day
+/// while the durable storage held all N incidents intact.
+///
+/// PR #335 (Phase 3) and PR #336 (Phase 4) closed RC-4. RC-2
+/// ("three-place writes") was *partially* closed by PR #333 (decision
+/// → outcome contract) but the count-source-of-truth half stayed
+/// open: tiles read the lossy KG, list endpoints read the lossy KG,
+/// nobody read the durable SQLite. Phase 5 makes SQLite the source
+/// of truth for `/api/overview` counts so the Home tile reflects
+/// what is actually on disk.
+#[derive(Default)]
+pub(super) struct OverviewCounts {
+    pub incidents_count: usize,
+    pub decisions_count: usize,
+    pub ai_confirmed: usize,
+    pub ai_responded: usize,
+    pub ai_ignored: usize,
+    pub unresolved_count: usize,
+    pub safely_resolved: usize,
+    pub handled_ips_today: usize,
+    pub blocked_count: usize,
+    pub observing_count: usize,
+    pub attention_count: usize,
+    pub severity_breakdown: std::collections::HashMap<String, usize>,
+    pub by_detector: BTreeMap<String, usize>,
+}
+
+/// Read all of `date`'s incidents from SQLite (the durable source of
+/// truth, unaffected by KG TTL eviction), join each with its latest
+/// decision, and aggregate into the Home counters.
+///
+/// Returns `None` when the SQLite store is not configured (test
+/// fixtures, transitional state). Callers must fall back to the
+/// in-memory KG iteration in that case so tests without a Store keep
+/// working.
+pub(super) fn compute_overview_counts_from_sqlite(
+    store: &innerwarden_store::Store,
+    date: &str,
+    sev_min_rank: u8,
+    detector_substring: Option<&str>,
+) -> Option<OverviewCounts> {
+    let conn = store.conn().ok()?;
+    let mut counts = OverviewCounts::default();
+    let mut handled_ips: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Prefix-match on the ISO timestamp string ("2026-04-29..."). The
+    // `idx_incidents_ts` index is on the same column so this is cheap.
+    let pattern = format!("{date}%");
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT i.detector, i.title, i.severity, i.data, \
+                    d.action_type, d.target_ip, d.auto_executed \
+             FROM incidents i \
+             LEFT JOIN ( \
+                 SELECT incident_id, action_type, target_ip, auto_executed, \
+                        ROW_NUMBER() OVER (PARTITION BY incident_id ORDER BY id DESC) AS rn \
+                 FROM decisions \
+             ) d ON d.incident_id = i.incident_id AND d.rn = 1 \
+             WHERE i.ts LIKE ?1",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map([&pattern], |row| {
+            Ok((
+                row.get::<_, String>(0)?,         // detector
+                row.get::<_, String>(1)?,         // title
+                row.get::<_, String>(2)?,         // severity
+                row.get::<_, String>(3)?,         // data (JSON)
+                row.get::<_, Option<String>>(4)?, // action_type
+                row.get::<_, Option<String>>(5)?, // target_ip
+                row.get::<_, Option<i64>>(6)?,    // auto_executed
+            ))
+        })
+        .ok()?;
+    for row in rows {
+        let Ok((detector, title, severity, data, action_type, target_ip, _auto_executed)) = row
+        else {
+            continue;
+        };
+        // Apply the same internal/system-noise filter the live-feed
+        // and threats tab use, so the Home tile counts match what the
+        // operator sees in the lists.
+        let parsed: serde_json::Value = match serde_json::from_str(&data) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let has_external_ip = parsed
+            .get("entities")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter().any(|e| {
+                    let is_ip = e
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .map(|t| t.eq_ignore_ascii_case("ip"))
+                        .unwrap_or(false);
+                    let value = e.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                    is_ip
+                        && !value.is_empty()
+                        && !crate::incident_auto_rules::is_internal_ip_pub(value)
+                })
+            })
+            .unwrap_or(false);
+        if crate::dashboard::live_feed::is_internal_incident_fields(
+            &detector,
+            &title,
+            has_external_ip,
+        ) {
+            continue;
+        }
+        if sev_min_rank > 0
+            && crate::dashboard::investigation::severity_rank(&severity) < sev_min_rank
+        {
+            continue;
+        }
+        if let Some(needle) = detector_substring {
+            if !detector.to_ascii_lowercase().contains(needle) {
+                continue;
+            }
+        }
+        // Skip research-only incidents (spec 015). These are stored
+        // in the JSON `data` blob; the column doesn't promote it.
+        if parsed
+            .get("research_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        counts.incidents_count += 1;
+        *counts.by_detector.entry(detector.clone()).or_insert(0) += 1;
+        *counts
+            .severity_breakdown
+            .entry(severity.to_lowercase())
+            .or_insert(0) += 1;
+        let outcome = super::threat_contract::classify_decision(action_type.as_deref(), Some("ok"));
+        match super::threat_contract::kpi_bucket(outcome) {
+            super::threat_contract::KpiBucket::Blocked => counts.blocked_count += 1,
+            super::threat_contract::KpiBucket::Observing => counts.observing_count += 1,
+            super::threat_contract::KpiBucket::Attention => counts.attention_count += 1,
+            super::threat_contract::KpiBucket::None => {}
+        }
+        if let Some(action) = action_type {
+            counts.decisions_count += 1;
+            let target_is_ip = target_ip.as_ref().is_some_and(|t| t.contains('.'));
+            match action.as_str() {
+                "ignore" | "dismiss" => counts.ai_ignored += 1,
+                "monitor" => {
+                    counts.ai_confirmed += 1;
+                    counts.safely_resolved += 1;
+                    if target_is_ip {
+                        if let Some(ip) = &target_ip {
+                            handled_ips.insert(ip.clone());
+                        }
+                    }
+                }
+                "request_confirmation" | "escalate" => {
+                    counts.ai_confirmed += 1;
+                    counts.unresolved_count += 1;
+                }
+                _ => {
+                    counts.ai_confirmed += 1;
+                    if target_is_ip {
+                        counts.ai_responded += 1;
+                        if let Some(ip) = &target_ip {
+                            handled_ips.insert(ip.clone());
+                        }
+                    }
+                    counts.safely_resolved += 1;
+                }
+            }
+        }
+    }
+    counts.handled_ips_today = handled_ips.len();
+    Some(counts)
+}
+
 pub(super) async fn api_overview(
     State(state): State<DashboardState>,
     Query(query): Query<ListQuery>,
@@ -108,6 +291,67 @@ pub(super) async fn api_overview(
     let metrics = graph.metrics();
     let date_filter: Option<chrono::NaiveDate> =
         explicit_date.and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok());
+
+    // Phase 5 (audit RC-2 deeper close): when the SQLite store is
+    // wired (production path), counts come from the durable incidents
+    // + decisions tables, not the lossy in-memory KG. The KG is still
+    // used below for graph traversal (events_count via metrics, plus
+    // the per-incident loop as a fallback when SQLite is unavailable).
+    //
+    // Operator-visible behaviour change: the "Handled Today" tile
+    // stops decaying as TTL eviction culls older today-incidents.
+    // Numbers now match what the Threats list and the JSONL file
+    // actually contain.
+    let sev_min_rank_filter = query
+        .severity_min
+        .as_deref()
+        .map(crate::dashboard::investigation::severity_rank)
+        .unwrap_or(0);
+    let detector_substring_filter = query
+        .detector
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_ascii_lowercase());
+    let sqlite_counts = state.sqlite_store.as_ref().and_then(|store| {
+        compute_overview_counts_from_sqlite(
+            store,
+            &date,
+            sev_min_rank_filter,
+            detector_substring_filter.as_deref(),
+        )
+    });
+    if let Some(c) = sqlite_counts {
+        let telemetry = crate::telemetry::read_latest_snapshot(&state.data_dir, &date);
+        let mut top_detectors: Vec<DetectorCount> = c
+            .by_detector
+            .into_iter()
+            .map(|(detector, count)| DetectorCount { detector, count })
+            .collect();
+        top_detectors.sort_by(|a, b| b.count.cmp(&a.count).then(a.detector.cmp(&b.detector)));
+        top_detectors.truncate(6);
+        return Json(OverviewResponse {
+            date,
+            events_count: metrics.edge_count, // graph metric — not date-filtered, separate concern
+            incidents_count: c.incidents_count,
+            decisions_count: c.decisions_count,
+            ai_confirmed: c.ai_confirmed,
+            ai_responded: c.ai_responded,
+            ai_ignored: c.ai_ignored,
+            unresolved_count: c.unresolved_count,
+            safely_resolved: c.safely_resolved,
+            handled_ips_today: c.handled_ips_today,
+            blocked_count: c.blocked_count,
+            observing_count: c.observing_count,
+            attention_count: c.attention_count,
+            severity_breakdown: c.severity_breakdown,
+            // SQLite path doesn't carry the dynamic-rule allowlist
+            // flag (lives only on the graph node post-ingestion).
+            // Frontend doesn't render this field; safe to leave 0.
+            allowlisted_count: 0,
+            top_detectors,
+            latest_telemetry: telemetry,
+        });
+    }
 
     // Count decisions from Incident nodes
     use crate::knowledge_graph::types::{Node, NodeType, Relation};
@@ -1301,6 +1545,282 @@ mod tests {
         // handled_ips_today must be present even if 0.
         assert_eq!(out.handled_ips_today, 0);
         assert_eq!(out.incidents_count, 0);
+    }
+
+    // ── Phase 5 anchors: SQLite is the source of truth for counts ──
+    //
+    // The KG suffers TTL eviction (~12h). Without these tests, a
+    // future refactor that "simplifies" /api/overview back to the
+    // graph path would silently regress the operator-visible
+    // count-decay-to-zero bug that motivated Phase 5.
+
+    fn make_overview_test_store() -> std::sync::Arc<innerwarden_store::Store> {
+        std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"))
+    }
+
+    fn insert_test_incident(
+        store: &innerwarden_store::Store,
+        incident_id: &str,
+        ts_iso: &str,
+        _detector: &str,
+        severity: &str,
+        title: &str,
+        ip: Option<&str>,
+    ) {
+        // Use the public `insert_incident` API so the rusqlite call
+        // stays out of the agent test surface. Detector is derived
+        // from incident_id by `Store::insert_incident` (first two
+        // colon-separated segments), so we encode the detector into
+        // the incident_id prefix for the test fixtures below.
+        use innerwarden_core::entities::EntityRef;
+        use innerwarden_core::event::Severity;
+        use innerwarden_core::incident::Incident;
+        let sev = match severity.to_lowercase().as_str() {
+            "critical" => Severity::Critical,
+            "high" => Severity::High,
+            "medium" => Severity::Medium,
+            "low" => Severity::Low,
+            _ => Severity::Info,
+        };
+        let entities = match ip {
+            Some(addr) => vec![EntityRef::ip(addr)],
+            None => vec![],
+        };
+        let inc = Incident {
+            ts: chrono::DateTime::parse_from_rfc3339(ts_iso)
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            host: "test-host".to_string(),
+            incident_id: incident_id.to_string(),
+            severity: sev,
+            title: title.to_string(),
+            summary: "test".to_string(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities,
+        };
+        store.insert_incident(&inc).expect("insert incident");
+    }
+
+    fn insert_test_decision(
+        store: &innerwarden_store::Store,
+        incident_id: &str,
+        ts_iso: &str,
+        action: &str,
+        target_ip: Option<&str>,
+    ) {
+        let row = innerwarden_store::decisions::DecisionRow {
+            ts: ts_iso.to_string(),
+            incident_id: incident_id.to_string(),
+            action_type: action.to_string(),
+            target_ip: target_ip.map(|s| s.to_string()),
+            target_user: None,
+            confidence: 1.0,
+            auto_executed: true,
+            reason: Some("test".into()),
+            data: serde_json::json!({"action_type": action}).to_string(),
+        };
+        store.insert_decision(&row).expect("insert decision");
+    }
+
+    #[test]
+    fn sqlite_overview_counts_survive_kg_eviction() {
+        // The motivating regression: graph TTL evicted today's earlier
+        // incidents and the Home tile decayed to 0. SQLite path must
+        // count all of today's incidents, regardless of graph state.
+        let store = make_overview_test_store();
+        let date = "2026-04-29";
+        // 4 today, varied decisions
+        insert_test_incident(
+            &store,
+            "ssh:bf:1",
+            "2026-04-29T01:00:00Z",
+            "ssh_bruteforce",
+            "high",
+            "ssh brute",
+            Some("203.0.113.10"),
+        );
+        insert_test_decision(
+            &store,
+            "ssh:bf:1",
+            "2026-04-29T01:00:01Z",
+            "block_ip",
+            Some("203.0.113.10"),
+        );
+        insert_test_incident(
+            &store,
+            "ssh:bf:2",
+            "2026-04-29T05:00:00Z",
+            "ssh_bruteforce",
+            "high",
+            "ssh brute",
+            Some("203.0.113.20"),
+        );
+        insert_test_decision(
+            &store,
+            "ssh:bf:2",
+            "2026-04-29T05:00:01Z",
+            "monitor",
+            Some("203.0.113.20"),
+        );
+        insert_test_incident(
+            &store,
+            "noise:1",
+            "2026-04-29T08:00:00Z",
+            "proto_anomaly",
+            "low",
+            "weird ssh",
+            Some("203.0.113.30"),
+        );
+        insert_test_decision(
+            &store,
+            "noise:1",
+            "2026-04-29T08:00:01Z",
+            "dismiss",
+            Some("203.0.113.30"),
+        );
+        insert_test_incident(
+            &store,
+            "open:1",
+            "2026-04-29T11:00:00Z",
+            "credential_stuffing",
+            "high",
+            "stuff",
+            Some("203.0.113.40"),
+        );
+        // No decision for open:1 → counts as Attention.
+
+        // Yesterday's incident must NOT leak into today's count.
+        insert_test_incident(
+            &store,
+            "old:1",
+            "2026-04-28T22:00:00Z",
+            "ssh_bruteforce",
+            "high",
+            "yesterday",
+            Some("203.0.113.99"),
+        );
+
+        let counts =
+            compute_overview_counts_from_sqlite(&store, date, 0, None).expect("counts returned");
+        assert_eq!(counts.incidents_count, 4, "today only, not yesterday");
+        assert_eq!(counts.blocked_count, 1, "ssh:bf:1");
+        assert_eq!(counts.observing_count, 1, "ssh:bf:2");
+        assert_eq!(counts.attention_count, 1, "open:1 (no decision)");
+        // ai_ignored: 1 (noise:1 dismissed). decisions_count: 3.
+        assert_eq!(counts.ai_ignored, 1);
+        assert_eq!(counts.decisions_count, 3);
+        // handled_ips_today: monitor + block touched 203.0.113.10 + .20
+        assert_eq!(counts.handled_ips_today, 2);
+    }
+
+    #[test]
+    fn sqlite_overview_filters_internal_traffic_incidents() {
+        // RFC 1918 IPs are internal — must be filtered by
+        // is_internal_incident_fields just like the live feed and
+        // threats list. Otherwise the Home tile inflates with self-
+        // traffic the operator can't act on.
+        let store = make_overview_test_store();
+        let date = "2026-04-29";
+        insert_test_incident(
+            &store,
+            "ssh:internal",
+            "2026-04-29T01:00:00Z",
+            "ssh_bruteforce",
+            "high",
+            "ssh brute",
+            Some("10.0.0.5"),
+        );
+        insert_test_incident(
+            &store,
+            "ssh:external",
+            "2026-04-29T02:00:00Z",
+            "ssh_bruteforce",
+            "high",
+            "ssh brute",
+            Some("203.0.113.10"),
+        );
+        let counts =
+            compute_overview_counts_from_sqlite(&store, date, 0, None).expect("counts returned");
+        assert_eq!(
+            counts.incidents_count, 1,
+            "internal IP must be filtered out"
+        );
+    }
+
+    #[test]
+    fn sqlite_overview_severity_filter_narrows_count() {
+        let store = make_overview_test_store();
+        let date = "2026-04-29";
+        insert_test_incident(
+            &store,
+            "low:1",
+            "2026-04-29T01:00:00Z",
+            "proto_anomaly",
+            "low",
+            "weird ssh",
+            Some("203.0.113.10"),
+        );
+        insert_test_incident(
+            &store,
+            "high:1",
+            "2026-04-29T02:00:00Z",
+            "ssh_bruteforce",
+            "high",
+            "brute",
+            Some("203.0.113.20"),
+        );
+        let high_only = crate::dashboard::investigation::severity_rank("high");
+        let counts =
+            compute_overview_counts_from_sqlite(&store, date, high_only, None).expect("counts");
+        assert_eq!(counts.incidents_count, 1);
+    }
+
+    #[tokio::test]
+    async fn api_overview_uses_sqlite_when_kg_evicted() {
+        // End-to-end: graph is empty (simulates TTL eviction completing)
+        // but SQLite has incidents. The handler must return the SQLite
+        // count, not 0.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::dashboard::state::test_dashboard_state(dir.path());
+        let store = make_overview_test_store();
+        let today = chrono::Utc::now().date_naive().to_string();
+        let ts = format!("{today}T01:00:00Z");
+        insert_test_incident(
+            &store,
+            "ssh:1",
+            &ts,
+            "ssh_bruteforce",
+            "high",
+            "brute",
+            Some("203.0.113.10"),
+        );
+        insert_test_decision(
+            &store,
+            "ssh:1",
+            &format!("{today}T01:00:01Z"),
+            "block_ip",
+            Some("203.0.113.10"),
+        );
+        state.sqlite_store = Some(store);
+        state.last_activity.store(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let q = ListQuery {
+            limit: None,
+            date: None,
+            severity_min: None,
+            detector: None,
+        };
+        let Json(out) = api_overview(State(state), Query(q)).await;
+        assert_eq!(out.incidents_count, 1, "SQLite count must surface");
+        assert_eq!(out.blocked_count, 1);
+        assert_eq!(out.handled_ips_today, 1);
     }
 
     #[tokio::test]
