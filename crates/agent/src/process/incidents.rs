@@ -320,6 +320,21 @@ pub(crate) async fn process_incidents(
             }
         }
 
+        // 2026-04-30: defense-in-depth for the sensor's NSS_INIT_CLI_TOOLS
+        // suppression. If a sensor detector emits the
+        // "comm = libc-using CLI tool + sensitive_file = /etc/passwd"
+        // shape (the standard NSS uid->name lookup at process startup
+        // followed by the outbound connect every CLI tool makes),
+        // dismiss inline so the operator never sees the FP in
+        // "needs attention" — even if the sensor binary is older than
+        // the agent and missing the new suppression list.
+        // See `incident_autodismiss::try_autodismiss_sensor_self_traffic_fp`
+        // for the full safety analysis.
+        if incident_autodismiss::try_autodismiss_sensor_self_traffic_fp(incident, state) {
+            handled += 1;
+            continue;
+        }
+
         // VirusTotal enrichment: when YARA scanner detects a binary, check its
         // SHA-256 hash against VT. Result logged for operator context.
         if incident.incident_id.starts_with("yara_scan:") {

@@ -23,6 +23,57 @@ esac
 
 echo "=== Deploy $component to production ==="
 
+# Step 0: Pre-deploy cleanup (free disk before pulling/building).
+#
+# Production deploys have hit "Out of diskspace" during git pull when
+# the rootfs creeps to 100% — the agent binary keeps running on whatever
+# is in /usr/local/bin, but `cargo build --release` and `git pull`
+# both fail. Targets here are CACHE / DEV / OBSOLETE files that the
+# running services do not depend on.
+#
+# Targets and rationale:
+#   - jeprof/                 jemalloc heap profiles, dev-only.
+#   - target/release/incremental
+#                             cargo's incremental compile cache. Safe
+#                             to drop; release builds rebuild it.
+#   - graph-snapshot-*.json*  >5 days old (canonical store is SQLite
+#                             post-PR-258; JSON snapshots are
+#                             redundant). Keep recent ones for the
+#                             threats Date picker fallback.
+#   - pcap/                   >3 days old. Operator pulls hot pcaps
+#                             same-day; older are forensic archive
+#                             material that should live elsewhere.
+#   - events-*.jsonl*         >7 days old. Canonical events live in
+#                             SQLite events table.
+#   - incidents-*.jsonl*      >14 days old. Canonical incidents live
+#                             in SQLite incidents table; JSONL is the
+#                             legacy compat path kept for replay
+#                             tooling.
+#   - journalctl --vacuum-time=3d
+#                             OS-level journald retention.
+#   - /tmp                    files >1 day. Build tmp + ad-hoc dumps.
+#   - sqlite WAL checkpoint   merge WAL into main DB so big WAL files
+#                             do not accumulate during agent uptime.
+echo "[0/4] Pre-deploy cleanup (free disk before pulling/building)..."
+$SSH 'set -e
+  before=$(df -h / | awk "NR==2 {print \$4}")
+  echo "  before: $before free on /"
+  sudo rm -rf /var/lib/innerwarden/jeprof 2>/dev/null || true
+  sudo rm -rf /home/ubuntu/innerwarden/target/release/incremental 2>/dev/null || true
+  sudo find /var/lib/innerwarden -maxdepth 1 -name "graph-snapshot-*.json*" -mtime +5 -delete 2>/dev/null || true
+  if [ -d /var/lib/innerwarden/pcap ]; then
+    sudo find /var/lib/innerwarden/pcap -type f -mtime +3 -delete 2>/dev/null || true
+  fi
+  sudo find /var/lib/innerwarden -maxdepth 1 -name "events-*.jsonl*" -mtime +7 -delete 2>/dev/null || true
+  sudo find /var/lib/innerwarden -maxdepth 1 -name "incidents-*.jsonl*" -mtime +14 -delete 2>/dev/null || true
+  sudo find /var/lib/innerwarden -maxdepth 1 -name "decisions-*.jsonl*" -mtime +14 -delete 2>/dev/null || true
+  sudo find /tmp -type f -mtime +1 -delete 2>/dev/null || true
+  sudo journalctl --vacuum-time=3d 2>&1 | tail -1 || true
+  sudo sqlite3 /var/lib/innerwarden/innerwarden.db "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true
+  after=$(df -h / | awk "NR==2 {print \$4}")
+  echo "  after:  $after free on /"
+'
+
 # Step 1: Pull latest code
 echo "[1/4] Pulling latest code..."
 $SSH "cd $REMOTE_DIR && git stash -q 2>/dev/null; git pull origin main --ff-only" || die "git pull failed"
