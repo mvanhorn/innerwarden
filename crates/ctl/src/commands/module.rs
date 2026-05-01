@@ -1127,6 +1127,7 @@ pub(crate) fn cmd_module_update_all(
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::io::Read;
     use tempfile::TempDir;
 
     fn test_cli(temp: &TempDir) -> Cli {
@@ -1155,6 +1156,449 @@ mod tests {
             allowed_commands: vec!["/usr/bin/true".to_string()],
             preflights: vec![],
         }
+    }
+
+    fn write_file(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("test should create parent directory");
+        }
+        std::fs::write(path, content).expect("test should write fixture");
+    }
+
+    fn readme_fixture() -> String {
+        let body = "This module fixture is intentionally verbose so the validator exercises the \
+            documentation-length path while still staying small and readable. Operators should \
+            review dry-run output before enabling modules, keep rollback notes nearby, and verify \
+            detector thresholds against local traffic. ";
+        format!(
+            "# Test Module\n\n## Overview\n\n{body}{body}\n\n## Configuration\n\n```toml\n[detectors.sudo_abuse]\nenabled = true\n```\n\n## Security\n\nAlways run with dry_run first.\n"
+        )
+    }
+
+    fn module_toml(id: &str, version: &str, update_url: Option<&str>) -> String {
+        let update = update_url
+            .map(|url| format!("update_url = \"{url}\"\n"))
+            .unwrap_or_default();
+        format!(
+            r#"
+[module]
+id          = "{id}"
+name        = "Test Module"
+version     = "{version}"
+description = "A reusable module fixture"
+tier        = "open"
+builtin     = false
+min_innerwarden = "0.1.0"
+{update}
+[provides]
+collectors = ["journald"]
+detectors  = ["sudo-abuse"]
+skills     = ["block-ip"]
+notifiers  = ["slack"]
+
+[[rules]]
+detector       = "sudo-abuse"
+skill          = "block-ip"
+min_confidence = 0.8
+auto_execute   = false
+"#
+        )
+    }
+
+    fn simple_module_toml(id: &str) -> String {
+        format!(
+            r#"
+[module]
+id          = "{id}"
+name        = "Simple Module"
+version     = "0.1.0"
+description = "A module fixture without runtime toggles"
+tier        = "open"
+builtin     = false
+min_innerwarden = "0.1.0"
+"#
+        )
+    }
+
+    fn write_valid_module(dir: &Path, id: &str) {
+        write_file(&dir.join("module.toml"), &module_toml(id, "0.1.0", None));
+        write_file(&dir.join("docs/README.md"), &readme_fixture());
+        write_file(
+            &dir.join("tests/integration.rs"),
+            "#[test]\nfn fixture_compiles() { assert!(true); }\n",
+        );
+    }
+
+    fn write_simple_module(dir: &Path, id: &str) {
+        write_file(&dir.join("module.toml"), &simple_module_toml(id));
+        write_file(&dir.join("docs/README.md"), &readme_fixture());
+        write_file(
+            &dir.join("tests/integration.rs"),
+            "#[test]\nfn fixture_compiles() { assert!(true); }\n",
+        );
+    }
+
+    fn enable_module_config(cli: &Cli) {
+        config_editor::write_bool(&cli.sensor_config, "collectors.journald", "enabled", true)
+            .expect("collector config");
+        config_editor::write_bool(&cli.sensor_config, "detectors.sudo_abuse", "enabled", true)
+            .expect("detector config");
+        config_editor::write_bool(&cli.agent_config, "slack", "enabled", true)
+            .expect("notifier config");
+        config_editor::write_array_push(
+            &cli.agent_config,
+            "responder",
+            "allowed_skills",
+            "block-ip",
+        )
+        .expect("allowed skill config");
+    }
+
+    fn serve_tarball(bytes: Vec<u8>, requests: usize) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+        let addr = listener.local_addr().expect("server address");
+        std::thread::spawn(move || {
+            for _ in 0..requests {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = [0u8; 1024];
+                let n = stream.read(&mut request).unwrap_or(0);
+                let head = String::from_utf8_lossy(&request[..n]);
+                if head.starts_with("GET /module.tar.gz.sha256") {
+                    let response =
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(response);
+                } else {
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        bytes.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(&bytes);
+                }
+            }
+        });
+        format!("http://{addr}/module.tar.gz")
+    }
+
+    #[test]
+    fn cmd_module_validate_accepts_valid_module_and_rejects_invalid_one() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let valid = temp.path().join("valid");
+        write_valid_module(&valid, "valid-module");
+
+        cmd_module_validate(&valid, false).expect("valid module should pass validation");
+
+        let invalid = temp.path().join("invalid");
+        write_file(&invalid.join("module.toml"), "not = [valid");
+        let err = cmd_module_validate(&invalid, false)
+            .expect_err("invalid module should fail validation");
+        assert!(err.to_string().contains("module validation failed"));
+    }
+
+    #[test]
+    fn cmd_module_enable_dry_run_covers_success_already_enabled_and_preflight_failure() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+
+        let module_dir = temp.path().join("enable-module");
+        write_valid_module(&module_dir, "enable-module");
+        cmd_module_enable(&cli, &module_dir, true).expect("dry-run enable should plan changes");
+
+        enable_module_config(&cli);
+        cmd_module_enable(&cli, &module_dir, true).expect("already-enabled module should be no-op");
+
+        let preflight_temp = TempDir::new().expect("test should create temp dir");
+        let preflight_cli = test_cli(&preflight_temp);
+        let failing_preflight = module_toml("preflight-module", "0.1.0", None) + &format!(
+            "\n[[preflights]]\nkind = \"directory_exists\"\nvalue = \"{}\"\nreason = \"fixture path\"\n",
+            preflight_temp.path().join("missing-dir").display()
+        );
+        let preflight_dir = preflight_temp.path().join("preflight-module");
+        write_file(&preflight_dir.join("module.toml"), &failing_preflight);
+        write_file(&preflight_dir.join("docs/README.md"), &readme_fixture());
+        write_file(
+            &preflight_dir.join("tests/integration.rs"),
+            "#[test]\nfn fixture_compiles() { assert!(true); }\n",
+        );
+
+        let err = cmd_module_enable(&preflight_cli, &preflight_dir, true)
+            .expect_err("failing preflight should stop enable");
+        assert!(err.to_string().contains("preflight checks failed"));
+    }
+
+    #[test]
+    fn cmd_module_disable_dry_run_covers_not_enabled_and_enabled_paths() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        let module_dir = temp.path().join("disable-module");
+        write_valid_module(&module_dir, "disable-module");
+
+        cmd_module_disable(&cli, &module_dir, true).expect("not-enabled disable should be no-op");
+
+        enable_module_config(&cli);
+        cmd_module_disable(&cli, &module_dir, true)
+            .expect("enabled module should produce dry-run disable plan");
+    }
+
+    #[test]
+    fn cmd_module_list_and_status_cover_empty_missing_disabled_and_enabled_modules() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        let modules_dir = temp.path().join("modules");
+        std::fs::create_dir_all(&modules_dir).expect("modules dir");
+
+        cmd_module_list(&cli, &modules_dir).expect("empty module list should render");
+        let missing = cmd_module_status(&cli, "missing", &modules_dir)
+            .expect_err("missing module status should error");
+        assert!(missing.to_string().contains("module 'missing' not found"));
+
+        let module_dir = modules_dir.join("listed-module");
+        write_valid_module(&module_dir, "listed-module");
+        cmd_module_list(&cli, &modules_dir).expect("module list should render installed modules");
+        cmd_module_status(&cli, "listed-module", &modules_dir)
+            .expect("disabled module status should render");
+
+        enable_module_config(&cli);
+        cmd_module_list(&cli, &modules_dir).expect("enabled module list should render");
+        cmd_module_status(&cli, "listed-module", &modules_dir)
+            .expect("enabled module status should render");
+    }
+
+    #[test]
+    fn cmd_module_install_local_package_covers_sidecar_existing_and_missing_path() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        let module_dir = temp.path().join("package-source");
+        write_valid_module(&module_dir, "package-source");
+        let tarball = temp.path().join("package-source.tar.gz");
+        module_package::create_tarball(&module_dir, &tarball).expect("tarball should be created");
+        module_package::write_sha256_sidecar(&tarball).expect("sidecar should be created");
+        let modules_dir = temp.path().join("modules");
+
+        cmd_module_install(
+            &cli,
+            tarball.to_str().expect("utf8 tarball path"),
+            &modules_dir,
+            true,
+            false,
+            true,
+        )
+        .expect("dry-run install should validate and plan");
+
+        std::fs::create_dir_all(modules_dir.join("package-source")).expect("existing install dir");
+        let duplicate = cmd_module_install(
+            &cli,
+            tarball.to_str().expect("utf8 tarball path"),
+            &modules_dir,
+            false,
+            false,
+            true,
+        )
+        .expect_err("existing install should require force");
+        assert!(duplicate.to_string().contains("already installed"));
+
+        cmd_module_install(
+            &cli,
+            tarball.to_str().expect("utf8 tarball path"),
+            &modules_dir,
+            false,
+            true,
+            true,
+        )
+        .expect("force dry-run install should allow overwrite plan");
+
+        let missing = temp.path().join("missing.tar.gz");
+        let err = cmd_module_install(
+            &cli,
+            missing.to_str().expect("utf8 missing path"),
+            &modules_dir,
+            false,
+            false,
+            true,
+        )
+        .expect_err("missing local path should fail");
+        assert!(err.to_string().contains("local path not found"));
+    }
+
+    #[test]
+    fn cmd_module_install_live_copies_package_and_force_overwrites() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let mut cli = test_cli(&temp);
+        cli.dry_run = false;
+        let module_dir = temp.path().join("live-install-source");
+        write_simple_module(&module_dir, "live-install-source");
+        let tarball = temp.path().join("live-install-source.tar.gz");
+        module_package::create_tarball(&module_dir, &tarball).expect("tarball should be created");
+        let modules_dir = temp.path().join("modules");
+
+        cmd_module_install(
+            &cli,
+            tarball.to_str().expect("utf8 tarball path"),
+            &modules_dir,
+            false,
+            false,
+            true,
+        )
+        .expect("live install should copy simple module");
+        assert!(modules_dir.join("live-install-source/module.toml").exists());
+
+        write_file(
+            &modules_dir.join("live-install-source/stale.txt"),
+            "stale install file",
+        );
+        cmd_module_install(
+            &cli,
+            tarball.to_str().expect("utf8 tarball path"),
+            &modules_dir,
+            false,
+            true,
+            true,
+        )
+        .expect("force install should replace existing module");
+        assert!(!modules_dir.join("live-install-source/stale.txt").exists());
+    }
+
+    #[test]
+    fn cmd_module_uninstall_covers_missing_dry_run_and_live_remove_without_runtime_toggles() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let mut cli = test_cli(&temp);
+        let modules_dir = temp.path().join("modules");
+
+        let missing = cmd_module_uninstall(&cli, "missing", &modules_dir, true)
+            .expect_err("missing uninstall should fail");
+        assert!(missing.to_string().contains("is not installed"));
+
+        let dry_dir = modules_dir.join("dry-module");
+        write_simple_module(&dry_dir, "dry-module");
+        cmd_module_uninstall(&cli, "dry-module", &modules_dir, true)
+            .expect("dry-run uninstall should plan removal");
+        assert!(
+            dry_dir.exists(),
+            "dry-run uninstall should not remove files"
+        );
+
+        let live_dir = modules_dir.join("live-module");
+        write_simple_module(&live_dir, "live-module");
+        cli.dry_run = false;
+        cmd_module_uninstall(&cli, "live-module", &modules_dir, true)
+            .expect("live uninstall should remove simple module");
+        assert!(!live_dir.exists());
+    }
+
+    #[test]
+    fn cmd_module_disable_live_audits_simple_module_without_restarts() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let mut cli = test_cli(&temp);
+        cli.dry_run = false;
+        let module_dir = temp.path().join("simple-disable");
+        write_simple_module(&module_dir, "simple-disable");
+
+        cmd_module_disable(&cli, &module_dir, true)
+            .expect("live disable should succeed for module without runtime toggles");
+
+        let audit = std::fs::read_dir(&cli.data_dir)
+            .expect("audit data dir")
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("admin-actions-"))
+            })
+            .expect("audit log should be written");
+        let content = std::fs::read_to_string(audit).expect("audit log");
+        assert!(content.contains("module_disable"));
+    }
+
+    #[test]
+    fn cmd_module_publish_creates_tarball_and_sha_sidecar() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let module_dir = temp.path().join("publish-module");
+        write_valid_module(&module_dir, "publish-module");
+        let output = temp.path().join("publish-module.tar.gz");
+
+        cmd_module_publish(&module_dir, Some(&output)).expect("publish should create package");
+
+        assert!(output.exists());
+        assert!(output
+            .with_file_name("publish-module.tar.gz.sha256")
+            .exists());
+    }
+
+    #[test]
+    fn cmd_module_update_all_skips_modules_without_update_url() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+        let modules_dir = temp.path().join("modules");
+        let module_dir = modules_dir.join("skipped-module");
+        write_valid_module(&module_dir, "skipped-module");
+
+        cmd_module_update_all(&cli, &modules_dir, true, true)
+            .expect("check-only update should skip module without update_url");
+    }
+
+    #[test]
+    fn cmd_module_update_all_detects_update_from_local_http_package() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+
+        let new_dir = temp.path().join("new-updatable-module");
+        write_simple_module(&new_dir, "updatable-module");
+        write_file(
+            &new_dir.join("module.toml"),
+            &simple_module_toml("updatable-module")
+                .replace("version     = \"0.1.0\"", "version     = \"0.2.0\""),
+        );
+        let tarball = temp.path().join("updatable-module.tar.gz");
+        module_package::create_tarball(&new_dir, &tarball).expect("update tarball");
+        let bytes = std::fs::read(&tarball).expect("tarball bytes");
+        let url = serve_tarball(bytes, 2);
+
+        let modules_dir = temp.path().join("modules");
+        let installed = modules_dir.join("updatable-module");
+        write_file(
+            &installed.join("module.toml"),
+            &simple_module_toml("updatable-module").replace(
+                "min_innerwarden = \"0.1.0\"",
+                &format!("min_innerwarden = \"0.1.0\"\nupdate_url = \"{url}\""),
+            ),
+        );
+
+        cmd_module_update_all(&cli, &modules_dir, true, true)
+            .expect("check-only update should report available update");
+    }
+
+    #[test]
+    fn cmd_module_update_all_dry_run_stops_before_installing_candidate() {
+        let temp = TempDir::new().expect("test should create temp dir");
+        let cli = test_cli(&temp);
+
+        let new_dir = temp.path().join("new-dry-run-module");
+        write_simple_module(&new_dir, "dry-run-module");
+        write_file(
+            &new_dir.join("module.toml"),
+            &simple_module_toml("dry-run-module")
+                .replace("version     = \"0.1.0\"", "version     = \"0.2.0\""),
+        );
+        let tarball = temp.path().join("dry-run-module.tar.gz");
+        module_package::create_tarball(&new_dir, &tarball).expect("update tarball");
+        let bytes = std::fs::read(&tarball).expect("tarball bytes");
+        let url = serve_tarball(bytes, 2);
+
+        let modules_dir = temp.path().join("modules");
+        let installed = modules_dir.join("dry-run-module");
+        write_file(
+            &installed.join("module.toml"),
+            &simple_module_toml("dry-run-module").replace(
+                "min_innerwarden = \"0.1.0\"",
+                &format!("min_innerwarden = \"0.1.0\"\nupdate_url = \"{url}\""),
+            ),
+        );
+
+        cmd_module_update_all(&cli, &modules_dir, false, true)
+            .expect("dry-run update should stop before installing");
     }
 
     // SEC-009: Unknown preflight kind fails closed.
