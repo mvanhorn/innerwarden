@@ -171,6 +171,14 @@ wait "$SENSOR_PID" || true
 
 echo "[replay] running agent once (AI stub + audit)"
 "$AGENT_BIN" --data-dir "$DATA_DIR" --config "$AGENT_CFG" --once > "$AGENT_LOG" 2>&1
+if [[ ! -s "$SUMMARY_FILE" ]]; then
+  echo "[replay] daily summary missing after first pass; retrying agent once"
+  # GitHub runners can release the sensor SQLite writer a moment later than
+  # the process exit is observed. A second one-shot pass keeps replay QA
+  # deterministic while still requiring the summary artifact below.
+  sleep 0.2
+  "$AGENT_BIN" --data-dir "$DATA_DIR" --config "$AGENT_CFG" --once >> "$AGENT_LOG" 2>&1
+fi
 
 echo "[replay] generating operational report"
 "$AGENT_BIN" --report --data-dir "$DATA_DIR" > "$REPORT_LOG" 2>&1

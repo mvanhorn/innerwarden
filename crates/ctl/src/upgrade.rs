@@ -134,6 +134,13 @@ fn github_get(url: &str) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
 /// Fetch the latest release metadata from GitHub.
 /// Set GITHUB_TOKEN env var to access private repository releases.
 pub fn fetch_latest_release() -> Result<GithubRelease> {
+    #[cfg(test)]
+    if let Ok(path) = std::env::var("INNERWARDEN_TEST_LATEST_RELEASE_JSON") {
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read test release fixture {path}"))?;
+        return serde_json::from_str(&content).context("failed to parse test release fixture");
+    }
+
     let url = format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest");
     let resp = github_get(&url)
         .call()

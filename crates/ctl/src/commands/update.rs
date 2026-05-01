@@ -75,6 +75,19 @@ pub(crate) fn cmd_upgrade(
     let release =
         fetch_latest_release().context("could not reach GitHub - check network and try again")?;
 
+    cmd_upgrade_with_release(cli, check_only, yes, notify, install_dir, release)
+}
+
+fn cmd_upgrade_with_release(
+    cli: &Cli,
+    check_only: bool,
+    yes: bool,
+    notify: bool,
+    install_dir: &Path,
+    release: crate::upgrade::GithubRelease,
+) -> Result<()> {
+    use crate::upgrade::*;
+
     let current = CURRENT_VERSION;
     let latest = strip_v(&release.tag_name);
 
@@ -356,6 +369,119 @@ fn fix_config_dir_permissions(config_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::upgrade::{detect_arch, GithubAsset, GithubRelease, CURRENT_VERSION};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use tempfile::TempDir;
+
+    fn test_cli(dir: &TempDir, dry_run: bool) -> Cli {
+        let agent_path = dir.path().join("agent.toml");
+        std::fs::write(&agent_path, "").unwrap();
+        Cli {
+            sensor_config: dir.path().join("config.toml"),
+            agent_config: agent_path,
+            data_dir: dir.path().to_path_buf(),
+            dry_run,
+            command: None,
+        }
+    }
+
+    fn release(tag_name: &str, assets: Vec<GithubAsset>) -> GithubRelease {
+        GithubRelease {
+            tag_name: tag_name.to_string(),
+            html_url: "https://github.com/InnerWarden/innerwarden/releases/tag/test".to_string(),
+            assets,
+            published_at: Some("2026-04-17T12:34:56Z".to_string()),
+            body: Some("release notes".to_string()),
+        }
+    }
+
+    fn asset(name: impl Into<String>, size: u64) -> GithubAsset {
+        let name = name.into();
+        GithubAsset {
+            browser_download_url: format!("https://example.com/{name}"),
+            name,
+            size,
+        }
+    }
+
+    fn asset_with_url(name: impl Into<String>, url: String, size: u64) -> GithubAsset {
+        GithubAsset {
+            name: name.into(),
+            browser_download_url: url,
+            size,
+        }
+    }
+
+    fn local_http_server(responses: Vec<String>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for body in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 1024];
+                let _ = stream.read(&mut request);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn matching_assets_with_sidecars(arch: &str) -> Vec<GithubAsset> {
+        let mut assets = Vec::new();
+        for binary in ["innerwarden-sensor", "innerwarden-agent", "innerwarden-ctl"] {
+            let base = format!("{binary}-linux-{arch}");
+            assets.push(asset(&base, 10_000));
+            assets.push(asset(format!("{base}.sha256"), 65));
+            assets.push(asset(format!("{base}.sig"), 88));
+        }
+        assets
+    }
+
+    fn matching_assets_without_sidecars(arch: &str) -> Vec<GithubAsset> {
+        ["innerwarden-sensor", "innerwarden-agent", "innerwarden-ctl"]
+            .into_iter()
+            .map(|binary| asset(format!("{binary}-linux-{arch}"), 10_000))
+            .collect()
+    }
+
+    fn write_release_fixture(dir: &TempDir, tag_name: &str) -> std::path::PathBuf {
+        let path = dir.path().join("latest-release.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "tag_name": tag_name,
+                "html_url": "https://github.com/InnerWarden/innerwarden/releases/tag/test",
+                "assets": [],
+                "published_at": "2026-04-17T12:34:56Z",
+                "body": "release notes"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        path
+    }
+
+    fn with_latest_release_fixture<T>(path: &Path, f: impl FnOnce() -> T) -> T {
+        static RELEASE_FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = RELEASE_FIXTURE_LOCK.lock().unwrap();
+        let prior = std::env::var_os("INNERWARDEN_TEST_LATEST_RELEASE_JSON");
+        std::env::set_var("INNERWARDEN_TEST_LATEST_RELEASE_JSON", path);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        match prior {
+            Some(value) => std::env::set_var("INNERWARDEN_TEST_LATEST_RELEASE_JSON", value),
+            None => std::env::remove_var("INNERWARDEN_TEST_LATEST_RELEASE_JSON"),
+        }
+        match result {
+            Ok(value) => value,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
 
     #[test]
     fn release_date_formatters_render_expected_shapes() {
@@ -414,5 +540,203 @@ mod tests {
         assert_eq!(classify_service_action(true, true), ServiceAction::Restart);
         assert_eq!(classify_service_action(false, true), ServiceAction::Start);
         assert_eq!(classify_service_action(false, false), ServiceAction::Skip);
+    }
+
+    #[test]
+    fn cmd_upgrade_fetches_release_and_delegates_to_upgrade_flow() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir, true);
+        let fixture = write_release_fixture(&dir, &format!("v{CURRENT_VERSION}"));
+
+        with_latest_release_fixture(&fixture, || {
+            cmd_upgrade(&cli, false, true, false, dir.path()).unwrap();
+        });
+    }
+
+    #[test]
+    fn cmd_upgrade_with_release_returns_ok_when_already_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir, true);
+
+        cmd_upgrade_with_release(
+            &cli,
+            false,
+            true,
+            false,
+            dir.path(),
+            release(CURRENT_VERSION, Vec::new()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cmd_upgrade_with_release_check_only_skips_asset_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir, true);
+
+        cmd_upgrade_with_release(
+            &cli,
+            true,
+            true,
+            false,
+            dir.path(),
+            release("v999.0.0", Vec::new()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cmd_upgrade_with_release_notify_without_credentials_skips_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir, true);
+        let env_file = cli.agent_config.parent().unwrap().join("agent.env");
+        std::fs::write(
+            &env_file,
+            "TELEGRAM_BOT_TOKEN=\"\"\nTELEGRAM_CHAT_ID=\"\"\n",
+        )
+        .unwrap();
+
+        cmd_upgrade_with_release(
+            &cli,
+            true,
+            true,
+            true,
+            dir.path(),
+            release("v999.0.0", Vec::new()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cmd_upgrade_with_release_errors_when_no_matching_assets_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir, true);
+        let err = cmd_upgrade_with_release(
+            &cli,
+            false,
+            true,
+            false,
+            dir.path(),
+            release("v999.0.0", vec![asset("innerwarden-ctl-linux-riscv64", 10)]),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("no assets found"));
+    }
+
+    #[test]
+    fn cmd_upgrade_with_release_dry_run_renders_assets_with_sidecars() {
+        let Some(arch) = detect_arch() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir, true);
+
+        cmd_upgrade_with_release(
+            &cli,
+            false,
+            true,
+            false,
+            dir.path(),
+            release("v999.0.0", matching_assets_with_sidecars(arch)),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cmd_upgrade_with_release_dry_run_allows_assets_without_sidecars() {
+        let Some(arch) = detect_arch() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir, true);
+
+        cmd_upgrade_with_release(
+            &cli,
+            false,
+            true,
+            false,
+            dir.path(),
+            release("v999.0.0", matching_assets_without_sidecars(arch)),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cmd_upgrade_with_release_rejects_checksum_mismatch_before_install() {
+        let Some(arch) = detect_arch() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir, false);
+        let base_url = local_http_server(vec![
+            "downloaded-binary".to_string(),
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+        ]);
+        let binary_name = format!("innerwarden-ctl-linux-{arch}");
+        let assets = vec![
+            asset_with_url(&binary_name, format!("{base_url}/bin"), 17),
+            asset_with_url(
+                format!("{binary_name}.sha256"),
+                format!("{base_url}/sha"),
+                65,
+            ),
+        ];
+
+        let err = cmd_upgrade_with_release(
+            &cli,
+            false,
+            true,
+            false,
+            dir.path(),
+            release("v999.0.0", assets),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("SHA-256 mismatch"));
+    }
+
+    #[test]
+    fn cmd_upgrade_with_release_surfaces_install_failure_after_download() {
+        let Some(arch) = detect_arch() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir, false);
+        let base_url = local_http_server(vec!["downloaded-binary".to_string()]);
+        let binary_name = format!("innerwarden-ctl-linux-{arch}");
+        let assets = vec![asset_with_url(&binary_name, format!("{base_url}/bin"), 17)];
+
+        let err = cmd_upgrade_with_release(
+            &cli,
+            false,
+            true,
+            false,
+            &dir.path().join("missing-install-dir"),
+            release("v999.0.0", assets),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("install failed")
+                || err.to_string().contains("failed to run install command")
+        );
+    }
+
+    #[test]
+    fn fix_config_dir_permissions_ignores_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        fix_config_dir_permissions(&dir.path().join("missing"));
+    }
+
+    #[test]
+    fn fix_config_dir_permissions_visits_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("agent.toml");
+        std::fs::write(&file, "[agent]\n").unwrap();
+
+        fix_config_dir_permissions(dir.path());
+
+        assert!(file.exists());
     }
 }
