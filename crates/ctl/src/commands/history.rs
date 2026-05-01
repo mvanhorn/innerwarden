@@ -900,3 +900,333 @@ pub(crate) fn cmd_gdpr_erase(data_dir: &Path, entity: &str, yes: bool) -> Result
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn make_cli(tmp: &TempDir) -> Cli {
+        Cli {
+            sensor_config: tmp.path().join("config.toml"),
+            agent_config: tmp.path().join("agent.toml"),
+            data_dir: tmp.path().to_path_buf(),
+            dry_run: true,
+            command: None,
+        }
+    }
+
+    fn today() -> String {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        epoch_secs_to_date(now_secs)
+    }
+
+    fn write_jsonl(path: &Path, rows: &[serde_json::Value]) {
+        let mut out = String::new();
+        for row in rows {
+            out.push_str(&serde_json::to_string(row).expect("serialize row"));
+            out.push('\n');
+        }
+        std::fs::write(path, out).expect("write jsonl");
+    }
+
+    fn incident(title: &str, severity: &str, ip: &str) -> serde_json::Value {
+        serde_json::json!({
+            "ts": "2026-05-01T12:34:56Z",
+            "severity": severity,
+            "title": title,
+            "summary": format!("summary for {title}"),
+            "entities": [{ "type": "Ip", "value": ip }]
+        })
+    }
+
+    fn event(summary: &str, user: &str) -> serde_json::Value {
+        serde_json::json!({
+            "ts": "2026-05-01T10:11:12Z",
+            "source": "sensor",
+            "kind": "shell.command_exec",
+            "severity": "Medium",
+            "summary": summary,
+            "entities": [{ "type": "User", "value": user }]
+        })
+    }
+
+    fn decision(action: &str, ip: &str, user: &str) -> serde_json::Value {
+        serde_json::json!({
+            "ts": "2026-05-01T13:14:15Z",
+            "action_type": action,
+            "target_ip": ip,
+            "target_user": user,
+            "confidence": 0.91,
+            "dry_run": true,
+            "ai_provider": "stub"
+        })
+    }
+
+    #[test]
+    fn severity_helpers_cover_known_and_default_levels() {
+        assert_eq!(severity_rank("critical"), 5);
+        assert_eq!(severity_rank("HIGH"), 4);
+        assert_eq!(severity_rank("medium"), 3);
+        assert_eq!(severity_rank("low"), 2);
+        assert_eq!(severity_rank("info"), 1);
+
+        assert_eq!(sev_tag_bracket("critical"), "[CRITICAL]");
+        assert_eq!(sev_tag_bracket("unknown"), "[INFO]    ");
+        assert_eq!(sev_tag_plain("high"), " HIGH    ");
+        assert_eq!(sev_tag_plain("unknown"), "         ");
+
+        assert_eq!(parse_severity_filter("critical"), 4);
+        assert_eq!(parse_severity_filter("high"), 3);
+        assert_eq!(parse_severity_filter("medium"), 2);
+        assert_eq!(parse_severity_filter("low"), 1);
+        assert_eq!(parse_severity_filter("anything"), 0);
+        assert_eq!(severity_rank_str("critical"), 4);
+        assert_eq!(severity_rank_str("anything"), 0);
+    }
+
+    #[test]
+    fn print_helpers_accept_event_incident_and_live_shapes() {
+        let inc = incident("Blocked", "High", "203.0.113.10");
+        let ev = event("shell ran", "root");
+        print_tail_entry(&ev, "events");
+        print_tail_entry(&inc, "incidents");
+        print_live_incident(&inc);
+        print_live_incident(&serde_json::json!({
+            "ts": "bad",
+            "severity": "info",
+            "title": "Title only",
+            "summary": "Title only",
+            "entities": []
+        }));
+    }
+
+    #[test]
+    fn cmd_incidents_filters_by_severity_and_handles_empty_results() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(&tmp);
+        let date = today();
+        write_jsonl(
+            &tmp.path().join(format!("incidents-{date}.jsonl")),
+            &[
+                incident("High hit", "High", "203.0.113.10"),
+                incident("Low noise", "Low", "203.0.113.11"),
+            ],
+        );
+
+        cmd_incidents(&cli, 1, "high", tmp.path()).expect("incidents should render");
+
+        let empty = TempDir::new().expect("empty tempdir");
+        let empty_cli = make_cli(&empty);
+        cmd_incidents(&empty_cli, 1, "high", empty.path()).expect("empty high path");
+        cmd_incidents(&empty_cli, 1, "low", empty.path()).expect("empty low path");
+    }
+
+    #[test]
+    fn cmd_export_writes_json_and_csv_outputs() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(&tmp);
+        let date = today();
+        write_jsonl(
+            &tmp.path().join(format!("incidents-{date}.jsonl")),
+            &[
+                incident("High, quoted", "High", "203.0.113.10"),
+                serde_json::json!({ "ts": "2026-05-01T00:00:00Z", "severity": "Low" }),
+            ],
+        );
+
+        let json_out = tmp.path().join("incidents.json");
+        cmd_export(
+            &cli,
+            "incidents",
+            Some(&date),
+            Some(&date),
+            "json",
+            Some(&json_out),
+            tmp.path(),
+        )
+        .expect("json export should pass");
+        let json = std::fs::read_to_string(json_out).expect("read json export");
+        assert!(json.contains("High, quoted"));
+
+        let csv_out = tmp.path().join("incidents.csv");
+        cmd_export(
+            &cli,
+            "incidents",
+            Some(&date),
+            Some(&date),
+            "csv",
+            Some(&csv_out),
+            tmp.path(),
+        )
+        .expect("csv export should pass");
+        let csv = std::fs::read_to_string(csv_out).expect("read csv export");
+        assert!(csv.contains("severity"));
+        assert!(csv.contains("\"High, quoted\""));
+
+        cmd_export(
+            &cli,
+            "events",
+            Some(&date),
+            Some(&date),
+            "json",
+            Some(&tmp.path().join("empty.json")),
+            tmp.path(),
+        )
+        .expect("empty export should be non-fatal");
+    }
+
+    #[test]
+    fn cmd_decisions_filters_and_reports_empty_paths() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(&tmp);
+        let date = today();
+        write_jsonl(
+            &tmp.path().join(format!("decisions-{date}.jsonl")),
+            &[
+                decision("block_ip", "203.0.113.10", ""),
+                decision("ignore", "", "root"),
+            ],
+        );
+
+        cmd_decisions(&cli, 1, Some("block_ip"), tmp.path()).expect("filtered decisions");
+        cmd_decisions(&cli, 1, None, tmp.path()).expect("all decisions");
+
+        let empty = TempDir::new().expect("empty tempdir");
+        let empty_cli = make_cli(&empty);
+        cmd_decisions(&empty_cli, 1, Some("block_ip"), empty.path()).expect("empty filtered");
+        cmd_decisions(&empty_cli, 1, None, empty.path()).expect("empty all");
+    }
+
+    #[test]
+    fn cmd_entity_collects_ip_user_and_empty_activity() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cli = make_cli(&tmp);
+        let date = today();
+        write_jsonl(
+            &tmp.path().join(format!("events-{date}.jsonl")),
+            &[event("root shell", "root")],
+        );
+        write_jsonl(
+            &tmp.path().join(format!("incidents-{date}.jsonl")),
+            &[incident("IP incident", "Critical", "203.0.113.10")],
+        );
+        write_jsonl(
+            &tmp.path().join(format!("decisions-{date}.jsonl")),
+            &[
+                decision("block_ip", "203.0.113.10", ""),
+                decision("suspend_user_sudo", "", "root"),
+            ],
+        );
+
+        cmd_entity(&cli, "203.0.113.10", 1, tmp.path()).expect("ip entity");
+        cmd_entity(&cli, "root", 1, tmp.path()).expect("user entity");
+        cmd_entity(&cli, "nobody", 1, tmp.path()).expect("empty entity");
+    }
+
+    #[test]
+    fn matches_entity_covers_entities_and_direct_fields() {
+        assert!(matches_entity(
+            &serde_json::to_string(&event("root shell", "root")).unwrap(),
+            "root"
+        ));
+        assert!(matches_entity(
+            &serde_json::to_string(&decision("block_ip", "203.0.113.10", "")).unwrap(),
+            "203.0.113.10"
+        ));
+        assert!(matches_entity(
+            r#"{"operator":"alice","target":"system"}"#,
+            "alice"
+        ));
+        assert!(!matches_entity("not-json", "root"));
+        assert!(!matches_entity(r#"{"entities":[]}"#, "root"));
+    }
+
+    #[test]
+    fn recompute_hash_chain_rewrites_prev_hashes() {
+        let mut lines = vec![
+            r#"{"target_ip":"203.0.113.10","prev_hash":"old"}"#.to_string(),
+            r#"{"target_ip":"203.0.113.11","prev_hash":"old"}"#.to_string(),
+        ];
+
+        recompute_hash_chain(&mut lines);
+
+        let first: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+        assert!(first["prev_hash"].is_null());
+        assert!(second["prev_hash"].as_str().is_some());
+    }
+
+    #[test]
+    fn cmd_gdpr_export_writes_matching_records_only() {
+        let tmp = TempDir::new().expect("tempdir");
+        let date = today();
+        write_jsonl(
+            &tmp.path().join(format!("events-{date}.jsonl")),
+            &[event("root shell", "root"), event("deploy shell", "deploy")],
+        );
+        std::fs::write(tmp.path().join("ignore.txt"), "root\n").expect("write ignored file");
+
+        let out = tmp.path().join("gdpr.jsonl");
+        cmd_gdpr_export(tmp.path(), "root", Some(&out)).expect("gdpr export");
+
+        let exported = std::fs::read_to_string(out).expect("read gdpr export");
+        assert!(exported.contains("root shell"));
+        assert!(!exported.contains("deploy shell"));
+    }
+
+    #[test]
+    fn cmd_gdpr_erase_removes_matches_and_recomputes_hash_chain() {
+        let tmp = TempDir::new().expect("tempdir");
+        let date = today();
+        write_jsonl(
+            &tmp.path().join(format!("decisions-{date}.jsonl")),
+            &[
+                decision("block_ip", "203.0.113.10", ""),
+                decision("block_ip", "203.0.113.11", ""),
+            ],
+        );
+
+        cmd_gdpr_erase(tmp.path(), "203.0.113.10", true).expect("gdpr erase");
+
+        let decisions = std::fs::read_to_string(tmp.path().join(format!("decisions-{date}.jsonl")))
+            .expect("read decisions");
+        assert!(!decisions.contains("203.0.113.10"));
+        assert!(decisions.contains("203.0.113.11"));
+        let remaining: serde_json::Value = serde_json::from_str(decisions.lines().next().unwrap())
+            .expect("remaining decision json");
+        assert!(remaining["prev_hash"].is_null());
+
+        let audit = std::fs::read_dir(tmp.path())
+            .expect("read tempdir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("admin-actions-"))
+            })
+            .expect("audit log created");
+        let audit = std::fs::read_to_string(audit).expect("read audit");
+        assert!(audit.contains("\"action\":\"gdpr_erase\""));
+    }
+
+    #[test]
+    fn cmd_gdpr_erase_no_matches_is_noop() {
+        let tmp = TempDir::new().expect("tempdir");
+        let date = today();
+        write_jsonl(
+            &tmp.path().join(format!("events-{date}.jsonl")),
+            &[event("deploy shell", "deploy")],
+        );
+
+        cmd_gdpr_erase(tmp.path(), "root", true).expect("gdpr erase no matches");
+
+        let events = std::fs::read_to_string(tmp.path().join(format!("events-{date}.jsonl")))
+            .expect("read events");
+        assert!(events.contains("deploy"));
+    }
+}
