@@ -23,11 +23,18 @@ fn responder_outcome_message(
     }
 }
 
-fn parse_responder_interactive_choice(choice: &str) -> Option<u8> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponderMode {
+    ObserveOnly,
+    DryRun,
+    Live,
+}
+
+fn parse_responder_interactive_choice(choice: &str) -> Option<ResponderMode> {
     match choice.trim() {
-        "1" => Some(1),
-        "2" => Some(2),
-        "3" => Some(3),
+        "1" => Some(ResponderMode::ObserveOnly),
+        "2" => Some(ResponderMode::DryRun),
+        "3" => Some(ResponderMode::Live),
         _ => None,
     }
 }
@@ -126,8 +133,37 @@ fn cmd_configure_responder_interactive(cli: &Cli) -> Result<()> {
 
     let choice = prompt("Choose [1/2/3]")?;
 
-    match parse_responder_interactive_choice(&choice) {
-        Some(1) => {
+    let Some(mode) = parse_responder_interactive_choice(&choice) else {
+        anyhow::bail!("invalid choice - enter 1, 2, or 3");
+    };
+
+    let live_confirmed = if mode == ResponderMode::Live {
+        println!();
+        println!("  WARNING: In live mode, InnerWarden will automatically:");
+        println!("    - Block IPs with: sudo ufw deny from <IP>  (or iptables/nftables)");
+        println!("    - Suspend users:  drop-in in /etc/sudoers.d/");
+        println!();
+        println!("  Make sure block-ip is enabled: innerwarden enable block-ip");
+        println!();
+        print!("  Type 'yes' to enable live execution: ");
+        std::io::stdout().flush()?;
+        let mut ans = String::new();
+        std::io::stdin().read_line(&mut ans)?;
+        if ans.trim() != "yes" {
+            println!("Aborted.");
+            return Ok(());
+        }
+        true
+    } else {
+        false
+    };
+
+    apply_responder_mode(cli, mode, live_confirmed)
+}
+
+fn apply_responder_mode(cli: &Cli, mode: ResponderMode, live_confirmed: bool) -> Result<()> {
+    match mode {
+        ResponderMode::ObserveOnly => {
             if !cli.dry_run {
                 config_editor::write_bool(&cli.agent_config, "responder", "enabled", false)?;
                 println!("  [ok] responder disabled - observe only");
@@ -137,7 +173,7 @@ fn cmd_configure_responder_interactive(cli: &Cli) -> Result<()> {
             restart_agent(cli);
             println!("\nSystem is in observe mode. No automatic actions will be taken.");
         }
-        Some(2) => {
+        ResponderMode::DryRun => {
             if !cli.dry_run {
                 config_editor::write_bool(&cli.agent_config, "responder", "enabled", true)?;
                 config_editor::write_bool(&cli.agent_config, "responder", "dry_run", true)?;
@@ -152,19 +188,8 @@ fn cmd_configure_responder_interactive(cli: &Cli) -> Result<()> {
             println!("Check decisions-*.jsonl to review. When ready, run:");
             println!("  innerwarden configure responder --enable --dry-run false");
         }
-        Some(3) => {
-            println!();
-            println!("  WARNING: In live mode, InnerWarden will automatically:");
-            println!("    - Block IPs with: sudo ufw deny from <IP>  (or iptables/nftables)");
-            println!("    - Suspend users:  drop-in in /etc/sudoers.d/");
-            println!();
-            println!("  Make sure block-ip is enabled: innerwarden enable block-ip");
-            println!();
-            print!("  Type 'yes' to enable live execution: ");
-            std::io::stdout().flush()?;
-            let mut ans = String::new();
-            std::io::stdin().read_line(&mut ans)?;
-            if ans.trim() != "yes" {
+        ResponderMode::Live => {
+            if !live_confirmed {
                 println!("Aborted.");
                 return Ok(());
             }
@@ -183,9 +208,6 @@ fn cmd_configure_responder_interactive(cli: &Cli) -> Result<()> {
                 "Monitor decisions: tail -f /var/lib/innerwarden/decisions-$(date +%Y-%m-%d).jsonl"
             );
         }
-        _ => {
-            anyhow::bail!("invalid choice - enter 1, 2, or 3");
-        }
     }
     Ok(())
 }
@@ -193,6 +215,32 @@ fn cmd_configure_responder_interactive(cli: &Cli) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn test_cli(dir: &TempDir, dry_run: bool) -> Cli {
+        let agent_path = dir.path().join("agent.toml");
+        std::fs::write(&agent_path, "").unwrap();
+        Cli {
+            sensor_config: dir.path().join("config.toml"),
+            agent_config: agent_path,
+            data_dir: dir.path().to_path_buf(),
+            dry_run,
+            command: None,
+        }
+    }
+
+    fn read_agent_doc(cli: &Cli) -> toml_edit::DocumentMut {
+        std::fs::read_to_string(&cli.agent_config)
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    fn responder_bool(doc: &toml_edit::DocumentMut, key: &str) -> Option<bool> {
+        doc.get("responder")
+            .and_then(|section| section.get(key))
+            .and_then(|value| value.as_bool())
+    }
 
     #[test]
     fn requires_live_confirmation_only_for_real_live_mode() {
@@ -233,9 +281,18 @@ mod tests {
     #[test]
     fn parse_responder_interactive_choice_accepts_supported_values() {
         // Verifies canonical interactive options resolve to stable branch identifiers.
-        assert_eq!(parse_responder_interactive_choice("1"), Some(1));
-        assert_eq!(parse_responder_interactive_choice("2"), Some(2));
-        assert_eq!(parse_responder_interactive_choice("3"), Some(3));
+        assert_eq!(
+            parse_responder_interactive_choice("1"),
+            Some(ResponderMode::ObserveOnly)
+        );
+        assert_eq!(
+            parse_responder_interactive_choice("2"),
+            Some(ResponderMode::DryRun)
+        );
+        assert_eq!(
+            parse_responder_interactive_choice("3"),
+            Some(ResponderMode::Live)
+        );
     }
 
     #[test]
@@ -244,5 +301,107 @@ mod tests {
         assert_eq!(parse_responder_interactive_choice("0"), None);
         assert_eq!(parse_responder_interactive_choice("4"), None);
         assert_eq!(parse_responder_interactive_choice("abc"), None);
+    }
+
+    #[test]
+    fn cmd_configure_responder_dry_run_enable_does_not_write_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir, true);
+
+        cmd_configure_responder(&cli, true, false, Some(true)).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&cli.agent_config).unwrap(), "");
+    }
+
+    #[test]
+    fn cmd_configure_responder_dry_run_live_path_skips_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir, true);
+
+        cmd_configure_responder(&cli, true, false, Some(false)).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&cli.agent_config).unwrap(), "");
+    }
+
+    #[test]
+    fn cmd_configure_responder_writes_enable_and_dry_run_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir, false);
+
+        cmd_configure_responder(&cli, true, false, Some(true)).unwrap();
+
+        let doc = read_agent_doc(&cli);
+        assert_eq!(responder_bool(&doc, "enabled"), Some(true));
+        assert_eq!(responder_bool(&doc, "dry_run"), Some(true));
+    }
+
+    #[test]
+    fn cmd_configure_responder_writes_disable_without_dry_run_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir, false);
+
+        cmd_configure_responder(&cli, false, true, None).unwrap();
+
+        let doc = read_agent_doc(&cli);
+        assert_eq!(responder_bool(&doc, "enabled"), Some(false));
+        assert_eq!(responder_bool(&doc, "dry_run"), None);
+    }
+
+    #[test]
+    fn cmd_configure_responder_can_update_dry_run_flag_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir, false);
+
+        cmd_configure_responder(&cli, false, false, Some(false)).unwrap();
+
+        let doc = read_agent_doc(&cli);
+        assert_eq!(responder_bool(&doc, "enabled"), None);
+        assert_eq!(responder_bool(&doc, "dry_run"), Some(false));
+    }
+
+    #[test]
+    fn apply_responder_mode_observe_only_writes_disabled_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir, false);
+
+        apply_responder_mode(&cli, ResponderMode::ObserveOnly, false).unwrap();
+
+        let doc = read_agent_doc(&cli);
+        assert_eq!(responder_bool(&doc, "enabled"), Some(false));
+        assert_eq!(responder_bool(&doc, "dry_run"), None);
+    }
+
+    #[test]
+    fn apply_responder_mode_dry_run_writes_enabled_safe_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir, false);
+
+        apply_responder_mode(&cli, ResponderMode::DryRun, false).unwrap();
+
+        let doc = read_agent_doc(&cli);
+        assert_eq!(responder_bool(&doc, "enabled"), Some(true));
+        assert_eq!(responder_bool(&doc, "dry_run"), Some(true));
+    }
+
+    #[test]
+    fn apply_responder_mode_live_requires_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir, false);
+
+        apply_responder_mode(&cli, ResponderMode::Live, false).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&cli.agent_config).unwrap(), "");
+    }
+
+    #[test]
+    fn apply_responder_mode_live_writes_confirmed_live_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir, false);
+
+        apply_responder_mode(&cli, ResponderMode::Live, true).unwrap();
+
+        let doc = read_agent_doc(&cli);
+        assert_eq!(responder_bool(&doc, "enabled"), Some(true));
+        assert_eq!(responder_bool(&doc, "dry_run"), Some(false));
     }
 }

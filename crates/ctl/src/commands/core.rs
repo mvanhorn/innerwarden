@@ -122,6 +122,17 @@ pub(crate) fn cmd_welcome() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn test_cli(dir: &TempDir) -> Cli {
+        Cli {
+            sensor_config: dir.path().join("config.toml"),
+            agent_config: dir.path().join("agent.toml"),
+            data_dir: dir.path().to_path_buf(),
+            dry_run: true,
+            command: None,
+        }
+    }
 
     #[test]
     fn capability_status_label_enabled_branch() {
@@ -155,5 +166,84 @@ mod tests {
     fn count_innerwarden_programs_returns_zero_without_matches() {
         // Guards the no-match path so welcome output remains deterministic when bpftool output is unrelated.
         assert_eq!(count_innerwarden_programs(b"prog_a\nprog_b"), 0);
+    }
+
+    #[test]
+    fn cmd_daily_without_command_prints_help() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir);
+        let registry = CapabilityRegistry::default_all();
+
+        cmd_daily(&cli, &registry, None).unwrap();
+    }
+
+    #[test]
+    fn cmd_daily_dispatches_empty_threat_and_action_views() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir);
+        let registry = CapabilityRegistry::default_all();
+
+        cmd_daily(
+            &cli,
+            &registry,
+            Some(&DailyCommand::Threats {
+                days: 1,
+                severity: "low".to_string(),
+                live: false,
+            }),
+        )
+        .unwrap();
+        cmd_daily(&cli, &registry, Some(&DailyCommand::Actions { days: 1 })).unwrap();
+    }
+
+    #[test]
+    fn cmd_daily_dispatches_missing_report_without_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir);
+        let registry = CapabilityRegistry::default_all();
+
+        cmd_daily(
+            &cli,
+            &registry,
+            Some(&DailyCommand::Report {
+                date: "today".to_string(),
+            }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cmd_daily_dispatches_agent_menu() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir);
+        let registry = CapabilityRegistry::default_all();
+
+        cmd_daily(
+            &cli,
+            &registry,
+            Some(&DailyCommand::Agent { command: None }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cmd_daily_dispatches_pipeline_test_to_temp_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir);
+        let registry = CapabilityRegistry::default_all();
+
+        cmd_daily(&cli, &registry, Some(&DailyCommand::Test { wait: 0 })).unwrap();
+
+        let today = crate::today_date_string();
+        assert!(dir.path().join(format!("incidents-{today}.jsonl")).exists());
+    }
+
+    #[test]
+    fn cmd_list_smoke_uses_registry_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir);
+        let registry = CapabilityRegistry::default_all();
+
+        cmd_list(&cli, &registry).unwrap();
     }
 }

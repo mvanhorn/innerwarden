@@ -215,6 +215,19 @@ pub(crate) fn cmd_mesh_status(cli: &Cli) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn test_cli(dir: &TempDir, agent_config: &str) -> Cli {
+        let agent_path = dir.path().join("agent.toml");
+        std::fs::write(&agent_path, agent_config).unwrap();
+        Cli {
+            sensor_config: dir.path().join("config.toml"),
+            agent_config: agent_path,
+            data_dir: dir.path().to_path_buf(),
+            dry_run: true,
+            command: None,
+        }
+    }
 
     #[test]
     fn is_mesh_enabled_requires_section_and_true_flag() {
@@ -280,5 +293,148 @@ mod tests {
             line,
             "  Peer 1234567890abcdef...  trust=0.62  signals=8/5confirmed"
         );
+    }
+
+    #[test]
+    fn cmd_mesh_enable_appends_mesh_section_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir, "[agent]\nname = \"node-a\"\n");
+
+        cmd_mesh_enable(&cli).unwrap();
+
+        let updated = std::fs::read_to_string(&cli.agent_config).unwrap();
+        assert!(updated.contains("[mesh]"));
+        assert!(updated.contains("enabled = true"));
+        assert!(updated.contains("bind = \"0.0.0.0:8790\""));
+    }
+
+    #[test]
+    fn cmd_mesh_enable_flips_disabled_mesh_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir, "[mesh]\nenabled = false\n");
+
+        cmd_mesh_enable(&cli).unwrap();
+
+        let updated = std::fs::read_to_string(&cli.agent_config).unwrap();
+        assert!(updated.contains("enabled = true"));
+        assert!(!updated.contains("enabled = false"));
+    }
+
+    #[test]
+    fn cmd_mesh_enable_is_noop_when_already_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = "[mesh]\nenabled = true\n";
+        let cli = test_cli(&dir, original);
+
+        cmd_mesh_enable(&cli).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&cli.agent_config).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn cmd_mesh_disable_flips_enabled_mesh_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir, "[mesh]\nenabled = true\n");
+
+        cmd_mesh_disable(&cli).unwrap();
+
+        let updated = std::fs::read_to_string(&cli.agent_config).unwrap();
+        assert!(updated.contains("enabled = false"));
+        assert!(!updated.contains("enabled = true"));
+    }
+
+    #[test]
+    fn cmd_mesh_disable_is_noop_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = "[agent]\nname = \"node-a\"\n";
+        let cli = test_cli(&dir, original);
+
+        cmd_mesh_disable(&cli).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&cli.agent_config).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn cmd_mesh_add_peer_appends_peer_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir, "[mesh]\nenabled = true\n");
+
+        cmd_mesh_add_peer(&cli, "https://peer-a:8790", Some("edge-a")).unwrap();
+
+        let updated = std::fs::read_to_string(&cli.agent_config).unwrap();
+        assert!(updated.contains("[[mesh.peers]]"));
+        assert!(updated.contains("endpoint = \"https://peer-a:8790\""));
+        assert!(updated.contains("label = \"edge-a\""));
+    }
+
+    #[test]
+    fn cmd_mesh_add_peer_is_noop_when_mesh_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = "[agent]\nname = \"node-a\"\n";
+        let cli = test_cli(&dir, original);
+
+        cmd_mesh_add_peer(&cli, "https://peer-a:8790", Some("edge-a")).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&cli.agent_config).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn cmd_mesh_add_peer_is_noop_for_duplicate_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = "\
+[mesh]
+enabled = true
+
+[[mesh.peers]]
+endpoint = \"https://peer-a:8790\"
+public_key = \"\"
+";
+        let cli = test_cli(&dir, original);
+
+        cmd_mesh_add_peer(&cli, "https://peer-a:8790", Some("edge-a")).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&cli.agent_config).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn cmd_mesh_status_handles_missing_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir, "[mesh]\nenabled = true\n");
+
+        cmd_mesh_status(&cli).unwrap();
+    }
+
+    #[test]
+    fn cmd_mesh_status_renders_state_and_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = test_cli(&dir, "[mesh]\nenabled = true\n");
+        std::fs::write(cli.data_dir.join("mesh-identity.key"), "secret").unwrap();
+        std::fs::write(
+            cli.data_dir.join("mesh-state.json"),
+            r#"{
+                "peers": [{"endpoint": "https://peer-a:8790"}],
+                "reputations": [{
+                    "node_id": "1234567890abcdefXYZ",
+                    "trust_score": 0.875,
+                    "signals_sent": 12,
+                    "signals_confirmed": 10
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        cmd_mesh_status(&cli).unwrap();
     }
 }
