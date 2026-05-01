@@ -345,7 +345,7 @@ function renderAuditTrail() {
     }
     html += '<tr style="border-bottom:1px solid rgba(255,255,255,0.04)">' +
       '<td style="padding:5px 6px;color:var(--muted)">' + r.id + '</td>' +
-      '<td style="padding:5px 6px;color:var(--text)">' + esc(r.ts || '') + '</td>' +
+      '<td style="padding:5px 6px;color:var(--text)" title="' + esc(r.ts || '') + '">' + esc(fmtUtcFull(r.ts || '')) + '</td>' +
       '<td style="padding:5px 6px"><code style="color:var(--accent);font-size:0.7rem">' + esc(r.action_type || '') + '</code></td>' +
       '<td style="padding:5px 6px">' + esc(target) + '</td>' +
       '<td style="padding:5px 6px;color:var(--accent)">' + conf + '</td>' +

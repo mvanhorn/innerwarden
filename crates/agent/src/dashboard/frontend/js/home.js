@@ -126,12 +126,7 @@ function renderCriticalBanner(top) {
     });
     var ip = ipEntity ? ipEntity.value : '';
     var ageSec = top.ts ? Math.max(0, Math.floor((Date.now() - new Date(top.ts).getTime()) / 1000)) : null;
-    var ageText = ageSec == null
-      ? ''
-      : (ageSec < 60 ? ageSec + 's ago'
-        : ageSec < 3600 ? Math.floor(ageSec / 60) + 'm ago'
-        : ageSec < 86400 ? Math.floor(ageSec / 3600) + 'h ago'
-        : Math.floor(ageSec / 86400) + 'd ago');
+    var ageText = fmtAgo(ageSec);
     var parts = [];
     if (ip) parts.push(ip);
     if (ageText) parts.push(ageText);
@@ -320,8 +315,7 @@ function renderHealthLine(status, sensors, overview, softStale) {
     parts.push(active + ' of ' + total + ' data sources active');
   }
   if (telemetrySecs != null && !unhealthy) {
-    parts.push('last data ' + (telemetrySecs < 60 ? telemetrySecs + 's ago'
-      : Math.floor(telemetrySecs / 60) + 'm ago'));
+    parts.push('last data ' + fmtAgo(telemetrySecs));
   }
   summaryEl.textContent = parts.join(' · ');
 }
