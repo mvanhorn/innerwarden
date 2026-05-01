@@ -46,6 +46,37 @@ async function loadCompliance() {
         : chain.intact
           ? '<span style="color:var(--ok);font-weight:700;display:inline-flex;align-items:center;gap:6px">' + lucideIcon('check-circle',{size:14}) + ' Chain integrity verified</span>'
           : '<span style="color:var(--warn);font-weight:700;display:inline-flex;align-items:center;gap:6px">' + lucideIcon('alert-triangle',{size:14}) + ' Verification failed \u2014 review recent changes</span>';
+      // 2026-05-01: render documented chain breaks alongside the
+      // verified-chain summary. Operator viewing the compliance tab
+      // sees "audit chain has N documented breaks" with the operator,
+      // reason, and rowid range — instead of having to ssh in and
+      // query sqlite. The breaks list comes from
+      // `compliance.hash_chain.sqlite.breaks` populated by
+      // `dashboard/compliance.rs::sqlite_chain_status`.
+      const sqliteChain = (chain.sqlite) || {};
+      const breaks = sqliteChain.breaks || [];
+      const docBreakCount = sqliteChain.documented_breaks || 0;
+      let breaksHtml = '';
+      if (breaks.length > 0) {
+        breaksHtml =
+          '<div style="margin-top:8px;padding:8px 10px;border-radius:6px;background:rgba(255,184,77,0.05);border:1px solid rgba(255,184,77,0.18);font-size:0.7rem">' +
+          '<div style="font-weight:700;color:var(--warn);margin-bottom:4px;display:flex;align-items:center;gap:6px">' +
+          lucideIcon('clipboard-list', { size: 12 }) +
+          ' ' + breaks.length + ' documented break' + (breaks.length === 1 ? '' : 's') +
+          ' (' + docBreakCount + ' rows tolerated by verifier)' +
+          '</div>' +
+          '<div style="font-size:0.62rem;color:var(--muted);margin-bottom:6px">Intentional breaks recorded via <code>innerwarden chain-break register</code>. The hourly verifier skips these ranges; only undocumented breaks fire the security alert.</div>' +
+          breaks
+            .map(b =>
+              '<div style="padding:4px 0;border-top:1px solid rgba(255,184,77,0.15)">' +
+              '<div><strong>rows ' + b.rowid_start + '..' + b.rowid_end + '</strong> (' + b.rows_documented + ' rows) — by <em>' + esc(b.operator || '?') + '</em></div>' +
+              '<div style="font-size:0.62rem;color:var(--muted);margin-top:2px">Registered ' + esc((b.registered_at || '').slice(0, 16)) + '</div>' +
+              '<div style="font-size:0.65rem;color:var(--text);margin-top:2px">' + esc(b.reason || '') + '</div>' +
+              '</div>'
+            )
+            .join('') +
+          '</div>';
+      }
       chainEl.innerHTML =
         '<div style="display:flex;flex-direction:column;gap:8px">' +
         '<div>' + intactBadge + '</div>' +
@@ -54,6 +85,7 @@ async function loadCompliance() {
         '<span>Last hash: <code style="color:var(--accent);font-size:0.68rem">' + esc((chain.last_hash || 'none').substring(0, 16)) + '…</code></span>' +
         '</div>' +
         '<div style="font-size:0.65rem;color:var(--muted)">Each decision entry includes a SHA-256 hash of the previous entry, forming a tamper-evident chain.</div>' +
+        breaksHtml +
         '</div>';
     }
 

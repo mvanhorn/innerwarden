@@ -1522,6 +1522,52 @@ mod tests {
     }
 
     #[test]
+    fn compliance_api_surfaces_documented_chain_breaks() {
+        // 2026-05-01 (PR after #357): the documented chain breaks
+        // must surface in the compliance tab so the operator sees
+        // them without ssh + sqlite. Anchor pins the JSON contract
+        // (`hash_chain.sqlite.documented_breaks` + `breaks[]`) and
+        // the frontend rendering path.
+        let compliance_src = include_str!("compliance.rs");
+        assert!(
+            compliance_src.contains("\"documented_breaks\": r.documented_breaks"),
+            "compliance API must include documented_breaks count"
+        );
+        assert!(
+            compliance_src.contains("\"breaks\": breaks"),
+            "compliance API must include the breaks array"
+        );
+        assert!(
+            JS_COMPLIANCE.contains("sqliteChain.breaks"),
+            "compliance.js must read the new breaks array"
+        );
+        assert!(
+            JS_COMPLIANCE.contains("documented break"),
+            "compliance.js must surface the human label"
+        );
+    }
+
+    #[test]
+    fn ctl_chain_break_subcommand_is_wired() {
+        // Operator-facing CLI for chain_break_audit. Anchor pins the
+        // subcommand wiring + the two invocations (register / list).
+        let ctl_main = include_str!("../../../ctl/src/main.rs");
+        assert!(
+            ctl_main.contains("name = \"chain-break\"")
+                || ctl_main.contains("name=\"chain-break\""),
+            "ctl must expose `innerwarden chain-break` subcommand"
+        );
+        assert!(
+            ctl_main.contains("ChainBreakCommand::Register"),
+            "ctl must dispatch chain-break register"
+        );
+        assert!(
+            ctl_main.contains("ChainBreakCommand::List"),
+            "ctl must dispatch chain-break list"
+        );
+    }
+
+    #[test]
     fn chain_break_audit_table_is_in_schema_v4() {
         // Schema migration v4 adds the chain_break_audit table.
         // Anchor pins the v4 SQL so a future migration renumber or

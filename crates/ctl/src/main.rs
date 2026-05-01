@@ -1787,6 +1787,61 @@ enum SystemCommand {
         #[arg(long)]
         apply: bool,
     },
+
+    /// Document or list intentional breaks in the decisions hash chain.
+    ///
+    /// The agent's hourly maintenance verifier walks the decisions
+    /// table SHA-256 chain. A row whose hash does not match its prev
+    /// triggers a "DATABASE SECURITY ALERT — HASH CHAIN BROKEN"
+    /// Telegram message — meant to catch tampering. But manual SQL
+    /// recovery (orphan sweeps, bulk imports, schema rewrites) also
+    /// breaks the chain legitimately, and without registration the
+    /// alert fires every hour forever.
+    ///
+    /// `register` documents an intentional break so the verifier
+    /// stops alerting for that range. `list` shows what is on file.
+    ///
+    /// Examples:
+    ///   innerwarden chain-break register --start 9876 --end 14577 \
+    ///       --operator alice --reason "manual orphan recovery 2026-04-29"
+    ///   innerwarden chain-break list
+    ///   innerwarden chain-break list --json
+    #[clap(name = "chain-break")]
+    ChainBreak {
+        #[command(subcommand)]
+        command: ChainBreakCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ChainBreakCommand {
+    /// Register a documented break for rowid range [--start, --end].
+    Register {
+        /// First decisions.id in the documented break range.
+        #[arg(long)]
+        start: i64,
+        /// Last decisions.id in the documented break range (inclusive).
+        #[arg(long)]
+        end: i64,
+        /// Operator name — recorded for audit. Free text; pick something
+        /// the next maintainer will recognize ("alice", "ops-2026-05-01").
+        #[arg(long)]
+        operator: String,
+        /// Why the break exists. Required — undocumented breaks are
+        /// the only thing that should ever fire the security alert,
+        /// so registrations must be self-explanatory.
+        #[arg(long)]
+        reason: String,
+        /// Output as JSON instead of human-readable format.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List every registered chain break.
+    List {
+        /// Output as JSON instead of human-readable format.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -2210,6 +2265,28 @@ fn main() -> Result<()> {
             SystemCommand::ReconcileBlocks { apply } => {
                 commands::reconcile::cmd_reconcile_blocks(&cli, &cli.data_dir.clone(), *apply)
             }
+            SystemCommand::ChainBreak { ref command } => match command {
+                ChainBreakCommand::Register {
+                    start,
+                    end,
+                    operator,
+                    reason,
+                    json,
+                } => commands::chain_break::cmd_chain_break_register(
+                    &cli.agent_config,
+                    &cli.data_dir,
+                    *start,
+                    *end,
+                    operator,
+                    reason,
+                    *json,
+                ),
+                ChainBreakCommand::List { json } => commands::chain_break::cmd_chain_break_list(
+                    &cli.agent_config,
+                    &cli.data_dir,
+                    *json,
+                ),
+            },
         },
 
         // ===================================================================

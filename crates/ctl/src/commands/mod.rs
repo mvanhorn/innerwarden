@@ -1,6 +1,7 @@
 pub(crate) mod agent;
 pub(crate) mod ai;
 pub(crate) mod capability;
+pub(crate) mod chain_break;
 pub(crate) mod circuit;
 pub(crate) mod core;
 pub(crate) mod firmware;

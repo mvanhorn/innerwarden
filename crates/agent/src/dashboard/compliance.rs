@@ -374,12 +374,37 @@ pub(super) fn sqlite_chain_status(store: &innerwarden_store::Store) -> serde_jso
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| "none".to_string());
+            // 2026-05-01: surface documented chain breaks alongside
+            // the verifier result. Operator viewing the compliance
+            // tab should see "audit chain has 2 documented breaks
+            // (rows 9876-14577 + 15693-15695)" with reasons, instead
+            // of having to ssh in and query sqlite directly. The
+            // breaks list is bounded (one row per recovery sweep,
+            // expected < 100 lifetime) so loading inline is fine.
+            let breaks: Vec<serde_json::Value> = store
+                .list_chain_breaks()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|b| {
+                    serde_json::json!({
+                        "id": b.id,
+                        "rowid_start": b.rowid_start,
+                        "rowid_end": b.rowid_end,
+                        "rows_documented": b.rowid_end - b.rowid_start + 1,
+                        "registered_at": b.registered_at,
+                        "operator": b.operator,
+                        "reason": b.reason,
+                    })
+                })
+                .collect();
             serde_json::json!({
                 "available": true,
                 "intact": r.intact,
                 "length": r.verified,
                 "broken_at": r.broken_at,
                 "last_hash": last_hash,
+                "documented_breaks": r.documented_breaks,
+                "breaks": breaks,
             })
         }
         Err(e) => serde_json::json!({
