@@ -16,6 +16,7 @@ mod agent_api;
 mod auth;
 mod compliance;
 mod data_api;
+mod fleet;
 mod helpers;
 mod intelligence;
 mod investigation;
@@ -340,6 +341,7 @@ pub async fn serve(
     briefing_hour: u8,
     briefing_minute: u8,
     sqlite_store: Option<Arc<innerwarden_store::Store>>,
+    fleet_state: Option<crate::fleet::FleetState>,
     tls_cert: Option<String>,
     tls_key: Option<String>,
     insecure_no_tls: bool,
@@ -432,6 +434,7 @@ pub async fn serve(
         briefing_hour,
         briefing_minute,
         sqlite_store,
+        fleet_state,
     };
     let auth_layer = middleware::from_fn_with_state(
         (
@@ -578,6 +581,9 @@ pub async fn serve(
         .route("/api/advisory-cache", get(api_advisory_cache))
         .route("/api/compliance", get(api_compliance))
         .route("/api/compliance/audit-trail", get(api_audit_trail))
+        // MSSP fleet (spec 038 Phase 1) — returns 404 when fleet
+        // mode is disabled so the absence is unambiguous.
+        .route("/api/fleet/hosts", get(fleet::api_fleet_hosts))
         // Attacker Intelligence & Monthly Reports
         .route("/api/attacker-profiles", get(api_attacker_profiles))
         .route(

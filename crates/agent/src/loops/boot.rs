@@ -389,6 +389,27 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
     );
     info!(router = %ai_router.describe(), "AI router ready");
 
+    // Fleet (MSSP multi-host) — spec 038 Phase 1. The state cache is
+    // pre-seeded with the configured host roster so the very first
+    // `/api/fleet/hosts` call after boot returns the shape, not an
+    // empty list. The background poller is spawned only when fleet
+    // mode is enabled AND the host list is non-empty so a misplaced
+    // `enabled = true` with no hosts does not log the empty-list
+    // warning every 30 s.
+    let fleet_state = if cfg.fleet.enabled && !cfg.fleet.hosts.is_empty() {
+        let state = crate::fleet::FleetState::from_config(&cfg.fleet.hosts);
+        let cfg_for_poller = std::sync::Arc::new(cfg.fleet.clone());
+        let _join = crate::fleet::poller::spawn(state.clone(), cfg_for_poller);
+        info!(
+            host_count = cfg.fleet.hosts.len(),
+            interval_secs = cfg.fleet.poll_interval_seconds,
+            "fleet poller spawned"
+        );
+        Some(state)
+    } else {
+        None
+    };
+
     // Dashboard spawn is gated by both the CLI flag AND the config
     // toggle. CLI `--dashboard` is the historical opt-in; the config
     // field (default `true`) lets the operator switch the dashboard
@@ -492,6 +513,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                 briefing_hour,
                 briefing_minute,
                 dashboard_store,
+                fleet_state,
                 tls_cert,
                 tls_key,
                 insecure_no_tls,

@@ -208,6 +208,10 @@ pub(crate) struct DashboardState {
     pub(super) briefing_minute: u8,
     /// SQLite store for blob reads (Phase 6: try blob before JSON file).
     pub(super) sqlite_store: Option<Arc<innerwarden_store::Store>>,
+    /// MSSP fleet state cache (spec 038 Phase 1). `None` when
+    /// `[fleet].enabled = false` so the route handler returns 404
+    /// for `/api/fleet/hosts` instead of an empty list.
+    pub(super) fleet_state: Option<crate::fleet::FleetState>,
 }
 
 /// Aggregated status from integrated security modules.
@@ -298,6 +302,7 @@ pub(super) fn test_dashboard_state(data_dir: &std::path::Path) -> DashboardState
         briefing_hour: 0,
         briefing_minute: 0,
         sqlite_store: None,
+        fleet_state: None,
     }
 }
 

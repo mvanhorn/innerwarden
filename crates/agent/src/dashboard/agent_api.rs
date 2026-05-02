@@ -1790,6 +1790,7 @@ enabled = false
             briefing_hour: 0,
             briefing_minute: 0,
             sqlite_store,
+            fleet_state: None,
         }
     }
 

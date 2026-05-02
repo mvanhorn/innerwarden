@@ -89,6 +89,7 @@ mod dna_inline;
 mod environment_profile;
 mod fail2ban;
 mod firmware_tick;
+mod fleet;
 mod forensics;
 mod geoip;
 mod honeypot_always_on;

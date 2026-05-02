@@ -109,3 +109,6 @@ dhat-heap = ["dep:dhat"]
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 filetime = "0.2"
+# Spec 038 Phase 1: mock the spoke `/api/status` endpoint in fleet
+# poller unit tests. Async-aware fork (mockito 1.x).
+mockito = "1"

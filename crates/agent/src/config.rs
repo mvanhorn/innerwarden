@@ -52,6 +52,10 @@ pub struct AgentConfig {
     /// Dashboard settings
     #[serde(default)]
     pub dashboard: DashboardConfig,
+    /// MSSP fleet (multi-host) settings. Spec 038. Default
+    /// `enabled = false` keeps every single-host deploy unchanged.
+    #[serde(default)]
+    pub fleet: FleetConfig,
     /// Firmware security monitoring (innerwarden-smm)
     #[serde(default)]
     pub firmware: FirmwareConfig,
@@ -201,6 +205,69 @@ pub struct ConfigSigningConfig {
     /// Hex-encoded Ed25519 public key for signature verification.
     #[serde(default)]
     pub public_key: Option<String>,
+}
+
+/// Fleet (MSSP multi-host) configuration. Spec 038 Phase 1.
+///
+/// Default `enabled = false` keeps every existing deploy unchanged.
+/// When enabled, a background tokio task polls each configured spoke's
+/// `/api/status` endpoint at `poll_interval_seconds` cadence and the
+/// `GET /api/fleet/hosts` endpoint returns the cached status.
+///
+/// No new write paths on the spoke side: the manager talks to the
+/// existing single-host dashboard endpoints over HTTPS.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FleetConfig {
+    /// Master switch. When false the poller is not spawned and
+    /// `/api/fleet/hosts` returns 404. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// List of spoke hosts the manager will poll.
+    #[serde(default)]
+    pub hosts: Vec<FleetHostConfig>,
+    /// How often to refresh each host's status. Default: 30 s.
+    #[serde(default = "default_fleet_poll_interval_seconds")]
+    pub poll_interval_seconds: u64,
+    /// HTTP request timeout for each spoke poll. Default: 5 s.
+    /// Tight enough that a hung spoke does not stall the poll loop.
+    #[serde(default = "default_fleet_request_timeout_seconds")]
+    pub request_timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FleetHostConfig {
+    /// Stable identifier the manager uses in URLs and status keys.
+    /// Must be unique across the fleet. Operator-chosen (e.g. `"prod-eu"`).
+    pub id: String,
+    /// Full URL of the spoke's dashboard, e.g.
+    /// `https://prod-eu.example.com:8787`. The poller appends
+    /// `/api/status` to this base.
+    pub url: String,
+    /// Name of the env var holding the bearer token for this spoke.
+    /// Phase 1 reads the token at boot only; Phase 4 wires login
+    /// refresh on 401. Empty string means "no auth header" — useful
+    /// for local testing against an open dashboard.
+    #[serde(default)]
+    pub token_env: String,
+}
+
+impl Default for FleetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hosts: Vec::new(),
+            poll_interval_seconds: default_fleet_poll_interval_seconds(),
+            request_timeout_seconds: default_fleet_request_timeout_seconds(),
+        }
+    }
+}
+
+fn default_fleet_poll_interval_seconds() -> u64 {
+    30
+}
+
+fn default_fleet_request_timeout_seconds() -> u64 {
+    5
 }
 
 /// Dashboard config - trusted proxy IPs and other dashboard-related settings.
@@ -2817,6 +2884,16 @@ mod tests {
             cfg.dashboard.enabled,
             "DashboardConfig.enabled must default to true (back-compat with pre-config-toggle deploys)"
         );
+        // Fleet (spec 038) defaults to disabled so single-host installs
+        // pay zero overhead. The poller is not spawned and the
+        // `/api/fleet/hosts` endpoint returns 404.
+        assert!(
+            !cfg.fleet.enabled,
+            "FleetConfig.enabled must default to false (single-host pays no fleet overhead)"
+        );
+        assert!(cfg.fleet.hosts.is_empty());
+        assert_eq!(cfg.fleet.poll_interval_seconds, 30);
+        assert_eq!(cfg.fleet.request_timeout_seconds, 5);
         assert!(cfg.narrative.enabled);
         assert_eq!(cfg.narrative.keep_days, 7);
         assert!(!cfg.webhook.enabled);
@@ -3417,6 +3494,33 @@ approval_ttl_secs = 300
             default_session_timeout_minutes()
         );
         assert_eq!(cfg.dashboard.max_sessions, default_max_sessions());
+    }
+
+    /// Spec 038 Phase 1: enabling fleet mode with a host roster must
+    /// parse cleanly and propagate to the runtime. The poller in
+    /// `boot.rs` reads from `cfg.fleet`; this anchor pins that the
+    /// shape (hosts as table-array with `id` / `url` / `token_env`)
+    /// is what the loader produces.
+    #[test]
+    fn fleet_enabled_with_host_list_parses() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        writeln!(
+            tmp,
+            "[fleet]\nenabled = true\npoll_interval_seconds = 60\n\
+             [[fleet.hosts]]\nid = \"prod-eu\"\nurl = \"https://eu.example.com:8787\"\ntoken_env = \"FLEET_TOKEN_EU\"\n\
+             [[fleet.hosts]]\nid = \"prod-us\"\nurl = \"https://us.example.com:8787\""
+        )
+        .unwrap();
+        let cfg = load(tmp.path()).unwrap();
+        assert!(cfg.fleet.enabled);
+        assert_eq!(cfg.fleet.poll_interval_seconds, 60);
+        assert_eq!(cfg.fleet.hosts.len(), 2);
+        assert_eq!(cfg.fleet.hosts[0].id, "prod-eu");
+        assert_eq!(cfg.fleet.hosts[0].url, "https://eu.example.com:8787");
+        assert_eq!(cfg.fleet.hosts[0].token_env, "FLEET_TOKEN_EU");
+        assert_eq!(cfg.fleet.hosts[1].id, "prod-us");
+        // Missing token_env defaults to empty string, not an error.
+        assert!(cfg.fleet.hosts[1].token_env.is_empty());
     }
 
     #[test]
