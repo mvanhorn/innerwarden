@@ -604,7 +604,7 @@ impl KnowledgeGraph {
 
     /// Reconstruct a `KnowledgeGraph` from a deserialized snapshot.
     /// Shared by `try_load_snapshot` (file) and `load_from_store` (SQLite).
-    fn reconstruct_from_snapshot(snapshot: GraphSnapshot) -> Option<Self> {
+    fn reconstruct_from_snapshot(mut snapshot: GraphSnapshot) -> Option<Self> {
         let mut graph = Self::new();
         graph.next_id = snapshot.next_id;
 
@@ -614,6 +614,22 @@ impl KnowledgeGraph {
             graph.memory_estimate += Self::estimate_node_size(node);
         }
         graph.nodes = snapshot.nodes;
+
+        // Re-intern property keys: serde produces a fresh `Arc<str>`
+        // per deserialized key, defeating the interner that
+        // `add_edge` relies on at insert time. Walk every edge once
+        // and swap each key for the canonical `Arc<str>` so the in-
+        // memory graph immediately benefits from deduplication.
+        for edge in snapshot.edges.iter_mut() {
+            if edge.properties.is_empty() {
+                continue;
+            }
+            let old = std::mem::take(&mut edge.properties);
+            edge.properties = old
+                .into_iter()
+                .map(|(k, v)| (super::intern::intern(&k), v))
+                .collect();
+        }
 
         // Restore edges and rebuild adjacency lists. Also rebuild the
         // `last_edge_ts` LRU index used by `enforce_memory_limit`. The index

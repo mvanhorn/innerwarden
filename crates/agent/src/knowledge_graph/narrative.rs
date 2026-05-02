@@ -40,7 +40,7 @@ impl KnowledgeGraph {
 
             // Add important properties inline
             for (key, val) in &edge.properties {
-                match key.as_str() {
+                match &**key {
                     "port" | "signal" | "method" | "command" | "module_name" => {
                         let val_str = match val {
                             serde_json::Value::String(s) => s.clone(),

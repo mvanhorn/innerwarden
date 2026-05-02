@@ -26,6 +26,7 @@ pub mod buckets;
 pub mod detectors;
 pub mod graph;
 pub mod ingestion;
+pub mod intern;
 pub mod migrations;
 pub mod narrative;
 pub mod persistence;
@@ -244,7 +245,7 @@ mod tests {
         let mut login = Edge::new(user, ip, Relation::LoggedInFrom, now - Duration::minutes(1));
         login
             .properties
-            .insert("success".to_string(), serde_json::json!(true));
+            .insert(intern::intern("success"), serde_json::json!(true));
         graph.add_edge(login);
         graph.add_edge(Edge::new(proc, incident, Relation::TriggeredBy, now));
 

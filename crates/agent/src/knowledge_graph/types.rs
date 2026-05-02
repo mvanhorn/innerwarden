@@ -2,8 +2,17 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 pub type NodeId = u64;
+
+/// Property key type used in `Edge.properties`. Backed by an `Arc<str>`
+/// served by `crate::knowledge_graph::intern::intern`, so repeated keys
+/// across edges (the common case — "event_source", "event_kind",
+/// "summary", "severity" recur on every event-derived edge) share a
+/// single heap allocation. `Arc<str>` implements `Borrow<str>` so map
+/// lookups continue to accept `&str` without allocating a key.
+pub type PropKey = Arc<str>;
 
 // ── Node types ──────────────────────────────────────────────────────────
 
@@ -288,7 +297,12 @@ pub struct Edge {
     pub to: NodeId,
     pub relation: Relation,
     pub ts: DateTime<Utc>,
-    pub properties: HashMap<String, serde_json::Value>,
+    /// Property bag keyed by interned `Arc<str>`. Edges that share a
+    /// key (the common case) share a single key allocation. The
+    /// derived `Serialize`/`Deserialize` emit/parse plain JSON
+    /// strings for keys, so the wire format is unchanged from when
+    /// keys were `String` — back-compat with snapshot v3.
+    pub properties: HashMap<PropKey, serde_json::Value>,
 }
 
 impl Edge {
@@ -303,7 +317,8 @@ impl Edge {
     }
 
     pub fn with_prop(mut self, key: &str, value: impl Into<serde_json::Value>) -> Self {
-        self.properties.insert(key.to_string(), value.into());
+        self.properties
+            .insert(crate::knowledge_graph::intern::intern(key), value.into());
         self
     }
 

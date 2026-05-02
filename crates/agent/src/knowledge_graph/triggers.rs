@@ -43,7 +43,10 @@ pub fn check_critical_triggers(
     from: NodeId,
     to: NodeId,
     now: chrono::DateTime<Utc>,
-    properties: &std::collections::HashMap<String, serde_json::Value>,
+    properties: &std::collections::HashMap<
+        crate::knowledge_graph::types::PropKey,
+        serde_json::Value,
+    >,
 ) {
     match relation {
         Relation::RedirectedFd => {
@@ -73,7 +76,10 @@ fn trigger_reverse_shell_from_fd(
     graph: &mut KnowledgeGraph,
     proc_id: NodeId,
     now: chrono::DateTime<Utc>,
-    properties: &std::collections::HashMap<String, serde_json::Value>,
+    properties: &std::collections::HashMap<
+        crate::knowledge_graph::types::PropKey,
+        serde_json::Value,
+    >,
 ) {
     let fd = properties
         .get("old_fd")
@@ -380,7 +386,10 @@ fn trigger_service_stop(
     graph: &mut KnowledgeGraph,
     proc_id: NodeId,
     now: chrono::DateTime<Utc>,
-    properties: &std::collections::HashMap<String, serde_json::Value>,
+    properties: &std::collections::HashMap<
+        crate::knowledge_graph::types::PropKey,
+        serde_json::Value,
+    >,
 ) {
     let comm = match graph.get_node(proc_id) {
         Some(Node::Process { comm, .. }) if comm == "systemctl" || comm == "service" => {
