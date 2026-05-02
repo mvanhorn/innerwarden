@@ -341,8 +341,25 @@ refreshLeft(false).then(() => {
     clearTimeout(fallbackTimer);
     fallbackTimer = setTimeout(() => {
       refreshLeftLive();
-      fallbackTimer = setInterval(() => refreshLeftLive(), 30000);
+      _refreshActiveView();
+      fallbackTimer = setInterval(() => {
+        refreshLeftLive();
+        _refreshActiveView();
+      }, 30000);
     }, 35000);
+  }
+
+  // 2026-05-02 audit fix: when SSE drops, fallbackTimer is the only
+  // pulse keeping live views fresh. Until now it only refreshed the
+  // left rail, so the Sensors view stayed frozen on whatever data
+  // was first painted. This helper is the single place to add other
+  // active-view refreshes (sensors today; report/intel can join later
+  // if a similar freeze report comes in).
+  function _refreshActiveView() {
+    var sensorsView = document.getElementById('viewSensors');
+    if (sensorsView && sensorsView.style.display !== 'none' && typeof loadSensors === 'function') {
+      loadSensors();
+    }
   }
 
   function connect() {
@@ -376,6 +393,15 @@ refreshLeft(false).then(() => {
                     window._lastSSERefresh = now;
                     refreshLeftLive();
                     if (document.getElementById('viewHome').style.display !== 'none') loadHome();
+                    // 2026-05-02 audit fix: Sensors view never refreshed after
+                    // the initial mount, so its KPIs and three charts stayed
+                    // frozen for the entire session. Re-run loadSensors when a
+                    // refresh signal arrives and the view is visible. Same
+                    // throttle as Home applies via the outer guard.
+                    var sensorsView = document.getElementById('viewSensors');
+                    if (sensorsView && sensorsView.style.display !== 'none' && typeof loadSensors === 'function') {
+                      loadSensors();
+                    }
                   }
                 } else if (lastEvent === 'alert') {
                   try {

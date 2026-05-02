@@ -562,6 +562,17 @@ async function loadJourney(subjectType, subjectValue) {
 
   const panel = document.getElementById('rightPanel');
 
+  // 2026-05-02 audit fix (P7): timeline got stuck on "Loading..."
+  // for >15s after rapid toggle / IP switching because the previous
+  // fetch resolved last and overwrote the new content. Cancel any
+  // in-flight journey fetch before kicking off the next one.
+  if (window._activeFetch_journey && typeof window._activeFetch_journey.abort === 'function') {
+    try { window._activeFetch_journey.abort(); } catch (_) {}
+  }
+  const journeyAbort = new AbortController();
+  window._activeFetch_journey = journeyAbort;
+  const journeySignal = journeyAbort.signal;
+
   try {
     const baseQs = buildQuery({
       subject_type: subjectType,
@@ -583,8 +594,8 @@ async function loadJourney(subjectType, subjectValue) {
         })
       : '';
     const [j, compare] = await Promise.all([
-      loadJson('/api/journey?' + baseQs),
-      shouldCompare ? loadJson('/api/journey?' + compareQs) : Promise.resolve(null),
+      loadJson('/api/journey?' + baseQs, { signal: journeySignal }),
+      shouldCompare ? loadJson('/api/journey?' + compareQs, { signal: journeySignal }) : Promise.resolve(null),
     ]);
     window._currentJourneyOutcome = j.outcome || 'unknown';
     const first = j.first_seen ? fmtDateTime(j.first_seen) : '-';
@@ -870,6 +881,9 @@ async function loadJourney(subjectType, subjectValue) {
     // Load mini-graph for this subject
     loadJourneyGraph(subjectType, subjectValue);
   } catch (e) {
+    // Swallow AbortError quietly: a fast user toggle/IP switch raced
+    // and we already kicked off the new fetch that owns the panel.
+    if (e && (e.name === 'AbortError' || e.code === 20)) return;
     document.getElementById('journeyContent').innerHTML = '<div class="err">Failed to load journey: ' + esc(e.message) + '</div>';
   }
 }

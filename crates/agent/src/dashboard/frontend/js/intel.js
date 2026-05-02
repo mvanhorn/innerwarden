@@ -3,10 +3,11 @@ async function loadIntel() {
   const status = document.getElementById('intelViewStatus');
   const content = document.getElementById('intelContent');
   if (status) status.textContent = 'Loading…';
+  const signal = window._activeFetch_intel ? window._activeFetch_intel.signal : undefined;
   try {
     const sort = document.getElementById('intelSort')?.value || 'risk_score';
     const minRisk = document.getElementById('intelMinRisk')?.value || '0';
-    const data = await loadJson(`/api/attacker-profiles?sort=${sort}&min_risk=${minRisk}&limit=100`);
+    const data = await loadJson(`/api/attacker-profiles?sort=${sort}&min_risk=${minRisk}&limit=100`, { signal });
     if (!data || !data.profiles) { content.innerHTML = '<p style="color:var(--dim)">No attacker profiles yet.</p>'; return; }
 
     let html = `<div class="kpi-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:16px;">
@@ -54,6 +55,7 @@ async function loadIntel() {
     content.innerHTML = html;
     if (status) status.textContent = `${data.total} profiles`;
   } catch(e) {
+    if (e && (e.name === 'AbortError' || e.code === 20)) return;
     content.innerHTML = `<p style="color:#e74c3c;">Failed to load: ${e.message}</p>`;
     if (status) status.textContent = 'Error';
   }
@@ -162,6 +164,20 @@ function switchIntelTab(tab) {
     const btn = document.getElementById('intelTab'+t);
     if (btn) { const active = t.toLowerCase() === tab; btn.style.background = active ? 'var(--accent)' : 'var(--card-bg)'; btn.style.color = active ? '#0a0f1a' : 'var(--text)'; btn.style.fontWeight = active ? '600' : '400'; btn.style.borderColor = active ? 'var(--accent)' : 'var(--border)'; }
   });
+
+  // 2026-05-02 audit fix (P8): the previous tab's content stayed on
+  // screen for ~5s while the new sub-tab fetch was in flight. Clear
+  // the content area immediately and abort any in-flight intel fetch
+  // so a fast tab cycle never paints stale data under the new title.
+  if (window._activeFetch_intel && typeof window._activeFetch_intel.abort === 'function') {
+    try { window._activeFetch_intel.abort(); } catch (_) {}
+  }
+  window._activeFetch_intel = new AbortController();
+  const content = document.getElementById('intelContent');
+  if (content) content.innerHTML = '<div style="text-align:center;padding:40px;color:var(--muted);font-size:0.8rem">Loading...</div>';
+  const status = document.getElementById('intelViewStatus');
+  if (status) status.textContent = '';
+
   if (tab === 'campaigns') loadCampaigns();
   else if (tab === 'chains') loadChains();
   else if (tab === 'baseline') loadBaseline();
@@ -174,8 +190,9 @@ async function loadCampaigns() {
   const status = document.getElementById('intelViewStatus');
   const content = document.getElementById('intelContent');
   if (status) status.textContent = 'Loading campaigns…';
+  const signal = window._activeFetch_intel ? window._activeFetch_intel.signal : undefined;
   try {
-    const data = await loadJson('/api/campaigns');
+    const data = await loadJson('/api/campaigns', { signal });
     if (!data || !data.campaigns || data.campaigns.length === 0) {
       content.innerHTML = `<div style="text-align:center;padding:40px;">
         <div style="margin-bottom:8px;">${lucideIcon('search',{size:32})}</div>
@@ -246,6 +263,7 @@ async function loadCampaigns() {
     content.innerHTML = html;
     if (status) status.textContent = `${data.total} campaigns`;
   } catch(e) {
+    if (e && (e.name === 'AbortError' || e.code === 20)) return;
     content.innerHTML = `<p style="color:#e74c3c;">Failed to load: ${e.message}</p>`;
     if (status) status.textContent = 'Error';
   }
@@ -256,8 +274,9 @@ async function loadChains() {
   const content = document.getElementById('intelContent');
   const status = document.getElementById('intelViewStatus');
   if (status) status.textContent = 'Loading chains…';
+  const signal = window._activeFetch_intel ? window._activeFetch_intel.signal : undefined;
   try {
-    const data = await loadJson('/api/correlation-chains');
+    const data = await loadJson('/api/correlation-chains', { signal });
     if (!data?.chains?.length) {
       // 2026-04-30: Fix — was a single-quoted string with ${lucideIcon('link',...)}
       // inside it. The single quote in 'link' closed the outer string and
@@ -323,7 +342,10 @@ async function loadChains() {
     }
     content.innerHTML = html;
     if (status) status.textContent = `${data.total} chains`;
-  } catch(e) { content.innerHTML = `<p style="color:#e74c3c">Failed: ${e.message}</p>`; }
+  } catch(e) {
+    if (e && (e.name === 'AbortError' || e.code === 20)) return;
+    content.innerHTML = `<p style="color:#e74c3c">Failed: ${e.message}</p>`;
+  }
 }
 
 // ── Baseline sub-tab ──────────────────────────────────────────────
@@ -331,8 +353,9 @@ async function loadBaseline() {
   const content = document.getElementById('intelContent');
   const status = document.getElementById('intelViewStatus');
   if (status) status.textContent = 'Loading baseline…';
+  const signal = window._activeFetch_intel ? window._activeFetch_intel.signal : undefined;
   try {
-    const b = await loadJson('/api/baseline-status');
+    const b = await loadJson('/api/baseline-status', { signal });
     let html = `<div class="kpi-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:16px;">
       <div class="kpi-card"><div class="kpi-value">${b.mature ? lucideIcon('check-circle',{size:14}) + ' Active' : lucideIcon('bar-chart-3',{size:14}) + ' Training'}</div><div class="kpi-label">Status</div></div>
       <div class="kpi-card" title="Days of baseline learning so far. The model needs 7 days minimum before anomaly detection activates; once mature it keeps learning but is no longer in training phase."><div class="kpi-value">${(b.training_days||0) >= 7 ? 'Mature ✓' : ((b.training_days||0) + '/7')}</div><div class="kpi-label">Training Days</div></div>
@@ -380,7 +403,10 @@ async function loadBaseline() {
 
     content.innerHTML = html;
     if (status) status.textContent = b.mature ? 'Anomaly detection active' : `Training: ${b.training_days||0}/7 days`;
-  } catch(e) { content.innerHTML = `<p style="color:#e74c3c">Failed: ${e.message}</p>`; }
+  } catch(e) {
+    if (e && (e.name === 'AbortError' || e.code === 20)) return;
+    content.innerHTML = `<p style="color:#e74c3c">Failed: ${e.message}</p>`;
+  }
 }
 
 // ── Playbooks sub-tab ─────────────────────────────────────────────
@@ -388,8 +414,9 @@ async function loadPlaybooks() {
   const content = document.getElementById('intelContent');
   const status = document.getElementById('intelViewStatus');
   if (status) status.textContent = 'Loading playbooks…';
+  const signal = window._activeFetch_intel ? window._activeFetch_intel.signal : undefined;
   try {
-    const data = await loadJson('/api/playbook-log');
+    const data = await loadJson('/api/playbook-log', { signal });
     if (!data?.executions?.length) {
       // 2026-04-30: same fix as the chains empty-state path above —
       // single-quoted JS string with embedded ${lucideIcon('clipboard-list',...)}
@@ -437,7 +464,10 @@ async function loadPlaybooks() {
     }
     content.innerHTML = html;
     if (status) status.textContent = `${data.total} executions`;
-  } catch(e) { content.innerHTML = `<p style="color:#e74c3c">Failed: ${e.message}</p>`; }
+  } catch(e) {
+    if (e && (e.name === 'AbortError' || e.code === 20)) return;
+    content.innerHTML = `<p style="color:#e74c3c">Failed: ${e.message}</p>`;
+  }
 }
 
 // Defender Brain sub-tab removed: the AlphaZero brain was replaced
@@ -448,8 +478,9 @@ async function loadMitreCoverage() {
   const content = document.getElementById('intelContent');
   const status = document.getElementById('intelViewStatus');
   if (status) status.textContent = 'Loading MITRE coverage…';
+  const signal = window._activeFetch_intel ? window._activeFetch_intel.signal : undefined;
   try {
-    const data = await loadJson('/api/mitre/coverage');
+    const data = await loadJson('/api/mitre/coverage', { signal });
     const pct = data.coverage_pct || 0;
     const pctColor = pct >= 70 ? 'var(--ok)' : pct >= 40 ? 'var(--warn)' : 'var(--danger)';
 
@@ -520,6 +551,9 @@ async function loadMitreCoverage() {
 
     content.innerHTML = html;
     if (status) status.textContent = `${pct}% coverage`;
-  } catch(e) { content.innerHTML = `<p style="color:#e74c3c">Failed: ${e.message}</p>`; }
+  } catch(e) {
+    if (e && (e.name === 'AbortError' || e.code === 20)) return;
+    content.innerHTML = `<p style="color:#e74c3c">Failed: ${e.message}</p>`;
+  }
 }
 

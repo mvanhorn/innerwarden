@@ -3317,6 +3317,68 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_audit_2026_05_02_small_fixes_are_wired() {
+        // 2026-05-02 audit (P2/P7/P8 + frozen graph): five small wiring
+        // fixes bundled in PR #407. This anchor pins them so a future
+        // refactor that strips one of them out fails CI before the
+        // operator ever sees the regression.
+
+        // ── (a) Frozen Sensors graph: SSE refresh + 30s fallback both
+        //        re-fire loadSensors when the Sensors view is visible.
+        assert!(
+            JS_SSE.contains("typeof loadSensors === 'function'"),
+            "sse.js must re-fire loadSensors on refresh events when the Sensors view is visible \
+             — without it the three Sensors charts stay frozen on the data fetched at first paint"
+        );
+        assert!(
+            JS_SSE.contains("function _refreshActiveView"),
+            "sse.js must carry the fallback _refreshActiveView helper so the 30s polling pulse \
+             keeps the Sensors view fresh when the SSE stream is down"
+        );
+
+        // ── (b) P2 Badge oscillation: showView (not just loadHome)
+        //        must call syncModeBadgeFromHealth so every tab paints
+        //        the same OPERATIONAL DEBT / CATCHING UP / etc value.
+        assert!(
+            JS_NAV.contains("syncModeBadgeFromHealth(window._lastOverview"),
+            "nav.js::showView must sync the persistent badge from window._lastOverview \
+             — without it the badge oscillates between OPERATIONAL DEBT (Home) and \
+             PROTECTED (Threats/Sensors/Health) on the same page reload (audit P2)"
+        );
+
+        // ── (c) loadJson must accept an AbortSignal so cancel-in-flight
+        //        actually cancels the network request, not just the UI.
+        assert!(
+            JS_API.contains("if (opts && opts.signal) init.signal = opts.signal"),
+            "api.js::loadJson must thread the signal option through to fetch — required by the \
+             Journey (P7) and Intel (P8) AbortController plumbing"
+        );
+
+        // ── (d) P7 Timeline AbortController on loadJourney.
+        assert!(
+            JS_JOURNEY.contains("window._activeFetch_journey"),
+            "journey.js::loadJourney must stash an AbortController on window._activeFetch_journey \
+             so a fast IP / toggle switch cancels the previous fetch (audit P7)"
+        );
+        assert!(
+            JS_JOURNEY.contains("{ signal: journeySignal }"),
+            "journey.js must pass the AbortController signal into loadJson — without it the \
+             stale fetch still resolves and overwrites the new content"
+        );
+
+        // ── (e) P8 Intel sub-tab clear-before-fetch + AbortController.
+        assert!(
+            JS_INTEL.contains("window._activeFetch_intel"),
+            "intel.js::switchIntelTab must abort the previous sub-tab fetch (audit P8)"
+        );
+        assert!(
+            JS_INTEL.contains("Loading...</div>"),
+            "intel.js::switchIntelTab must clear intelContent synchronously so the previous \
+             tab's content does not paint under the new tab's title (audit P8)"
+        );
+    }
+
+    #[test]
     fn fleet_frontend_wiring_is_complete() {
         // Spec 038 Phase 3: the Fleet tab must be wired end-to-end.
         // HTML: nav button + view container present.

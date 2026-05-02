@@ -71,6 +71,28 @@ function showView(name) {
 
   // Clear outcome filter when leaving investigate
   if (name !== 'investigate') state.filterOutcome = null;
+
+  // 2026-05-02 audit fix (P2): the persistent header pill drifted to
+  // PROTECTED on tabs other than Home/Threats because only those two
+  // loaders called syncModeBadgeFromHealth. Re-sync from the cached
+  // overview on every view switch so OPERATIONAL DEBT / CATCHING UP /
+  // AI NOT RESPONDING paint the same value across the whole nav.
+  if (typeof syncModeBadgeFromHealth === 'function') {
+    var cachedCfg = (typeof actionCfg !== 'undefined') ? actionCfg : null;
+    if (window._lastOverview) {
+      syncModeBadgeFromHealth(window._lastOverview, cachedCfg);
+    } else {
+      // First view-switch before Home/Threats has populated the cache:
+      // fetch overview once so the badge does not paint a stale
+      // PROTECTED label from actionCfg alone. Result is cached for
+      // subsequent switches.
+      loadJson('/api/overview').then(function(ov) {
+        window._lastOverview = ov;
+        syncModeBadgeFromHealth(ov, cachedCfg);
+      }).catch(function() { /* swallow — not critical for navigation */ });
+    }
+  }
+
   if (name === 'home') loadHome();
   if (name === 'sensors') { loadSensors(); loadTopAction(); }
   if (name === 'report') loadReport();

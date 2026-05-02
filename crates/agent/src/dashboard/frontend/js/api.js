@@ -83,14 +83,22 @@ function toast(msg, type) {
   setTimeout(() => { t.style.opacity = '0'; t.style.transition = 'opacity .3s'; setTimeout(() => t.remove(), 300); }, 4000);
 }
 
-async function loadJson(url) {
-  const r = await fetch(url, {cache: 'no-store'});
+async function loadJson(url, opts) {
+  // 2026-05-02 audit fix (P7): callers can pass `{ signal }` to bind
+  // a fetch to an AbortController so a fast user toggle/IP switch
+  // cancels the previous request instead of letting two completions
+  // race onto the same DOM target.
+  const init = { cache: 'no-store' };
+  if (opts && opts.signal) init.signal = opts.signal;
+  const r = await fetch(url, init);
   if (!r.ok) throw new Error('HTTP ' + r.status);
   return r.json();
 }
 
-async function loadText(url) {
-  const r = await fetch(url, {cache: 'no-store'});
+async function loadText(url, opts) {
+  const init = { cache: 'no-store' };
+  if (opts && opts.signal) init.signal = opts.signal;
+  const r = await fetch(url, init);
   if (!r.ok) throw new Error('HTTP ' + r.status);
   return r.text();
 }
