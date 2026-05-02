@@ -532,6 +532,7 @@ pub async fn serve(
         .route("/js/responses.js", get(serve_js_responses))
         .route("/js/actions.js", get(serve_js_actions))
         .route("/js/sse.js", get(serve_js_sse))
+        .route("/js/fleet.js", get(serve_js_fleet))
         .route("/api/overview", get(api_overview))
         .route("/api/incidents", get(api_incidents))
         .route("/api/decisions", get(api_decisions))
@@ -581,9 +582,11 @@ pub async fn serve(
         .route("/api/advisory-cache", get(api_advisory_cache))
         .route("/api/compliance", get(api_compliance))
         .route("/api/compliance/audit-trail", get(api_audit_trail))
-        // MSSP fleet (spec 038 Phase 1) — returns 404 when fleet
-        // mode is disabled so the absence is unambiguous.
+        // MSSP fleet (spec 038). Both endpoints return 404 when
+        // fleet mode is disabled so the absence is unambiguous to
+        // the frontend.
         .route("/api/fleet/hosts", get(fleet::api_fleet_hosts))
+        .route("/api/fleet/overview", get(fleet::api_fleet_overview))
         // Attacker Intelligence & Monthly Reports
         .route("/api/attacker-profiles", get(api_attacker_profiles))
         .route(
@@ -892,6 +895,7 @@ js_handler!(serve_js_monthly, JS_MONTHLY);
 js_handler!(serve_js_responses, JS_RESPONSES);
 js_handler!(serve_js_actions, JS_ACTIONS);
 js_handler!(serve_js_sse, JS_SSE);
+js_handler!(serve_js_fleet, JS_FLEET);
 
 // ---------------------------------------------------------------------------
 // D10 - Report API
@@ -921,6 +925,7 @@ const JS_MONTHLY: &str = include_str!("frontend/js/monthly.js");
 const JS_RESPONSES: &str = include_str!("frontend/js/responses.js");
 const JS_ACTIONS: &str = include_str!("frontend/js/actions.js");
 const JS_SSE: &str = include_str!("frontend/js/sse.js");
+const JS_FLEET: &str = include_str!("frontend/js/fleet.js");
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -3309,6 +3314,45 @@ mod tests {
         );
         // The branch that calls loadJourney must be reachable.
         assert!(JS_SSE.contains("loadJourney('ip', alertIp)"));
+    }
+
+    #[test]
+    fn fleet_frontend_wiring_is_complete() {
+        // Spec 038 Phase 3: the Fleet tab must be wired end-to-end.
+        // HTML: nav button + view container present.
+        assert!(
+            INDEX_HTML.contains("id=\"navFleet\""),
+            "nav must carry the Fleet button (hidden by default; fleet.js unhides on probe)"
+        );
+        assert!(INDEX_HTML.contains("id=\"viewFleet\""));
+        assert!(INDEX_HTML.contains("id=\"fleetContent\""));
+        // Default-hidden so single-host operators do not see a tab
+        // they cannot use. fleet.js::probeFleetEnabled flips this.
+        let nav_btn_start = INDEX_HTML
+            .find("id=\"navFleet\"")
+            .expect("nav button exists");
+        let nav_btn_slice = &INDEX_HTML[nav_btn_start..nav_btn_start + 200];
+        assert!(
+            nav_btn_slice.contains("display:none"),
+            "navFleet must start hidden until the backend probe confirms fleet mode"
+        );
+
+        // Script tag included.
+        assert!(INDEX_HTML.contains("/js/fleet.js"));
+
+        // Nav.js wires the showView dispatcher.
+        assert!(JS_NAV.contains("fleet: 'viewFleet'"));
+        assert!(JS_NAV.contains("if (name === 'fleet') loadFleet()"));
+
+        // fleet.js carries the probe + loader + renderer.
+        assert!(JS_FLEET.contains("function probeFleetEnabled"));
+        assert!(JS_FLEET.contains("async function loadFleet"));
+        assert!(JS_FLEET.contains("function renderFleet"));
+        // Probe is invoked at boot so the button visibility settles
+        // before the operator has a chance to click.
+        assert!(JS_FLEET.contains("probeFleetEnabled();"));
+        // 404 path renders the disabled-mode copy instead of throwing.
+        assert!(JS_FLEET.contains("Fleet mode is not enabled"));
     }
 
     #[test]

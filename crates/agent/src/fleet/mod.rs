@@ -22,17 +22,39 @@ use std::sync::{Arc, RwLock};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
+/// Slim subset of `OverviewResponse` the fleet poller caches per
+/// spoke. Phase 2: the manager parses the spoke's `/api/overview`
+/// body defensively and stores only the numeric fields that drive
+/// fleet aggregation. Skipping the full struct insulates the
+/// manager from cosmetic field changes on the spoke side and keeps
+/// the cache footprint small (~80 bytes per host).
+#[derive(Debug, Clone, Serialize)]
+pub struct FleetHostOverview {
+    /// Date the spoke reported. Manager records it but does not act
+    /// on date-mismatch — the spoke owns that dimension.
+    pub date: String,
+    pub events_count: u64,
+    pub incidents_count: u64,
+    pub decisions_count: u64,
+    pub blocked_count: u64,
+    pub observing_count: u64,
+    pub attention_count: u64,
+    pub handled_ips_today: u64,
+    /// `health.kind` from the spoke's `OverviewSnapshot` when
+    /// present. Drives the manager's `Degraded` verdict: a 200-OK
+    /// spoke with `health_kind = "ai_not_responding"` flips its
+    /// fleet card from Up to Degraded.
+    pub health_kind: Option<String>,
+}
+
 /// Snapshot of one spoke's last-known reachability + headline KPIs.
-/// Phase 1 carries only liveness; Phase 2 will add the OverviewSnapshot
-/// fields directly so the fleet view does not need a second round-trip
-/// per host to render KPI tiles.
 #[derive(Debug, Clone, Serialize)]
 pub struct HostStatus {
     /// Stable id from `[fleet.hosts]` config. Used as map key + the
     /// path component for drill-down endpoints (`/api/fleet/host/<id>/...`).
     pub id: String,
     /// Spoke base URL (no trailing slash). The poller appends
-    /// `/api/status` to this when probing.
+    /// `/api/overview` to this when probing.
     pub url: String,
     /// Liveness verdict produced by the most recent poll attempt.
     pub state: HostState,
@@ -43,6 +65,13 @@ pub struct HostStatus {
     /// Trimmed to 200 chars so a misbehaving spoke cannot inflate
     /// the manager's response payload.
     pub last_error: Option<String>,
+    /// Phase 2: most recent overview snapshot from this spoke.
+    /// `None` while the host is Down or before the first successful
+    /// poll. Serialised as `null` in JSON so the frontend can
+    /// distinguish "spoke is up but the snapshot is being fetched"
+    /// from "spoke just came up".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overview: Option<FleetHostOverview>,
 }
 
 /// Liveness verdict per spoke.
@@ -92,6 +121,7 @@ impl FleetState {
                     state: HostState::Unknown,
                     last_polled_at: None,
                     last_error: None,
+                    overview: None,
                 },
             );
         }
@@ -110,11 +140,21 @@ impl FleetState {
     }
 
     /// Apply a poll result for one host. Called by the poller task.
-    /// Unknown host ids are silently ignored — the cache is seeded
+    /// Unknown host ids are silently ignored: the cache is seeded
     /// from config, so a stale id arriving here means a config
-    /// reload removed the host between polls; better to drop the
+    /// reload removed the host between polls. Better to drop the
     /// stale write than to grow the map indefinitely.
-    pub(crate) fn record(&self, id: &str, state: HostState, error: Option<String>) {
+    ///
+    /// `overview` is optional: a Down host or a malformed response
+    /// passes `None` to clear the previous snapshot so a stale
+    /// overview cannot mask the host being unreachable.
+    pub(crate) fn record(
+        &self,
+        id: &str,
+        state: HostState,
+        error: Option<String>,
+        overview: Option<FleetHostOverview>,
+    ) {
         let mut map = self.inner.write().unwrap_or_else(|p| p.into_inner());
         if let Some(entry) = map.get_mut(id) {
             entry.state = state;
@@ -128,6 +168,78 @@ impl FleetState {
                     s
                 }
             });
+            entry.overview = overview;
+        }
+    }
+}
+
+/// Aggregate KPI counts across every UP host in the fleet, plus the
+/// per-host breakdown the dashboard uses to render individual cards.
+/// Phase 2 contract: the frontend Fleet tab consumes this shape.
+#[derive(Debug, Clone, Serialize)]
+pub struct FleetOverviewResponse {
+    pub fleet: FleetSummary,
+    pub by_host: Vec<HostStatus>,
+}
+
+/// Aggregated counters across hosts whose overview is present
+/// (i.e. Up or Degraded with a successful poll). Hosts in `Down` /
+/// `Unknown` contribute zero to these sums but still increment
+/// `down_count` / `unknown_count` so the operator sees the gap.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct FleetSummary {
+    pub host_count: usize,
+    pub up_count: usize,
+    pub down_count: usize,
+    pub degraded_count: usize,
+    pub unknown_count: usize,
+    pub events_count: u64,
+    pub incidents_count: u64,
+    pub decisions_count: u64,
+    pub blocked_count: u64,
+    pub observing_count: u64,
+    pub attention_count: u64,
+    pub handled_ips_today: u64,
+    /// True when at least one host reports a non-`operating_normally`
+    /// health_kind. Drives the fleet KPI tile colour.
+    pub any_unhealthy: bool,
+}
+
+impl FleetState {
+    /// Build the aggregate response from the current cache snapshot.
+    /// Pure function over the cache; cheap to call on every request
+    /// (the cache itself is updated out-of-band by the poller).
+    pub fn aggregate_overview(&self) -> FleetOverviewResponse {
+        let hosts = self.snapshot();
+        let mut summary = FleetSummary {
+            host_count: hosts.len(),
+            ..Default::default()
+        };
+        for host in &hosts {
+            match host.state {
+                HostState::Up => summary.up_count += 1,
+                HostState::Down => summary.down_count += 1,
+                HostState::Degraded => summary.degraded_count += 1,
+                HostState::Unknown => summary.unknown_count += 1,
+            }
+            if let Some(o) = &host.overview {
+                summary.events_count += o.events_count;
+                summary.incidents_count += o.incidents_count;
+                summary.decisions_count += o.decisions_count;
+                summary.blocked_count += o.blocked_count;
+                summary.observing_count += o.observing_count;
+                summary.attention_count += o.attention_count;
+                summary.handled_ips_today += o.handled_ips_today;
+                if let Some(kind) = &o.health_kind {
+                    if kind != "operating_normally" {
+                        summary.any_unhealthy = true;
+                    }
+                }
+            }
+        }
+        FleetOverviewResponse {
+            fleet: summary,
+            by_host: hosts,
         }
     }
 }
@@ -168,7 +280,7 @@ mod tests {
     fn record_flips_state_and_stamps_timestamp() {
         let cfg = vec![host("prod-eu", "https://eu.example.com:8787")];
         let state = FleetState::from_config(&cfg);
-        state.record("prod-eu", HostState::Up, None);
+        state.record("prod-eu", HostState::Up, None, None);
         let snap = state.snapshot();
         assert_eq!(snap[0].state, HostState::Up);
         assert!(snap[0].last_polled_at.is_some());
@@ -180,7 +292,7 @@ mod tests {
         let cfg = vec![host("prod-eu", "https://eu.example.com:8787")];
         let state = FleetState::from_config(&cfg);
         let err = "x".repeat(500);
-        state.record("prod-eu", HostState::Down, Some(err));
+        state.record("prod-eu", HostState::Down, Some(err), None);
         let snap = state.snapshot();
         let stored = snap[0].last_error.as_ref().expect("error stored");
         // 200 chars + " ..." suffix; bytes-wise either ≤ 204 or close
@@ -199,7 +311,7 @@ mod tests {
         let cfg = vec![host("prod-eu", "https://eu.example.com:8787")];
         let state = FleetState::from_config(&cfg);
         // Stale id from a prior config — must NOT inflate the map.
-        state.record("removed-host", HostState::Down, None);
+        state.record("removed-host", HostState::Down, None, None);
         let snap = state.snapshot();
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].id, "prod-eu");

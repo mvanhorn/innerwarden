@@ -36,8 +36,8 @@ function toggleMoreMenu() {
 }
 
 function showView(name) {
-  const views = { home: 'viewHome', sensors: 'viewSensors', investigate: 'viewInvestigate', report: 'viewReport', status: 'viewStatus', honeypot: 'viewHoneypot', compliance: 'viewCompliance', intel: 'viewIntel', monthly: 'viewMonthly', responses: 'viewResponses', graph: 'viewGraph' };
-  const btns  = { home: 'navHome', sensors: 'navSensors', investigate: 'navInvestigate', report: 'navReport', status: 'navStatus', honeypot: 'navHoneypot', compliance: 'navCompliance', intel: 'navIntel', monthly: 'navMonthly', responses: 'navResponses', graph: 'navGraph' };
+  const views = { home: 'viewHome', sensors: 'viewSensors', investigate: 'viewInvestigate', report: 'viewReport', status: 'viewStatus', honeypot: 'viewHoneypot', compliance: 'viewCompliance', intel: 'viewIntel', monthly: 'viewMonthly', responses: 'viewResponses', fleet: 'viewFleet', graph: 'viewGraph' };
+  const btns  = { home: 'navHome', sensors: 'navSensors', investigate: 'navInvestigate', report: 'navReport', status: 'navStatus', honeypot: 'navHoneypot', compliance: 'navCompliance', intel: 'navIntel', monthly: 'navMonthly', responses: 'navResponses', fleet: 'navFleet', graph: 'navGraph' };
   // Update URL hash (use friendly name for threats)
   var hashName = name === 'investigate' ? 'threats' : name;
   if (location.hash !== '#' + hashName) {
@@ -80,6 +80,7 @@ function showView(name) {
   if (name === 'intel') loadIntel();
   if (name === 'monthly') loadMonthly();
   if (name === 'responses') loadResponses();
+  if (name === 'fleet') loadFleet();
   // Graph tab was removed and stats moved to Health; the old loadGraph()
   // module is no longer bundled so we stop dispatching here too.
 }

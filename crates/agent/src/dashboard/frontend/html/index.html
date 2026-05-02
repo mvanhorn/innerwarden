@@ -59,6 +59,10 @@
       <button type="button" class="main-nav-btn" id="navResponses" onclick="showView('responses')" aria-label="Active responses">Responses</button>
       <button type="button" class="main-nav-btn" id="navStatus" onclick="showView('status')" aria-label="System health">Health</button>
       <button type="button" class="main-nav-btn" id="navIntel" onclick="showView('intel')" aria-label="Intelligence profiles">Intel</button>
+      <!-- Spec 038 Phase 3: Fleet tab. Hidden by default; fleet.js
+           probes `/api/fleet/hosts` at boot and shows this button
+           only when the backend reports fleet mode enabled. -->
+      <button type="button" class="main-nav-btn" id="navFleet" onclick="showView('fleet')" aria-label="MSSP fleet view" style="display:none">Fleet</button>
       <div class="nav-more-wrap">
         <button type="button" class="main-nav-btn" id="navMore" onclick="toggleMoreMenu()" aria-label="More views"><span id="moreLabel">More</span> &#9662;</button>
         <div class="nav-more-menu" id="moreMenu" style="display:none">
@@ -535,6 +539,23 @@
     </div>
   </div>
 
+  <!-- ── Fleet view (spec 038 Phase 3) ──
+       Hidden by default; navFleet button is unhidden by fleet.js
+       on boot when /api/fleet/hosts returns 200. The view contains
+       fleet-aggregate KPI tiles plus a per-host card grid. Each
+       card surfaces UP/DOWN/DEGRADED state, last-polled time,
+       and a slim KPI line so the operator can spot the noisy host
+       without drilling in. Drill-down navigation is Phase 4+. -->
+  <div class="report-view" id="viewFleet" style="display:none">
+    <div class="report-toolbar">
+      <button type="button" class="report-refresh-btn" onclick="loadFleet()">↻ Refresh</button>
+      <span id="fleetViewStatus" class="report-status"></span>
+    </div>
+    <div id="fleetContent" class="report-content" style="padding:16px;">
+      <p style="color:var(--dim);">Loading fleet…</p>
+    </div>
+  </div>
+
   <!-- Graph view removed — stats moved to Health, visual was unusable at scale -->
 
   <!-- Action toast (single, action confirmations) -->
@@ -560,6 +581,7 @@
 <script src="/js/intel.js"></script>
 <script src="/js/monthly.js"></script>
 <script src="/js/responses.js"></script>
+<script src="/js/fleet.js"></script>
 <script src="/js/actions.js"></script>
 <script src="/js/sse.js"></script>
 </body>

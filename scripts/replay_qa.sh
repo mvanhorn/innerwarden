@@ -174,8 +174,21 @@ echo "[replay] running agent once (AI stub + audit)"
 if [[ ! -s "$SUMMARY_FILE" ]]; then
   echo "[replay] daily summary missing after first pass; retrying agent once"
   # GitHub runners can release the sensor SQLite writer a moment later than
-  # the process exit is observed. A second one-shot pass keeps replay QA
-  # deterministic while still requiring the summary artifact below.
+  # the process exit is observed. The first pass sometimes finishes
+  # before all sensor-written events are visible to the agent's reader.
+  #
+  # The retry must re-read the same events: slow_loop advances the
+  # `events` cursor in `agent_cursors` after every read, so without
+  # resetting it the retry sees 0 new events and the
+  # `events_count > 0` gate in `narrative_daily_summary::maybe_write_*`
+  # blocks the summary write — the failure mode CI hit on PR #404.
+  #
+  # Resetting the cursor is safe because the agent uses a baseline
+  # to dedupe re-processed events; correctness is preserved while the
+  # summary write becomes deterministic.
+  if command -v sqlite3 > /dev/null 2>&1; then
+    sqlite3 "$SQLITE_DB" "DELETE FROM agent_cursors WHERE name = 'events';" 2>/dev/null || true
+  fi
   sleep 0.2
   "$AGENT_BIN" --data-dir "$DATA_DIR" --config "$AGENT_CFG" --once >> "$AGENT_LOG" 2>&1
 fi
