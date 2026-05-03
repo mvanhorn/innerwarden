@@ -1970,6 +1970,12 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                                     "baseline rate anomaly: {}",
                                     anomaly.description
                                 );
+                                // 2026-05-03: surface rate anomalies on the
+                                // dashboard's Baseline tab. observe_event-time
+                                // anomalies already record themselves; these
+                                // come from the periodic rate sweep so the
+                                // record happens here.
+                                state.baseline.record_anomaly(anomaly, None);
                             }
                             state.baseline.save(&cli.data_dir, state.sqlite_store.as_deref());
                         }

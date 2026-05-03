@@ -645,8 +645,15 @@ pub(super) struct DegradedSignals {
 /// Thresholds:
 /// - `STUCK_AGE_THRESHOLD_MS = 1h` (incidents older than this with
 ///   no decision count as stuck — see compute_overview_counts_*)
-/// - `AI_DOWN_THRESHOLD_SECS = 300` (5 minutes of no decision activity
-///   = AI is genuinely down)
+/// - `AI_DOWN_THRESHOLD_SECS = 1800` (30 minutes of no decision
+///   activity = AI is genuinely down). Bumped from 300s on
+///   2026-05-03 because the original 5-minute threshold tripped
+///   AiNotResponding on quiet systems where 30+ min between
+///   decisions is normal — operator sees a healthy AI flagged as
+///   "down" while incidents are streaming through. The new
+///   threshold is still aggressive enough to catch real outages
+///   (production typically has decisions every few minutes when
+///   incidents are arriving) but tolerates legitimate idle gaps.
 /// - `BACKED_UP_IN_FLIGHT_THRESHOLD = 50`
 pub(super) fn derive_system_health(
     pending: &super::types::PendingBreakdown,
@@ -654,7 +661,7 @@ pub(super) fn derive_system_health(
     degraded: &DegradedSignals,
 ) -> super::types::SystemHealth {
     use super::types::SystemHealth;
-    const AI_DOWN_THRESHOLD_SECS: i64 = 300;
+    const AI_DOWN_THRESHOLD_SECS: i64 = 1800;
     const BACKED_UP_IN_FLIGHT_THRESHOLD: usize = 50;
 
     let ai_is_down_now = match last_decision_secs_ago {
@@ -3136,18 +3143,71 @@ mod tests {
         // mask it. The headline operator sees is the most acute
         // failure mode; chronic drift can wait until the immediate
         // emergency is handled.
+        //
+        // 2026-05-03: AI_DOWN_THRESHOLD_SECS bumped from 300 to 1800
+        // (30 min). Use Some(2400) here so the test exercises the
+        // "AI genuinely silent for over half an hour" path.
         let mut pending = fresh_pending();
         pending.stuck = 5;
         let degraded = super::DegradedSignals {
             orphaned_total: 17,
             revert_failures_total: 111,
         };
-        let h = super::derive_system_health(&pending, Some(600), &degraded);
+        let h = super::derive_system_health(&pending, Some(2400), &degraded);
         match h {
             SystemHealth::AiNotResponding { stuck_count, .. } => {
                 assert_eq!(stuck_count, 5);
             }
             other => panic!("expected AiNotResponding to take priority, got {other:?}"),
+        }
+    }
+
+    // 2026-05-03 anchor: the 5-minute AI_DOWN_THRESHOLD was tripping
+    // AiNotResponding on quiet systems where 5-30 min between decisions
+    // is normal. Operator screenshot 2026-05-03 had 6 incidents
+    // in-flight, last decision 5 min ago, AI clearly working — but the
+    // header rendered "AI NOT RESPONDING" because of a strict `>300s`
+    // boundary check at exactly the 5-min boundary. This test pins the
+    // new contract: with stuck>0 AND a recent (<30 min) decision, the
+    // verb is AbandonedBacklog (yellow), not AiNotResponding (red).
+    #[test]
+    fn recent_decision_with_stuck_incidents_is_yellow_not_red() {
+        let mut pending = fresh_pending();
+        pending.stuck = 2;
+        let degraded = super::DegradedSignals::default();
+        // Last decision 5 minutes ago — well under the 30-min "AI
+        // genuinely down" threshold. With stuck>0 the verb is
+        // AbandonedBacklog (yellow soft signal), NOT AiNotResponding.
+        let h = super::derive_system_health(&pending, Some(300), &degraded);
+        match h {
+            SystemHealth::AbandonedBacklog { stuck_count, .. } => {
+                assert_eq!(stuck_count, 2);
+            }
+            other => panic!(
+                "5-min-ago decision with 2 stuck incidents must be \
+                 AbandonedBacklog (yellow). Got: {other:?}. If this \
+                 fails, the AI_DOWN_THRESHOLD_SECS regressed below 300s."
+            ),
+        }
+    }
+
+    #[test]
+    fn truly_silent_ai_with_stuck_incidents_is_red() {
+        // Same setup as above but last decision is 35 min ago — over
+        // the 30-min threshold. NOW it's genuinely AiNotResponding.
+        let mut pending = fresh_pending();
+        pending.stuck = 2;
+        let degraded = super::DegradedSignals::default();
+        let h = super::derive_system_health(&pending, Some(2100), &degraded);
+        match h {
+            SystemHealth::AiNotResponding { stuck_count, .. } => {
+                assert_eq!(stuck_count, 2);
+            }
+            other => panic!(
+                "35-min-ago decision with 2 stuck incidents MUST be \
+                 AiNotResponding (red) — that is the genuine AI-down \
+                 signal we want to catch. Got: {other:?}"
+            ),
         }
     }
 

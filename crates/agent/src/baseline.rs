@@ -77,7 +77,40 @@ pub struct BaselineStore {
 
     /// Total observations (for stats).
     total_observations: u64,
+
+    /// 2026-05-03: ring buffer of the most recent anomalies detected,
+    /// surfaced to the dashboard's Baseline tab so the operator can
+    /// see "what changed in the last 24h" instead of just "what does
+    /// the agent consider normal". Bounded so the buffer never grows
+    /// unbounded and persistence stays cheap. Cleared entries past
+    /// the cap drop oldest-first.
+    #[serde(default)]
+    pub recent_anomalies: std::collections::VecDeque<TimedAnomaly>,
 }
+
+/// An anomaly stamped with the wall-clock time it fired. Kept
+/// separate from `AnomalyReport` so the in-memory detection path
+/// stays cheap (no timestamp until the report is being persisted
+/// for the dashboard).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimedAnomaly {
+    pub ts: chrono::DateTime<Utc>,
+    pub anomaly_type: AnomalyType,
+    pub description: String,
+    pub expected: String,
+    pub observed: String,
+    pub severity: Severity,
+    /// Optional subject (user, process, IP) extracted from the
+    /// anomaly source so the dashboard can render an actionable
+    /// link directly to the relevant journey.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+}
+
+/// Maximum recent anomalies kept in memory and persisted. Sized to
+/// give the operator a 24-48h window of context without bloating
+/// `baseline.json`.
+const MAX_RECENT_ANOMALIES: usize = 50;
 
 /// An anomaly detected by the baseline engine.
 #[derive(Debug, Clone, Serialize)]
@@ -90,7 +123,7 @@ pub struct AnomalyReport {
     pub severity: Severity,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnomalyType {
     /// Event rate dropped significantly vs baseline.
@@ -117,6 +150,7 @@ impl BaselineStore {
             process_lineages: HashSet::new(),
             user_login_hours: HashMap::new(),
             process_destinations: HashMap::new(),
+            recent_anomalies: std::collections::VecDeque::new(),
             mature: false,
             training_days: 0,
             observed_dates: HashSet::new(),
@@ -142,6 +176,39 @@ impl BaselineStore {
     #[allow(dead_code)]
     pub fn total_observations(&self) -> u64 {
         self.total_observations
+    }
+
+    /// 2026-05-03: append an anomaly to the ring buffer that the
+    /// dashboard's Baseline tab consumes. Bounded to MAX_RECENT_ANOMALIES;
+    /// drops oldest first. Each entry is timestamped at insertion so
+    /// the UI can display "what changed in the last 24h" without
+    /// re-deriving from logs.
+    pub fn record_anomaly(&mut self, anomaly: &AnomalyReport, subject: Option<String>) {
+        let timed = TimedAnomaly {
+            ts: chrono::Utc::now(),
+            anomaly_type: anomaly.anomaly_type.clone(),
+            description: anomaly.description.clone(),
+            expected: anomaly.expected.clone(),
+            observed: anomaly.observed.clone(),
+            severity: anomaly.severity.clone(),
+            subject,
+        };
+        self.recent_anomalies.push_back(timed);
+        while self.recent_anomalies.len() > MAX_RECENT_ANOMALIES {
+            self.recent_anomalies.pop_front();
+        }
+    }
+
+    /// 2026-05-03: how many anomalies fired in the last `secs` seconds.
+    /// Used by the dashboard hero card to render "X different
+    /// patterns nas últimas 24h".
+    #[allow(dead_code)]
+    pub fn anomalies_within(&self, secs: i64) -> usize {
+        let cutoff = chrono::Utc::now() - chrono::Duration::seconds(secs);
+        self.recent_anomalies
+            .iter()
+            .filter(|a| a.ts > cutoff)
+            .count()
     }
 
     /// Observe an event to update baselines (always) and check for anomalies
@@ -695,5 +762,178 @@ mod tests {
             anomalies[0].anomaly_type,
             AnomalyType::EventRateSpike
         ));
+    }
+
+    // ── recent_anomalies ring buffer (PR #414 / Baseline redesign) ──
+    //
+    // The dashboard's Baseline tab consumes recent_anomalies to render
+    // deviation cards. Buffer is bounded so the JSON payload + RAM
+    // stay tiny. These tests pin the contract: append-on-call, drop
+    // oldest first when over cap, count-by-window predicate.
+
+    fn dummy_anomaly(severity: Severity) -> AnomalyReport {
+        AnomalyReport {
+            anomaly_type: AnomalyType::UserLoginTime,
+            description: "user logged at 3am".to_string(),
+            expected: "9-18h".to_string(),
+            observed: "03:47".to_string(),
+            confidence: 0.9,
+            severity,
+        }
+    }
+
+    #[test]
+    fn record_anomaly_appends_to_recent_buffer() {
+        let mut store = BaselineStore::new();
+        assert_eq!(store.recent_anomalies.len(), 0);
+        store.record_anomaly(&dummy_anomaly(Severity::Medium), Some("ubuntu".to_string()));
+        assert_eq!(store.recent_anomalies.len(), 1);
+        let a = &store.recent_anomalies[0];
+        assert_eq!(a.subject.as_deref(), Some("ubuntu"));
+        assert!(matches!(a.severity, Severity::Medium));
+        assert!(matches!(a.anomaly_type, AnomalyType::UserLoginTime));
+    }
+
+    #[test]
+    fn record_anomaly_caps_at_max_recent_anomalies() {
+        let mut store = BaselineStore::new();
+        // Push more than the cap. Cap value is intentionally not
+        // imported here so the test enforces the *behaviour*
+        // ("bounded buffer") even if the constant changes.
+        for i in 0..(MAX_RECENT_ANOMALIES + 25) {
+            store.record_anomaly(&dummy_anomaly(Severity::Low), Some(format!("subj-{i}")));
+        }
+        assert_eq!(
+            store.recent_anomalies.len(),
+            MAX_RECENT_ANOMALIES,
+            "buffer must not exceed cap"
+        );
+        // Oldest entries dropped first: subject of first remaining
+        // entry is the (cap)-th push (0-indexed: subj-25).
+        let first = store.recent_anomalies.front().unwrap();
+        assert_eq!(first.subject.as_deref(), Some("subj-25"));
+    }
+
+    #[test]
+    fn record_anomaly_preserves_insertion_order() {
+        let mut store = BaselineStore::new();
+        store.record_anomaly(&dummy_anomaly(Severity::Low), Some("a".to_string()));
+        store.record_anomaly(&dummy_anomaly(Severity::Medium), Some("b".to_string()));
+        store.record_anomaly(&dummy_anomaly(Severity::High), Some("c".to_string()));
+        let subjects: Vec<_> = store
+            .recent_anomalies
+            .iter()
+            .map(|a| a.subject.as_deref().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(subjects, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn record_anomaly_accepts_none_subject() {
+        let mut store = BaselineStore::new();
+        store.record_anomaly(&dummy_anomaly(Severity::Low), None);
+        assert_eq!(store.recent_anomalies.len(), 1);
+        assert!(store.recent_anomalies[0].subject.is_none());
+    }
+
+    #[test]
+    fn anomalies_within_filters_by_time_window() {
+        let mut store = BaselineStore::new();
+        // Push three anomalies, then manually backdate two of them
+        // to test the time-window filter.
+        for s in ["a", "b", "c"] {
+            store.record_anomaly(&dummy_anomaly(Severity::Low), Some(s.to_string()));
+        }
+        // Backdate first two: 'a' = 25h ago, 'b' = 10 min ago, 'c' = now.
+        store.recent_anomalies[0].ts = Utc::now() - chrono::Duration::hours(25);
+        store.recent_anomalies[1].ts = Utc::now() - chrono::Duration::minutes(10);
+        // last 1h window catches only 'b' and 'c'.
+        assert_eq!(store.anomalies_within(3600), 2);
+        // last 24h window catches 'b' and 'c' but not 'a'.
+        assert_eq!(store.anomalies_within(24 * 3600), 2);
+        // last 30 days catches all three.
+        assert_eq!(store.anomalies_within(30 * 24 * 3600), 3);
+        // Window of 0 catches nothing.
+        assert_eq!(store.anomalies_within(0), 0);
+    }
+
+    #[test]
+    fn anomalies_within_returns_zero_on_empty_buffer() {
+        let store = BaselineStore::new();
+        assert_eq!(store.anomalies_within(24 * 3600), 0);
+    }
+
+    #[test]
+    fn timed_anomaly_serializes_with_subject_field() {
+        // The JSON schema is consumed by the dashboard's Baseline
+        // tab. Pin the wire shape so a future struct refactor that
+        // renames a field is caught at build time, not at the
+        // dashboard layer.
+        let mut store = BaselineStore::new();
+        store.record_anomaly(
+            &dummy_anomaly(Severity::Critical),
+            Some("203.0.113.7".to_string()),
+        );
+        let json = serde_json::to_value(&store.recent_anomalies).unwrap();
+        let arr = json.as_array().unwrap();
+        let entry = &arr[0];
+        for field in [
+            "ts",
+            "anomaly_type",
+            "description",
+            "expected",
+            "observed",
+            "severity",
+            "subject",
+        ] {
+            assert!(
+                entry.get(field).is_some(),
+                "TimedAnomaly serialization must include `{field}` for the dashboard"
+            );
+        }
+        assert_eq!(entry["subject"].as_str(), Some("203.0.113.7"));
+    }
+
+    #[test]
+    fn timed_anomaly_omits_subject_when_none() {
+        // `skip_serializing_if = "Option::is_none"` keeps the JSON
+        // payload tight. Dashboard handles missing field gracefully.
+        let mut store = BaselineStore::new();
+        store.record_anomaly(&dummy_anomaly(Severity::Low), None);
+        let json = serde_json::to_value(&store.recent_anomalies).unwrap();
+        let entry = &json.as_array().unwrap()[0];
+        assert!(
+            entry.get("subject").is_none(),
+            "subject field must be skipped when None — keeps JSON tight"
+        );
+    }
+
+    #[test]
+    fn baseline_store_serializes_recent_anomalies_with_default_empty() {
+        // Default `recent_anomalies` deserialization is exercised by
+        // load() of pre-PR-#414 baseline.json files. Round-trip a
+        // store with NO recent_anomalies and verify it deserializes
+        // as an empty buffer (back-compat anchor).
+        let mut store = BaselineStore::new();
+        store.record_anomaly(&dummy_anomaly(Severity::Medium), Some("u".to_string()));
+        let json = serde_json::to_string(&store).unwrap();
+        let restored: BaselineStore = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.recent_anomalies.len(), 1);
+        // Pre-PR-#414 baselines lack the field entirely; serde
+        // `default` populates an empty deque.
+        let legacy_json = r#"{
+            "event_rate_by_hour": {},
+            "process_lineages": [],
+            "user_login_hours": {},
+            "process_destinations": {},
+            "mature": false,
+            "training_days": 0,
+            "observed_dates": [],
+            "current_hour_counts": {},
+            "current_hour": 0,
+            "total_observations": 0
+        }"#;
+        let legacy: BaselineStore = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(legacy.recent_anomalies.len(), 0);
     }
 }

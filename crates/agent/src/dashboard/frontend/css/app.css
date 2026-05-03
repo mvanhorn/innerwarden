@@ -2353,3 +2353,126 @@
       font-size:0.68rem;
       padding-left:2px;
     }
+
+    /* ── Baseline tab redesign (2026-05-03) ───────────────────────
+       Three-level UX: hero card answers "is everything normal?";
+       deviation cards explain "if not, what changed?"; learned
+       baseline (collapsed) shows "what does the agent consider
+       normal here?". Heatmap + sparkline replace the long tables
+       that the previous layout produced. */
+    .baseline-hero {
+      display: flex; align-items: center; gap: 14px;
+      padding: 16px 18px; border-radius: 10px;
+      border: 1px solid var(--border); margin-bottom: 16px;
+      background: var(--card-bg);
+    }
+    .baseline-hero-normal { border-color: rgba(74,222,128,0.35); background: rgba(74,222,128,0.06); }
+    .baseline-hero-deviation { border-color: rgba(251,191,36,0.4); background: rgba(251,191,36,0.06); }
+    .baseline-hero-learning { border-color: rgba(96,165,250,0.4); background: rgba(96,165,250,0.06); }
+    .baseline-hero-icon { font-size: 1.8rem; line-height: 1; }
+    .baseline-hero-body { flex: 1; }
+    .baseline-hero-title { font-weight: 700; font-size: 1rem; color: var(--text); }
+    .baseline-hero-sub { font-size: 0.85rem; color: var(--dim); margin-top: 4px; line-height: 1.5; }
+
+    .baseline-section-title {
+      margin: 18px 0 10px; font-size: 0.78rem;
+      color: var(--accent); letter-spacing: 0.05em;
+      text-transform: uppercase; font-weight: 700;
+    }
+    .baseline-deviations { display: flex; flex-direction: column; gap: 8px; }
+    .baseline-deviation-card {
+      padding: 12px 14px; border-radius: 8px;
+      border: 1px solid var(--border); background: var(--card-bg);
+    }
+    .baseline-deviation-card:hover { border-color: rgba(127,231,255,0.3); }
+    .baseline-empty-deviations {
+      padding: 14px; border-radius: 8px; text-align: center;
+      background: rgba(74,222,128,0.04); color: var(--dim);
+      font-size: 0.85rem; border: 1px dashed rgba(74,222,128,0.2);
+      margin-bottom: 12px;
+    }
+
+    .baseline-learned {
+      margin-top: 18px; border: 1px solid var(--border);
+      border-radius: 8px; background: rgba(255,255,255,0.01);
+    }
+    .baseline-learned-summary {
+      padding: 12px 14px; cursor: pointer;
+      list-style: none; display: flex;
+      justify-content: space-between; align-items: center; gap: 12px;
+      font-weight: 600; font-size: 0.88rem; color: var(--text);
+    }
+    .baseline-learned-summary::-webkit-details-marker { display: none; }
+    .baseline-learned-summary::before {
+      content: "▸"; color: var(--dim); margin-right: 6px;
+      transition: transform 0.15s;
+    }
+    .baseline-learned[open] .baseline-learned-summary::before {
+      transform: rotate(90deg); display: inline-block;
+    }
+    .baseline-learned-meta {
+      font-weight: 400; font-size: 0.72rem;
+      color: var(--dim); flex-shrink: 0;
+    }
+    .baseline-learned-body {
+      padding: 14px; border-top: 1px solid var(--border);
+    }
+    .baseline-subtitle {
+      margin: 14px 0 6px; font-size: 0.85rem;
+      font-weight: 600; color: var(--text);
+    }
+
+    .baseline-sparkline { margin-bottom: 12px; }
+    .baseline-sparkline-label { font-size: 0.78rem; color: var(--dim); margin-bottom: 6px; }
+    .baseline-sparkline-bars {
+      display: flex; align-items: flex-end; gap: 2px; height: 40px;
+    }
+    .sparkline-bar {
+      flex: 1; min-width: 8px;
+      background: linear-gradient(180deg, var(--accent), rgba(127,231,255,0.3));
+      border-radius: 2px 2px 0 0;
+    }
+    .baseline-sparkline-axis {
+      display: flex; justify-content: space-between;
+      font-size: 0.65rem; color: var(--dim); margin-top: 4px;
+    }
+
+    .login-heatmap {
+      display: flex; flex-direction: column; gap: 4px;
+      margin-bottom: 12px; max-width: 720px;
+    }
+    .login-heatmap-axis {
+      display: flex; justify-content: space-between;
+      font-size: 0.65rem; color: var(--dim);
+      padding-left: 110px; padding-right: 4px;
+    }
+    .login-heatmap-row {
+      display: flex; align-items: center; gap: 8px;
+    }
+    .login-heatmap-user {
+      width: 100px; font-family: monospace;
+      font-size: 0.78rem; color: var(--text);
+      text-align: right; flex-shrink: 0;
+    }
+    .login-heatmap-cells {
+      display: grid;
+      grid-template-columns: repeat(24, 1fr);
+      gap: 1px; flex: 1;
+    }
+    .login-cell {
+      height: 14px; background: rgba(255,255,255,0.04);
+      border-radius: 1px;
+    }
+    .login-cell-active { background: rgba(127,231,255,0.7); }
+
+    .baseline-dest-list {
+      list-style: none; padding: 0; margin: 0;
+      display: flex; flex-direction: column; gap: 4px;
+      font-size: 0.85rem;
+    }
+    .baseline-dest-list li code {
+      background: rgba(127,231,255,0.08);
+      padding: 1px 6px; border-radius: 3px;
+      font-size: 0.78rem;
+    }
+

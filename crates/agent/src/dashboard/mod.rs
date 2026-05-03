@@ -3478,6 +3478,66 @@ mod tests {
     }
 
     #[test]
+    fn baseline_tab_renders_three_level_ux() {
+        // 2026-05-03 redesign: operator complaint was that the
+        // Baseline tab dumped raw learned state in long tables with
+        // SOC vocabulary nobody understood. The redesign answers
+        // three questions in order via three UX levels:
+        //   1. Hero card: "is everything normal right now?"
+        //   2. Deviation cards: "if not, what changed in the last 24h?"
+        //   3. Collapsed learned-baseline section: "what does the
+        //      agent consider normal here?" (heatmap + sparkline)
+        // This anchor pins the structure so a future refactor that
+        // collapses back to a flat table fails CI.
+
+        // Level 1: hero card builder + status keywords.
+        assert!(
+            JS_INTEL.contains("function baselineHeroCard"),
+            "intel.js must define baselineHeroCard — the operator's \
+             1-line answer to 'is everything normal?'"
+        );
+        assert!(JS_INTEL.contains("Aprendendo o normal deste servidor"));
+        assert!(JS_INTEL.contains("Algo diferente"));
+        assert!(JS_INTEL.contains("baseline-hero-normal"));
+        assert!(JS_INTEL.contains("baseline-hero-deviation"));
+        assert!(JS_INTEL.contains("baseline-hero-learning"));
+
+        // Level 2: friendly anomaly labels, NOT raw enum values, for
+        // each anomaly_type the backend can emit.
+        assert!(JS_INTEL.contains("BASELINE_ANOMALY_LABELS"));
+        for kind in [
+            "event_rate_drop",
+            "event_rate_spike",
+            "process_lineage",
+            "user_login_time",
+            "new_destination",
+        ] {
+            assert!(
+                JS_INTEL.contains(kind),
+                "BASELINE_ANOMALY_LABELS must cover anomaly type `{kind}` \
+                 — without it that anomaly renders as the generic fallback"
+            );
+        }
+        assert!(
+            JS_INTEL.contains("function baselineCardForAnomaly"),
+            "intel.js must build deviation cards via a dedicated helper \
+             so each card carries icon + headline + explainer + why-string"
+        );
+
+        // Level 3: collapsed learned-baseline section, heatmap, sparkline.
+        assert!(JS_INTEL.contains("baseline-learned"));
+        assert!(JS_INTEL.contains("function loginHeatmap"));
+        assert!(JS_INTEL.contains("function eventRateAggregateSparkline"));
+        // Heatmap is grid-based (24 columns) — not a table.
+        assert!(APP_CSS.contains(".login-heatmap-cells"));
+        assert!(APP_CSS.contains("repeat(24, 1fr)"));
+        // Hero variants and deviation card style exist in CSS.
+        assert!(APP_CSS.contains(".baseline-hero-normal"));
+        assert!(APP_CSS.contains(".baseline-deviation-card"));
+        assert!(APP_CSS.contains(".baseline-sparkline"));
+    }
+
+    #[test]
     fn dashboard_audit_2026_05_02_small_fixes_are_wired() {
         // 2026-05-02 audit (P2/P7/P8 + frozen graph): five small wiring
         // fixes bundled in PR #407. This anchor pins them so a future

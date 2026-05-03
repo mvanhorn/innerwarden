@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
+use innerwarden_core::entities::EntityType;
 use tracing::{info, warn};
 
 use crate::{
@@ -336,6 +337,45 @@ fn update_narrative_accumulator(
 ///
 /// Returns `()` (infallible). Called once per 60s tick from the
 /// snapshot block, never in a hot loop, so the warn is not a
+/// 2026-05-03: extract a useful "subject" from an event for the
+/// Baseline tab's anomaly cards. Priority: User entity → IP entity →
+/// `details.comm` (process name). The subject becomes the actionable
+/// link the operator clicks to pivot into Threats. Returns None when
+/// the event has no recognisable subject — the dashboard falls back
+/// to an unsubject'd card.
+///
+/// Pulled out of `process_narrative_tick` as a standalone helper so
+/// it can be unit-tested without setting up the full slow_loop
+/// fixture; the tick path simply calls this on every event with
+/// detected anomalies.
+fn extract_anomaly_subject(
+    entities: &[innerwarden_core::entities::EntityRef],
+    event: &innerwarden_core::event::Event,
+) -> Option<String> {
+    // Strict priority User > IP > comm — User is the most actionable
+    // pivot for the operator (named identity rather than network
+    // endpoint). Two scans rather than one `find` so the ordering
+    // does not depend on the entities[] insertion order at the call
+    // site.
+    entities
+        .iter()
+        .find(|e| matches!(e.r#type, EntityType::User))
+        .map(|e| e.value.clone())
+        .or_else(|| {
+            entities
+                .iter()
+                .find(|e| matches!(e.r#type, EntityType::Ip))
+                .map(|e| e.value.clone())
+        })
+        .or_else(|| {
+            event
+                .details
+                .get("comm")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+}
+
 /// log-spam vector.
 fn write_graph_stats_or_warn(data_dir: &Path, json: &[u8]) {
     let path = data_dir.join("graph-stats.json");
@@ -768,12 +808,24 @@ pub(crate) async fn process_narrative_tick(
         if !anomalies.is_empty() {
             state.last_baseline_anomaly_ts = Some(chrono::Utc::now());
         }
+        // Pull a subject (user / IP / process comm) out of the event
+        // entities so the dashboard can render an actionable link
+        // when this anomaly is shown to the operator. Best-effort —
+        // None when the event has no obviously named subject.
+        let anomaly_subject: Option<String> = extract_anomaly_subject(&ev_entities, ev);
         for anomaly in &anomalies {
             info!(
                 anomaly_type = ?anomaly.anomaly_type,
                 description = %anomaly.description,
                 "baseline anomaly detected"
             );
+
+            // 2026-05-03: persist a stamped copy of the anomaly so
+            // the Baseline dashboard tab can show "what changed in
+            // the last 24h" without re-walking the journald stream.
+            state
+                .baseline
+                .record_anomaly(anomaly, anomaly_subject.clone());
 
             // Inject baseline anomalies into correlation engine.
             let kind = match anomaly.anomaly_type {
@@ -1257,6 +1309,99 @@ mod tests {
     use crate::knowledge_graph::types::Node;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    // ── extract_anomaly_subject (PR #414 / Baseline redesign) ───────
+    //
+    // The dashboard's Baseline tab shows anomaly cards with an
+    // "Investigar <subject> →" button. The subject is whatever
+    // operator-actionable string we can pull out of the event:
+    // user > IP > process comm. None when the event has no
+    // recognisable subject (the card renders without the action).
+
+    fn make_event(details: serde_json::Value) -> innerwarden_core::event::Event {
+        innerwarden_core::event::Event {
+            ts: chrono::Utc::now(),
+            host: "h".to_string(),
+            source: "test".to_string(),
+            kind: "k".to_string(),
+            severity: innerwarden_core::event::Severity::Info,
+            summary: String::new(),
+            details,
+            tags: vec![],
+            entities: vec![],
+        }
+    }
+
+    fn entity(t: EntityType, v: &str) -> innerwarden_core::entities::EntityRef {
+        innerwarden_core::entities::EntityRef {
+            r#type: t,
+            value: v.to_string(),
+        }
+    }
+
+    #[test]
+    fn extract_anomaly_subject_prefers_user_entity_over_ip() {
+        // Both User and Ip present — User wins because it is the more
+        // identifiable subject for an operator pivot.
+        let entities = vec![
+            entity(EntityType::Ip, "203.0.113.5"),
+            entity(EntityType::User, "ubuntu"),
+        ];
+        let ev = make_event(serde_json::json!({"comm": "sshd"}));
+        assert_eq!(
+            extract_anomaly_subject(&entities, &ev),
+            Some("ubuntu".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_anomaly_subject_uses_ip_when_no_user() {
+        let entities = vec![entity(EntityType::Ip, "198.51.100.7")];
+        let ev = make_event(serde_json::json!({"comm": "ssh"}));
+        assert_eq!(
+            extract_anomaly_subject(&entities, &ev),
+            Some("198.51.100.7".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_anomaly_subject_falls_back_to_comm_when_no_user_or_ip() {
+        // No User, no Ip — fallback to process comm.
+        let entities = vec![entity(EntityType::Container, "web-1")];
+        let ev = make_event(serde_json::json!({"comm": "python3"}));
+        assert_eq!(
+            extract_anomaly_subject(&entities, &ev),
+            Some("python3".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_anomaly_subject_returns_none_when_nothing_actionable() {
+        // No User, no Ip, no comm in details — anomaly card renders
+        // without the Investigar button. Dashboard handles None gracefully.
+        let entities = vec![entity(EntityType::Container, "web-1")];
+        let ev = make_event(serde_json::json!({"other": "field"}));
+        assert_eq!(extract_anomaly_subject(&entities, &ev), None);
+    }
+
+    #[test]
+    fn extract_anomaly_subject_handles_empty_entities() {
+        // Empty entity list — only `details.comm` matters.
+        let ev = make_event(serde_json::json!({"comm": "bash"}));
+        assert_eq!(extract_anomaly_subject(&[], &ev), Some("bash".to_string()));
+    }
+
+    #[test]
+    fn extract_anomaly_subject_skips_non_user_non_ip_entities() {
+        // Container / Service / Path entities should not become the
+        // subject — only User and Ip are pivotable in the dashboard.
+        let entities = vec![
+            entity(EntityType::Container, "web-1"),
+            entity(EntityType::Service, "nginx.service"),
+        ];
+        let ev = make_event(serde_json::json!({})); // no comm either
+        assert_eq!(extract_anomaly_subject(&entities, &ev), None);
+    }
 
     #[test]
     fn operator_ips_from_who_output_filters_and_strips_parentheses() {
