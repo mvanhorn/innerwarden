@@ -112,12 +112,24 @@ pub(crate) async fn execute_block_ip_decision(
 
     // Layer 1: XDP wire-speed drop (if available).
     // Prefer shield's XdpManager (unified blocklist) over standalone skill.
-    let xdp_blocked = if let Some(ref mut shield) = state.shield_state {
+    //
+    // 2026-05-03 (Wave 5b PR-2): both XDP attempts are gated by
+    // `xdp_availability::should_attempt_xdp`. After one observed
+    // failure the gate skips XDP for `RECHECK_INTERVAL_SECS` (5 min)
+    // and emits exactly one operator-actionable WARN with the
+    // recovery recipe. Without the gate, prod was emitting two WARN
+    // lines per block decision while bpffs was unmounted, drowning
+    // out real warnings.
+    let xdp_should_try = crate::xdp_availability::should_attempt_xdp();
+    let xdp_blocked = if !xdp_should_try {
+        false
+    } else if let Some(ref mut shield) = state.shield_state {
         let reason = format!("agent:block:{}", incident.incident_id);
         match shield.xdp.add_to_blocklist(ip, &reason) {
             Ok(()) => {
                 layers_applied.push("XDP");
                 any_success = true;
+                crate::xdp_availability::mark_succeeded();
                 // Spec 037 PR-1: runtime first (immediate protection),
                 // persist second (SQLite canonical for warm-cache on
                 // restart). `set_xdp_block_time` already swallows
@@ -134,20 +146,22 @@ pub(crate) async fn execute_block_ip_decision(
                 true
             }
             Err(e) => {
-                warn!(ip, error = %e, "shield XDP blocklist add failed, falling back to skill");
+                crate::xdp_availability::mark_failed("shield xdp_manager", &format!("{e}"));
                 false
             }
         }
     } else {
         false
     };
-    // Fallback: use standalone XDP skill if shield is not active.
-    if !xdp_blocked {
+    // Fallback: use standalone XDP skill if shield is not active AND
+    // the gate still allows attempts.
+    if !xdp_blocked && xdp_should_try {
         if let Some(xdp_skill) = state.skill_registry.get("block-ip-xdp") {
             let xdp_result = xdp_skill.execute(&ctx, cfg.responder.dry_run).await;
             if xdp_result.success {
                 layers_applied.push("XDP");
                 any_success = true;
+                crate::xdp_availability::mark_succeeded();
                 // Spec 037 PR-1: same ordering as the shield path —
                 // runtime first, persist second with swallowed errors.
                 let blocked_at = chrono::Utc::now();
@@ -157,6 +171,11 @@ pub(crate) async fn execute_block_ip_decision(
                 state
                     .store
                     .set_xdp_block_time(ip, blocked_at, block_ttl_secs);
+            } else {
+                // Standalone skill carries its own message string; pass
+                // it through to the gate so the (rate-limited) WARN
+                // names the failure surface.
+                crate::xdp_availability::mark_failed("block-ip-xdp skill", &xdp_result.message);
             }
         }
     }

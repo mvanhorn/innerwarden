@@ -111,13 +111,19 @@ impl ResponseSkill for BlockIpXdp {
                 };
             }
 
-            // Check if pinned map exists
+            // Check if pinned map exists.
+            //
+            // 2026-05-03 (Wave 5b PR-2): no per-call WARN here. The
+            // `xdp_availability` gate in `decision_block_ip` is the
+            // canonical surface for XDP-unavailable warnings; it
+            // emits one operator-actionable WARN per 5 min with the
+            // recovery recipe. Logging here AS WELL would re-create
+            // the spam this PR fixes (operator's prod was producing
+            // two WARN lines per block decision, one from each path).
+            // The skill still returns success=false so the caller
+            // can call `xdp_availability::mark_failed` and gate
+            // future attempts.
             if !std::path::Path::new(map_pin).exists() {
-                warn!(
-                    ip,
-                    map = map_pin,
-                    "XDP blocklist map not found - XDP firewall not loaded"
-                );
                 return SkillResult {
                     success: false,
                     message: format!(
