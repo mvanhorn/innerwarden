@@ -1572,6 +1572,41 @@ impl ResponseLifecycle {
         (n_active, n_pending, n_failed)
     }
 
+    /// PR #425 Wave 4d: count *current* orphans, not the cumulative counter.
+    ///
+    /// `total_orphaned` is monotonic — it never decreases, by design (audit
+    /// trail / Prometheus counter convention). Until 2026-05-03 the dashboard
+    /// banner read this as if it were a gauge, displaying "17 orphaned
+    /// responses (rule may still be active)" months after the actual entries
+    /// had been GC'd, which gaslit the operator into looking for ghost rules.
+    ///
+    /// "Current orphans" = sum of two buckets:
+    ///
+    /// 1. `history` entries whose `reason` starts with `orphaned:` — the
+    ///    operator-visible, still-pending audit gap. PR #408's GC sweep
+    ///    eventually prunes these (default 7-day retention) but they remain
+    ///    visible during the diagnostic window.
+    /// 2. `active` entries with `state.kind == revert_failed` — defense in
+    ///    depth. The lifecycle is *supposed* to move retried-failed entries
+    ///    out of `active`, but if the move ever races a snapshot save, the
+    ///    operator-visible count still reflects reality.
+    ///
+    /// Returns 0 on a healthy system. Any non-zero value is the right number
+    /// for the banner to scream about, never the lifetime counter.
+    pub fn current_orphan_count(&self) -> usize {
+        let in_history = self
+            .history
+            .iter()
+            .filter(|r| r.reason.starts_with("orphaned:"))
+            .count();
+        let in_active = self
+            .active
+            .iter()
+            .filter(|r| matches!(r.state, LifecycleState::RevertFailed { .. }))
+            .count();
+        in_history + in_active
+    }
+
     /// Serialize active responses as JSON (for /api/responses).
     /// Canonical persistence snapshot (v2). Distinct from `to_json()`,
     /// which is the dashboard view. `to_json()` reverses history for
@@ -1673,7 +1708,14 @@ impl ResponseLifecycle {
             .collect();
 
         let (n_active, n_pending, n_failed) = self.state_counts();
+        let orphans_now = self.current_orphan_count();
 
+        // PR #425 Wave 4d: explicit gauge / counter separation in the JSON
+        // shape. Frontend reads `gauges.*` for "right now" displays
+        // (banner, KPI grid current-state cards, sub-header) and reads
+        // `totals.*` only when the operator is explicitly looking at
+        // lifetime numbers. Pre-Wave-4d the dashboard read `totals.orphaned`
+        // for the banner, which lied because counters never decrement.
         serde_json::json!({
             "active": active,
             "active_count": self.active.len(),
@@ -1681,6 +1723,12 @@ impl ResponseLifecycle {
                 "active": n_active,
                 "revert_pending": n_pending,
                 "revert_failed": n_failed,
+            },
+            "gauges": {
+                "active": self.active.len(),
+                "in_retry": n_failed,
+                "pending": n_pending,
+                "orphaned": orphans_now,
             },
             "history": history,
             "totals": {
@@ -3451,5 +3499,92 @@ mod tests {
         // Don't create the file at all.
         let loaded = read_orphan_resolutions(dir.path());
         assert!(loaded.is_empty());
+    }
+
+    // ─── PR #425 Wave 4d — current_orphan_count + gauges shape ───
+    //
+    // Real prod observation 2026-05-03: dashboard banner showed
+    // "17 orphaned (rule may still be active)" but the JSON had zero
+    // entries with reason="orphaned:" and zero active in revert_failed.
+    // Mechanism: `total_orphaned` is a monotonic counter, never
+    // decrements after PR #408's GC pruned the entries. Banner read
+    // it as a gauge.
+    //
+    // These tests pin the new contract: `current_orphan_count()`
+    // returns 0 when no entries actually exist, regardless of
+    // `total_orphaned`. `to_json()` exposes both shapes — `gauges.*`
+    // for the banner / now-display, `totals.*` for lifetime counters.
+
+    #[test]
+    fn current_orphan_count_returns_zero_on_clean_system() {
+        let mut lc = ResponseLifecycle::new();
+        // Simulate a system that had orphans in the past (counter
+        // bumped) but GC pruned them all. `total_orphaned` is high,
+        // current count must be zero.
+        lc.total_orphaned = 17;
+        assert_eq!(
+            lc.current_orphan_count(),
+            0,
+            "current count must reflect actual entries, not the lifetime counter"
+        );
+    }
+
+    #[test]
+    fn current_orphan_count_counts_history_entries() {
+        let mut lc = ResponseLifecycle::new();
+        let now = Utc::now();
+        for i in 0..3 {
+            lc.history.push_back(CompletedResponse {
+                id: format!("orph-{i}"),
+                response_type: ResponseType::BlockIp,
+                backend: ResponseBackend::Ufw,
+                target: format!("203.0.113.{i}"),
+                incident_id: format!("inc-{i}"),
+                created_at: now - chrono::Duration::hours(2),
+                reverted_at: now - chrono::Duration::hours(1),
+                reason: format!("orphaned: rule does not exist on attempt {i}"),
+            });
+        }
+        // Add a non-orphan history entry — must not be counted.
+        lc.history.push_back(CompletedResponse {
+            id: "expired-1".into(),
+            response_type: ResponseType::BlockIp,
+            backend: ResponseBackend::Ufw,
+            target: "203.0.113.99".into(),
+            incident_id: "inc-99".into(),
+            created_at: now - chrono::Duration::hours(2),
+            reverted_at: now - chrono::Duration::hours(1),
+            reason: "expired".into(),
+        });
+        assert_eq!(lc.current_orphan_count(), 3);
+    }
+
+    #[test]
+    fn to_json_exposes_gauges_shape_distinct_from_totals() {
+        // The dashboard's banner reads gauges.orphaned (current);
+        // the lifetime KPI reads totals.orphaned. They must differ
+        // when the counter has been bumped but the entries have
+        // been GC'd. This anchor pins both shapes simultaneously.
+        let mut lc = ResponseLifecycle::new();
+        lc.total_orphaned = 17;
+        // Zero history entries with reason="orphaned:" → current
+        // count is 0 even though counter says 17.
+        let v = lc.to_json();
+        assert_eq!(
+            v["gauges"]["orphaned"].as_u64().unwrap(),
+            0,
+            "gauges.orphaned must reflect current entries (0 here)"
+        );
+        assert_eq!(
+            v["totals"]["orphaned"].as_u64().unwrap(),
+            17,
+            "totals.orphaned keeps the lifetime counter (17 here)"
+        );
+        // The two MUST be queryable separately so dashboard JS
+        // distinguishes "now" from "ever".
+        assert_ne!(
+            v["gauges"]["orphaned"], v["totals"]["orphaned"],
+            "anti-regression: a future refactor must not collapse them back into one field"
+        );
     }
 }

@@ -7,54 +7,74 @@ async function loadResponses() {
     const r = await loadJson('/api/responses');
     let html = '';
 
-    // KPI cards — row 1: lifetime totals
-    html += `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;margin-bottom:10px;">
-      <div class="kpi-card"><div class="kpi-value">${r.active_count||0}</div><div class="kpi-label">Active</div></div>
-      <div class="kpi-card"><div class="kpi-value">${r.totals?.registered||0}</div><div class="kpi-label">Total</div></div>
-      <div class="kpi-card"><div class="kpi-value">${r.totals?.expired||0}</div><div class="kpi-label">Expired</div></div>
-      <div class="kpi-card"><div class="kpi-value">${r.totals?.reverted||0}</div><div class="kpi-label">Reverted</div></div>
+    // PR #425 Wave 4d: gauges (now) vs counters (lifetime) explicit.
+    // Pre-Wave-4d the dashboard banner read totals.orphaned (counter,
+    // monotonic), which gaslit the operator into seeing "17 orphaned
+    // (rule may still be active)" months after the entries had been
+    // GC'd. Now the banner / drift warning use only `gauges.orphaned`
+    // (count of entries that really are orphaned right now). Lifetime
+    // counters move to a clearly-labeled row below.
+    const gOrphans   = r.gauges?.orphaned ?? r.state_counts?.revert_failed ?? 0;
+    const gPending   = r.gauges?.pending  ?? r.state_counts?.revert_pending ?? 0;
+    const gInRetry   = r.gauges?.in_retry ?? r.state_counts?.revert_failed ?? 0;
+    const gActive    = r.gauges?.active   ?? r.active_count ?? 0;
+    const tOrphaned  = r.totals?.orphaned       || 0;
+    const tFailures  = r.totals?.revert_failures|| 0;
+    const tAlreadyAbsent = r.totals?.already_absent || 0;
+    const tExpired   = r.totals?.expired   || 0;
+    const tManual    = r.totals?.reverted  || 0;
+    const tRegistered= r.totals?.registered|| 0;
+
+    // Row 1 — current state (gauges). What's happening right now.
+    html += `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;margin-bottom:8px;">
+      <div class="kpi-card">
+        <div class="kpi-value">${gActive}</div>
+        <div class="kpi-label" title="Number of responses currently active in the kernel/firewall.">Active <span style="color:var(--dim);font-weight:400">(now)</span></div>
+      </div>
+      <div class="kpi-card" style="${gOrphans > 0 ? 'border-color:#e74c3c;background:#e74c3c10;' : ''}">
+        <div class="kpi-value" style="${gOrphans > 0 ? 'color:#e74c3c' : ''}">${gOrphans}</div>
+        <div class="kpi-label" title="Orphaned responses still pending operator review (history entries with reason='orphaned:' plus any active entry stuck in revert_failed). Excludes orphans that PR #408's GC has already pruned.">Orphaned <span style="color:var(--dim);font-weight:400">(now)</span></div>
+      </div>
+      <div class="kpi-card" style="${gInRetry > 0 ? 'border-color:#f39c12;' : ''}">
+        <div class="kpi-value" style="${gInRetry > 0 ? 'color:#f39c12' : ''}">${gInRetry}</div>
+        <div class="kpi-label" title="Entries currently mid-retry (transient revert failures).">In Retry <span style="color:var(--dim);font-weight:400">(now)</span></div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-value">${gPending}</div>
+        <div class="kpi-label" title="Revert command dispatched to executor, awaiting result.">Pending <span style="color:var(--dim);font-weight:400">(now)</span></div>
+      </div>
     </div>`;
 
-    // KPI cards — row 2: state machine health indicators. Orphaned is the
-    // one that matters most — it means the system admits a rule may still
-    // be active in the kernel/firewall even though we gave up reverting.
-    const orphaned = r.totals?.orphaned || 0;
-    const revertFailures = r.totals?.revert_failures || 0;
-    const alreadyAbsent = r.totals?.already_absent || 0;
-    const pending = r.state_counts?.revert_pending || 0;
-    const failed = r.state_counts?.revert_failed || 0;
-    const hasDrift = orphaned > 0 || failed > 0;
-    html += `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;margin-bottom:16px;">
-      <div class="kpi-card" style="${orphaned > 0 ? 'border-color:#e74c3c;background:#e74c3c10;' : ''}">
-        <div class="kpi-value" style="${orphaned > 0 ? 'color:#e74c3c' : ''}">${orphaned}</div>
-        <div class="kpi-label" title="Reverts given up on after retries. Rule may still be active in kernel/firewall.">Orphaned</div>
-      </div>
-      <div class="kpi-card" style="${failed > 0 ? 'border-color:#f39c12;' : ''}">
-        <div class="kpi-value" style="${failed > 0 ? 'color:#f39c12' : ''}">${failed}</div>
-        <div class="kpi-label" title="Entries currently mid-retry (transient revert failures).">In Retry</div>
-      </div>
-      <div class="kpi-card">
-        <div class="kpi-value">${pending}</div>
-        <div class="kpi-label" title="Revert command dispatched to executor, awaiting result.">Pending</div>
-      </div>
-      <div class="kpi-card">
-        <div class="kpi-value">${revertFailures}</div>
-        <div class="kpi-label" title="Lifetime count of individual failed revert attempts.">Failures</div>
-      </div>
-      <div class="kpi-card">
-        <div class="kpi-value">${alreadyAbsent}</div>
-        <div class="kpi-label" title="Reverts that resolved because the rule was already gone (success).">Already Gone</div>
-      </div>
+    // Row 2 — lifetime totals (counters). Monotonic, never decrement.
+    // Operator sees these to understand the system's overall track
+    // record, not to act on them. Visually separated from gauges
+    // above so the difference is unambiguous.
+    html += `<div style="font-size:0.7rem;color:var(--dim);letter-spacing:0.05em;text-transform:uppercase;margin:4px 0 6px;">Lifetime totals (cumulative since boot)</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;margin-bottom:16px;">
+      <div class="kpi-card"><div class="kpi-value">${tRegistered}</div><div class="kpi-label" title="Every response action ever registered.">Total Registered</div></div>
+      <div class="kpi-card"><div class="kpi-value">${tExpired}</div><div class="kpi-label" title="Reverteds that expired naturally via TTL. Counts as success.">Expired</div></div>
+      <div class="kpi-card"><div class="kpi-value">${tManual}</div><div class="kpi-label" title="Reverteds explicitly removed via the dashboard. Most reverteds expire naturally and count as 'Expired', not here.">Manual Reverts</div></div>
+      <div class="kpi-card"><div class="kpi-value">${tAlreadyAbsent}</div><div class="kpi-label" title="Reverteds that resolved because the rule was already gone (success).">Already Gone</div></div>
+      <div class="kpi-card"><div class="kpi-value">${tFailures}</div><div class="kpi-label" title="Lifetime count of individual failed revert attempts (most are retried successfully).">Revert Failures</div></div>
+      <div class="kpi-card"><div class="kpi-value">${tOrphaned}</div><div class="kpi-label" title="Lifetime count of entries that exhausted retries and were marked orphaned. The 'Orphaned (now)' card above is the actionable subset.">Orphaned (lifetime)</div></div>
     </div>`;
 
-    // Drift warning banner when we know state is out of sync with kernel.
+    // Drift warning banner — fires only on CURRENT-state drift, not
+    // historical counters. Pre-Wave-4d this used the lifetime counter,
+    // which screamed "17 orphans, rule may still be active" months
+    // after PR #408's GC had pruned every entry.
+    const hasDrift = gOrphans > 0 || gInRetry > 0;
     if (hasDrift) {
       html += `<div style="padding:10px 14px;margin-bottom:14px;border-left:3px solid #e74c3c;background:#e74c3c10;border-radius:3px;font-size:0.85rem;">
         <strong style="color:#e74c3c;display:inline-flex;align-items:center;gap:4px">${lucideIcon('alert-triangle',{size:14})} State drift detected.</strong>
-        ${orphaned > 0 ? `<span>${orphaned} orphaned response(s) — rule may still be active in kernel/firewall. Check WARN logs for stderr.</span>` : ''}
-        ${failed > 0 ? `<span>${failed} response(s) mid-retry.</span>` : ''}
+        ${gOrphans > 0 ? `<span>${gOrphans} orphaned response(s) currently pending operator review — rule may still be active in kernel/firewall. Check WARN logs for stderr.</span>` : ''}
+        ${gInRetry > 0 ? `<span>${gInRetry} response(s) mid-retry.</span>` : ''}
       </div>`;
     }
+
+    // Backwards-compat shim for the rest of the function.
+    const orphaned = gOrphans;
+    const failed = gInRetry;
 
     // Active responses table
     if (r.active?.length > 0) {

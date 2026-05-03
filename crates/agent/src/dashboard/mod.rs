@@ -4160,6 +4160,56 @@ mod tests {
         assert!(JS_RESPONSES.contains("Resolved as"));
     }
 
+    // ─── PR #425 Wave 4d — banner reads gauges, not lifetime counters ───
+
+    #[test]
+    fn js_responses_banner_reads_gauges_not_totals() {
+        // Real prod observation 2026-05-03: the dashboard banner
+        // showed "17 orphaned (rule may still be active)" months
+        // after PR #408's GC had pruned every actual entry. Mechanism
+        // was: banner read `r.totals.orphaned` (counter, monotonic),
+        // gaslit operator into searching for ghost rules.
+        //
+        // Fix is two layers:
+        //   1. Backend `to_json()` exposes `gauges.orphaned` (current)
+        //      separate from `totals.orphaned` (lifetime).
+        //   2. Frontend banner reads `r.gauges.orphaned` ONLY.
+        //
+        // This test pins layer 2 so a refactor that goes back to
+        // the counter doesn't ship silently.
+
+        // Positive: banner derives `gOrphans` from `r.gauges`.
+        assert!(
+            JS_RESPONSES.contains("r.gauges?.orphaned"),
+            "banner must read gauges.orphaned (current count), not totals.orphaned"
+        );
+
+        // Positive: lifetime counter still rendered, but in a row
+        // labeled clearly as such.
+        assert!(JS_RESPONSES.contains("Lifetime totals"));
+        assert!(JS_RESPONSES.contains("Orphaned (lifetime)"));
+
+        // Negative: the drift-warning banner must NOT use the
+        // lifetime counter as its trigger condition.
+        // Look for the bad pattern explicitly. Pre-Wave-4d had:
+        //     const orphaned = r.totals?.orphaned || 0;
+        //     const hasDrift = orphaned > 0 || failed > 0;
+        //
+        // The `tOrphaned` variable is allowed to exist (lifetime
+        // KPI render) but the drift trigger must not key off it.
+        assert!(
+            !JS_RESPONSES.contains("hasDrift = tOrphaned"),
+            "drift trigger must not read the lifetime counter"
+        );
+        // Anti-regression: banner copy must say "currently pending"
+        // so the operator reads it as present-tense gauge, not as
+        // "this happened sometime in the past."
+        assert!(
+            JS_RESPONSES.contains("currently pending operator review"),
+            "banner copy must clarify it's the current count, not lifetime"
+        );
+    }
+
     #[tokio::test]
     async fn csrf_protection_rejects_post_without_header() {
         // Wire the CSRF middleware to a tiny echo router and verify

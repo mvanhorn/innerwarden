@@ -553,13 +553,22 @@ pub(super) fn compute_overview_counts_from_sqlite(
     Some(counts)
 }
 
-/// Read totals from the response lifecycle JSON (SQLite blob first,
-/// then `data_dir/responses.json` fallback — same precedence as the
-/// `/api/responses` handler). The function is best-effort: any read
-/// or parse failure returns `Default::default()` so a transient I/O
-/// hiccup never flips the banner red on its own. The caller
-/// (api_overview) treats this as a snapshot input, not a
-/// critical-path read.
+/// Read drift signals from the response lifecycle JSON (SQLite blob
+/// first, then `data_dir/responses.json` fallback — same precedence
+/// as the `/api/responses` handler). Best-effort: any read or parse
+/// failure returns `Default::default()` so a transient I/O hiccup
+/// never flips the banner red on its own. The caller (api_overview)
+/// treats this as a snapshot input, not a critical-path read.
+///
+/// PR #425 Wave 4d: orphaned count now reads `gauges.orphaned`
+/// (current count) instead of `totals.orphaned` (lifetime counter).
+/// Pre-Wave-4d the dashboard banner screamed "17 orphaned (rule may
+/// still be active)" months after PR #408's GC had pruned the
+/// underlying entries — counter never decrements, so the banner
+/// gaslit the operator into searching for ghost rules. Now the
+/// banner only fires when entries actually exist on disk. Falls
+/// back to `state_counts.revert_failed` if `gauges.orphaned` is
+/// missing (transitional shape during deploy).
 pub(super) fn read_degraded_signals(state: &super::state::DashboardState) -> DegradedSignals {
     let raw = state
         .sqlite_store
@@ -576,12 +585,23 @@ pub(super) fn read_degraded_signals(state: &super::state::DashboardState) -> Deg
     let mut signals = DegradedSignals::default();
     if let Some(text) = raw {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-            let totals = v.get("totals");
-            signals.orphaned_total = totals
-                .and_then(|t| t.get("orphaned"))
+            // Current orphan count — gauge, not counter. Falls back
+            // to the revert_failed gauge if the new shape is absent.
+            signals.orphaned_now = v
+                .get("gauges")
+                .and_then(|g| g.get("orphaned"))
                 .and_then(|n| n.as_u64())
+                .or_else(|| {
+                    v.get("state_counts")
+                        .and_then(|s| s.get("revert_failed"))
+                        .and_then(|n| n.as_u64())
+                })
                 .unwrap_or(0);
-            signals.revert_failures_total = totals
+            // Revert failures stays as a lifetime counter — there's no
+            // gauge equivalent because every individual failure is a
+            // discrete event rather than a state.
+            signals.revert_failures_total = v
+                .get("totals")
                 .and_then(|t| t.get("revert_failures"))
                 .and_then(|n| n.as_u64())
                 .unwrap_or(0);
@@ -607,19 +627,24 @@ pub(super) fn read_degraded_signals(state: &super::state::DashboardState) -> Deg
 /// orchestration belongs to Spec 042 active defense.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct DegradedSignals {
-    /// Cumulative orphaned-response count from `responses.json`
-    /// totals (`response_lifecycle::total_orphaned`). An "orphaned"
-    /// response is one where the agent gave up retrying revert; the
-    /// rule may still be live in kernel/firewall and is now invisible
-    /// to the lifecycle. Any non-zero value is a real maintenance
-    /// debt the operator should see.
-    pub(super) orphaned_total: u64,
+    /// PR #425 Wave 4d: current orphan count — entries that really
+    /// exist right now, not a lifetime counter. An "orphaned" response
+    /// is one where the agent gave up retrying revert and the rule
+    /// may still be live in kernel/firewall. Sourced from
+    /// `gauges.orphaned` in `to_json()` which is the sum of history
+    /// entries with `reason: "orphaned:..."` plus active entries
+    /// stuck in `revert_failed`. Pre-Wave-4d this read
+    /// `totals.orphaned` (lifetime counter) which gaslit the operator
+    /// into seeing 17 orphans months after the entries had been GC'd.
+    pub(super) orphaned_now: u64,
     /// Cumulative revert-failure count (`response_lifecycle::total_revert_failures`).
     /// Distinct from `orphaned`: a single response can rack up many
     /// revert failures before the retry budget is exhausted and it
     /// gets orphaned. Tracks the rate of "tried to undo, kernel/firewall
     /// rejected" — a non-zero total indicates either a config drift
     /// (rule was rewritten by an external tool) or a backend bug.
+    /// Stays as a lifetime counter because each failure is a discrete
+    /// event, not a state.
     pub(super) revert_failures_total: u64,
 }
 
@@ -706,16 +731,22 @@ pub(super) fn derive_system_health(
 /// `OperatingNormally`.
 fn collect_degraded_reasons(degraded: &DegradedSignals) -> Vec<String> {
     let mut reasons = Vec::new();
-    if degraded.orphaned_total > 0 {
+    if degraded.orphaned_now > 0 {
         reasons.push(format!(
-            "{} orphaned response{} (rule may still be active in kernel/firewall, lifecycle gave up retrying revert)",
-            degraded.orphaned_total,
-            if degraded.orphaned_total == 1 { "" } else { "s" },
+            "{} orphaned response{} pending review (rule may still be active in kernel/firewall, lifecycle gave up retrying revert)",
+            degraded.orphaned_now,
+            if degraded.orphaned_now == 1 { "" } else { "s" },
         ));
     }
-    if degraded.revert_failures_total > 0 {
+    // PR #425 Wave 4d: revert_failures_total stays a lifetime counter
+    // because each failure is a discrete event. But surfacing it on the
+    // banner WHEN there are no current orphans is gaslighting — those
+    // failures may all have been resolved by retry. Only add this
+    // reason if we already have an orphaned-now reason (there ARE
+    // current orphans, the failure count helps explain why).
+    if degraded.orphaned_now > 0 && degraded.revert_failures_total > 0 {
         reasons.push(format!(
-            "{} revert failure{} on responses — backend rejected the undo (config drift or external mutation)",
+            "{} cumulative revert failure{} (backend rejected undo — config drift or external mutation)",
             degraded.revert_failures_total,
             if degraded.revert_failures_total == 1 { "" } else { "s" },
         ));
@@ -3073,8 +3104,11 @@ mod tests {
 
     #[test]
     fn degraded_when_orphaned_responses_exist() {
+        // PR #425 Wave 4d: signal is now orphaned_now (current count),
+        // not the lifetime counter. Banner only fires when entries
+        // actually exist on disk.
         let degraded = super::DegradedSignals {
-            orphaned_total: 17,
+            orphaned_now: 17,
             ..Default::default()
         };
         let h = super::derive_system_health(&fresh_pending(), Some(30), &degraded);
@@ -3087,29 +3121,33 @@ mod tests {
     }
 
     #[test]
-    fn degraded_when_revert_failures_exist() {
+    fn no_degraded_signal_when_only_lifetime_revert_failures() {
+        // PR #425 Wave 4d: pre-fix this would surface "111 revert
+        // failures" on a clean system because the lifetime counter
+        // never decrements. Now the banner only fires for current
+        // drift — revert_failures_total alone, with zero current
+        // orphans, returns OperatingNormally because every failure
+        // may have been retried successfully.
         let degraded = super::DegradedSignals {
             revert_failures_total: 111,
             ..Default::default()
         };
         let h = super::derive_system_health(&fresh_pending(), Some(30), &degraded);
-        match h {
-            SystemHealth::Degraded { reasons } => {
-                assert!(reasons.iter().any(|r| r.contains("111 revert failure")));
-            }
-            other => panic!("expected Degraded, got {other:?}"),
-        }
+        assert_eq!(
+            h,
+            SystemHealth::OperatingNormally,
+            "lifetime revert_failures alone should not flip Degraded"
+        );
     }
 
     #[test]
     fn degraded_collects_all_reasons_in_priority_order() {
-        // When multiple drift signals are present the banner shows
-        // the headline (`reasons[0]`) but the operator can drill
-        // into the full list. Order matters: orphaned and revert-
-        // failure are immediate maintenance debt — orphaned headlines
-        // because the kernel state may still be live.
+        // When current orphans exist, the lifetime revert_failures
+        // count adds context as a follow-up reason. Without current
+        // orphans, the failure count alone is gaslighting — see the
+        // `no_degraded_signal_when_only_lifetime_revert_failures` test.
         let degraded = super::DegradedSignals {
-            orphaned_total: 17,
+            orphaned_now: 17,
             revert_failures_total: 111,
         };
         let h = super::derive_system_health(&fresh_pending(), Some(30), &degraded);
@@ -3150,7 +3188,7 @@ mod tests {
         let mut pending = fresh_pending();
         pending.stuck = 5;
         let degraded = super::DegradedSignals {
-            orphaned_total: 17,
+            orphaned_now: 17,
             revert_failures_total: 111,
         };
         let h = super::derive_system_health(&pending, Some(2400), &degraded);
