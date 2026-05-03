@@ -585,11 +585,27 @@ fn kg_tick(state: &mut AgentState, data_dir: &Path, events: &[innerwarden_core::
     // (sub-ms with the `last_edge_ts` cache from PR #261).
     if state.last_graph_snapshot.elapsed().as_secs() >= 60 {
         // Scope 1: cheap mutations under WRITE lock.
+        //
+        // 2026-05-03 (Wave 5b PR-4): order is `cleanup_expired →
+        // enforce_memory_limit → compact_edges_force`. Both
+        // `cleanup_expired` and `enforce_memory_limit` call
+        // `remove_node`, which tombstones edges (decrements
+        // adjacency lists) but leaves the entries in `self.edges`
+        // until compaction runs. Compaction MUST come last so it
+        // sweeps tombstones from BOTH passes — the previous order
+        // (`compact_edges → enforce_memory_limit`) left
+        // `enforce`'s tombstones in `self.edges` for the
+        // serialise step that followed, producing dangling-edge
+        // warns on the next reload (operator's prod showed
+        // `dangling=30157` every save cycle). `compact_edges_force`
+        // ignores the 20%-ratio gate so the pre-save sweep always
+        // happens; gated `compact_edges` stays the right call for
+        // any other site doing inline mutations.
         {
             let mut graph = state.knowledge_graph.write().unwrap();
             graph.cleanup_expired(chrono::Utc::now());
-            graph.compact_edges();
             graph.enforce_memory_limit();
+            graph.compact_edges_force();
         }
 
         // Scope 2: serialize snapshot + metrics under READ lock so

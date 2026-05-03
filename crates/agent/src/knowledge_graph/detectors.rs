@@ -769,7 +769,23 @@ fn detect_discovery_burst_calibrated(
                 continue;
             }
 
-            let severity = if total >= adjusted_threshold * 2 {
+            // 2026-05-03 (Wave 5b PR-4): cap severity at Medium for
+            // Service-class users. snap_daemon doing 92 actions in
+            // 60 s during a routine `snap refresh` legitimately
+            // exceeds even the 5x multiplier; firing HIGH (which
+            // pushes a red-banner alert to the operator's site
+            // home) is operator-misleading. Operator's verbatim
+            // 2026-05-03 report: "RED on home, only if server was
+            // compromised: HIGH: Graph Discovery Burst — user
+            // uid:584788 (92 actions in 60s)". uid 584788 is
+            // snap_daemon (verified in /etc/passwd). The signal is
+            // still recorded (Medium → still visible in journey +
+            // Telegram digest), just not in the
+            // "drop-everything" surface.
+            let user_class = ctx.classify_user(&user_name);
+            let severity = if matches!(user_class, UserClass::Service) {
+                Severity::Medium
+            } else if total >= adjusted_threshold * 2 {
                 Severity::High
             } else {
                 Severity::Medium
@@ -789,6 +805,7 @@ fn detect_discovery_burst_calibrated(
                     "source": "knowledge_graph",
                     "detector": "graph_discovery_burst",
                     "user": user_name,
+                    "user_class": user_class_label(user_class),
                     "exec_count": exec_count,
                     "sensitive_reads": sensitive_reads,
                 }),
@@ -3820,7 +3837,15 @@ mod tests {
             ("data_exfil", exfil_section_start),
             ("host_drift", drift_section_start),
         ] {
-            let end = std::cmp::min(start + 6000, src.len());
+            // 2026-05-03 (Wave 5b PR-4 follow-up): walk the slice end
+            // forward to the next char boundary. PR #432 added text
+            // with em-dashes / arrows to the discovery_burst section,
+            // pushing the 6000-byte cut into a multi-byte codepoint
+            // and panicking `&src[start..end]`.
+            let mut end = std::cmp::min(start + 6000, src.len());
+            while end < src.len() && !src.is_char_boundary(end) {
+                end += 1;
+            }
             let section = &src[start..end];
             assert!(
                 section.contains("classify_user"),
@@ -3833,7 +3858,11 @@ mod tests {
         // data_exfil must NOT have the old `_ctx: &CalibrationContext`
         // pattern (underscore prefix = unused). If it returns, the
         // detector silently stops applying suppression.
-        let exfil_end = std::cmp::min(exfil_section_start + 200, src.len());
+        // Same char-boundary safety as above.
+        let mut exfil_end = std::cmp::min(exfil_section_start + 200, src.len());
+        while exfil_end < src.len() && !src.is_char_boundary(exfil_end) {
+            exfil_end += 1;
+        }
         let exfil_signature = &src[exfil_section_start..exfil_end];
         assert!(
             !exfil_signature.contains("_ctx: &CalibrationContext"),
@@ -3880,5 +3909,51 @@ mod tests {
         );
         // Avoid `now` warning.
         let _ = Utc::now();
+    }
+
+    /// 2026-05-03 (Wave 5b PR-4 anchor): the discovery_burst severity
+    /// must be capped at Medium when the user is Service-class. The
+    /// Service multiplier (5x) is enough to suppress routine `snap
+    /// refresh` bursts, but a sustained burst (operator's prod showed
+    /// snap_daemon doing 92 actions in 60s) still trips the elevated
+    /// threshold and would fire HIGH under the old logic. HIGH on a
+    /// service-account discovery burst is operator-misleading
+    /// (red-banner alert that can't be acted on) — Medium is the
+    /// right severity for "informative, not urgent". Pinned via
+    /// source-grep so the cap survives refactors.
+    #[test]
+    fn discovery_burst_severity_caps_at_medium_for_service_users() {
+        let src = include_str!("detectors.rs");
+        let burst_section_start = src
+            .find("fn detect_discovery_burst_calibrated")
+            .expect("discovery_burst function must exist");
+        // Slice safely: `src[start..end]` panics if either index is
+        // mid-codepoint, and the source has em-dashes / arrows that
+        // span multiple bytes. Walk forward to the next char
+        // boundary at-or-after the requested end.
+        let mut burst_end = std::cmp::min(burst_section_start + 6000, src.len());
+        while burst_end < src.len() && !src.is_char_boundary(burst_end) {
+            burst_end += 1;
+        }
+        let section = &src[burst_section_start..burst_end];
+        // The cap must use `matches!(user_class, UserClass::Service)`
+        // BEFORE the `total >= adjusted_threshold * 2 → High` branch
+        // so the High path never reaches Service users. Anchor on the
+        // exact pattern; if a future refactor moves to a match
+        // statement OR an early-return, the test is loud.
+        assert!(
+            section.contains("matches!(user_class, UserClass::Service)"),
+            "discovery_burst must cap severity at Medium for Service-class users — \
+             the pattern `matches!(user_class, UserClass::Service)` was lost. \
+             Operator's 2026-05-03 report: HIGH alert for snap_daemon (92 actions/60s) \
+             on the site home was operator-misleading."
+        );
+        // The user_class field must be in evidence so investigators
+        // can see which class triggered without re-deriving from the
+        // username string.
+        assert!(
+            section.contains("user_class_label(user_class)"),
+            "evidence JSON must carry user_class for investigator use"
+        );
     }
 }

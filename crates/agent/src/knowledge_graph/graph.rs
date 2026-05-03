@@ -191,6 +191,19 @@ impl KnowledgeGraph {
 
     /// Compact the edge vec by removing tombstoned entries and rebuilding adjacency.
     /// Called periodically when tombstone ratio exceeds 20%.
+    ///
+    /// 2026-05-03 (Wave 5b PR-4): the 20% ratio gate exists to amortise
+    /// the O(E) rebuild cost across many remove_node calls. It is the
+    /// right behaviour during steady-state ingest. It is NOT the right
+    /// behaviour right before a snapshot serialise — tombstoned edges
+    /// would leak into the persisted blob and reload would tag them
+    /// as "dangling" (operator-visible WARN every time the snapshot
+    /// is round-tripped). The slow_loop path now calls
+    /// `compact_edges_force` instead; this gated method is retained
+    /// as the canonical inline-mutation entry point for any future
+    /// site that needs amortised compaction without forcing a
+    /// full rebuild on every call.
+    #[allow(dead_code)]
     pub fn compact_edges(&mut self) {
         if self.edges.is_empty() || self.tombstoned_edges == 0 {
             return;
@@ -246,6 +259,77 @@ impl KnowledgeGraph {
                 removed,
                 live = self.edges.len(),
                 "knowledge graph: compacted edges"
+            );
+        }
+    }
+
+    /// 2026-05-03 (Wave 5b PR-4): unconditional compaction for the
+    /// pre-serialise path. Same body as `compact_edges` minus the
+    /// 20%-ratio gate. Use this from slow_loop right before
+    /// `serialize_snapshot_bytes` so tombstoned edges accumulated by
+    /// `enforce_memory_limit` and `cleanup_expired` do not leak into
+    /// the persisted blob.
+    ///
+    /// Why a separate method instead of dropping the gate from
+    /// `compact_edges`: the gated path is the right behaviour during
+    /// inline mutations (avoid O(E) work on every remove). The
+    /// unconditional path is the right behaviour when the next
+    /// operation is a serialise — we are about to walk every edge
+    /// anyway, so paying compaction now amortises into the same scan.
+    pub fn compact_edges_force(&mut self) {
+        if self.edges.is_empty() || self.tombstoned_edges == 0 {
+            return;
+        }
+
+        // Same body as `compact_edges` from here on. Kept as a
+        // dedicated method (not a refactor that calls into a shared
+        // helper) because the gate is the only difference and
+        // splitting further would obscure the call graph the heap-
+        // budget anchor walks.
+        let mut live: HashSet<usize> = HashSet::new();
+        for idxs in self.outgoing.values() {
+            for &i in idxs {
+                live.insert(i);
+            }
+        }
+
+        let mut new_edges = Vec::with_capacity(live.len());
+        let mut old_to_new: HashMap<usize, usize> = HashMap::new();
+
+        for (old_idx, edge) in self.edges.iter().enumerate() {
+            if live.contains(&old_idx) {
+                let new_idx = new_edges.len();
+                old_to_new.insert(old_idx, new_idx);
+                new_edges.push(edge.clone());
+            } else {
+                self.memory_estimate = self
+                    .memory_estimate
+                    .saturating_sub(Self::estimate_edge_size(edge));
+            }
+        }
+
+        for idxs in self.outgoing.values_mut() {
+            *idxs = idxs
+                .iter()
+                .filter_map(|i| old_to_new.get(i).copied())
+                .collect();
+        }
+        for idxs in self.incoming.values_mut() {
+            *idxs = idxs
+                .iter()
+                .filter_map(|i| old_to_new.get(i).copied())
+                .collect();
+        }
+
+        let removed = self.edges.len() - new_edges.len();
+        self.edges = new_edges;
+        self.tombstoned_edges = 0;
+
+        if removed > 0 {
+            tracing::debug!(
+                removed,
+                live = self.edges.len(),
+                "knowledge graph: force-compacted edges before snapshot"
             );
         }
     }

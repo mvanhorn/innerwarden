@@ -831,6 +831,71 @@ mod tests {
         assert_eq!(g.node_count(), 0);
     }
 
+    /// 2026-05-03 (Wave 5b PR-4 anchor): pre-save compaction must
+    /// remove tombstoned edges so reload does NOT see them as
+    /// dangling. Pinned the operator-visible WARN
+    /// "Knowledge graph has dangling edge references — pruning
+    /// dangling=30157" that fired every save cycle in prod for days.
+    /// The bug class: `enforce_memory_limit` removes nodes (which
+    /// tombstones edges) AFTER the gated `compact_edges` runs. Without
+    /// `compact_edges_force` between the two, tombstones from
+    /// `enforce_memory_limit` leaked into the persisted blob.
+    #[test]
+    fn snapshot_after_node_eviction_carries_no_dangling_edges() {
+        use crate::knowledge_graph::types::Relation;
+
+        let mut g = KnowledgeGraph::new();
+        // Build a small graph: 5 IPs each connected to a Process.
+        let proc_id = g.ensure_process(1234, 800, "bash", 0, Utc::now());
+        let mut ip_ids = Vec::new();
+        for n in 1..=5 {
+            let ip = g.ensure_ip(&format!("10.0.0.{n}"), Utc::now());
+            g.add_edge(Edge::new(proc_id, ip, Relation::ConnectedTo, Utc::now()));
+            ip_ids.push(ip);
+        }
+        let edges_before = g.edge_count();
+        assert_eq!(edges_before, 5);
+
+        // Simulate `enforce_memory_limit` removing 3 nodes: tombstones
+        // 3 edges but does NOT remove them from `self.edges`.
+        for &id in &ip_ids[..3] {
+            g.remove_node(id);
+        }
+        // Pre-fix path: gated `compact_edges` would NOT run because
+        // tombstone ratio is 3/5 = 60% which DOES exceed 20%, but the
+        // operator's prod showed the inverse (large graph + small
+        // batch eviction = sub-20% ratio). Force the case here by
+        // construction: the unconditional path must always sweep.
+        // Force-compact mirrors the pre-serialise call.
+        g.compact_edges_force();
+
+        // Round-trip via the file path (covers `try_load_snapshot`
+        // → `reconstruct_from_snapshot` → dangling check).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("post-eviction.json");
+        g.save_snapshot(&path).unwrap();
+        let reloaded = KnowledgeGraph::load_snapshot(&path);
+
+        // Every reloaded edge must have both endpoints in the node
+        // map — no dangling references survived the round-trip.
+        // `KnowledgeGraph` does not expose `edges()` directly (only
+        // `nodes()` and per-node `all_edges(NodeId)`), so we walk
+        // through every node and check its outgoing edges.
+        let nodes_map = reloaded.nodes();
+        for &id in nodes_map.keys() {
+            for edge in reloaded.all_edges(id) {
+                assert!(
+                    nodes_map.contains_key(&edge.from) && nodes_map.contains_key(&edge.to),
+                    "dangling edge in reloaded snapshot: {:?} → {:?}",
+                    edge.from,
+                    edge.to
+                );
+            }
+        }
+        // And the count is right: 2 live edges (the IPs we kept).
+        assert_eq!(reloaded.edge_count(), 2);
+    }
+
     #[test]
     fn save_to_store_and_load_from_store_roundtrip() {
         // Covers the SQLite-backed persistence path. Equivalent to
