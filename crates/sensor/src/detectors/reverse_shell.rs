@@ -446,9 +446,20 @@ impl ReverseShellDetector {
             ),
             severity: Severity::Critical,
             title: format!("Reverse shell detected ({pattern}): {display_cmd}"),
+            // 2026-05-03 (CodeQL alert #144 / `rust/cleartext-logging`):
+            // `uid` flows from `event.details["uid"]` (sensor input,
+            // CodeQL-tagged as user-controlled) into the human-readable
+            // `summary` string, which is then persisted to the
+            // `incidents-YYYY-MM-DD.jsonl` log on disk. Even though the
+            // file is mode 600 in prod and `uid` is not OWASP-sensitive
+            // (it is a process attribute, not a credential), the
+            // duplication is unnecessary: `uid` already lives in
+            // `evidence.uid` below as a structured field for downstream
+            // tooling. Drop it from the operator-facing summary; the
+            // JSONL evidence still carries the value for forensics.
             summary: format!(
                 "Reverse shell pattern '{pattern}' detected in process {comm} \
-                 (pid={pid}, uid={uid}): {display_cmd}"
+                 (pid={pid}): {display_cmd}"
             ),
             evidence: serde_json::json!([{
                 "kind": "reverse_shell",

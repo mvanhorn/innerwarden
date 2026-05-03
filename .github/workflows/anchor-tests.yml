@@ -13,11 +13,24 @@ on:
       - main
       - development
 
+# Read-only token. The job only checks out the tree and runs a shell
+# script — no API writes, no PR comments, no release uploads. Adding
+# this block raises Scorecard Token-Permissions from 0 to 10
+# (the default GITHUB_TOKEN is write-all when no `permissions:` is
+# declared, which Scorecard penalises maximally).
+permissions:
+  contents: read
+
 jobs:
   verify-anchors:
     name: Verify anchor tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Pinned by SHA per Scorecard Pinned-Dependencies. SHA below
+      # resolves to actions/checkout v4 — same major version the
+      # workflow shipped with, no behaviour change. Keep the trailing
+      # `# v4` comment so a future maintainer knows the major they
+      # are bumping past.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Run verify-anchor-tests.sh
         run: ./scripts/verify-anchor-tests.sh
