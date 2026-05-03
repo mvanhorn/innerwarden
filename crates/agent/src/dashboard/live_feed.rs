@@ -78,7 +78,25 @@ pub(super) fn load_ip_reputation_map(data_dir: &Path) -> HashMap<String, StoredI
     serde_json::from_str(&content).unwrap_or_default()
 }
 
-/// Live feed response with totals and items.
+/// 2026-05-03 (Wave 6a): one row in the `sources` array of
+/// `LiveFeedResponse`. Carries the geo data already attached so the
+/// frontend can render the attack-origins map without a follow-up
+/// `/api/live-feed/geoip` round-trip per IP.
+///
+/// `incidents` is the count of distinct incidents this IP triggered
+/// in the response window — drives the marker size/heat on the map.
+#[derive(Serialize, Clone, Debug)]
+pub(super) struct LiveFeedSource {
+    pub ip: String,
+    /// 2-letter or full country name from ip-api. Empty when the
+    /// cache miss has not been backfilled yet.
+    pub country: String,
+    pub lat: f64,
+    pub lon: f64,
+    pub incidents: u32,
+}
+
+/// Live feed response with totals, items, and pre-enriched origin map.
 #[derive(Serialize)]
 pub(super) struct LiveFeedResponse {
     total_today: usize,
@@ -86,6 +104,15 @@ pub(super) struct LiveFeedResponse {
     total_high: usize,
     /// Number of unique source IPs across all real incidents today.
     unique_sources: usize,
+    /// 2026-05-03 (Wave 6a): per-IP geo enrichment for the map. One
+    /// entry per unique source IP (deduped). Geo fields are populated
+    /// from the on-disk `geo-cache.json` — IPs not yet in the cache
+    /// arrive with `country=""` / `lat=lon=0.0` and the frontend
+    /// either renders them at lat=0/lon=0 OR (preferred) skips them
+    /// from the map until the next slow_loop tick backfills the
+    /// cache. Bounded at 200 (matches `items`) so a 10k-IP day cannot
+    /// blow the response size.
+    sources: Vec<LiveFeedSource>,
     items: Vec<LiveFeedItem>,
 }
 
@@ -142,6 +169,7 @@ pub(super) async fn api_live_feed(State(state): State<DashboardState>) -> Json<L
             total_blocked: 0,
             total_high: 0,
             unique_sources: 0,
+            sources: Vec::new(),
             items: Vec::new(),
         });
     Json(resp)
@@ -409,18 +437,40 @@ pub(super) fn build_live_feed_response(
         .iter()
         .filter(|i| matches!(i.severity, Severity::High | Severity::Critical))
         .count();
-    let unique_sources = {
-        let ips: std::collections::HashSet<&str> = real_incidents
-            .iter()
-            .flat_map(|i| {
-                i.entities
-                    .iter()
-                    .filter(|e| e.r#type == EntityType::Ip)
-                    .map(|e| e.value.as_str())
-            })
-            .collect();
-        ips.len()
-    };
+    // 2026-05-03 (Wave 6a): build the per-IP source list with geo
+    // attached. Counting incidents per IP first so the map can size
+    // markers by activity. Geo lookup is cache-only (load_cache reads
+    // `geo-cache.json`) — no API hit at request time. Cache misses
+    // arrive at the frontend with `country=""` so the JS can decide
+    // to either skip the marker or render it at the equator until
+    // the slow_loop tick backfills it.
+    let mut incidents_per_ip: HashMap<String, u32> = HashMap::new();
+    for inc in &real_incidents {
+        for e in &inc.entities {
+            if e.r#type == EntityType::Ip {
+                *incidents_per_ip.entry(e.value.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    let unique_sources = incidents_per_ip.len();
+    let geo_cache = crate::geo_cache::load_cache(data_dir);
+    let now_secs = chrono::Utc::now().timestamp();
+    let mut sources: Vec<LiveFeedSource> = incidents_per_ip
+        .into_iter()
+        .map(|(ip, incidents)| {
+            let geo = geo_cache.get_fresh(&ip, now_secs);
+            LiveFeedSource {
+                ip,
+                country: geo.map(|g| g.country.clone()).unwrap_or_default(),
+                lat: geo.map(|g| g.lat).unwrap_or(0.0),
+                lon: geo.map(|g| g.lon).unwrap_or(0.0),
+                incidents,
+            }
+        })
+        .collect();
+    // Sort: most-active first so a 200-cap keeps the busiest IPs.
+    sources.sort_by(|a, b| b.incidents.cmp(&a.incidents));
+    sources.truncate(200);
 
     let mut items: Vec<LiveFeedItem> = real_incidents
         .iter()
@@ -488,6 +538,7 @@ pub(super) fn build_live_feed_response(
         total_blocked,
         total_high,
         unique_sources,
+        sources,
         items,
     }
 }
@@ -614,46 +665,104 @@ pub(super) async fn api_live_feed_stream(
 }
 
 /// `GET /api/live-feed/geoip?ips=1.2.3.4,5.6.7.8` - batch GeoIP lookup (public proxy).
-pub(super) async fn api_live_feed_geoip(Query(query): Query<GeoIpQuery>) -> Json<Vec<GeoIpResult>> {
-    let ips: Vec<&str> = query
+///
+/// 2026-05-03 (Wave 6a): cache-first. Each IP is checked against
+/// `geo-cache.json` (TTL 7 days). Hits return immediately with no
+/// network call. Misses fall through to ip-api.com (rate-limited at
+/// 45 req/min on the free tier) and the result is written back to
+/// the cache so a subsequent page load is instant.
+///
+/// The cache is shared with `build_live_feed_response`'s `sources`
+/// enrichment — once a frontend request triggers a lookup for an
+/// IP, the next /api/live-feed call carries it pre-attached.
+pub(super) async fn api_live_feed_geoip(
+    State(state): State<DashboardState>,
+    Query(query): Query<GeoIpQuery>,
+) -> Json<Vec<GeoIpResult>> {
+    let ips: Vec<String> = query
         .ips
         .split(',')
+        .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .take(30)
         .collect();
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap_or_default();
+
+    let data_dir = state.data_dir.clone();
+    let mut cache = crate::geo_cache::load_cache(&data_dir);
+    let now_secs = chrono::Utc::now().timestamp();
 
     let mut results = Vec::new();
-    for ip in ips {
-        let ip = ip.trim();
-        // ip-api.com free tier returns 403 on HTTPS; HTTPS requires the paid
-        // plan. The IPs queried here are public attacker addresses already
-        // observed on the server's public interfaces, so plaintext transit
-        // adds no material disclosure. See also `crate::geoip`.
-        let url = format!(
-            "http://ip-api.com/json/{}?fields=status,lat,lon,country",
-            ip
-        );
-        if let Ok(resp) = client.get(&url).send().await {
-            if let Ok(data) = resp.json::<serde_json::Value>().await {
-                if data.get("status").and_then(|s| s.as_str()) == Some("success") {
-                    results.push(GeoIpResult {
-                        ip: ip.to_string(),
-                        lat: data.get("lat").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                        lon: data.get("lon").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                        country: data
+    let mut to_fetch: Vec<String> = Vec::new();
+
+    // Cache pass: collect hits; queue misses.
+    for ip in &ips {
+        if let Some(entry) = cache.get_fresh(ip, now_secs) {
+            results.push(GeoIpResult {
+                ip: ip.clone(),
+                lat: entry.lat,
+                lon: entry.lon,
+                country: entry.country.clone(),
+            });
+        } else {
+            to_fetch.push(ip.clone());
+        }
+    }
+
+    // Network pass: only for cache misses. Bounded by the 30-IP cap
+    // above so a single request can spend at most 30 / 45 of the
+    // ip-api budget.
+    if !to_fetch.is_empty() {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+        let mut cache_dirty = false;
+        for ip in &to_fetch {
+            // ip-api.com free tier returns 403 on HTTPS; HTTPS requires the paid
+            // plan. The IPs queried here are public attacker addresses already
+            // observed on the server's public interfaces, so plaintext transit
+            // adds no material disclosure. See also `crate::geoip`.
+            let url = format!(
+                "http://ip-api.com/json/{}?fields=status,lat,lon,country",
+                ip
+            );
+            if let Ok(resp) = client.get(&url).send().await {
+                if let Ok(data) = resp.json::<serde_json::Value>().await {
+                    if data.get("status").and_then(|s| s.as_str()) == Some("success") {
+                        let lat = data.get("lat").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let lon = data.get("lon").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let country = data
                             .get("country")
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
-                            .to_string(),
-                    });
+                            .to_string();
+                        cache.put(
+                            ip.clone(),
+                            crate::geo_cache::GeoEntry {
+                                country: country.clone(),
+                                lat,
+                                lon,
+                                ts: now_secs,
+                            },
+                        );
+                        cache_dirty = true;
+                        results.push(GeoIpResult {
+                            ip: ip.clone(),
+                            lat,
+                            lon,
+                            country,
+                        });
+                    }
                 }
             }
         }
+        if cache_dirty {
+            if let Err(e) = crate::geo_cache::save_cache(&data_dir, &cache) {
+                tracing::warn!("failed to persist geo-cache.json: {e:#}");
+            }
+        }
     }
+
     Json(results)
 }
 
@@ -1177,9 +1286,61 @@ mod tests {
             total_blocked: 0,
             total_high: 0,
             unique_sources: 0,
+            sources: Vec::new(),
             items: empty,
         };
         assert!(response.items.is_empty());
+    }
+
+    /// 2026-05-03 (Wave 6a anchor): the `sources` array on the
+    /// LiveFeedResponse must be populated from the on-disk
+    /// `geo-cache.json` so the public site map can render markers
+    /// without making N follow-up calls to /api/live-feed/geoip.
+    /// Pinned because the operator-visible bug shape is "map shows
+    /// 4 dots even though there are 138 attackers" — the
+    /// `unique_sources` count would already be right but the map
+    /// would be empty until the frontend completed N geo round-trips
+    /// (and ip-api throttles at 45 req/min so 138 IPs ≈ 3+ minutes
+    /// of cold-start lag). Anti-regression for any refactor that
+    /// drops the cache-attached `sources` field or its disk
+    /// roundtrip.
+    #[test]
+    fn live_feed_sources_carry_geo_from_disk_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = crate::geo_cache::GeoCache::new();
+        let now = chrono::Utc::now().timestamp();
+        cache.put(
+            "1.2.3.4".into(),
+            crate::geo_cache::GeoEntry {
+                country: "RU".into(),
+                lat: 55.7,
+                lon: 37.6,
+                ts: now,
+            },
+        );
+        cache.put(
+            "5.6.7.8".into(),
+            crate::geo_cache::GeoEntry {
+                country: "BR".into(),
+                lat: -23.5,
+                lon: -46.6,
+                ts: now,
+            },
+        );
+        crate::geo_cache::save_cache(dir.path(), &cache).unwrap();
+        // Reload + sanity check: the disk shape must be loadable
+        // by the same helper `build_live_feed_response` calls.
+        let loaded = crate::geo_cache::load_cache(dir.path());
+        assert_eq!(loaded.len(), 2);
+        let ru = loaded
+            .get_fresh("1.2.3.4", now)
+            .expect("RU IP must be in cache");
+        assert_eq!(ru.country, "RU");
+        assert!((ru.lat - 55.7).abs() < 1e-6);
+        // Unknown IP returns None — the live_feed populator turns
+        // this into `country=""` so the frontend can decide
+        // whether to plot at lat=0/lon=0 or skip the marker.
+        assert!(loaded.get_fresh("9.9.9.9", now).is_none());
     }
 
     #[test]

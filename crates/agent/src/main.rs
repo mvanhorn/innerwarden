@@ -91,6 +91,7 @@ mod fail2ban;
 mod firmware_tick;
 mod fleet;
 mod forensics;
+mod geo_cache;
 mod geoip;
 mod honeypot_always_on;
 mod honeypot_post_session;

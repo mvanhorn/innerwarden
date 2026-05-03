@@ -1,6 +1,8 @@
 # Inner Warden
 
-**The open-source security agent that detects, scores, and fights back.**
+**The security agent that fights back.**
+
+Most security tools warn you when something's wrong. Inner Warden runs its own AI **inside your server**, decides what's a real threat, and stops it. No team to react, no cloud needed. Open source, you decide where your data goes.
 
 > It's 2 AM. Someone brute-forces your SSH. You're asleep.
 > Inner Warden blocks the IP, captures the session, deploys a honeypot, and alerts you on Telegram.
@@ -45,9 +47,9 @@ Installs in 10 seconds. Starts in observe-only mode. Dry-run by default. You dec
 
 ### How is this different?
 
-Inner Warden is the **autonomous alternative to MDR**: same outcome (24/7 detection + response), no SOC cost. Self-contained runtime defense stack: kernel-level telemetry, native network visibility, AI triage, and autonomous response in one system. Single SQLite database for all state, no scattered log files, no external database. No SIEM bundle, no external IDS/HIDS dependency, and no cloud control plane required.
+It lives where the action is. Not a tool watching from outside, not an alert in someone else's dashboard. Inner Warden runs inside the server, sees what every program does, and decides what to do — all without leaving the box. One binary, one SQLite database, no SIEM bundle, no external IDS, no cloud control plane. Two Rust daemons and a CLI.
 
-40 eBPF kernel hooks. 49 detectors. 22 collectors. 47 cross-layer correlation rules. 65 MITRE ATT&CK techniques (40% validated via Caldera). 208 Sigma community rules. Autoencoder anomaly detection. Behavioral DNA attacker fingerprinting. JA3/JA4 TLS fingerprinting. YARA + Sigma rule engines. 20 automated playbooks. Monthly threat reports. Mesh collaborative defense. **Unified SQLite store** for every artifact (incidents, decisions, KV cache, graph snapshots, attacker profiles). **Intelligent notifications**: incidents group into a single Telegram message per IP instead of one-per-event. **Circuit breaker**: per-hour cap on autonomous block decisions protects against runaway enforcement (pause / log-only / dry-run modes). **Continuous trust scoring**: graduated enforcement plus AI SOC daily checks. **Regression safety net**: `make scenario-qa` gates every PR against drift for 7 canonical attack scenarios. No cloud. No dependencies. Just two Rust daemons and a CLI.
+40 eBPF kernel hooks. 49 detectors. 22 collectors. 47 cross-layer correlation rules. 65 MITRE ATT&CK techniques (40% validated via Caldera). 208 Sigma community rules. Autoencoder anomaly detection. Behavioral DNA attacker fingerprinting. JA3/JA4 TLS fingerprinting. YARA + Sigma rule engines. Monthly threat reports. Mesh collaborative defense. **Unified SQLite store** for every artifact (incidents, decisions, KV cache, graph snapshots, attacker profiles). **Intelligent notifications**: incidents group into a single Telegram message per IP instead of one-per-event. **Circuit breaker**: per-hour cap on autonomous block decisions protects against runaway enforcement (pause / log-only / dry-run modes). **Continuous trust scoring**: graduated enforcement plus daily self-check. **Regression safety net**: `make scenario-qa` gates every PR against drift for 7 canonical attack scenarios.
 
 <h3 align="center">
   <a href="https://innerwarden.com/live">See it responding to real attacks right now</a>

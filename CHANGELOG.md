@@ -9,6 +9,47 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-05-03
+
+Operator-trust release. Closes the recurring "the dashboard says one number, the site says another, JSONL says a third" class of bug. Adds the persistent IP→geo cache that keeps the site map honest at scale (138+ unique attackers/day on the operator's prod host). Removes the half-shipped playbook engine (deferred to Spec 042).
+
+### Added — Wave 6a (PR #434)
+- **Persistent GeoIP cache** (`crates/agent/src/geo_cache.rs`) — IP → geo-entry map with 7-day TTL, atomic tmp-rename persistence at `data_dir/geo-cache.json`. Public site `Attack origins` map was making N round-trips to ip-api.com per page load (N = unique attacker IPs); with 138 unique IPs in 24h and ip-api free tier capped at 45 req/min, cold-cache load took ~3 minutes to plot all markers. Cache makes subsequent loads instant.
+- **`/api/live-feed` carries pre-attached geo** — new `sources: Vec<{ip, country, lat, lon, incidents}>` field (capped at 200 by activity). Frontend renders the map immediately for cached IPs without per-IP `/geoip` follow-up. Cache misses arrive with `country=""`/`lat=lon=0` so the JS can decide to skip or render at the equator until a backfill round.
+- **`/api/live-feed/geoip` is cache-first** — hits return immediately with no network call. Misses fall through to ip-api and write back to the cache so the next call is instant.
+
+### Fixed — Wave 5 / 5b / 5c (PRs #427 #429 #430 #431 #432 #433)
+
+**Number honesty:**
+- **Site live-feed and dashboard counts now match prod truth (PR #433)** — public `/api/live-feed` walked ONLY the in-memory KG; KG TTL evicted everything older than ~1 day. Site reported `4 events / 0 IPs blocked / 0 high (24h)` while prod JSONL had 42 incidents and 647 block decisions for the same window. New `merge_incidents_prefer_kg` / `merge_decisions_prefer_kg` helpers concat KG (rich entity context) with JSONL (full daily history), dedup by `incident_id`. Today + yesterday window covers cross-midnight. Anchored by `jsonl_fallback_recovers_count_when_kg_is_empty`.
+- **Knowledge graph snapshot no longer carries dangling edges (PR #432)** — `enforce_memory_limit` removed nodes (which tombstones edges via `remove_node`) AFTER the gated `compact_edges` ran in slow_loop. Tombstones leaked into the persisted blob; reload tagged them as dangling and emitted `Knowledge graph has dangling edge references — pruning dangling=30157` every save cycle for days. New `compact_edges_force()` (no 20%-ratio gate) runs LAST in the maintenance order so both passes' tombstones are swept before serialise. Anchored by `snapshot_after_node_eviction_carries_no_dangling_edges`.
+
+**Detection / response correctness:**
+- **`graph_discovery_burst` no longer fires HIGH on snap_daemon (PR #432)** — operator's site home rendered `HIGH: Graph Discovery Burst — user uid:584788 (92 actions in 60s)` for routine `snap refresh`. Even with the PR #418 5x Service-class threshold (5×5=25), 92 actions tripped the `>= adjusted * 2 → HIGH` branch. Now caps severity at Medium for Service-class users; signal still recorded (visible in journey + Telegram digest) but no red banner for non-actionable noise. Evidence JSON gains `user_class` field.
+- **Baseline learning rejects honeypot + brute-force usernames (PR #429)** — operator's `baseline.json` was full of `Admin`, `AdminGPON`, `Administrator`, `1234`, `123456789`, plus literal special chars. Three filters added: skip events with `source` starting `honeypot` or tag `honeypot`; reject entity values that fail `is_valid_unix_username` (POSIX `[a-z_][a-z0-9_-]{0,31}`); one-shot prune at boot wipes pre-existing pollution. Four anchors pin each layer.
+- **Reverse_shell incident summary no longer leaks `uid={uid}` (PR #428, CodeQL #144)** — `uid` already lives in `evidence.uid` as structured data. Removing the redundant interpolation cleared the `rust/cleartext-logging` finding without losing forensic fidelity.
+
+**Runtime resilience:**
+- **XDP unavailability stops spamming the journal (PR #430)** — when bpffs is not mounted at `/sys/fs/bpf/innerwarden`, every block decision was emitting two WARN lines (`shield XDP blocklist add failed` + `XDP blocklist map not found`). New `xdp_availability` module gates both call sites: after one observed failure, XDP attempts skip for 5 min and exactly one operator-actionable WARN with the recovery recipe is logged. Auto-recovers when bpffs is mounted. Steady-state log volume drops from ~6 WARN/hour to 1 every 5 min.
+- **`events.src_ip` backfill no longer races sensor for SQLite writer lock (PR #431)** — agent and sensor are separate processes sharing the .db file. Agent's 1000-row UPDATE batch held the writer lock long enough that the sensor's INSERTs blocked past `busy_timeout=5000ms`. Three changes: `BACKFILL_BATCH_SIZE` 1000 → 100 (10× shorter lock hold), throttle to 1/min (was every 30s tick), retry-with-backoff up to 3× on `database is locked`. Steady-state log volume drops from ~120 WARN/hour to <5.
+
+**Dashboard UX honesty:**
+- **Baseline tab "Who logs in, when" heatmap default-hides daemon PAM sessions (PR #427)** — operator opened the tab and reported many "users logged in" when only `ubuntu` had real SSH sessions. Endpoint enriches the response with `user_classes` map (read from `/etc/passwd` via existing `parse_passwd_for_user_classes` from PR #418). Frontend default-hides Service-class rows behind a "Show system accounts (N)" toggle (state persisted in localStorage). Per-row class badge so the operator sees Human / Root / Service / Unknown. Pagination at 21+ visible rows. Heatmap now uses full card width.
+
+### Changed
+- **README + GitHub repo "About" sidebar** (PR #434) — drop "autonomous alternative to MDR / no SOC cost" framing in favour of the site's voice ("The security agent that fights back. ... runs inside your server, decides what's a real threat, and stops it."). Same key points (one binary, one SQLite, no SIEM/IDS/cloud) without renting positioning from a category the project does not occupy.
+- **Stale `20 automated playbooks` claim removed from README** — PR #413 (in this release) already removed the playbook engine; the README boast was leftover. Spec 042 active defense will be the future home for declarative orchestration.
+
+### CI / supply chain
+- **OpenSSF Scorecard hardening (PR #428)** — `anchor-tests.yml` workflow gained an explicit top-level `permissions: contents: read` block (was implicitly write-all, scoring 0/10 on Token-Permissions) and pinned `actions/checkout@v4` to its commit SHA (Pinned-Dependencies 9 → 10). Recovers ~0.7 of overall Scorecard.
+
+### Anchor-test count
+- 8 → 26 (+18 new anchors across Waves 5/5b/5c/6a). Manifest at `ANCHOR_TESTS.md`; CI gate `verify-anchor-tests` runs on every PR.
+
+---
+
+## [0.12.4-pre — entries below were on `Unreleased` from 0.12.4 onward; rolled into 0.13.0]
+
 ### Fixed
 - **Home tile "X handled today" now matches the Threats tab entry count** — the home tile read `safely_resolved` (incident-count) while the Threats tab grouped by attacker IP. Operators saw "54 handled" then clicked through and counted ~14 entries. New `handled_ips_today` field on `OverviewResponse` is the unique-IP count; `home.js` reads it (with `safely_resolved` fallback for older backends). Validated in prod canary 2026-04-23: home shows 2, threats shows 2 blocked + 12 resolved = 14, site live-feed shows `unique_sources: 14`. (`NUMBER_CONSISTENCY.md` row "handled count")
 - **Threats tab now applies the same internal/research filter as the public site** — pre-fix, advisory-only detectors (`neural_anomaly`, `host_drift`, `network_sniffing`, `discovery_burst`) and InnerWarden system processes (`(en-agent)`, `(en-sensor)`, `(systemd)`, etc) showed up in the Threats tab as "attackers" but were filtered out of the site live-feed. Same `is_internal_incident_fields` predicate now applied at both surfaces. Validated in prod: `/api/entities` returns the same 14 unique sources as `/api/live-feed`.
