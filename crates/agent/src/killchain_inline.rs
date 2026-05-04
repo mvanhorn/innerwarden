@@ -327,6 +327,16 @@ pub(crate) const BUILTIN_SELF_TRAFFIC_COMMS: &[&str] = &[
     "git-remote-", // git-remote-https etc (truncated form)
     "curl",
     "wget",
+    // 2026-05-05 (Wave 9b): libcurl-using package fetchers (apt, snap, etc)
+    // launch worker threads whose `comm` becomes the protocol scheme rather
+    // than the parent binary name. On 2026-04-28..05-04 prod these accounted
+    // for 77 of 169 (45%) killchain DATA_EXFIL incidents that did not get
+    // auto-dismissed because the comms were absent from this list. Kept
+    // separately from `apt`/`snap` so a future contributor sees the
+    // motivation; the prefix matcher in `matches_self_traffic_comm` does
+    // not actually need them broken out.
+    "http",
+    "https",
     // System package management & daemons that legitimately do
     // socket + sensitive_read against cloud / mirror endpoints.
     "apt",
@@ -343,6 +353,60 @@ pub(crate) const BUILTIN_SELF_TRAFFIC_COMMS: &[&str] = &[
     // Cloud-init / systemd helpers that fetch metadata at boot.
     "cloud-init",
 ];
+
+/// Subset of [`BUILTIN_SELF_TRAFFIC_COMMS`] whose dismissal does NOT require
+/// the uid to be either 0 or >=1000.
+///
+/// **Why this exists.** The general uid filter (`uid == 0 || uid >= 1000`)
+/// was added to catch lateral-movement-flavoured cases like `www-data` (uid
+/// 33) running `ssh`. For ssh / scp / git / rsync that is the right call,
+/// because those comms can spawn shells and pivot. For pure network-fetcher
+/// comms (`apt`, `http`, `https`, `wget`, package daemons) the uid is
+/// largely irrelevant: the operation is "download from a public host" and
+/// the worst-case interpretation of an unexpected uid is "compromised
+/// service used the package manager", which still does not warrant a
+/// `kill_chain DATA_EXFIL @ Critical` alert.
+///
+/// **Real-world prod symptom.** Debian/Ubuntu apt runs its HTTPS download
+/// step under uid 105 (`_apt`, the unprivileged sandbox), and the worker's
+/// `comm` becomes `http` or `https` rather than `apt`. Pre-Wave-9b that hit
+/// BOTH gates (comm not in list AND uid 105 fails the {0, >=1000} check),
+/// so the operator's nightly apt update produced 9-15 critical "DATA_EXFIL
+/// to Ubuntu mirror IP" incidents per day that reached the AI router.
+///
+/// **Login-shell tools deliberately stay uid-checked.** `ssh`, `scp`,
+/// `sftp`, `rsync`, `git`, `git-remote-` are NOT in this set. The lateral-
+/// movement risk on those comms still justifies the {0, >=1000} gate.
+const UID_AGNOSTIC_FETCHER_COMMS: &[&str] = &[
+    "apt",
+    "apt-get",
+    "snap",
+    "snapd",
+    "http",
+    "https",
+    "curl",
+    "wget",
+    "systemd-resolv",
+    "systemd-network",
+    "chronyd",
+    "ntpd",
+    "fwupdmgr",
+    "unattended-upgr",
+    "needrestart",
+    "cloud-init",
+];
+
+/// True iff `comm` is a network-fetcher tool whose dismissal does not need
+/// the uid to be in `{0, >=1000}`. Uses the same prefix-match semantics as
+/// [`matches_self_traffic_comm`].
+fn comm_is_uid_agnostic_fetcher(comm: &str) -> bool {
+    if comm.is_empty() {
+        return false;
+    }
+    UID_AGNOSTIC_FETCHER_COMMS
+        .iter()
+        .any(|prefix| comm == *prefix || comm.starts_with(*prefix))
+}
 
 /// Returns the merged self-traffic comm list: builtins + operator
 /// additions from `[killchain].self_traffic_comms_extra`. This is
@@ -411,15 +475,22 @@ pub(crate) fn dismiss_self_traffic_incidents(
             continue;
         }
 
-        // Self-traffic check: comm matches a known operator/system
-        // tool; uid must be either root (system services) or a
-        // regular user (operator). Reject service-account uids in
-        // the 1-999 range (web servers etc) — those running ssh /
-        // curl deserve a real AI decision.
+        // Self-traffic check: comm matches a known operator/system tool.
         if !matches_self_traffic_comm(comm, self_traffic_list) {
             continue;
         }
-        let uid_ok = uid == 0 || uid >= 1000;
+        // Uid policy:
+        //   - Login-shell tools (ssh, scp, sftp, rsync, git, git-remote-)
+        //     require uid in {0, >=1000}. Service-account uids (1-999)
+        //     running these comms could be lateral movement and deserve a
+        //     real AI decision.
+        //   - Network-fetcher tools (apt, http, https, wget, snap, ...)
+        //     are uid-agnostic. The operation is "download from a public
+        //     host", not shell escalation, so the uid is irrelevant to
+        //     the FP determination. This unblocks the apt-as-_apt (uid
+        //     105) case that flooded prod with FP DATA_EXFIL incidents
+        //     pre-Wave-9b.
+        let uid_ok = comm_is_uid_agnostic_fetcher(comm) || uid == 0 || uid >= 1000;
         if !uid_ok {
             continue;
         }
@@ -1470,6 +1541,249 @@ mod tests {
         let list = self_traffic_comms(&cfg);
         assert!(list.iter().any(|c| c == "puppet"));
         assert!(!list.iter().any(|c| c.is_empty() || c.trim().is_empty()));
+    }
+
+    // ── 2026-05-05 (Wave 9b) anchors — service-account fetcher dismiss ──
+    //
+    // The general uid filter (uid == 0 || uid >= 1000) was too strict for
+    // network-fetcher comms. Specifically: Debian/Ubuntu apt runs its
+    // HTTPS download under uid 105 (`_apt`, the unprivileged sandbox), and
+    // the worker thread's `comm` becomes `http` or `https`. Pre-Wave-9b
+    // both gates rejected the dismiss (comm not in BUILTIN list AND uid
+    // 105 fails the {0, >=1000} check) and the operator's nightly apt
+    // update produced 9-15 critical "DATA_EXFIL to Ubuntu mirror IP"
+    // incidents per day that reached the AI router (62 https + 15 http
+    // incidents in the 7d window 2026-04-28..05-04).
+    //
+    // Anchors below pin: (1) http/https/etc are now in the self-traffic
+    // list, (2) the uid check is bypassed for fetcher comms only,
+    // (3) login-shell comms (ssh, scp, ...) still enforce the uid check
+    // so the original lateral-movement protection is intact.
+
+    #[test]
+    fn dismiss_self_traffic_dismisses_apt_https_thread_at_apt_uid_105() {
+        // The exact prod symptom that motivated Wave 9b: apt's https
+        // worker (uid 105 = _apt) downloads from Ubuntu mirror.
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let incidents = vec![serde_json::json!({
+            "incident_id": "kill_chain:detected:DATA_EXFIL:1234:2026-05-05T03:00Z",
+            "evidence": [{
+                "kind": "kill_chain_detected",
+                "pattern": "DATA_EXFIL",
+                "c2_ip": "91.189.91.46",
+                "pid": 1234,
+                "comm": "https",
+                "uid": 105,
+            }]
+        })];
+        dismiss_self_traffic_incidents(
+            tmp.path(),
+            Some(&store),
+            &incidents,
+            &test_self_traffic_list(),
+        );
+        assert_eq!(
+            store.decisions_count().unwrap(),
+            1,
+            "apt's https worker at uid 105 (_apt) MUST be auto-dismissed - this was 62 \
+             of 169 prod incidents per 7d window pre-Wave-9b"
+        );
+    }
+
+    #[test]
+    fn dismiss_self_traffic_dismisses_apt_http_at_apt_uid() {
+        // Same path as above but the http (port 80) variant.
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let incidents = vec![serde_json::json!({
+            "incident_id": "kill_chain:detected:DATA_EXFIL:5555:2026-05-05T03:01Z",
+            "evidence": [{
+                "kind": "kill_chain_detected",
+                "pattern": "DATA_EXFIL",
+                "c2_ip": "91.189.91.104",
+                "pid": 5555,
+                "comm": "http",
+                "uid": 105,
+            }]
+        })];
+        dismiss_self_traffic_incidents(
+            tmp.path(),
+            Some(&store),
+            &incidents,
+            &test_self_traffic_list(),
+        );
+        assert_eq!(store.decisions_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn dismiss_self_traffic_dismisses_apt_at_apt_uid_directly() {
+        // Even when the worker comm IS `apt` (no thread-rename), uid 105
+        // would have failed pre-Wave-9b. After Wave 9b apt is fetcher-class
+        // and uid-agnostic.
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let incidents = vec![serde_json::json!({
+            "incident_id": "kill_chain:detected:DATA_EXFIL:7777:2026-05-05T03:02Z",
+            "evidence": [{
+                "kind": "kill_chain_detected",
+                "pattern": "DATA_EXFIL",
+                "c2_ip": "91.189.91.46",
+                "pid": 7777,
+                "comm": "apt",
+                "uid": 105,
+            }]
+        })];
+        dismiss_self_traffic_incidents(
+            tmp.path(),
+            Some(&store),
+            &incidents,
+            &test_self_traffic_list(),
+        );
+        assert_eq!(store.decisions_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn dismiss_self_traffic_still_blocks_ssh_at_service_account_uid() {
+        // Lateral-movement guard on login-shell comms must NOT regress.
+        // ssh from www-data (uid 33) is not legitimate operator activity
+        // and must reach the AI router for a real call. This is the test
+        // the Wave 9b uid-agnostic carveout MUST NOT erode.
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let incidents = vec![serde_json::json!({
+            "incident_id": "kill_chain:detected:DATA_EXFIL:8888:2026-05-05T03:03Z",
+            "evidence": [{
+                "kind": "kill_chain_detected",
+                "pattern": "DATA_EXFIL",
+                "c2_ip": "203.0.113.20",
+                "pid": 8888,
+                "comm": "ssh",
+                "uid": 33,
+            }]
+        })];
+        dismiss_self_traffic_incidents(
+            tmp.path(),
+            Some(&store),
+            &incidents,
+            &test_self_traffic_list(),
+        );
+        assert_eq!(
+            store.decisions_count().unwrap(),
+            0,
+            "ssh from www-data (uid 33) MUST still reach the AI router - the Wave 9b \
+             fetcher carveout cannot erode the lateral-movement guard on login-shell comms"
+        );
+    }
+
+    #[test]
+    fn dismiss_self_traffic_still_dismisses_ssh_at_operator_uid() {
+        // Pre-Wave-9b ssh at uid >= 1000 was already dismissed via the
+        // {0, >=1000} gate. This anchor pins that it still IS dismissed
+        // post-Wave-9b (the old branch is preserved as the fallback when
+        // the comm is not a fetcher).
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let incidents = vec![serde_json::json!({
+            "incident_id": "kill_chain:detected:DATA_EXFIL:9001:2026-05-05T03:04Z",
+            "evidence": [{
+                "kind": "kill_chain_detected",
+                "pattern": "DATA_EXFIL",
+                "c2_ip": "20.26.156.215",
+                "pid": 9001,
+                "comm": "ssh",
+                "uid": 1001,
+            }]
+        })];
+        dismiss_self_traffic_incidents(
+            tmp.path(),
+            Some(&store),
+            &incidents,
+            &test_self_traffic_list(),
+        );
+        assert_eq!(store.decisions_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn comm_is_uid_agnostic_fetcher_recognises_documented_fetchers() {
+        // Lock the fetcher set against a future contributor accidentally
+        // moving a comm out of UID_AGNOSTIC_FETCHER_COMMS without bumping
+        // a comment. If you add a comm here, also add a behavioural test
+        // upstream that exercises it through dismiss_self_traffic.
+        for comm in [
+            "apt",
+            "apt-get",
+            "snap",
+            "snapd",
+            "http",
+            "https",
+            "curl",
+            "wget",
+            "systemd-resolv",
+            "systemd-network",
+            "chronyd",
+            "ntpd",
+            "fwupdmgr",
+            "unattended-upgr",
+            "needrestart",
+            "cloud-init",
+        ] {
+            assert!(
+                comm_is_uid_agnostic_fetcher(comm),
+                "expected `{comm}` to be classified as a uid-agnostic fetcher comm"
+            );
+        }
+        // Login-shell tools must NOT be uid-agnostic - the lateral-
+        // movement guard applies to them.
+        for login in ["ssh", "scp", "sftp", "rsync", "git", "git-remote-https"] {
+            assert!(
+                !comm_is_uid_agnostic_fetcher(login),
+                "`{login}` must require the uid check (lateral-movement guard)"
+            );
+        }
+        // Empty comm is never a fetcher (avoids matching everything via
+        // the "starts_with empty" pitfall).
+        assert!(!comm_is_uid_agnostic_fetcher(""));
+    }
+
+    #[test]
+    fn dismiss_self_traffic_still_skips_strong_pattern_for_apt_uid_105() {
+        // Wave 9b extends the dismiss for fetcher comms across uids, but
+        // the strong-pattern guard (audit B2/P3) MUST still skip. apt at
+        // uid 105 with REVERSE_SHELL is still a kernel-level forensic
+        // signal that cannot be overruled by a comm/uid heuristic.
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(innerwarden_store::Store::open_memory().expect("open_memory"));
+        let incidents = vec![serde_json::json!({
+            "incident_id": "kill_chain:detected:REVERSE_SHELL:6666:2026-05-05T03:05Z",
+            "evidence": [{
+                "kind": "kill_chain_detected",
+                "pattern": "REVERSE_SHELL",
+                "c2_ip": "203.0.113.99",
+                "pid": 6666,
+                "comm": "https",
+                "uid": 105,
+            }]
+        })];
+        dismiss_self_traffic_incidents(
+            tmp.path(),
+            Some(&store),
+            &incidents,
+            &test_self_traffic_list(),
+        );
+        assert_eq!(
+            store.decisions_count().unwrap(),
+            0,
+            "REVERSE_SHELL must NEVER be auto-dismissed even when comm/uid match the \
+             new fetcher carveout - kernel-level forensic evidence routes through the \
+             AI router + incident_untouchable"
+        );
     }
 
     #[test]
