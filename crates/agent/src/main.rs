@@ -285,6 +285,14 @@ struct Cli {
     /// whole day for the baseline to recalibrate.
     #[arg(long)]
     retrain_anomaly: bool,
+
+    /// Parse `--config <path>` against the strict AgentConfig schema, print a
+    /// short OK summary on success or the parse error on failure, then exit
+    /// without booting the agent. Used by `innerwarden config validate` and
+    /// by `scripts/deploy-prod.sh` to refuse a deploy whose `agent.toml` has
+    /// unknown / typo'd keys (Wave 9e, anchor for AUDIT-002).
+    #[arg(long)]
+    validate_config_only: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -731,7 +739,68 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // --validate-config-only: parse the agent.toml against the strict
+    // schema, print OK + a section count summary, exit 0 on success or
+    // exit 1 on parse error. Used by `innerwarden config validate` (the
+    // ctl subcommand) and by `scripts/deploy-prod.sh` step [-1/4] to
+    // refuse a deploy whose agent.toml has unknown keys. Wave 9e anchor
+    // for AUDIT-002 ("agent.toml [data_retention] silently ignored").
+    if cli.validate_config_only {
+        return run_validate_config_only(cli);
+    }
+
     loops::boot::run_agent(cli).await
+}
+
+/// Implements `--validate-config-only`. Lives in main.rs (not boot.rs) so the
+/// validate path does not pull in any of run_agent's heavyweight init - the
+/// goal is "parse + exit" and nothing else, so the deploy-prod pre-flight
+/// runs in milliseconds even on a slow box.
+fn run_validate_config_only(cli: Cli) -> Result<()> {
+    let path = cli
+        .config
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--validate-config-only requires --config <path>"))?;
+    if !path.exists() {
+        anyhow::bail!(
+            "--validate-config-only: config file not found at {}\n\
+             (no error: a missing file would default to AgentConfig::default(), \
+             which is fine at runtime but a likely operator mistake at deploy time)",
+            path.display()
+        );
+    }
+    match config::load(path) {
+        Ok(_cfg) => {
+            println!(
+                "OK: {} parsed against strict AgentConfig schema (Wave 9e).",
+                path.display()
+            );
+            println!("All sections / keys recognised; deny_unknown_fields gate would not refuse this config.");
+            Ok(())
+        }
+        Err(e) => {
+            // Operator-friendly error. The serde error chain already names the
+            // unknown field + section; print the chain so the operator sees
+            // which line of agent.toml to fix.
+            eprintln!(
+                "FAIL: {} did NOT parse against strict AgentConfig schema.",
+                path.display()
+            );
+            eprintln!("Reason: {:#}", e);
+            eprintln!();
+            eprintln!(
+                "Wave 9e enforcement: agent.toml fields must match the AgentConfig struct exactly."
+            );
+            eprintln!("Common fixes:");
+            eprintln!("  - Section [data_retention] is now also accepted via serde alias for [data]; if your");
+            eprintln!("    file uses [data_retention] and STILL fails, check inner field names (events_keep_days,");
+            eprintln!("    incidents_keep_days, filestore_max_size_mb, etc) against `crates/agent/src/config.rs`.");
+            eprintln!("  - Typo'd keys: cross-check against the same struct.");
+            eprintln!("  - Unknown sections: remove or rename to match.");
+            std::process::exit(1);
+        }
+    }
 }
 
 #[cfg(test)]

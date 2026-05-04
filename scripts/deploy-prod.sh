@@ -75,6 +75,26 @@ this guard fires first so the operator sees the gap."
   echo "  OK: on main, in sync with origin, clean working tree."
 fi
 
+# Step -0.5: Config schema gate (Wave 9e, 2026-05-04).
+#
+# Anchors AUDIT-002 ("agent.toml [data_retention] silently ignored"). The
+# agent now has #[serde(deny_unknown_fields)] on every nested config struct,
+# so an unknown / typo'd key is a LOUD startup error. Catching it here
+# (before the build + restart) means the operator sees the typo in the
+# deploy log instead of finding their agent in a crashloop after the
+# `systemctl start`.
+#
+# Skipped when source guard is skipped (matching the bypass-everything
+# semantics). To intentionally skip just this gate set
+# DEPLOY_SKIP_CONFIG_VALIDATE=1 (e.g. when validating against an in-flight
+# config that you know has known-warning legacy keys).
+echo "[-0.5/4] Config schema gate (validates /etc/innerwarden/agent.toml)..."
+if [ "${DEPLOY_SKIP_CONFIG_VALIDATE:-0}" = "1" ] || [ "${DEPLOY_SKIP_SOURCE_GUARD:-0}" = "1" ]; then
+  echo "  WARN: DEPLOY_SKIP_CONFIG_VALIDATE=1 set - skipping schema validation."
+else
+  $SSH "$BIN_DIR/innerwarden config validate --path /etc/innerwarden/agent.toml" || die "agent.toml failed strict-schema validation; refusing deploy until the operator fixes the unknown/typo'd keys reported above. To intentionally bypass: DEPLOY_SKIP_CONFIG_VALIDATE=1 ./scripts/deploy-prod.sh"
+fi
+
 
 # Step 0: Pre-deploy cleanup (free disk before pulling/building).
 #

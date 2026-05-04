@@ -2564,6 +2564,7 @@ mod tests {
             cleanup_015_graph_signal_quality: false,
             backfill_015_research_only: false,
             retrain_anomaly: false,
+            validate_config_only: false,
         }
     }
 
@@ -3190,6 +3191,7 @@ mod heap_budget {
             insecure_no_tls: false,
             dashboard_generate_password_hash: false,
             interval: 30,
+            validate_config_only: false,
             honeypot_sandbox_runner: false,
             honeypot_sandbox_spec: None,
             honeypot_sandbox_result: None,

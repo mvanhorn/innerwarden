@@ -1582,6 +1582,28 @@ enum ConfigAllCommand {
         #[command(subcommand)]
         command: MeshCommand,
     },
+
+    /// Validate `agent.toml` against the strict AgentConfig schema.
+    ///
+    /// Wave 9e (2026-05-04): every nested config struct now has
+    /// `#[serde(deny_unknown_fields)]`. Typo'd or invented keys produce a
+    /// loud error at agent boot - this command surfaces those errors
+    /// BEFORE the deploy so the operator can fix them without bricking
+    /// prod.
+    ///
+    /// Run before every deploy. `scripts/deploy-prod.sh` calls this in
+    /// step `[-1/4]` automatically; use it manually when editing
+    /// `agent.toml` to verify the change parses cleanly.
+    ///
+    /// Examples:
+    ///   innerwarden config validate
+    ///   innerwarden config validate --path /etc/innerwarden/agent.toml
+    ///   innerwarden config validate --path ./my-test-agent.toml
+    Validate {
+        /// Path to agent.toml. Defaults to /etc/innerwarden/agent.toml.
+        #[arg(long, default_value = "/etc/innerwarden/agent.toml")]
+        path: PathBuf,
+    },
 }
 
 /// System health, tuning, security, and data management.
@@ -1962,7 +1984,60 @@ fn dispatch_config(cli: &Cli, command: &Option<ConfigAllCommand>) -> Result<()> 
             } => commands::mesh::cmd_mesh_add_peer(cli, endpoint, label.as_deref()),
             MeshCommand::Status => commands::mesh::cmd_mesh_status(cli),
         },
+        Some(ConfigAllCommand::Validate { ref path }) => cmd_config_validate(path),
     }
+}
+
+/// `innerwarden config validate <path>` — shells out to
+/// `innerwarden-agent --validate-config-only --config <path>`. The agent
+/// owns the canonical schema, so duplicating the parser here would create
+/// a drift surface (the same class of bug AUDIT-002 caught for TOML
+/// section names). The shell-out runs in milliseconds because the agent's
+/// validate path early-returns BEFORE booting any of run_agent.
+///
+/// Looks for the agent binary in this order:
+///
+///   1. `target/release/innerwarden-agent` (dev: post-`cargo build --release`)
+///   2. `target/debug/innerwarden-agent` (dev fallback)
+///   3. `/usr/local/bin/innerwarden-agent` (standard prod install)
+///
+/// First match wins. Workspace builds are preferred over `/usr/local/bin/`
+/// so a dev that just rebuilt the agent immediately exercises the fresh
+/// binary instead of whatever stale copy `make install` once dropped in
+/// `/usr/local/bin/`. Production hosts have `target/release` pruned by the
+/// deploy script (or never built it locally) so they fall through cleanly.
+fn cmd_config_validate(path: &Path) -> Result<()> {
+    // Prefer in-workspace builds over /usr/local/bin/ so a dev running
+    // `cargo build --release -p innerwarden-agent` then `innerwarden config
+    // validate` picks up the freshly-compiled binary, not whatever stale
+    // copy is in /usr/local/bin/. Production hosts have target/release
+    // pruned by the deploy script (or never built it locally), so they
+    // fall through to /usr/local/bin/ as expected.
+    let agent_binary = [
+        "target/release/innerwarden-agent",
+        "target/debug/innerwarden-agent",
+        "/usr/local/bin/innerwarden-agent",
+    ]
+    .into_iter()
+    .map(Path::new)
+    .find(|p| p.exists())
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "innerwarden-agent binary not found. Tried target/release/, target/debug/, /usr/local/bin/.\n\
+             Build with `cargo build --release -p innerwarden-agent` or install via deploy-prod.sh."
+        )
+    })?;
+
+    let status = std::process::Command::new(agent_binary)
+        .arg("--validate-config-only")
+        .arg("--config")
+        .arg(path)
+        .status()
+        .with_context(|| format!("failed to invoke {}", agent_binary.display()))?;
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
 }
 
 fn dispatch_module(cli: &Cli, command: &ModuleCommand) -> Result<()> {

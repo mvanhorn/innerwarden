@@ -9,6 +9,7 @@ use serde::Deserialize;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     #[serde(default)]
     pub narrative: NarrativeConfig,
@@ -26,7 +27,16 @@ pub struct AgentConfig {
     pub responder: ResponderConfig,
     #[serde(default)]
     pub telegram: TelegramConfig,
-    #[serde(default)]
+    /// Data retention settings. Historic prod deploys labelled this section
+    /// `[data_retention]`; the canonical TOML key is `[data]` because that
+    /// matches the field name on `AgentConfig`. The serde alias accepts both
+    /// so existing `[data_retention]` blocks keep working - operator
+    /// migration is gradual. (Wave 9e, 2026-05-04: this alias was added
+    /// after audit AUDIT-002 found prod's `[data_retention]` block had been
+    /// silently ignored for the lifetime of agent.toml because the section
+    /// name did not match the field. With `deny_unknown_fields` on
+    /// `AgentConfig`, that failure mode is now LOUD instead of silent.)
+    #[serde(default, alias = "data_retention")]
     pub data: DataRetentionConfig,
     #[serde(default)]
     pub crowdsec: CrowdSecConfig,
@@ -125,6 +135,7 @@ pub struct AgentConfig {
 /// staged: this PR lands the flag + config, the follow-up PR lands the decide
 /// call. See spec 028 section 028-b.
 #[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct IncidentFlowConfig {
     /// When true, Escalate from observation-verify should trigger a Fase 4
     /// decide() call. The wiring itself is a follow-up PR; today the flag
@@ -148,6 +159,7 @@ pub struct IncidentFlowConfig {
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigSigningConfig {
     /// When true, agent refuses to start if signature is missing or invalid.
     #[serde(default)]
@@ -167,6 +179,7 @@ pub struct ConfigSigningConfig {
 /// No new write paths on the spoke side: the manager talks to the
 /// existing single-host dashboard endpoints over HTTPS.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FleetConfig {
     /// Master switch. When false the poller is not spawned and
     /// `/api/fleet/hosts` returns 404. Default: `false`.
@@ -185,6 +198,7 @@ pub struct FleetConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FleetHostConfig {
     /// Stable identifier the manager uses in URLs and status keys.
     /// Must be unique across the fleet. Operator-chosen (e.g. `"prod-eu"`).
@@ -234,6 +248,7 @@ fn default_fleet_request_timeout_seconds() -> u64 {
 
 /// Dashboard config - trusted proxy IPs and other dashboard-related settings.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DashboardConfig {
     /// Master switch for the embedded dashboard server. Combined with
     /// the `--dashboard` CLI flag via AND: both must be set for the
@@ -283,6 +298,7 @@ fn default_max_sessions() -> usize {
 
 /// Firmware security monitoring via innerwarden-smm.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FirmwareConfig {
     /// Enable periodic firmware audits. Default: true.
     #[serde(default = "default_firmware_enabled")]
@@ -317,6 +333,7 @@ fn default_firmware_trust_threshold() -> f64 {
 
 /// Hypervisor security monitoring via innerwarden-hypervisor.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HypervisorConfig {
     /// Enable periodic hypervisor audits. Default: true.
     #[serde(default = "default_hypervisor_enabled")]
@@ -351,6 +368,7 @@ fn default_hypervisor_trust_threshold() -> f64 {
 
 /// Kill chain detection — inline PID tracking against 8 attack patterns.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KillchainConfig {
     /// Enable kill chain detection on eBPF events. Default: true.
     #[serde(default = "default_killchain_enabled")]
@@ -411,6 +429,7 @@ fn default_killchain_session_timeout() -> i64 {
 
 /// Threat DNA behavioral fingerprinting.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DnaConfig {
     /// Enable inline DNA fingerprinting. Default: true.
     #[serde(default = "default_dna_enabled")]
@@ -452,6 +471,7 @@ fn default_dna_session_timeout() -> i64 {
 
 /// DDoS Shield — inline rate limiting, SYN tracking, auto-escalation.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShieldConfig {
     /// Enable inline shield processing. Default: true.
     #[serde(default = "default_shield_enabled")]
@@ -485,6 +505,7 @@ fn default_shield_bpf_path() -> String {
 /// but decoupled so the agent compiles without the mesh feature.
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
+#[serde(deny_unknown_fields)]
 pub struct MeshNetworkConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -501,6 +522,7 @@ pub struct MeshNetworkConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 pub struct MeshPeerEntry {
     pub endpoint: String,
@@ -540,6 +562,7 @@ fn default_mesh_max_signals() -> usize {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NarrativeConfig {
     /// Generate daily Markdown summaries (default: true)
     #[serde(default = "default_true")]
@@ -560,7 +583,9 @@ impl Default for NarrativeConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)] // enabled/telegram consumed by briefing scheduler wiring in main.rs; kept accessible for inspection
+#[allow(dead_code)]
+// enabled/telegram consumed by briefing scheduler wiring in main.rs; kept accessible for inspection
+#[serde(deny_unknown_fields)]
 pub struct BriefingConfig {
     /// Enable daily AI intelligence briefing (default: true)
     #[serde(default = "default_true")]
@@ -596,6 +621,7 @@ impl Default for BriefingConfig {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WebhookConfig {
     /// Enable webhook notifications
     #[serde(default)]
@@ -668,6 +694,7 @@ impl WebhookConfig {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AiConfig {
     /// Enable AI-powered real-time incident analysis
     #[serde(default)]
@@ -850,6 +877,7 @@ pub struct AiConfig {
 /// shared knobs like `confidence_threshold`, `min_severity`, and the
 /// shadow wrapper continue to live on the top-level `[ai]` block.
 #[derive(Debug, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RoleProviderConfig {
     /// If false (default), this role is not configured separately
     /// and the boot path falls back to the primary `[ai]` block.
@@ -909,6 +937,7 @@ impl RoleProviderConfig {
 /// Shadow provider configuration (subset of AiConfig applied to a second
 /// provider that runs in parallel with the primary for auditing).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShadowConfig {
     /// If false (default), no shadow provider is created.
     #[serde(default)]
@@ -1080,6 +1109,7 @@ impl AiConfig {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CorrelationConfig {
     /// Enable lightweight temporal incident correlation (window + entity pivots)
     #[serde(default = "default_true")]
@@ -1109,6 +1139,7 @@ impl Default for CorrelationConfig {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TelemetryConfig {
     /// Enable local operational telemetry JSONL output
     #[serde(default = "default_true")]
@@ -1126,6 +1157,7 @@ impl Default for TelemetryConfig {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HoneypotConfig {
     /// Honeypot mode:
     /// - `demo`: synthetic marker only (safe default)
@@ -1232,6 +1264,7 @@ pub struct HoneypotConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HoneypotSandboxConfig {
     /// Run decoy listeners in dedicated subprocess workers.
     #[serde(default)]
@@ -1258,6 +1291,7 @@ impl Default for HoneypotSandboxConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HoneypotPcapHandoffConfig {
     /// Run bounded pcap capture at session end.
     #[serde(default)]
@@ -1283,6 +1317,7 @@ impl Default for HoneypotPcapHandoffConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HoneypotContainmentConfig {
     /// Containment mode:
     /// - `process`: standard subprocess runner (default)
@@ -1338,6 +1373,7 @@ impl Default for HoneypotContainmentConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HoneypotExternalHandoffConfig {
     /// Execute optional external handoff command after session completion.
     #[serde(default)]
@@ -1419,6 +1455,7 @@ impl Default for HoneypotExternalHandoffConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HoneypotRedirectConfig {
     /// Enable selective redirection rules for target IP.
     #[serde(default)]
@@ -1474,6 +1511,7 @@ impl Default for HoneypotConfig {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ResponderConfig {
     /// Enable skill execution on AI decisions
     #[serde(default)]
@@ -1580,6 +1618,7 @@ impl Default for ResponderConfig {
 
 /// Configuration for the Telegram conversational bot interface.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct TelegramBotConfig {
     /// Enable the conversational bot interface (default: true).
     #[serde(default = "default_true")]
@@ -1635,6 +1674,7 @@ impl Default for TelegramBotConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TelegramConfig {
     /// Enable Telegram notifications (T.1) and approval bot (T.2)
     #[serde(default)]
@@ -1782,6 +1822,7 @@ impl Default for TelegramConfig {
 
 /// Configuration for Slack Incoming Webhook notifications.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SlackConfig {
     /// Enable Slack notifications (default: false)
     #[serde(default)]
@@ -1854,6 +1895,7 @@ impl Default for SlackConfig {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CloudflareConfig {
     /// Enable Cloudflare IP block push (default: false)
     #[serde(default)]
@@ -1899,6 +1941,7 @@ fn default_cloudflare_notes_prefix() -> String {
 /// Entities in the allowlist are still logged and notified but skip the AI
 /// gate - no automated response skill is ever executed for them.
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AllowlistConfig {
     /// IP addresses or CIDR ranges that are never auto-responded to.
     /// Examples: ["10.0.0.1", "192.168.0.0/24"]
@@ -1919,6 +1962,7 @@ pub struct AllowlistConfig {
 ///
 /// Generate keys with: `innerwarden notify web-push setup`
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct WebPushConfig {
     /// Enable browser push notifications for High/Critical incidents.
     #[serde(default)]
@@ -1974,6 +2018,7 @@ impl Default for WebPushConfig {
 
 /// Security settings for operator authentication.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
     /// Two-factor authentication method: "none", "totp", "dashboard".
     /// Default: "none" (2FA disabled, v1 behavior).
@@ -2377,6 +2422,7 @@ fn default_honeypot_http_max_requests() -> usize {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DataRetentionConfig {
     /// Keep daily events JSONL for N days (default: 7)
     #[serde(default = "default_data_events_keep_days")]
@@ -2489,6 +2535,7 @@ fn default_slack_min_severity() -> String {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CrowdSecConfig {
     /// Enable CrowdSec LAPI polling (default: false)
     #[serde(default)]
@@ -2557,6 +2604,7 @@ fn default_user_profile() -> String {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AbuseIpDbConfig {
     /// Enable AbuseIPDB IP reputation enrichment (default: false).
     #[serde(default)]
@@ -2666,6 +2714,7 @@ fn default_fail2ban_poll_secs() -> u64 {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct GeoIpConfig {
     /// Enable IP geolocation enrichment via ip-api.com (default: false).
     /// No API key required. Free tier: 45 requests/minute.
@@ -2678,6 +2727,7 @@ pub struct GeoIpConfig {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ThreatFeedsConfig {
     /// External IOC feed URLs (plaintext IP/domain lists). Polled periodically.
     /// Free public feeds:
@@ -2777,6 +2827,7 @@ pub enum DigestFrequency {
 /// group_count_threshold = 10
 /// ```
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NotificationPipelineConfig {
     /// Grouping window in seconds. Incidents from the same detector+entity
     /// within this window are grouped into a single notification.
@@ -2816,6 +2867,7 @@ fn default_group_count_threshold() -> u32 {
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
+#[serde(deny_unknown_fields)]
 pub struct ChannelNotificationConfig {
     /// Filter level for real-time notifications.
     #[serde(default = "default_channel_level_actionable")]
@@ -2858,6 +2910,7 @@ fn default_digest_hour() -> u8 {
 /// ```
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
+#[serde(deny_unknown_fields)]
 pub struct EnvironmentConfig {
     /// Run bootstrap profiling on first boot (or when profile missing).
     #[serde(default = "default_true_val")]
@@ -3920,5 +3973,201 @@ model = "legacy"
         // back to the primary [ai] provider for both slots.
         assert!(!cfg.ai.classifier.enabled);
         assert!(!cfg.ai.llm.enabled);
+    }
+
+    // ── Wave 9e anchors (2026-05-04) — strict schema gate ─────────────────
+    //
+    // AUDIT-002 root cause: prod's agent.toml had a `[data_retention]`
+    // section with an `enabled` and `keep_days` keys, but the AgentConfig
+    // field is `pub data: DataRetentionConfig` (TOML key would be `[data]`),
+    // and `enabled`/`keep_days` are not fields on DataRetentionConfig (real
+    // names are `events_keep_days`, `filestore_keep_days`, etc). The whole
+    // section silently deserialised as the default for who knows how long;
+    // the operator's Wave 9c attempt to set `filestore_max_size_mb = 1024`
+    // there was a no-op for the same reason.
+    //
+    // The fix is two-pronged:
+    //   1. `#[serde(deny_unknown_fields)]` on every nested *Config struct so
+    //      typo'd keys produce a LOUD startup error instead of being dropped
+    //      silently.
+    //   2. `#[serde(alias = "data_retention")]` on `AgentConfig::data` so
+    //      existing `[data_retention]` blocks keep working - operators
+    //      migrate at their own pace and a forced rename does not brick the
+    //      next deploy.
+    //
+    // These anchors pin both sides. Removing either is a regression because
+    // (1) takes us back to silent drift, (2) bricks every existing
+    // [data_retention] config on the next deploy.
+
+    #[test]
+    fn data_retention_alias_resolves_to_data_section() {
+        // Existing prod-style config. With the alias on `pub data`, this
+        // section parses into `cfg.data` (the canonical AgentConfig field),
+        // and the inner field `filestore_max_size_mb` is now actually
+        // applied (pre-alias the section was dropped silently).
+        let toml_src = r#"
+[data_retention]
+filestore_max_size_mb = 1024
+events_keep_days = 14
+"#;
+        let cfg: AgentConfig = toml::from_str(toml_src)
+            .expect("[data_retention] alias must resolve to [data] - this is the AUDIT-002 fix");
+        assert_eq!(cfg.data.filestore_max_size_mb, 1024);
+        assert_eq!(cfg.data.events_keep_days, 14);
+    }
+
+    #[test]
+    fn data_section_canonical_name_works_too() {
+        // The canonical TOML key is `[data]` because that matches the
+        // AgentConfig field name. Both forms must parse so operators can
+        // migrate gradually without a flag day.
+        let toml_src = r#"
+[data]
+filestore_max_size_mb = 512
+"#;
+        let cfg: AgentConfig =
+            toml::from_str(toml_src).expect("canonical [data] section must parse");
+        assert_eq!(cfg.data.filestore_max_size_mb, 512);
+    }
+
+    #[test]
+    fn unknown_top_level_section_fails_loudly() {
+        // A typo'd or invented section name is rejected by serde because
+        // AgentConfig has #[serde(deny_unknown_fields)]. This is the gate
+        // that prevents the AUDIT-002 class of silent drift on top-level
+        // sections.
+        let toml_src = r#"
+[bogus_section]
+key = "value"
+"#;
+        let err = toml::from_str::<AgentConfig>(toml_src).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("unknown field") || msg.contains("bogus_section"),
+            "deny_unknown_fields must reject [bogus_section]; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_inner_key_fails_loudly_in_data_section() {
+        // The actual prod failure mode: under [data_retention] (or [data])
+        // the operator wrote keys that are not fields on
+        // DataRetentionConfig. With deny_unknown_fields on the inner struct
+        // those typos fail at boot.
+        let toml_src = r#"
+[data]
+keep_dayss = 7
+"#;
+        let err = toml::from_str::<AgentConfig>(toml_src).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("unknown field") || msg.contains("keep_dayss"),
+            "deny_unknown_fields must reject `keep_dayss` typo; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn legacy_data_retention_with_unknown_inner_key_also_fails_loudly() {
+        // Same as above but via the [data_retention] alias, so the alias
+        // does not weaken the strictness of the inner schema. The previous
+        // prod agent.toml had `keep_days = 7` and `enabled = true` under
+        // [data_retention] - both are not fields on DataRetentionConfig.
+        // After this change those would now LOUDLY fail at boot, prompting
+        // the operator to either remove them or correct the field name.
+        let toml_src = r#"
+[data_retention]
+keep_days = 7
+enabled = true
+"#;
+        let err = toml::from_str::<AgentConfig>(toml_src).unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("unknown field"),
+            "alias must NOT bypass deny_unknown_fields on the inner DataRetentionConfig; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn empty_config_uses_defaults_cleanly() {
+        // Sanity: an empty file parses to AgentConfig::default(). This is
+        // the path that `crate::config::load` takes for a missing file via
+        // an explicit early-return; testing the in-memory parse confirms
+        // the wire compatibility too. If a future struct breaks Default,
+        // this anchor catches it before the agent panics on first restart.
+        let cfg: AgentConfig = toml::from_str("").expect("empty config is valid");
+        assert_eq!(
+            cfg.data.filestore_max_size_mb,
+            default_data_filestore_max_size_mb()
+        );
+    }
+
+    #[test]
+    fn every_top_level_section_is_documented_with_an_inner_struct() {
+        // Lock the set of top-level sections so a future contributor cannot
+        // remove a section silently (which would make every operator's
+        // existing config fail loudly). Adding a new section is fine; the
+        // assertion lives over a stable subset that prod has been parsing
+        // for months. If a section is RENAMED, this test fails AND it must
+        // be paired with a `#[serde(alias)]` on the new field name (same
+        // pattern as `data_retention -> data` here).
+        let known = &[
+            "narrative",
+            "webhook",
+            "ai",
+            "correlation",
+            "telemetry",
+            "honeypot",
+            "responder",
+            "telegram",
+            "data",
+            // "data_retention" is intentionally NOT here: toml refuses to
+            // parse the same field twice via aliases. The alias is exercised
+            // by `data_retention_alias_resolves_to_data_section` instead.
+            "crowdsec",
+            "abuseipdb",
+            "fail2ban",
+            "geoip",
+            "threat_feeds",
+            "slack",
+            "cloudflare",
+            "allowlist",
+            "web_push",
+            "mesh",
+            "dashboard",
+            "fleet",
+            "firmware",
+            "hypervisor",
+            "killchain",
+            "dna",
+            "shield",
+            "security",
+            "notifications",
+            "environment",
+            "briefing",
+            "config_signing",
+            "observation",
+            "trust_scoring",
+            "soc_checks",
+            "zero_trust",
+            "graph_only_detectors",
+            "incident_flow",
+        ];
+        // Build a minimal TOML with every section header. None of the
+        // sections gets unknown keys, so they all default-fill. If any
+        // section name in the list is wrong, parsing fails.
+        let mut toml_src = String::new();
+        for name in known {
+            // [graph_only_detectors] is a Vec, not a section; skip header.
+            if *name == "graph_only_detectors" {
+                continue;
+            }
+            toml_src.push_str(&format!("[{}]\n", name));
+        }
+        let result: Result<AgentConfig, _> = toml::from_str(&toml_src);
+        assert!(
+            result.is_ok(),
+            "minimal [section] file with all known sections must parse; got: {:#}",
+            result.err().unwrap()
+        );
     }
 }
