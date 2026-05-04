@@ -131,6 +131,12 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/ctl/src/commands/response.rs::tests::cmd_allowlist_add_without_reason_records_null_reason_in_audit` — `--reason` is OPTIONAL for backwards compat with existing operator scripts, but omitting it MUST surface as `"reason":null` in the audit log so future-operator tooling can grep for entries with no recorded WHY. Anti-regression for silently accepting reason-less adds (the original 2026-05-04 bug shape).
 
+### Config file permission fix (Wave 8d)
+
+- `crates/agent/src/config.rs::tests::perm_fix_command_does_chown_before_chmod` — the operator-facing fix command for over-permissive `agent.toml` MUST do `chown innerwarden:innerwarden` BEFORE `chmod 600`. Pinned because the previous WARN ("consider chmod 600") led the operator straight into a broken-restart trap on 2026-05-04: chmod 600 on a root-owned file with the agent running as a non-root service user makes the config unreadable on the next start. Reversing the order in this string is the bug we are guarding against.
+
+- `crates/agent/src/config.rs::tests::perm_fix_command_handles_paths_without_shell_injection` — the path is operator-controlled (passed via `--config`), so the fix-suggestion string must not contain backticks, `$()`, or extra `&&` chains beyond the one we put there. Anti-regression for accidentally interpolating shell metacharacters into a copy-pasteable command.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:

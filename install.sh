@@ -736,7 +736,15 @@ EOF
 fi
 
 log "writing agent config: ${AGENT_CONFIG}"
-install_from_stdin "${AGENT_CONFIG}" 640 "${INSTALL_USER:-root}" "${IW_USER}" <<EOF
+# Wave 8d (2026-05-04): agent.toml carries API keys (OpenAI / Anthropic /
+# Telegram bot tokens / AbuseIPDB) so it must NOT be group-readable on
+# multi-tenant hosts. Owner is the agent's own service user (not root)
+# so that `chmod 600` works without breaking the agent on next restart.
+# Pre-fix: owner=root group=innerwarden mode=640. Operators following
+# the agent's own "consider chmod 600" WARN naively then made the file
+# unreadable by the agent process. See `crates/agent/src/config.rs`
+# loader for the matching warning text.
+install_from_stdin "${AGENT_CONFIG}" 600 "${IW_USER}" "${IW_USER}" <<EOF
 [narrative]
 enabled = true
 keep_days = 7

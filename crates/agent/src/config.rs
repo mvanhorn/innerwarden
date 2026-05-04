@@ -2002,6 +2002,20 @@ impl Default for SecurityConfig {
 // Loader
 // ---------------------------------------------------------------------------
 
+/// Wave 8d (2026-05-04): build the operator-facing one-liner that fixes
+/// over-permissive config files. Shipping this as a pure function so the
+/// anchor test can pin the exact string shape (chown FIRST, chmod 600
+/// SECOND) without needing a `tracing` test subscriber.
+///
+/// Returns a single shell command, no newlines, ready to paste into a
+/// terminal. The order is load-bearing: chown then chmod, so the chmod
+/// is applied to a file the agent already owns. Reversing the order is
+/// the bug class this fix exists to prevent.
+pub(crate) fn build_perm_fix_command(path: &Path) -> String {
+    let p = path.display();
+    format!("sudo chown innerwarden:innerwarden {p} && sudo chmod 600 {p}")
+}
+
 /// Load agent config from a TOML file.
 /// If the file doesn't exist, returns `AgentConfig::default()`.
 pub fn load(path: &Path) -> Result<AgentConfig> {
@@ -2009,17 +2023,33 @@ pub fn load(path: &Path) -> Result<AgentConfig> {
         return Ok(AgentConfig::default());
     }
 
-    // Warn if config file is readable by group/others (may contain API keys)
+    // Warn if config file is readable by group/others (may contain API keys).
+    // Wave 8d (2026-05-04): the WARN now spells out BOTH the chown and the
+    // chmod the operator needs. The previous text said "consider chmod 600"
+    // alone; following that literally broke the agent on the next restart
+    // when the existing owner was `root` (installs through 2026-05-03 set
+    // the file to `root:innerwarden 640`). chmod 600 with owner=root locks
+    // the agent (running as the innerwarden user) out of its own config.
+    // install.sh from this PR onwards creates the file as
+    // `innerwarden:innerwarden 600` from the start, but existing prod
+    // hosts upgraded in place still have the old ownership — the WARN
+    // walks them through the right fix.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         if let Ok(meta) = std::fs::metadata(path) {
             let mode = meta.permissions().mode() & 0o777;
+            let owner_uid = meta.uid();
             if mode & 0o077 != 0 {
+                let fix = build_perm_fix_command(path);
                 tracing::warn!(
                     path = %path.display(),
                     mode = format!("{:o}", mode),
-                    "config file is readable by other users, consider chmod 600"
+                    owner_uid,
+                    %fix,
+                    "config file is readable by other users (may contain API keys). \
+                     Run the `fix` command in this log line — chown FIRST so the \
+                     subsequent chmod 600 leaves the agent able to read its own config."
                 );
             }
         }
@@ -2896,6 +2926,59 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    // Wave 8d anchor (2026-05-04): the operator-facing fix command for
+    // over-permissive config files MUST do chown BEFORE chmod 600. Pinned
+    // because the previous WARN ("consider chmod 600") led the operator
+    // straight into a broken-restart trap when the existing owner was
+    // root: chmod 600 on a root-owned file with the agent running as a
+    // non-root service user makes the config unreadable. Reversing the
+    // order in this string is the bug we are guarding against.
+    #[test]
+    fn perm_fix_command_does_chown_before_chmod() {
+        let cmd = build_perm_fix_command(Path::new("/etc/innerwarden/agent.toml"));
+        let chown_idx = cmd.find("chown ").expect("fix command must contain chown");
+        let chmod_idx = cmd.find("chmod ").expect("fix command must contain chmod");
+        assert!(
+            chown_idx < chmod_idx,
+            "chown must come before chmod in the fix; got: {cmd}"
+        );
+        assert!(
+            cmd.contains("innerwarden:innerwarden"),
+            "fix must chown to the service user, not root; got: {cmd}"
+        );
+        assert!(
+            cmd.contains("chmod 600"),
+            "fix must end at mode 600 (no group/world readability); got: {cmd}"
+        );
+        assert!(
+            cmd.contains("/etc/innerwarden/agent.toml"),
+            "fix must reference the actual file; got: {cmd}"
+        );
+    }
+
+    // Anchor: the warning suggestion must not embed shell metacharacters
+    // that would let a path containing `;` or `$()` execute arbitrary
+    // code if an operator copy-pastes it. The path is OPERATOR-CONTROLLED
+    // (passed via --config), so a malicious path could otherwise turn
+    // the WARN into command injection.
+    #[test]
+    fn perm_fix_command_handles_paths_without_shell_injection() {
+        // The standard production path — should embed cleanly.
+        let safe = build_perm_fix_command(Path::new("/etc/innerwarden/agent.toml"));
+        // No backticks, no $(...), no ;` between commands beyond our own &&.
+        assert!(!safe.contains('`'), "fix must not contain backticks");
+        assert!(
+            !safe.contains("$("),
+            "fix must not contain $() substitution"
+        );
+        // Exactly one `&&` (the one we put there) — no shell-injected chains.
+        assert_eq!(
+            safe.matches("&&").count(),
+            1,
+            "fix must use exactly one && (chown && chmd); got: {safe}"
+        );
+    }
 
     #[test]
     fn defaults_when_no_file() {
