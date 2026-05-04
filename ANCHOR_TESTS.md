@@ -153,6 +153,34 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/config.rs::tests::every_top_level_section_is_documented_with_an_inner_struct` — locks the canonical set of top-level sections. Adding a new section is fine; renaming or removing one fails this test, forcing the contributor to either pair the rename with a `serde(alias)` (back-compat for existing prod agent.toml files) or document the breaking change.
 
+### Cloudflare CIDR validation (Wave 9g — AUDIT-017 anchor)
+
+- `crates/agent/src/cloudflare.rs::tests::cloudflare_target_is_valid_accepts_bare_ipv4` — bare IPv4 / IPv6 addresses (no prefix) pass the validator. Cloudflare's IP Access Rules API treats them as host-targeted blocks; the validator must not require a prefix.
+
+- `crates/agent/src/cloudflare.rs::tests::cloudflare_target_is_valid_accepts_documented_ipv4_widths` — only `/16`, `/24`, `/32` are accepted for IPv4 per Cloudflare docs. Anchor against accidentally adding /20 / /28 / etc to the allowlist (would re-introduce AUDIT-017 silent failures).
+
+- `crates/agent/src/cloudflare.rs::tests::cloudflare_target_is_valid_rejects_undocumented_ipv4_widths` — pins the EXACT prod failure shape from 2026-05-04: `/22`, `/8`, `/12`, `/20`, `/27`, `/0` all rejected. Pre-fix these wasted an HTTP round trip and got `firewallaccessrules.api.validation_error: invalid ip provided`. Post-fix they short-circuit at the agent boundary.
+
+- `crates/agent/src/cloudflare.rs::tests::cloudflare_target_is_valid_accepts_documented_ipv6_widths` — IPv6 supports `/32`, `/48`, `/64` per Cloudflare. Distinct rules from IPv4; pin them.
+
+- `crates/agent/src/cloudflare.rs::tests::cloudflare_target_is_valid_rejects_undocumented_ipv6_widths` — `/128` (single IPv6) is technically a CIDR but Cloudflare expects bare IPv6 for hosts; reject `/128` so callers use the bare form. Also rejects `/16`, `/24`, `/56` (valid for IPv4 but not IPv6) — the validator must keep the family rules separate.
+
+- `crates/agent/src/cloudflare.rs::tests::cloudflare_target_is_valid_rejects_garbage_input` — defensive: empty, whitespace, non-IP, broken CIDR, missing prefix, missing host all rejected. Anti-regression for accidentally allowing `parse::<IpAddr>` on a partial string.
+
+- `crates/agent/src/cloudflare.rs::tests::cloudflare_target_is_valid_trims_surrounding_whitespace` — operator config / CLI often emits stray whitespace; trim before validating so a copy-pasted IP with a trailing newline does not get rejected as malformed.
+
+### Local classifier safety net (Wave 9g — AUDIT-016 anchor)
+
+- `crates/agent/src/ai/local_classifier.rs::tests::block_ip_without_ip_entity_is_downgraded_to_ignore` — when the classifier predicts `block_ip` but the incident has no IP entity, the resulting action MUST be `Ignore` (NOT `BlockIp`). Pinned the 2026-05-04 audit AUDIT-016 finding: the safety-net downgrade is intended behaviour, not an operator-actionable WARN. Removing the downgrade would let the classifier produce a structurally invalid `BlockIp` action with no IP target.
+
+- `crates/agent/src/ai/local_classifier.rs::tests::block_ip_with_ip_entity_produces_block_ip` — when the IP IS present, the action MUST be `BlockIp`. Anti-regression for over-eagerly downgrading.
+
+- `crates/agent/src/ai/local_classifier.rs::tests::monitor_without_ip_uses_unknown_placeholder` — documents the existing fallback for `monitor` predictions without an IP (uses `"unknown"`); future contributors cannot drop the unwrap_or without changing the public action shape.
+
+- `crates/agent/src/ai/local_classifier.rs::tests::unknown_action_name_falls_back_to_ignore` — if a future model adds a label we don't recognise, the agent MUST fall back to `Ignore` (no panic, no partial decision). Confidence stays in the reason string for audit visibility.
+
+- `crates/agent/src/ai/local_classifier.rs::tests::dismiss_includes_confidence_in_reason_string` — audit-trail anchor: the reason for a `Dismiss` action must include the confidence so the operator can grep `dismiss (confidence 0.` for low-confidence dismisses without re-querying the inference batch.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:

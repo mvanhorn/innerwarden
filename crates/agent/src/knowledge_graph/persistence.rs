@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::graph::KnowledgeGraph;
 use super::types::*;
-use tracing::warn;
+use tracing::{debug, warn};
 
 // ── Observability counters for `load_dated_sqlite_first` ──────────────
 //
@@ -700,9 +700,20 @@ impl KnowledgeGraph {
             }
         }
         if dangling > 0 {
-            warn!(
+            // Wave 9g (AUDIT-014, 2026-05-04): demoted from `warn!` to
+            // `debug!`. The prune is purely self-healing - dangling edges
+            // happen routinely when a node TTLs out before the edges that
+            // referenced it, and the retain-and-rebuild block below cleans
+            // them up in-place. There is no operator action to take. Pre-
+            // demotion this fired ~6 times per 30 minutes on prod (audit
+            // tick #7), generating noise the operator could not act on.
+            // The Wave 5b PR-4 anchor
+            // (`snapshot_after_node_eviction_carries_no_dangling_edges`)
+            // continues to assert that the SAVE path leaves no danglings;
+            // the LOAD path's defensive prune below remains, just quietly.
+            debug!(
                 dangling,
-                "Knowledge graph has dangling edge references — pruning"
+                "Knowledge graph has dangling edge references — pruning (self-heals)"
             );
             graph
                 .edges

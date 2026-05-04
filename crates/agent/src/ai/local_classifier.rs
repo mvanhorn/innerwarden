@@ -198,34 +198,7 @@ impl AiProvider for LocalClassifier {
         let action_name = LABELS[idx];
         let target_ip = Self::primary_ip(ctx);
 
-        let action = match action_name {
-            "block_ip" => match target_ip.clone() {
-                Some(ip) => AiAction::BlockIp {
-                    ip,
-                    skill_id: "block-ip-ufw".to_string(),
-                },
-                None => {
-                    warn!(
-                        "classifier predicted block_ip but incident has no IP entity, downgrading to ignore"
-                    );
-                    AiAction::Ignore {
-                        reason: "block_ip predicted but no target IP".to_string(),
-                    }
-                }
-            },
-            "monitor" => AiAction::Monitor {
-                ip: target_ip.unwrap_or_else(|| "unknown".to_string()),
-            },
-            "ignore" => AiAction::Ignore {
-                reason: format!("classifier: ignore (confidence {:.3})", conf),
-            },
-            "dismiss" => AiAction::Dismiss {
-                reason: format!("classifier: dismiss (confidence {:.3})", conf),
-            },
-            _ => AiAction::Ignore {
-                reason: format!("unknown classifier action: {}", action_name),
-            },
-        };
+        let action = build_action_from_prediction(action_name, target_ip.clone(), conf);
 
         let alternatives: Vec<String> = LABELS
             .iter()
@@ -269,6 +242,49 @@ fn pad_or_truncate(v: &mut Vec<i64>, len: usize, pad: i64) {
     }
 }
 
+/// Build an `AiAction` from the classifier's predicted action name + the
+/// optional IP entity extracted from the incident context. Pure logic so the
+/// downgrade behaviour can be unit-tested without an ONNX runtime.
+///
+/// Wave 9g (AUDIT-016 anchor): the `"block_ip"` arm matches `target_ip`
+/// and downgrades to `Ignore` when no IP is present. Pre-demotion the
+/// downgrade emitted a WARN; now it logs at DEBUG because the safety net
+/// works as designed and there is no operator action.
+fn build_action_from_prediction(
+    action_name: &str,
+    target_ip: Option<String>,
+    conf: f32,
+) -> AiAction {
+    match action_name {
+        "block_ip" => match target_ip {
+            Some(ip) => AiAction::BlockIp {
+                ip,
+                skill_id: "block-ip-ufw".to_string(),
+            },
+            None => {
+                debug!(
+                    "classifier predicted block_ip but incident has no IP entity, downgrading to ignore (safety net)"
+                );
+                AiAction::Ignore {
+                    reason: "block_ip predicted but no target IP".to_string(),
+                }
+            }
+        },
+        "monitor" => AiAction::Monitor {
+            ip: target_ip.unwrap_or_else(|| "unknown".to_string()),
+        },
+        "ignore" => AiAction::Ignore {
+            reason: format!("classifier: ignore (confidence {:.3})", conf),
+        },
+        "dismiss" => AiAction::Dismiss {
+            reason: format!("classifier: dismiss (confidence {:.3})", conf),
+        },
+        _ => AiAction::Ignore {
+            reason: format!("unknown classifier action: {}", action_name),
+        },
+    }
+}
+
 fn truncate(s: &str, max: usize) -> &str {
     if s.len() <= max {
         s
@@ -304,5 +320,89 @@ mod tests {
         let s = "áéíóú".repeat(10);
         let t = truncate(&s, 12);
         assert!(t.len() <= 12);
+    }
+
+    // ── Wave 9g anchors (2026-05-04) — classifier safety net ─────────────
+    //
+    // AUDIT-016 (audit tick 7): the classifier emitted block_ip predictions
+    // on incidents that had no IP entity. The agent downgrades to Ignore
+    // (correct) but pre-Wave-9g it WARN-logged the event, suggesting an
+    // operator-actionable problem - there is none, the safety net is the
+    // intended behaviour. These anchors pin the downgrade contract so
+    // future refactors do not (a) actually block on a missing IP, or
+    // (b) re-promote the log to a level that asks the operator to act.
+
+    #[test]
+    fn block_ip_without_ip_entity_is_downgraded_to_ignore() {
+        // The exact AUDIT-016 prod failure shape: classifier said block_ip
+        // but the incident had no IP entity to act on. Result must be
+        // Ignore (NOT BlockIp), with a stable reason string the audit log
+        // can grep for.
+        let action = build_action_from_prediction("block_ip", None, 0.95);
+        match action {
+            AiAction::Ignore { reason } => {
+                assert!(
+                    reason.contains("no target IP"),
+                    "downgrade reason must mention the missing IP; got: {reason}"
+                );
+            }
+            other => panic!("expected Ignore, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_ip_with_ip_entity_produces_block_ip() {
+        // Anti-regression for over-coercing the downgrade: when the IP IS
+        // present, the action MUST be BlockIp, not Ignore.
+        let action =
+            build_action_from_prediction("block_ip", Some("203.0.113.42".to_string()), 0.92);
+        match action {
+            AiAction::BlockIp { ip, skill_id } => {
+                assert_eq!(ip, "203.0.113.42");
+                assert_eq!(skill_id, "block-ip-ufw");
+            }
+            other => panic!("expected BlockIp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn monitor_without_ip_uses_unknown_placeholder() {
+        // Document the existing fallback so future contributors cannot
+        // remove the unwrap_or without changing the public action shape.
+        let action = build_action_from_prediction("monitor", None, 0.7);
+        match action {
+            AiAction::Monitor { ip } => assert_eq!(ip, "unknown"),
+            other => panic!("expected Monitor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_action_name_falls_back_to_ignore() {
+        // If a future model adds a new label LABELS[i] we don't yet
+        // recognise, the agent must fall back to Ignore (not panic, not
+        // execute a partial decision). Confidence stays in the reason
+        // string for audit visibility.
+        let action = build_action_from_prediction("frobnicate", None, 0.66);
+        match action {
+            AiAction::Ignore { reason } => {
+                assert!(reason.contains("unknown classifier action"));
+                assert!(reason.contains("frobnicate"));
+            }
+            other => panic!("expected Ignore, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dismiss_includes_confidence_in_reason_string() {
+        // Audit-trail anchor: the reason must include the confidence so
+        // the operator can grep `dismiss (confidence 0.` for low-confidence
+        // dismisses without re-querying the inference batch.
+        let action = build_action_from_prediction("dismiss", None, 0.123);
+        match action {
+            AiAction::Dismiss { reason } => {
+                assert!(reason.contains("0.123"), "got: {reason}");
+            }
+            other => panic!("expected Dismiss, got {other:?}"),
+        }
     }
 }
