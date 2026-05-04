@@ -693,6 +693,56 @@ fn kg_tick(state: &mut AgentState, data_dir: &Path, events: &[innerwarden_core::
         state.anomaly_engine.set_graph_features(gf);
     }
 
+    // 2026-05-04 (Wave 7a): trigger a one-shot post-graph
+    // recalibration the first time we have graph features. Boot's
+    // recalibration ran with `graph_features = None`, so its
+    // anchors used zero-graph feature vectors and now under-sample
+    // the live distribution → live observe() saturates near 1.0
+    // again. Re-running here lets the new anchors reflect the
+    // production feature shape that observe() actually consumes.
+    // Best-effort and runs at most once per process lifetime;
+    // future periodic recalibrations are a separate follow-up.
+    if state.anomaly_engine.needs_post_graph_recalibration() {
+        if let Some(ref sq) = state.sqlite_store {
+            const POST_GRAPH_RECAL_SAMPLE: i64 = 10_000;
+            match sq.events_max_id() {
+                Ok(max_id) => {
+                    let after = max_id.saturating_sub(POST_GRAPH_RECAL_SAMPLE);
+                    match sq.events_since(after, POST_GRAPH_RECAL_SAMPLE as usize) {
+                        Ok(rows) => {
+                            let events: Vec<innerwarden_core::event::Event> =
+                                rows.into_iter().map(|(_, ev)| ev).collect();
+                            if !events.is_empty() {
+                                match state
+                                    .anomaly_engine
+                                    .recalibrate_anchors_from_events(&events)
+                                {
+                                    Ok(samples) => {
+                                        info!(
+                                            samples,
+                                            events_read = events.len(),
+                                            "anomaly: post-graph anchor recalibration complete"
+                                        );
+                                        state
+                                            .anomaly_engine
+                                            .clear_post_graph_recalibration_flag();
+                                    }
+                                    Err(e) => warn!(
+                                        "anomaly: post-graph recalibration failed (will retry next tick): {e}"
+                                    ),
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("anomaly: post-graph recalibration sqlite read failed: {e}")
+                        }
+                    }
+                }
+                Err(e) => warn!("anomaly: post-graph recalibration max-id read failed: {e}"),
+            }
+        }
+    }
+
     // ── Step 6: run graph-based detectors ───────────────────────────
     // Reads the POST-ingest graph and POST-snapshot maintenance state.
     // Detector incidents are written back into the graph so the next

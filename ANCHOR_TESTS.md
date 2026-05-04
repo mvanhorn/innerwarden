@@ -85,6 +85,22 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/dashboard/live_feed.rs::tests::live_feed_sources_carry_geo_from_disk_cache` — `/api/live-feed` carries a `sources` array with country/lat/lon already attached for every IP found in `geo-cache.json`. Pinned the operator-visible bug shape "site map shows 4 dots while there are 138 attackers" — without pre-attached geo the frontend would need 138 round-trips to ip-api (rate-limited at 45/min = 3+ minutes of cold start).
 
+### Autoencoder anchor recalibration (Wave 7a)
+
+- `crates/agent/src/neural_lifecycle.rs::tests::recalibrate_replaces_anchors_with_fresh_distribution` — `recalibrate_anchors_from_events` rebuilds `baseline_percentile_anchors` from a fresh batch of events without touching the network weights, and the new anchors are sorted ascending. Pinned the 2026-05-04 prod symptom where every observe() returned `score="1.000"` because stale training-time anchors did not represent current event distribution; spec-033 tanh extrapolation saturated near 1.0; +9.9% boost in `incident_decision_eval` fired as a constant offset (zero discriminative value).
+
+- `crates/agent/src/neural_lifecycle.rs::tests::recalibrate_refuses_short_input_keeps_old_anchors` — refuses to act when fewer than `BASELINE_PERCENTILES` (101) full-window MSE samples can be collected, and leaves existing anchors untouched. Anti-regression for a future change that silently writes degenerate (under-sampled) anchors.
+
+- `crates/agent/src/neural_lifecycle.rs::tests::recalibrate_persisted_state_round_trips_via_disk` — recalibrated state survives the `anomaly-model.bin` save → reload cycle. `training_cycles` is preserved exactly via the synthesised `total_samples = cycles * 100_000` field that the v2 file format expects. Anti-regression for any change that breaks the binary layout match between `persist_model_state` and `parse_model_file`.
+
+- `crates/agent/src/neural_lifecycle.rs::tests::persist_after_recal_preserves_loaded_total_samples_exactly` — when the engine was loaded from a model file with `total_samples` not a multiple of 100_000 (e.g. 499_999), a recalibration save preserves the original value rather than re-deriving from `cycles * 100_000`. Pre-fix the synthesis would have truncated 499_999 → 400_000 and silently dropped maturity from ~1.0 to ~0.8. (Copilot #2 review on PR #435)
+
+- `crates/agent/src/neural_lifecycle.rs::tests::persist_pads_anchor_table_to_exact_layout_size` — `persist_model_state` writes exactly `BASELINE_PERCENTILES * 4` anchor bytes, padding with 0.0 if the in-memory vec ever shrinks below the constant. Pre-fix a short vec would emit a truncated v2 layout that the loader would reject on the next restart. (Copilot #3 review on PR #435)
+
+- `crates/agent/src/neural_lifecycle.rs::tests::persist_keeps_previous_model_as_dot_prev_backup` — write order is "tmp first, durable, then rotate previous to .prev, then atomic rename onto target". Pre-fix the rotate-then-write order created a window where a tmp-write failure left zero usable model files. (Copilot #1 review on PR #435)
+
+- `crates/agent/src/neural_lifecycle.rs::tests::train_nightly_post_recal_skips_when_no_graph_features` — the post-train recalibration block in `train_nightly_with_store` is gated on `Some(graph_features)`; without graph features the recalibration is skipped so test fixtures and pre-graph boots do not get a recalibration that would overwrite anchors with a degraded no-graph distribution. Pinned the operator-observed bug where the 2026-05-04 nightly retrain wiped Wave 7a's boot recalibration and prod returned to 100% saturation by morning.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:

@@ -1108,6 +1108,80 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
         );
     }
 
+    // 2026-05-04 (Wave 7a): one-shot anchor recalibration on every
+    // boot. Production observation 2026-05-04: every observe() was
+    // returning `score="1.000"` because the trained percentile
+    // anchors did not represent the current event distribution —
+    // every reconstruction error landed past `anchors.last()`, so
+    // the spec-033 Phase 0 tanh extrapolation saturated near 1.0,
+    // and the +9.9% boost in `incident_decision_eval` fired on
+    // every triggered incident as a constant offset (zero
+    // discriminative value).
+    //
+    // Recalibration walks the last ~10k events from SQLite through
+    // the same pipeline `observe()` uses, collects per-window MSEs,
+    // and rebuilds the anchor table from that fresh distribution.
+    // Cheap (~seconds) and best-effort: any failure leaves the
+    // existing anchors in place. Falls back to the next nightly
+    // retrain (`train_nightly_with_store`) for full model recovery
+    // if the recalibration alone does not restore signal.
+    // Copilot #5 fix: SQLite read + JSON deserialize + feature
+    // extraction are synchronous CPU/IO. Wrap in `block_in_place` on
+    // multi-thread runtimes so we do not stall tokio worker threads
+    // during boot — same pattern as `run_events_src_ip_backfill_in_place`
+    // in `slow_loop.rs`. On a current_thread runtime (tests,
+    // `#[tokio::test]` default) `block_in_place` panics, so the
+    // synchronous fallback runs there. Both branches produce the
+    // same observable effect; only the worker-transfer hint
+    // differs.
+    if let Some(ref sq) = state.sqlite_store {
+        let multi_thread = tokio::runtime::Handle::try_current()
+            .map(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+            .unwrap_or(false);
+        let mut run_recal = || {
+            const BOOT_RECALIBRATION_SAMPLE: i64 = 10_000;
+            match sq.events_max_id() {
+                Ok(max_id) => {
+                    let after = max_id.saturating_sub(BOOT_RECALIBRATION_SAMPLE);
+                    match sq.events_since(after, BOOT_RECALIBRATION_SAMPLE as usize) {
+                        Ok(rows) => {
+                            let events: Vec<innerwarden_core::event::Event> =
+                                rows.into_iter().map(|(_, ev)| ev).collect();
+                            if events.is_empty() {
+                                info!(
+                                    "anomaly: skipping boot recalibration (no events in store yet)"
+                                );
+                            } else {
+                                match state
+                                    .anomaly_engine
+                                    .recalibrate_anchors_from_events(&events)
+                                {
+                                    Ok(samples) => info!(
+                                        samples,
+                                        events_read = events.len(),
+                                        "anomaly: boot anchor recalibration complete"
+                                    ),
+                                    Err(e) => warn!(
+                                        "anomaly: boot recalibration failed (keeping existing anchors): {e}"
+                                    ),
+                                }
+                            }
+                        }
+                        Err(e) => warn!("anomaly: boot recalibration sqlite read failed: {e}"),
+                    }
+                }
+                Err(e) => warn!("anomaly: boot recalibration max-id read failed: {e}"),
+            }
+        };
+        if multi_thread {
+            tokio::task::block_in_place(run_recal);
+        } else {
+            run_recal();
+        }
+    } else {
+        info!("anomaly: skipping boot recalibration (no sqlite store)");
+    }
+
     // Initialize threat feed client if VT API key or IOC feed URLs are configured
     {
         let vt_key = if cfg.threat_feeds.virustotal_api_key.is_empty() {
