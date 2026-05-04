@@ -112,6 +112,15 @@ pub struct Supervisor {
     hook: Box<dyn RestartHook>,
 }
 
+impl std::fmt::Debug for Supervisor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Supervisor")
+            .field("config", &self.config)
+            .field("hook", &"<dyn RestartHook>")
+            .finish()
+    }
+}
+
 impl Supervisor {
     /// Validate the agent binary path (rejects symlinks) and prepare a
     /// supervisor that will spawn it on `run()`.
@@ -220,5 +229,148 @@ impl Supervisor {
 
         info!("supervisor shutting down gracefully");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn tmpfile_bin() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("agent");
+        std::fs::write(&bin, b"placeholder").unwrap();
+        (dir, bin)
+    }
+
+    #[test]
+    fn config_defaults_match_oss_agent_layout() {
+        let cfg = SupervisorConfig::new("/dev/null");
+        assert_eq!(cfg.agent_api, "http://127.0.0.1:8787");
+        assert_eq!(cfg.health_interval, Duration::from_secs(30));
+        assert_eq!(cfg.max_restarts_per_hour, 10);
+        assert!(cfg.agent_args.is_empty());
+        assert!(cfg.telegram_token.is_none());
+        assert!(cfg.telegram_chat_id.is_none());
+    }
+
+    #[test]
+    fn config_with_args_sets_args() {
+        let cfg = SupervisorConfig::new("/dev/null").with_args(vec!["--config".into(), "x".into()]);
+        assert_eq!(cfg.agent_args, vec!["--config", "x"]);
+    }
+
+    #[test]
+    fn config_with_health_overrides_url_and_interval() {
+        let cfg = SupervisorConfig::new("/dev/null")
+            .with_health("http://1.2.3.4:9000", Duration::from_secs(7));
+        assert_eq!(cfg.agent_api, "http://1.2.3.4:9000");
+        assert_eq!(cfg.health_interval, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn config_with_max_restarts_per_hour_overrides_cap() {
+        let cfg = SupervisorConfig::new("/dev/null").with_max_restarts_per_hour(99);
+        assert_eq!(cfg.max_restarts_per_hour, 99);
+    }
+
+    #[test]
+    fn config_with_telegram_sets_both_credentials() {
+        let cfg = SupervisorConfig::new("/dev/null").with_telegram("tok".into(), "chat".into());
+        assert_eq!(cfg.telegram_token.as_deref(), Some("tok"));
+        assert_eq!(cfg.telegram_chat_id.as_deref(), Some("chat"));
+    }
+
+    #[test]
+    fn supervisor_new_rejects_symlinked_agent_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let link = dir.path().join("link");
+        std::fs::write(&real, b"x").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let cfg = SupervisorConfig::new(link);
+        let err = Supervisor::new(cfg).unwrap_err();
+        assert!(format!("{:#}", err).contains("symlink"));
+    }
+
+    #[test]
+    fn supervisor_new_accepts_regular_file() {
+        let (_dir, bin) = tmpfile_bin();
+        assert!(Supervisor::new(SupervisorConfig::new(bin)).is_ok());
+    }
+
+    #[test]
+    fn supervisor_with_hook_replaces_default() {
+        // Builder smoke test. The hook itself is observed in the run-loop
+        // tests below via shared atomic state.
+        let (_dir, bin) = tmpfile_bin();
+        let supervisor = Supervisor::new(SupervisorConfig::new(bin))
+            .unwrap()
+            .with_hook(Box::new(NoopHook));
+        drop(supervisor);
+    }
+
+    /// Shared-state hook that returns Ok the first `bail_after` times, then
+    /// bails with `bail_msg`. Drives Supervisor::run into specific halt paths
+    /// without mocking the agent process.
+    struct CountingHook {
+        bail_after: u32,
+        bail_msg: &'static str,
+        observed: Arc<AtomicU32>,
+    }
+    impl RestartHook for CountingHook {
+        fn before_spawn(&self) -> Result<()> {
+            let n = self.observed.fetch_add(1, Ordering::SeqCst);
+            if n < self.bail_after {
+                Ok(())
+            } else {
+                anyhow::bail!("{}", self.bail_msg)
+            }
+        }
+    }
+
+    #[test]
+    fn supervisor_run_returns_err_when_initial_spawn_hook_refuses() {
+        // Hook fails on the very first call so Supervisor::run propagates
+        // before ever spawning the agent. Covers the initial-spawn early
+        // return path.
+        let (_dir, bin) = tmpfile_bin();
+        let cfg = SupervisorConfig::new(bin);
+        let observed = Arc::new(AtomicU32::new(0));
+        let hook = CountingHook {
+            bail_after: 0,
+            bail_msg: "synthetic init refusal",
+            observed: Arc::clone(&observed),
+        };
+        let result = Supervisor::new(cfg)
+            .unwrap()
+            .with_hook(Box::new(hook))
+            .run();
+        let err = result.unwrap_err();
+        assert!(format!("{:#}", err).contains("synthetic init refusal"));
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn supervisor_run_halts_when_hook_reports_tampered_after_agent_dies() {
+        // Spawn /bin/sleep 0.1, agent exits naturally, supervisor calls hook
+        // before restart, hook returns "TAMPERED" so loop halts with Ok.
+        let cfg = SupervisorConfig::new("/bin/sleep")
+            .with_args(vec!["0.1".into()])
+            .with_health("http://127.0.0.1:1", Duration::from_secs(3600));
+        let observed = Arc::new(AtomicU32::new(0));
+        let hook = CountingHook {
+            bail_after: 1,
+            bail_msg: "binary TAMPERED: hash mismatch",
+            observed: Arc::clone(&observed),
+        };
+        let result = Supervisor::new(cfg)
+            .unwrap()
+            .with_hook(Box::new(hook))
+            .run();
+        assert!(result.is_ok(), "graceful break is Ok, got {:?}", result);
+        let n = observed.load(Ordering::SeqCst);
+        assert!(n >= 2, "expected hook called >=2 times, got {n}");
     }
 }

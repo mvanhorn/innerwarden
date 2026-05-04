@@ -62,6 +62,7 @@ coverage:
           - "**/*"
           - "!crates/agent/src/main.rs"
           - "!crates/agent/src/loops/boot.rs"
+          - "!crates/supervisor/src/main.rs"
       # Orchestration / boot wiring gets its own *informational* gauge so
       # it is measured (not hidden) but never blocks merges. Real ceiling
       # is set by integration tests, not unit tests.

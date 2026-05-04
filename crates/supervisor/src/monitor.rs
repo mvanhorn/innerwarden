@@ -77,8 +77,32 @@ impl Monitor {
         Ok(())
     }
 
-    pub fn is_alive(&self) -> bool {
-        self.agent_pid.is_some_and(Self::pid_alive)
+    /// Returns whether the supervised process is still running.
+    ///
+    /// When the supervisor owns the child handle (the typical case after
+    /// `spawn_agent`), this calls `try_wait` so a child that has exited but
+    /// not yet been reaped is reported as dead AND its zombie is cleared in
+    /// the same step. Without this, `kill(pid, 0)` would report the zombie
+    /// as alive forever (zombies live in the kernel until their parent
+    /// reaps them) and the supervisor's restart loop would never fire.
+    ///
+    /// When the supervisor merely attached to an existing PID (no child
+    /// handle), it falls back to `kill(pid, 0)` because waitpid cannot be
+    /// called on a process that is not our child. The zombie blind-spot
+    /// applies in that case but is unavoidable.
+    pub fn is_alive(&mut self) -> bool {
+        if let Some(ref mut child) = self.agent_child {
+            match child.try_wait() {
+                Ok(Some(_status)) => {
+                    self.agent_child = None;
+                    false
+                }
+                Ok(None) => true,
+                Err(_) => false,
+            }
+        } else {
+            self.agent_pid.is_some_and(Self::pid_alive)
+        }
     }
 
     pub fn agent_pid(&self) -> Option<u32> {
@@ -163,5 +187,65 @@ mod tests {
         let mut monitor = Monitor::new(link, vec![], 10);
         let err = monitor.spawn_agent().unwrap_err();
         assert!(format!("{:#}", err).contains("symlink"));
+    }
+
+    #[test]
+    fn spawn_real_process_then_detect_natural_exit() {
+        // /bin/sleep with a tiny duration: spawn, observe alive, wait past the
+        // exit, observe dead. Covers the spawn happy path + the try_wait-based
+        // is_alive that reaps zombies on detection (see is_alive doc comment
+        // for why kill(pid,0) alone would report the zombie as alive).
+        let mut monitor = Monitor::new("/bin/sleep".into(), vec!["0.1".into()], 5);
+        let pid = monitor.spawn_agent().unwrap();
+        assert_eq!(monitor.agent_pid(), Some(pid));
+        assert!(monitor.is_alive());
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(!monitor.is_alive());
+        // is_alive auto-reaped via try_wait — no further cleanup needed.
+        assert!(monitor.agent_child.is_none());
+    }
+
+    #[test]
+    fn restart_real_process_assigns_a_new_pid() {
+        let mut monitor = Monitor::new("/bin/sleep".into(), vec!["0.05".into()], 5);
+        let pid1 = monitor.spawn_agent().unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        let pid2 = monitor.restart_agent().unwrap();
+        assert_ne!(pid1, pid2);
+        assert_eq!(monitor.restart_count_last_hour(), 1);
+        // Cleanup the second sleep.
+        std::thread::sleep(Duration::from_millis(150));
+        if let Some(ref mut child) = monitor.agent_child {
+            let _ = child.wait();
+        }
+    }
+
+    #[test]
+    fn attach_to_current_process_succeeds() {
+        let mut monitor = Monitor::new("/dev/null".into(), vec![], 5);
+        let me = std::process::id();
+        monitor.attach(me).unwrap();
+        assert_eq!(monitor.agent_pid(), Some(me));
+        assert!(monitor.is_alive());
+    }
+
+    #[test]
+    fn attach_to_unused_pid_fails() {
+        let mut monitor = Monitor::new("/dev/null".into(), vec![], 5);
+        let err = monitor.attach(2_147_483_647).unwrap_err();
+        assert!(format!("{:#}", err).contains("does not exist"));
+    }
+
+    #[test]
+    fn restart_count_last_hour_starts_at_zero() {
+        let monitor = Monitor::new("/dev/null".into(), vec![], 5);
+        assert_eq!(monitor.restart_count_last_hour(), 0);
+    }
+
+    #[test]
+    fn agent_pid_is_none_before_spawn() {
+        let mut monitor = Monitor::new("/dev/null".into(), vec![], 5);
+        assert_eq!(monitor.agent_pid(), None);
+        assert!(!monitor.is_alive());
     }
 }
