@@ -92,7 +92,13 @@ echo "[-0.5/4] Config schema gate (validates /etc/innerwarden/agent.toml)..."
 if [ "${DEPLOY_SKIP_CONFIG_VALIDATE:-0}" = "1" ] || [ "${DEPLOY_SKIP_SOURCE_GUARD:-0}" = "1" ]; then
   echo "  WARN: DEPLOY_SKIP_CONFIG_VALIDATE=1 set - skipping schema validation."
 else
-  $SSH "$BIN_DIR/innerwarden config validate --path /etc/innerwarden/agent.toml" || die "agent.toml failed strict-schema validation; refusing deploy until the operator fixes the unknown/typo'd keys reported above. To intentionally bypass: DEPLOY_SKIP_CONFIG_VALIDATE=1 ./scripts/deploy-prod.sh"
+  # `sudo` because /etc/innerwarden/agent.toml is mode 640 (root:innerwarden)
+  # on prod hosts that ran `innerwarden setup` — the SSH user (ubuntu) is
+  # neither root nor in the `innerwarden` group, so the validator would
+  # fail with "config file not found" without sudo. The validator runs
+  # the agent binary with --validate-config-only; it does not start any
+  # service, so sudo only grants read access to the config file.
+  $SSH "sudo $BIN_DIR/innerwarden config validate --path /etc/innerwarden/agent.toml" || die "agent.toml failed strict-schema validation; refusing deploy until the operator fixes the unknown/typo'd keys reported above. To intentionally bypass: DEPLOY_SKIP_CONFIG_VALIDATE=1 ./scripts/deploy-prod.sh"
 fi
 
 
