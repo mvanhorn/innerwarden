@@ -74,7 +74,13 @@ impl SupervisorConfig {
         Self {
             agent_binary: agent_binary.into(),
             agent_args: Vec::new(),
-            agent_api: "http://127.0.0.1:8787".into(),
+            // AUDIT-005: the OSS agent serves the dashboard over HTTPS by
+            // default (auto-generated self-signed cert). Probing HTTP
+            // gets TLS handshake bytes back, parse fails, and the
+            // supervisor SIGKILLs a healthy agent every 30s. Default to
+            // HTTPS; HealthChecker auto-disables cert verification for
+            // loopback hosts (see crates/supervisor/src/health.rs).
+            agent_api: "https://127.0.0.1:8787".into(),
             health_interval: Duration::from_secs(30),
             max_restarts_per_hour: 10,
             telegram_token: None,
@@ -247,7 +253,7 @@ mod tests {
     #[test]
     fn config_defaults_match_oss_agent_layout() {
         let cfg = SupervisorConfig::new("/dev/null");
-        assert_eq!(cfg.agent_api, "http://127.0.0.1:8787");
+        assert_eq!(cfg.agent_api, "https://127.0.0.1:8787");
         assert_eq!(cfg.health_interval, Duration::from_secs(30));
         assert_eq!(cfg.max_restarts_per_hour, 10);
         assert!(cfg.agent_args.is_empty());

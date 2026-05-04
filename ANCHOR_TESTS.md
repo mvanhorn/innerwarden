@@ -231,6 +231,22 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/ai/local_classifier.rs::tests::dismiss_includes_confidence_in_reason_string` — audit-trail anchor: the reason for a `Dismiss` action must include the confidence so the operator can grep `dismiss (confidence 0.` for low-confidence dismisses without re-querying the inference batch.
 
+### Supervisor HTTPS health probe (PR α - AUDIT-005 anchor)
+
+- `crates/supervisor/src/health.rs::tests::loopback_https_url_triggers_skip_verify` - constructing a `HealthChecker` with `https://127.0.0.1:8787` sets `skip_tls_verify=true` so the probe accepts a self-signed cert. Pinned the 2026-05-04 prod incident where the watchdog probed `http://127.0.0.1:8787` against an HTTPS-serving agent and accumulated 1100+ consecutive failures over ~10 hours, SIGKILLing a healthy agent every 30 s.
+
+- `crates/supervisor/src/health.rs::tests::loopback_https_localhost_triggers_skip_verify` - same anchor with `localhost` host; defensive against an operator-supplied URL that does not literally use the IP.
+
+- `crates/supervisor/src/health.rs::tests::loopback_https_ipv6_triggers_skip_verify` - IPv6 loopback `[::1]` is also recognised as loopback. Anti-regression for an IPv4-only matcher that would silently demote IPv6-host watchdog deployments.
+
+- `crates/supervisor/src/health.rs::tests::http_loopback_does_not_skip_verify` - plain HTTP keeps `skip_tls_verify=false`. Anti-regression for accidentally widening the skip path to plain HTTP, which is a pointless toggle and might mask other config errors.
+
+- `crates/supervisor/src/health.rs::tests::non_loopback_https_keeps_verify_on` - HTTPS to a non-loopback host (`10.0.0.5`, `example.com`) keeps verification ON. Anti-regression for "auto-disable on every HTTPS" which would erase the cert protection on a remote watchdog probe.
+
+- `crates/supervisor/src/health.rs::tests::url_is_loopback_https_handles_path_and_userinfo` - URL parsing tolerates `userinfo@`, query strings, and `/path` suffixes without losing the host comparison.
+
+- `crates/supervisor/src/health.rs::tests::url_is_loopback_https_rejects_lookalike_hosts` - the matcher uses exact host equality, NOT prefix or substring match. Anti-regression for a future "starts_with" shortcut that would let an attacker-controlled `127.0.0.1.attacker.com` skip TLS verification.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:
