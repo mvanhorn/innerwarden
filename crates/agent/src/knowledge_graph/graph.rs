@@ -360,12 +360,11 @@ impl KnowledgeGraph {
         }
         if let Some(ref summary) = self._current_event_summary {
             if !summary.is_empty() && !edge.properties.contains_key("summary") {
-                // Truncate summary to save memory
-                let trunc = if summary.len() > 200 {
-                    &summary[..200]
-                } else {
-                    summary.as_str()
-                };
+                // Truncate summary to save memory. Wave 1 (AUDIT-WAVE1-UTF8):
+                // pre-fix `&summary[..200]` panicked on multi-byte UTF-8
+                // boundaries (an attacker-supplied incident summary with
+                // emoji at the right offset DoSed the KG ingest path).
+                let trunc = crate::text_util::safe_truncate(summary, 200);
                 edge.properties
                     .insert(intern("summary"), serde_json::Value::from(trunc));
             }

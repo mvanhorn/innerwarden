@@ -433,16 +433,22 @@ pub(super) fn validate_action_params(target: &str, reason: &str) -> Result<(), &
         return Err("reason is required");
     }
     let t = target.trim();
-    if t == "127.0.0.1"
-        || t == "::1"
-        || t.starts_with("10.")
-        || t.starts_with("192.168.")
-        || (t.starts_with("172.")
-            && t.len() >= 6
-            && t[4..6].parse::<u8>().is_ok()
-            && (16..=31).contains(&t[4..6].parse::<u8>().unwrap()))
-    {
+    if t == "127.0.0.1" || t == "::1" || t.starts_with("10.") || t.starts_with("192.168.") {
         return Err("cannot target internal IP");
+    }
+    // RFC 1918 172.16.0.0/12 covers second octet 16-31 only. Wave 1
+    // (AUDIT-WAVE1-UTF8): the prior implementation did `t[4..6]` byte
+    // slicing which panicked when an attacker-supplied target like
+    // `172.<multibyte>16.0.1` placed a multi-byte codepoint at byte 4.
+    // It also incorrectly blocked `172.165.0.1` (NOT private) by
+    // accepting only the first two ASCII digits. Splitting on `.` is
+    // both panic-free and parses the full second octet.
+    if t.starts_with("172.") {
+        if let Some(second_octet) = t.split('.').nth(1).and_then(|o| o.parse::<u8>().ok()) {
+            if (16..=31).contains(&second_octet) {
+                return Err("cannot target internal IP");
+            }
+        }
     }
     Ok(())
 }
@@ -1084,6 +1090,80 @@ mod tests {
         // Allowed
         assert!(validate_action_params("8.8.8.8", "reason").is_ok());
         assert!(validate_action_params("admin", "reason").is_ok());
+    }
+
+    // ── Wave 1 anchors (AUDIT-WAVE1-UTF8) ────────────────────────────
+    //
+    // `validate_action_params` previously did `t[4..6]` byte slicing
+    // which (a) panicked when an attacker-supplied target placed a
+    // multi-byte UTF-8 codepoint at byte 4 and (b) incorrectly
+    // accepted only 2-digit second octets, falsely blocking
+    // `172.165.0.1` (NOT private) while letting any 3-digit start
+    // through.
+
+    #[test]
+    fn validate_action_params_does_not_panic_on_multibyte_after_172_dot() {
+        // Each of these places a multi-byte codepoint at byte 4
+        // (right after `172.`), the exact shape that triggered the
+        // pre-fix panic. The new split-on-`.` parser fails the parse
+        // and returns Ok (the address is not blockable as RFC1918,
+        // but more importantly this MUST NOT panic).
+        for evil in &["172.€16.0.1", "172.é.0.1", "172.🦀.0.1"] {
+            // NOT panicking is the headline anchor; the return value
+            // is secondary but pinned for completeness.
+            let result = validate_action_params(evil, "reason");
+            // For any of these, second octet does not parse as u8 in
+            // 16..=31, so the 172.x check does not block. Other
+            // checks may still fire (if e.g. 172.€16... starts with
+            // a private prefix), but for the chosen inputs none does.
+            assert!(
+                result.is_ok(),
+                "expected ok or non-panic for {evil:?}, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_action_params_allows_172_165_which_is_not_rfc1918() {
+        // 172.165.0.1 is in the 172.165.0.0/16 PUBLIC range. Pre-fix
+        // the byte-slice `t[4..6] = "16"` parsed to 16 and falsely
+        // matched the private range, blocking a real outbound
+        // attacker. Anti-regression for the silent operator-impacting
+        // bug the new split-on-`.` parser eliminates.
+        assert!(
+            validate_action_params("172.165.0.1", "real attacker").is_ok(),
+            "172.165.0.1 is public; must not be blocked"
+        );
+        // 172.200.0.1 has the same shape — three-digit second octet,
+        // public range. Also must pass.
+        assert!(validate_action_params("172.200.0.1", "real attacker").is_ok());
+    }
+
+    #[test]
+    fn validate_action_params_still_blocks_real_172_16_through_172_31() {
+        // The full RFC1918 172.16.0.0/12 range. Pin the boundary so
+        // a future "fix" that off-by-ones the range fails at test
+        // time.
+        for blocked in &[
+            "172.16.0.1",
+            "172.17.0.1",
+            "172.20.0.1",
+            "172.30.0.1",
+            "172.31.255.255",
+        ] {
+            assert_eq!(
+                validate_action_params(blocked, "internal").err(),
+                Some("cannot target internal IP"),
+                "{blocked:?} is RFC1918; must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_action_params_allows_172_15_and_172_32_at_range_edges() {
+        // Just outside 172.16.0.0/12 on both sides. Must pass.
+        assert!(validate_action_params("172.15.0.1", "public").is_ok());
+        assert!(validate_action_params("172.32.0.1", "public").is_ok());
     }
 
     #[test]

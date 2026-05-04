@@ -269,6 +269,26 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/correlation_engine.rs::tests::self_traffic_suppression_keeps_real_attacker_comms_alive` - common attacker tooling (`curl`, `wget`, `nc`, `python3`, `perl`, `ssh`, `bash`) is NOT in the suppression list. The carve-out is a tight allowlist, not a hole that disables CL-008.
 
+### UTF-8 panic class (Wave 1 - AUDIT-WAVE1-UTF8 anchor)
+
+- `crates/agent/src/text_util.rs::tests::multibyte_split_at_char_boundary_does_not_panic` - `safe_truncate` walks back to a UTF-8 char boundary instead of panicking on `&s[..N]`. Pinned the 2026-05-04 ultrareview class where 8 call sites (AI prompt builders, KG edge summary, agent-guard alert, Telegram alert, kill-chain stdout, honeypot SSH history) all DoSed on attacker-supplied multi-byte input.
+
+- `crates/agent/src/text_util.rs::tests::three_byte_codepoint_splits_walk_back_correctly` - 3-byte codepoint (`€`) walked back correctly when `max` lands on byte 1 or 2.
+
+- `crates/agent/src/text_util.rs::tests::four_byte_codepoint_emoji_splits_walk_back_correctly` - 4-byte codepoint (🦀) walked back correctly. Anti-regression for an attacker shipping emoji at exactly the truncation boundary.
+
+- `crates/agent/src/text_util.rs::tests::long_attacker_string_with_max_inside_multibyte_does_not_panic` - realistic prod shape: `€` repeated 100 times truncated at byte 200 returns 198 bytes (66 codepoints) without panicking.
+
+- `crates/agent/src/text_util.rs::tests::mixed_ascii_and_multibyte_truncates_at_the_first_unsplittable_boundary` - ASCII+multibyte mixed string truncates at the boundary before the unsplittable codepoint, never inside it.
+
+- `crates/agent/src/dashboard/actions.rs::tests::validate_action_params_does_not_panic_on_multibyte_after_172_dot` - the `validate_action_params` 172.x check no longer does byte-slice `t[4..6]` (which panicked on `172.€16.0.1`-shaped attacker input). Now uses `split('.').nth(1).parse::<u8>()`, which is panic-free.
+
+- `crates/agent/src/dashboard/actions.rs::tests::validate_action_params_allows_172_165_which_is_not_rfc1918` - anti-regression for the silent operator-impacting bug the byte-slice fix also resolved: `172.165.0.1` is in the PUBLIC range and must NOT be blocked. Pre-fix `t[4..6] = "16"` falsely matched the private range.
+
+- `crates/agent/src/dashboard/actions.rs::tests::validate_action_params_still_blocks_real_172_16_through_172_31` - pins the RFC1918 172.16.0.0/12 block range so a future "fix" that off-by-ones the boundary fails at test time.
+
+- `crates/agent/src/dashboard/actions.rs::tests::validate_action_params_allows_172_15_and_172_32_at_range_edges` - `172.15.0.1` and `172.32.0.1` are public and must pass.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:

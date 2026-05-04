@@ -506,7 +506,13 @@ fn build_shell_system_prompt(user: &str, hostname: &str, history: &[(String, Str
         // Send full history (not just 6) for better state tracking
         for (cmd, resp) in history.iter() {
             let resp_preview = if resp.len() > 200 {
-                format!("{}...[truncated]", &resp[..200])
+                // Wave 1 (AUDIT-WAVE1-UTF8): honeypot session history may
+                // contain attacker-supplied multi-byte UTF-8; the prior
+                // `&resp[..200]` panicked the LLM-prompt builder.
+                format!(
+                    "{}...[truncated]",
+                    crate::text_util::safe_truncate(resp, 200)
+                )
             } else {
                 resp.clone()
             };

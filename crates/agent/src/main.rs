@@ -166,6 +166,7 @@ mod task_group;
 mod telegram;
 mod telemetry;
 mod telemetry_tick;
+mod text_util;
 mod threat_feeds;
 mod threat_report;
 mod trust_rules;

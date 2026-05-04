@@ -270,9 +270,15 @@ async fn capture_network_snapshot() -> String {
     match Command::new("ss").args(["-tunp"]).output().await {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
-            // Truncate to avoid huge forensics files
+            // Truncate to avoid huge forensics files. Wave 1
+            // (AUDIT-WAVE1-UTF8): `from_utf8_lossy` already replaces
+            // invalid UTF-8 with the replacement character (3 bytes),
+            // so byte 8192 may land mid-codepoint.
             if stdout.len() > 8192 {
-                format!("{}... [truncated]", &stdout[..8192])
+                format!(
+                    "{}... [truncated]",
+                    crate::text_util::safe_truncate(&stdout, 8192)
+                )
             } else {
                 stdout.to_string()
             }

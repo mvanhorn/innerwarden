@@ -408,7 +408,11 @@ pub(super) fn run_analysis(
             ts: Utc::now(),
             agent_name: agent_name.unwrap_or("unknown").to_string(),
             command: if command.len() > 200 {
-                format!("{}...", &command[..200])
+                // Wave 1 (AUDIT-WAVE1-UTF8): `&command[..200]` panicked
+                // on multi-byte UTF-8. Attacker-supplied command going
+                // through agent-guard inspection could DoS the snitch
+                // alert builder.
+                format!("{}...", crate::text_util::safe_truncate(command, 200))
             } else {
                 command.to_string()
             },

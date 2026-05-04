@@ -219,15 +219,15 @@ Respond ONLY with valid JSON using exactly this schema (no extra fields, no mark
 }
 "#;
 
-/// Truncate a free-text string to at most `max` characters to limit the blast
-/// radius of prompt injection via attacker-controlled content (SSH usernames,
-/// shell commands, HTTP paths, etc.).
+/// Truncate a free-text string to at most `max` BYTES, ending on a UTF-8
+/// character boundary. Wave 1 (2026-05-04 ultrareview, AUDIT-WAVE1-UTF8):
+/// the prior implementation did `&s[..max]` which panicked when `max`
+/// fell inside a multi-byte codepoint. An attacker-controlled SSH
+/// username / HTTP path / shell command containing emoji or accented
+/// characters could DoS the agent at the AI-prompt-build step. Routes
+/// through the shared [`crate::text_util::safe_truncate`] helper.
 fn trunc(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        s
-    } else {
-        &s[..max]
-    }
+    crate::text_util::safe_truncate(s, max)
 }
 
 /// Sanitize attacker-controlled strings before injecting into AI prompts.

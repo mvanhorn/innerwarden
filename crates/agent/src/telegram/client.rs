@@ -745,7 +745,10 @@ impl TelegramClient {
                     .as_deref()
                     .map(|p| {
                         if p.len() > 20 {
-                            format!("{}...", &p[..20])
+                            // Wave 1 (AUDIT-WAVE1-UTF8): attacker-supplied
+                            // process names appearing in Telegram alerts
+                            // could DoS via multi-byte UTF-8 at byte 20.
+                            format!("{}...", crate::text_util::safe_truncate(p, 20))
                         } else {
                             p.to_string()
                         }

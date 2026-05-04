@@ -210,12 +210,11 @@ Respond ONLY with valid JSON using exactly this schema (no extra fields, no mark
 }
 "#;
 
+/// Wave 1 (2026-05-04 ultrareview, AUDIT-WAVE1-UTF8): same multi-byte
+/// UTF-8 panic class as `crate::ai::openai::trunc`. Routes through the
+/// shared [`crate::text_util::safe_truncate`] helper.
 fn trunc(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        s
-    } else {
-        &s[..max]
-    }
+    crate::text_util::safe_truncate(s, max)
 }
 
 /// Sanitize attacker-controlled strings before injecting into AI prompts.
