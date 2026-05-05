@@ -132,6 +132,30 @@ impl LiveFeedResponse {
 /// pins is "how many distinct IPs did the agent contain today"; it is
 /// shared by `/api/live-feed` here and `/api/agent/security-context` in
 /// `agent_api.rs` so every surface that reads "Blocked Today" agrees.
+///
+/// # Wave 10b (AUDIT-WAVE10B-NON-INCIDENT-BLOCKS, 2026-05-05)
+///
+/// Pre-Wave-10b a block decision was counted only if its `incident_id`
+/// matched an entry in `real_ids` (today's real-incident IDs). On
+/// 2026-05-05 the operator hit `total_blocked: 0` while
+/// `decisions-2026-05-05.jsonl` had 450 `block_ip` decisions —
+/// because today's blocks all came from non-incident paths whose
+/// `incident_id` shape never appears in `incidents-*.jsonl`:
+///
+///   * `honeypot:always-on:abuseipdb:<ip>` — honeypot AbuseIPDB submits
+///   * `repeat-offender:<ip>:<ts>`         — repeat-offender ladder
+///   * `proto_anomaly:SshVersionAnomaly:*` — direct decisions w/o incident
+///
+/// These are legitimate auto-blocks that the public site SHOULD count.
+/// The fix accepts a decision as public-eligible when EITHER:
+///   1. its `incident_id` matches a real incident, OR
+///   2. its `incident_id` starts with one of the known
+///      non-incident-pipeline prefixes (`is_public_block_decision`).
+///
+/// The classifier is conservative: any decision shape we don't
+/// recognise still requires `real_ids` membership, so a future
+/// internal/research-only block path can't accidentally inflate the
+/// public count.
 pub(super) fn count_unique_ips_blocked(
     decisions: &[DecisionEntry],
     real_ids: &std::collections::HashSet<&str>,
@@ -141,7 +165,7 @@ pub(super) fn count_unique_ips_blocked(
         if d.action_type != "block_ip" {
             continue;
         }
-        if !real_ids.contains(d.incident_id.as_str()) {
+        if !is_public_block_decision(d, real_ids) {
             continue;
         }
         if let Some(ip) = d.target_ip.as_deref().filter(|s| !s.is_empty()) {
@@ -149,6 +173,40 @@ pub(super) fn count_unique_ips_blocked(
         }
     }
     ips.len()
+}
+
+/// Wave 10b classifier: is this `block_ip` decision public-eligible?
+///
+/// Returns true when the decision either references a real incident
+/// (the existing pipeline path) OR carries one of the well-known
+/// non-incident-pipeline incident_id shapes that the production agent
+/// emits for auto-blocks (honeypot AbuseIPDB submits, repeat-offender
+/// ladder, direct proto-anomaly decisions). The list is allow-list
+/// not regex — adding a new auto-block path is a small, deliberate
+/// change to this function with a matching anchor test.
+pub(super) fn is_public_block_decision(
+    d: &DecisionEntry,
+    real_ids: &std::collections::HashSet<&str>,
+) -> bool {
+    if real_ids.contains(d.incident_id.as_str()) {
+        return true;
+    }
+    // Wave 10b: known non-incident-pipeline auto-block paths.
+    // Each prefix corresponds to a distinct production code path
+    // that emits `block_ip` decisions without going through the
+    // standard incident-creation flow.
+    const PUBLIC_NON_INCIDENT_PREFIXES: &[&str] = &[
+        "honeypot:always-on:abuseipdb:",
+        "honeypot:abuseipdb:",
+        "repeat-offender:",
+        "proto_anomaly:",
+        "suspicious_archive:",
+        "logging_config_change:",
+    ];
+    let id = d.incident_id.as_str();
+    PUBLIC_NON_INCIDENT_PREFIXES
+        .iter()
+        .any(|prefix| id.starts_with(prefix))
 }
 
 /// `GET /api/live-feed` - last 200 incidents with totals for the day (public).
@@ -1490,5 +1548,145 @@ mod tests {
             mk_decision("i3", "block_ip", Some("10.0.0.1")),
         ];
         assert_eq!(count_unique_ips_blocked(&decisions, &real), 1);
+    }
+
+    // ── Wave 10b anchors (AUDIT-WAVE10B-NON-INCIDENT-BLOCKS) ──────────
+    //
+    // 2026-05-05: site live page showed `0 IPs blocked (24h)` while
+    // `decisions-2026-05-05.jsonl` had 450 `block_ip` decisions. Cause:
+    // today's blocks all came from non-incident paths whose
+    // `incident_id` shape doesn't appear in `incidents-*.jsonl`
+    // (`honeypot:always-on:abuseipdb:*`, `repeat-offender:*`,
+    // `proto_anomaly:*`, etc.). Pre-Wave-10b
+    // `count_unique_ips_blocked` required `real_ids` membership and
+    // dropped every one of those 450 decisions.
+
+    #[test]
+    fn count_unique_ips_blocked_counts_honeypot_abuseipdb_blocks() {
+        // The headline anchor: a quiet day where every block decision
+        // is a honeypot AbuseIPDB submit and `real_ids` is empty must
+        // STILL produce a non-zero count. Pre-Wave-10b returned 0.
+        let real: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let decisions = vec![
+            mk_decision(
+                "honeypot:always-on:abuseipdb:103.117.203.203",
+                "block_ip",
+                Some("103.117.203.203"),
+            ),
+            mk_decision(
+                "honeypot:always-on:abuseipdb:118.145.104.105",
+                "block_ip",
+                Some("118.145.104.105"),
+            ),
+            mk_decision(
+                "honeypot:abuseipdb:128.14.225.253",
+                "block_ip",
+                Some("128.14.225.253"),
+            ),
+        ];
+        assert_eq!(
+            count_unique_ips_blocked(&decisions, &real),
+            3,
+            "honeypot AbuseIPDB block decisions must count as public-eligible blocks even with no matching incident_id in real_ids"
+        );
+    }
+
+    #[test]
+    fn count_unique_ips_blocked_counts_repeat_offender_and_proto_anomaly() {
+        // The other two non-incident-pipeline shapes the operator hit:
+        // repeat-offender ladder + direct proto-anomaly decisions.
+        let real: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let decisions = vec![
+            mk_decision(
+                "repeat-offender:119.203.251.187:1777939320",
+                "block_ip",
+                Some("119.203.251.187"),
+            ),
+            mk_decision(
+                "proto_anomaly:SshVersionAnomaly:92.118.39.235:2026-05-05T00:00Z",
+                "block_ip",
+                Some("92.118.39.235"),
+            ),
+            mk_decision(
+                "suspicious_archive:unknown:2026-05-05T00:00Z",
+                "block_ip",
+                Some("203.0.113.7"),
+            ),
+            mk_decision(
+                "logging_config_change:unknown:2026-05-05T00:00Z",
+                "block_ip",
+                Some("203.0.113.8"),
+            ),
+        ];
+        assert_eq!(
+            count_unique_ips_blocked(&decisions, &real),
+            4,
+            "repeat-offender + proto_anomaly + suspicious_archive + logging_config_change shapes must each count"
+        );
+    }
+
+    #[test]
+    fn count_unique_ips_blocked_still_dedupes_across_incident_and_non_incident_paths() {
+        // Anti-regression for double-counting: an attacker that
+        // appears via BOTH paths (e.g. blocked via incident pipeline
+        // AND via repeat-offender ladder for the same IP) must count
+        // exactly once. The dedup is on target_ip, not on
+        // incident_id, so this should hold.
+        let real: std::collections::HashSet<&str> = ["i1"].into_iter().collect();
+        let decisions = vec![
+            mk_decision("i1", "block_ip", Some("198.51.100.7")),
+            mk_decision(
+                "repeat-offender:198.51.100.7:1777940000",
+                "block_ip",
+                Some("198.51.100.7"),
+            ),
+        ];
+        assert_eq!(
+            count_unique_ips_blocked(&decisions, &real),
+            1,
+            "same IP via incident + repeat-offender must dedupe to 1"
+        );
+    }
+
+    #[test]
+    fn count_unique_ips_blocked_still_rejects_unknown_non_incident_shape() {
+        // Defensive bound: a decision with an unrecognised
+        // incident_id shape (no real_ids match, no known prefix)
+        // must NOT count. This pins the conservative classifier so a
+        // future internal/research-only block path can't accidentally
+        // inflate the public counter.
+        let real: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let decisions = vec![mk_decision(
+            "internal:probe:noise:7",
+            "block_ip",
+            Some("203.0.113.99"),
+        )];
+        assert_eq!(
+            count_unique_ips_blocked(&decisions, &real),
+            0,
+            "unknown incident_id shape with no real_ids match must be rejected"
+        );
+    }
+
+    #[test]
+    fn is_public_block_decision_recognises_all_known_prefixes() {
+        // Every prefix in the allow-list must classify correctly. If
+        // a future PR adds a new auto-block path it adds a prefix +
+        // a row here in the same change.
+        let real: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for id in [
+            "honeypot:always-on:abuseipdb:1.2.3.4",
+            "honeypot:abuseipdb:1.2.3.4",
+            "repeat-offender:1.2.3.4:1234567890",
+            "proto_anomaly:SshVersionAnomaly:1.2.3.4:2026-05-05T00:00Z",
+            "suspicious_archive:unknown:2026-05-05T00:00Z",
+            "logging_config_change:unknown:2026-05-05T00:00Z",
+        ] {
+            let d = mk_decision(id, "block_ip", Some("1.2.3.4"));
+            assert!(
+                is_public_block_decision(&d, &real),
+                "incident_id {id:?} must classify as public-eligible"
+            );
+        }
     }
 }
