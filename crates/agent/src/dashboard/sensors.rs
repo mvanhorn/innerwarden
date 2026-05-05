@@ -119,10 +119,14 @@ fn build_sensors_payload(
         match telem {
             Some(t) => {
                 let total = t.events_by_collector.values().sum::<u64>() as usize;
-                let mut s: Vec<_> = t
+                // Wave 6b: t.events_by_collector keys are now `Arc<str>`;
+                // the if-branch above produces `(String, usize)` from
+                // graph.source_counts, so convert to `String` here to
+                // keep both branches' element type identical.
+                let mut s: Vec<(String, usize)> = t
                     .events_by_collector
                     .into_iter()
-                    .map(|(k, v)| (k, v as usize))
+                    .map(|(k, v)| (k.to_string(), v as usize))
                     .collect();
                 s.sort_by(|a, b| b.1.cmp(&a.1));
                 (total, s)
@@ -418,10 +422,14 @@ pub(super) async fn api_collectors(State(state): State<DashboardState>) -> Json<
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         crate::telemetry::read_latest_snapshot(&state.data_dir, &today)
             .map(|t| {
+                // Wave 6b: snapshot keys are now `Arc<str>`; the local
+                // adapter HashMap below uses `String` keys so the
+                // `.get(source)` lookup against the &str signature
+                // works without an Arc-to-str adapter on every call.
                 t.events_by_collector
                     .into_iter()
-                    .map(|(k, v)| (k, v as usize))
-                    .collect()
+                    .map(|(k, v)| (k.to_string(), v as usize))
+                    .collect::<HashMap<String, usize>>()
             })
             .unwrap_or_default()
     };

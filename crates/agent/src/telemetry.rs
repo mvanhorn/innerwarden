@@ -14,12 +14,22 @@ use tracing::warn;
 use crate::ai::AiAction;
 use crate::correlation;
 
+/// Wave 6b (memory-opt, 2026-05-05): the keys in
+/// `events_by_collector` and the other `BTreeMap<*, u64>` fields here
+/// repeat across every observed event (only ~5-10 distinct collector
+/// names exist in steady state). Pre-Wave-6b each `.entry(event.source.clone())`
+/// cycle allocated a fresh `String` per event regardless of whether
+/// the entry already existed (HashMap/BTreeMap take owned keys, drop
+/// duplicates after lookup). With `Arc<str>` interned at the call
+/// site, the lookup uses a 16-byte pointer-clone in the steady-state
+/// case where the entry already exists. Wire format is unchanged
+/// (serde renders `Arc<str>` as a plain JSON string).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelemetrySnapshot {
     pub ts: DateTime<Utc>,
     pub tick: String,
-    pub events_by_collector: BTreeMap<String, u64>,
-    pub incidents_by_detector: BTreeMap<String, u64>,
+    pub events_by_collector: BTreeMap<Arc<str>, u64>,
+    pub incidents_by_detector: BTreeMap<Arc<str>, u64>,
     pub gate_pass_count: u64,
     /// Added by spec 024 Phase 7 (feedback loop). Snapshots written before
     /// that land on disk without this field, so default to 0 on replay.
@@ -41,8 +51,8 @@ pub struct TelemetrySnapshot {
 
 #[derive(Debug, Default)]
 pub struct TelemetryState {
-    events_by_collector: BTreeMap<String, u64>,
-    incidents_by_detector: BTreeMap<String, u64>,
+    events_by_collector: BTreeMap<Arc<str>, u64>,
+    incidents_by_detector: BTreeMap<Arc<str>, u64>,
     gate_pass_count: u64,
     gate_suppressed_total: Arc<AtomicU64>,
     ai_sent_count: u64,
@@ -69,16 +79,25 @@ impl TelemetryState {
 
     pub fn observe_events(&mut self, events: &[Event]) {
         for event in events {
+            // Wave 6b: intern source so the BTreeMap key allocation is
+            // shared across every observe_events call with the same
+            // collector name. Pre-Wave-6b each call allocated a fresh
+            // String even when the entry already existed.
             *self
                 .events_by_collector
-                .entry(event.source.clone())
+                .entry(crate::knowledge_graph::intern::intern(&event.source))
                 .or_insert(0) += 1;
         }
     }
 
     pub fn observe_incident(&mut self, incident: &Incident) {
         let kind = correlation::detector_kind(incident);
-        *self.incidents_by_detector.entry(kind).or_insert(0) += 1;
+        // Wave 6b: detector kind is one of ~50 known strings; intern so
+        // the BTreeMap dedupes the key allocation across the day.
+        *self
+            .incidents_by_detector
+            .entry(crate::knowledge_graph::intern::intern(&kind))
+            .or_insert(0) += 1;
     }
 
     pub fn observe_gate_pass(&mut self) {
@@ -322,6 +341,95 @@ mod tests {
         incident::Incident,
     };
     use tempfile::TempDir;
+
+    /// Wave 6b (AUDIT-WAVE6B-INTERN) anchor: 1000 events with the same
+    /// `source = "auth_log"` produce a `events_by_collector` BTreeMap
+    /// with ONE entry whose key is pointer-equal to
+    /// `intern("auth_log")`. Pre-Wave-6b each call did
+    /// `entry(event.source.clone())` which allocated a fresh `String`
+    /// PER EVENT — `BTreeMap::entry` takes owned keys so the
+    /// duplicate is allocated and then dropped after the lookup.
+    /// With `Arc<str>` interned at the call site, the per-event
+    /// cost is a 16-byte pointer-clone.
+    #[test]
+    fn observe_events_interns_collector_key_via_arc_str() {
+        let gate_counter = Arc::new(AtomicU64::new(0));
+        let telegram_counter = Arc::new(AtomicU64::new(0));
+        let mut state = TelemetryState::with_external_counters(telegram_counter, gate_counter);
+        let ev = Event {
+            ts: Utc::now(),
+            host: "h".into(),
+            source: "auth_log".into(),
+            kind: "ssh.login_failed".into(),
+            severity: Severity::Medium,
+            summary: "s".into(),
+            details: serde_json::json!({}),
+            tags: vec![],
+            entities: vec![],
+        };
+        let batch = vec![ev.clone(); 1000];
+        state.observe_events(&batch);
+        // Take a snapshot to inspect the map.
+        let snap = state.snapshot("tick");
+        assert_eq!(
+            snap.events_by_collector.len(),
+            1,
+            "1000 events with the same source produce ONE map entry"
+        );
+        assert_eq!(
+            snap.events_by_collector.values().copied().sum::<u64>(),
+            1000
+        );
+        // The key must share its allocation with `intern("auth_log")` —
+        // pointer-equality on the underlying `Arc<str>` proves the
+        // interner is wired at the insert site.
+        let canonical = crate::knowledge_graph::intern::intern("auth_log");
+        let stored_key = snap.events_by_collector.keys().next().unwrap();
+        assert!(
+            Arc::ptr_eq(stored_key, &canonical),
+            "events_by_collector key must share Arc allocation with intern(\"auth_log\")"
+        );
+    }
+
+    /// Wave 6b: round-trip JSON serialize → deserialize keeps the wire
+    /// format identical to pre-Wave-6b. The keys go from `Arc<str>` to
+    /// JSON string and back; deserialization produces a fresh
+    /// `Arc<str>` per key (no auto-interning on cold load), but
+    /// content equality is preserved so consumers see the same data.
+    #[test]
+    fn telemetry_snapshot_arc_str_keys_round_trip_through_json() {
+        let mut events_by_collector: BTreeMap<Arc<str>, u64> = BTreeMap::new();
+        events_by_collector.insert(crate::knowledge_graph::intern::intern("auth_log"), 42);
+        events_by_collector.insert(crate::knowledge_graph::intern::intern("ebpf"), 99);
+        let snap = TelemetrySnapshot {
+            ts: Utc::now(),
+            tick: "t".into(),
+            events_by_collector,
+            incidents_by_detector: BTreeMap::new(),
+            gate_pass_count: 0,
+            gate_suppressed_total: 0,
+            ai_sent_count: 0,
+            telegram_sent_count: 0,
+            ai_decision_count: 0,
+            avg_decision_latency_ms: 0.0,
+            errors_by_component: BTreeMap::new(),
+            decisions_by_action: BTreeMap::new(),
+            dry_run_execution_count: 0,
+            real_execution_count: 0,
+        };
+        let json = serde_json::to_string(&snap).expect("serialize");
+        // Wire format check: keys appear as plain JSON strings, not
+        // any Arc-tagged structure. Pre- and post-Wave-6b consumers
+        // must parse the SAME wire format.
+        assert!(
+            json.contains("\"auth_log\":42"),
+            "auth_log key must serialize as a plain JSON string: {json}"
+        );
+        assert!(json.contains("\"ebpf\":99"));
+        let back: TelemetrySnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.events_by_collector.get("auth_log").copied(), Some(42));
+        assert_eq!(back.events_by_collector.get("ebpf").copied(), Some(99));
+    }
 
     #[test]
     fn telemetry_state_tracks_counts_and_latency() {

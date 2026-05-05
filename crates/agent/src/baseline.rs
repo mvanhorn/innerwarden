@@ -12,6 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use chrono::{Timelike, Utc};
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,8 @@ use tracing::{info, warn};
 
 use innerwarden_core::entities::EntityType;
 use innerwarden_core::event::{Event, Severity};
+
+use crate::knowledge_graph::intern::intern;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -44,22 +47,36 @@ const MAX_DESTINATION_PROCESSES: usize = 200;
 // ---------------------------------------------------------------------------
 
 /// Persistent baseline store.
+///
+/// Wave 6b (memory-opt, 2026-05-05): the four high-reuse keyed
+/// collections below switched from `String` to `Arc<str>`. Cardinality
+/// in steady state is small (~10 distinct sources, ~50 distinct
+/// users, ~hundreds of process lineages), but the call sites
+/// `.entry(event.source.clone())` were pre-Wave-6b allocating a fresh
+/// `String` PER EVENT regardless of whether the entry already
+/// existed (HashMap takes owned keys, drops duplicates after the
+/// hash lookup). With `Arc<str>` interned at the call site every
+/// repeated event is a 16-byte pointer-clone instead of a string
+/// alloc + free. Wire format on `baseline.json` is unchanged
+/// (serde renders `Arc<str>` as JSON string).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BaselineStore {
     /// Events per hour by source. Key = source name (e.g., "auth_log").
     /// Value = 24-element array, each element is the average event count for that hour.
-    event_rate_by_hour: HashMap<String, [f32; 24]>,
+    event_rate_by_hour: HashMap<Arc<str>, [f32; 24]>,
 
     /// Known normal process lineages (parent_comm→child_comm).
-    process_lineages: HashSet<String>,
+    /// Lineage strings (e.g. "systemd > sshd > bash") repeat across
+    /// every observed event from the same parent chain.
+    process_lineages: HashSet<Arc<str>>,
 
     /// User login hour profile. Key = username.
     /// Value = 24-element array, each bit indicates login activity seen in that hour.
-    user_login_hours: HashMap<String, [u8; 24]>,
+    user_login_hours: HashMap<Arc<str>, [u8; 24]>,
 
     /// Normal outbound destinations per process. Key = process name.
     /// Value = set of destination IPs/hostnames seen.
-    process_destinations: HashMap<String, HashSet<String>>,
+    process_destinations: HashMap<Arc<str>, HashSet<String>>,
 
     /// Has the learning period completed?
     mature: bool,
@@ -71,7 +88,7 @@ pub struct BaselineStore {
     observed_dates: HashSet<String>,
 
     /// Running event counts for current hour (for rate calculation).
-    current_hour_counts: HashMap<String, u32>,
+    current_hour_counts: HashMap<Arc<str>, u32>,
     /// Which hour the current counts belong to.
     current_hour: u8,
 
@@ -239,10 +256,12 @@ impl BaselineStore {
             self.current_hour = hour;
         }
 
-        // Update event rate counts
+        // Update event rate counts.
+        // Wave 6b: intern source so the HashMap key allocation is
+        // shared across every event with the same source.
         *self
             .current_hour_counts
-            .entry(event.source.clone())
+            .entry(intern(&event.source))
             .or_default() += 1;
 
         // Track process lineages from eBPF exec events
@@ -255,9 +274,12 @@ impl BaselineStore {
                 event.details.get("comm").and_then(|v| v.as_str()),
             ) {
                 let lineage = format!("{ppid_comm}→{comm}");
-                let is_new = !self.process_lineages.contains(&lineage);
+                // Wave 6b: HashSet<Arc<str>>::contains accepts &str via
+                // Borrow; intern only on insert so the heap allocation
+                // is shared across repeats of the same lineage.
+                let is_new = !self.process_lineages.contains(lineage.as_str());
                 if self.process_lineages.len() < MAX_LINEAGES {
-                    self.process_lineages.insert(lineage.clone());
+                    self.process_lineages.insert(intern(&lineage));
                 }
                 if is_new && self.mature {
                     new_lineage = Some(lineage);
@@ -290,9 +312,11 @@ impl BaselineStore {
         if !is_honeypot && (event.kind == "ssh.login_success" || event.kind.contains("accepted")) {
             for entity in &event.entities {
                 if entity.r#type == EntityType::User && is_valid_unix_username(&entity.value) {
+                    // Wave 6b: usernames repeat per login event; intern
+                    // so the map key is shared across the day.
                     let profile = self
                         .user_login_hours
-                        .entry(entity.value.clone())
+                        .entry(intern(&entity.value))
                         .or_insert([0; 24]);
                     profile[hour as usize] = profile[hour as usize].saturating_add(1);
                 }
@@ -312,10 +336,11 @@ impl BaselineStore {
                         }
                     }
                     if self.process_destinations.len() < MAX_DESTINATION_PROCESSES {
-                        let dests = self
-                            .process_destinations
-                            .entry(comm.to_string())
-                            .or_default();
+                        // Wave 6b: process names (`comm`) are bounded
+                        // — `sshd`, `bash`, `curl`, etc. — and repeat
+                        // across every observed connect; intern so
+                        // the map key allocation is shared.
+                        let dests = self.process_destinations.entry(intern(comm)).or_default();
                         if dests.len() < MAX_DESTINATIONS_PER_PROCESS {
                             dests.insert(dst_ip.to_string());
                         }
@@ -347,7 +372,7 @@ impl BaselineStore {
         if event.kind.contains("login") || event.kind.contains("accepted") {
             for entity in &event.entities {
                 if entity.r#type == EntityType::User {
-                    if let Some(profile) = self.user_login_hours.get(&entity.value) {
+                    if let Some(profile) = self.user_login_hours.get(entity.value.as_str()) {
                         if profile[hour as usize] == 0 {
                             // User never logged in at this hour before
                             anomalies.push(AnomalyReport {
@@ -601,6 +626,103 @@ fn format_active_hours(profile: &[u8; 24]) -> String {
 mod tests {
     use super::*;
     use innerwarden_core::entities::EntityRef;
+
+    /// Wave 6b (AUDIT-WAVE6B-INTERN) anchor: 1000 events with the same
+    /// `source = "auth_log"` produce a `current_hour_counts` HashMap
+    /// with ONE entry whose key is pointer-equal to
+    /// `intern("auth_log")`. Same shape as the telemetry anchor —
+    /// proves the interning is wired at the per-event insert site
+    /// for `current_hour_counts`.
+    #[test]
+    fn observe_event_interns_current_hour_counts_key() {
+        let mut store = BaselineStore::new();
+        let ev = make_event("auth_log", "ssh.login_failed");
+        for _ in 0..1000 {
+            let _ = store.observe_event(&ev);
+        }
+        let canonical = intern("auth_log");
+        let stored = store
+            .current_hour_counts
+            .keys()
+            .find(|k| k.as_ref() == "auth_log")
+            .expect("auth_log key present");
+        assert!(
+            Arc::ptr_eq(stored, &canonical),
+            "current_hour_counts key must share Arc allocation with intern(\"auth_log\")"
+        );
+        assert_eq!(
+            store.current_hour_counts.get("auth_log").copied(),
+            Some(1000)
+        );
+    }
+
+    /// Wave 6b: user_login_hours map keys are interned. 100 successful
+    /// logins for `ubuntu` produce ONE entry whose key is pointer-equal
+    /// to `intern("ubuntu")`.
+    #[test]
+    fn observe_event_interns_user_login_hours_key() {
+        let mut store = BaselineStore::new();
+        let mut ev = make_event("auth_log", "ssh.login_success");
+        ev.entities = vec![EntityRef::user("ubuntu")];
+        for _ in 0..100 {
+            let _ = store.observe_event(&ev);
+        }
+        let canonical = intern("ubuntu");
+        let stored = store
+            .user_login_hours
+            .keys()
+            .find(|k| k.as_ref() == "ubuntu")
+            .expect("ubuntu key present");
+        assert!(
+            Arc::ptr_eq(stored, &canonical),
+            "user_login_hours key must share Arc allocation with intern(\"ubuntu\")"
+        );
+    }
+
+    /// Wave 6b: process_lineages set members are interned. Same
+    /// lineage observed many times produces ONE Arc<str> entry.
+    #[test]
+    fn observe_event_interns_process_lineages_member() {
+        let mut store = BaselineStore::new();
+        let ev = make_exec_event("systemd", "sshd");
+        for _ in 0..200 {
+            let _ = store.observe_event(&ev);
+        }
+        let canonical = intern("systemd→sshd");
+        let stored = store
+            .process_lineages
+            .iter()
+            .find(|s| s.as_ref() == "systemd→sshd")
+            .expect("lineage present");
+        assert!(
+            Arc::ptr_eq(stored, &canonical),
+            "process_lineages member must share Arc allocation with intern(\"systemd→sshd\")"
+        );
+    }
+
+    /// Wave 6b: round-trip JSON serialize → deserialize keeps the on-
+    /// disk wire format unchanged. Pre- and post-Wave-6b agents must
+    /// be able to load the SAME `baseline.json`.
+    #[test]
+    fn baseline_store_arc_str_keys_round_trip_through_json() {
+        let mut store = BaselineStore::new();
+        let ev = make_event("auth_log", "ssh.login_failed");
+        for _ in 0..3 {
+            let _ = store.observe_event(&ev);
+        }
+        let json = serde_json::to_string(&store).expect("serialize");
+        // Wire format check: keys appear as plain JSON strings.
+        assert!(
+            json.contains("\"auth_log\""),
+            "auth_log must appear as plain string: {json}"
+        );
+        let back: BaselineStore = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            back.current_hour_counts.get("auth_log").copied(),
+            Some(3),
+            "round-trip preserves count under same key"
+        );
+    }
 
     fn make_event(source: &str, kind: &str) -> Event {
         Event {

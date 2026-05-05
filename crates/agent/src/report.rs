@@ -180,8 +180,13 @@ pub struct FileHealth {
 pub struct OperationalTelemetry {
     pub available: bool,
     pub last_tick: Option<String>,
-    pub events_by_collector: BTreeMap<String, u64>,
-    pub incidents_by_detector: BTreeMap<String, u64>,
+    /// Wave 6b (memory-opt): mirrors `TelemetrySnapshot` field type
+    /// (`Arc<str>`) so the per-tick `from(snapshot)` conversion in
+    /// `build_operational_telemetry` is a cheap pointer-clone instead
+    /// of a per-key `String` re-allocation. Wire format unchanged
+    /// (serde renders `Arc<str>` as JSON string).
+    pub events_by_collector: BTreeMap<std::sync::Arc<str>, u64>,
+    pub incidents_by_detector: BTreeMap<std::sync::Arc<str>, u64>,
     pub gate_pass_count: u64,
     pub ai_sent_count: u64,
     pub ai_decision_count: u64,
@@ -3152,10 +3157,11 @@ mod tests {
         fs::write(dir.path().join("state.json"), "{}").unwrap();
         fs::write(dir.path().join("agent-state.json"), "{}").unwrap();
 
-        let mut events_by_collector = BTreeMap::new();
-        events_by_collector.insert("auth.log".to_string(), 12);
-        let mut incidents_by_detector = BTreeMap::new();
-        incidents_by_detector.insert("ssh_bruteforce".to_string(), 4);
+        // Wave 6b: TelemetrySnapshot map keys are now `Arc<str>`.
+        let mut events_by_collector: BTreeMap<std::sync::Arc<str>, u64> = BTreeMap::new();
+        events_by_collector.insert(std::sync::Arc::<str>::from("auth.log"), 12);
+        let mut incidents_by_detector: BTreeMap<std::sync::Arc<str>, u64> = BTreeMap::new();
+        incidents_by_detector.insert(std::sync::Arc::<str>::from("ssh_bruteforce"), 4);
         let mut errors_by_component = BTreeMap::new();
         errors_by_component.insert("webhook".to_string(), 1);
         let mut decisions_by_action = BTreeMap::new();

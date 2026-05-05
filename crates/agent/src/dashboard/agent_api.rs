@@ -1240,7 +1240,12 @@ fn read_event_rate_per_hour(
     let hour_ago_date = hour_ago.date_naive().format("%Y-%m-%d").to_string();
     let baseline = crate::telemetry::read_snapshot_at(data_dir, &hour_ago_date, hour_ago);
 
-    let mut sources = std::collections::BTreeSet::new();
+    // Wave 6b: snapshot keys are `Arc<str>`. Keep the local set in
+    // `Arc<str>` so map lookups stay pointer-cheap; convert to owned
+    // `String` only at the output boundary (this function returns
+    // `Vec<(String, f64)>` to keep the JSON wire format unchanged).
+    let mut sources: std::collections::BTreeSet<std::sync::Arc<str>> =
+        std::collections::BTreeSet::new();
     sources.extend(latest.events_by_collector.keys().cloned());
     if let Some(ref previous) = baseline {
         sources.extend(previous.events_by_collector.keys().cloned());
@@ -1259,7 +1264,7 @@ fn read_event_rate_per_hour(
                 .and_then(|snap| snap.events_by_collector.get(&source).copied())
                 .unwrap_or(0);
             let delta = current.saturating_sub(previous);
-            (source, delta as f64)
+            (source.to_string(), delta as f64)
         })
         .collect();
 
@@ -2144,7 +2149,10 @@ enabled = false
         crate::telemetry::TelemetrySnapshot {
             ts,
             tick: "incident_tick".into(),
-            events_by_collector: events.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
+            events_by_collector: events
+                .iter()
+                .map(|(k, v)| (std::sync::Arc::<str>::from(*k), *v))
+                .collect(),
             incidents_by_detector: Default::default(),
             gate_pass_count: 0,
             gate_suppressed_total,
