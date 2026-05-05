@@ -1,10 +1,11 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::warn;
@@ -100,6 +101,22 @@ impl DecisionWriter {
     /// Append a decision to the daily JSONL.
     /// Rotates to a new file at midnight.
     /// Each entry includes a hash chain pointer to the previous entry.
+    ///
+    /// # Wave 3 (AUDIT-WAVE3-CHAIN-RACE, 2026-05-04 ultrareview)
+    ///
+    /// Pre-fix this method buffered writes through `BufWriter<File>` and
+    /// re-read `disk_hash` to "guard against external writers". That
+    /// guard is racy: between the `read_last_hash` call and the actual
+    /// `writeln!` an external writer (the always-on honeypot calling
+    /// `append_chained`, or a parallel slow-loop tick) could append its
+    /// own entry. Both writers would compute their `prev_hash` from the
+    /// same on-disk state and produce a forked chain. The fix routes
+    /// the write through [`append_chained_locked`] so every writer
+    /// (struct or free function) holds an `flock(LOCK_EX)` over the
+    /// daily JSONL while it reads-the-hash, builds the line, writes,
+    /// and flushes. The struct's BufWriter is bypassed because flock
+    /// is on the `File` not the BufWriter, and an unflushed BufWriter
+    /// would leave the lock held over data not yet on disk.
     pub fn write(&mut self, entry: &DecisionEntry) -> Result<()> {
         let today = chrono::Local::now()
             .date_naive()
@@ -111,52 +128,20 @@ impl DecisionWriter {
             let file = open_or_create(&self.data_dir, &today)?;
             self.writer = BufWriter::new(file);
             self.current_date = today.clone();
-            self.last_hash = read_last_hash(&self.data_dir, &today);
         }
 
-        // Re-read the last hash from disk in case an external writer (e.g.
-        // always-on honeypot) appended entries since our last write.
-        let disk_hash = read_last_hash(&self.data_dir, &self.current_date);
-        if disk_hash != self.last_hash {
-            self.last_hash = disk_hash;
-        }
-
-        // Build a chained entry: set prev_hash from the last written entry.
-        // Serialize immediately so the borrow of self.last_hash is released
-        // before we update it with the new hash.
-        let line = {
-            let chained = ChainedEntry {
-                ts: entry.ts,
-                incident_id: &entry.incident_id,
-                host: &entry.host,
-                ai_provider: &entry.ai_provider,
-                action_type: &entry.action_type,
-                target_ip: entry.target_ip.as_deref(),
-                target_user: entry.target_user.as_deref(),
-                skill_id: entry.skill_id.as_deref(),
-                confidence: entry.confidence,
-                auto_executed: entry.auto_executed,
-                dry_run: entry.dry_run,
-                reason: &entry.reason,
-                estimated_threat: &entry.estimated_threat,
-                execution_result: &entry.execution_result,
-                prev_hash: self.last_hash.as_deref(),
-            };
-            serde_json::to_string(&chained).context("failed to serialize decision entry")?
-        };
-
-        // Compute SHA-256 of the serialized entry for the next link in the chain
+        // Wave 3 fix: route through the locked-append helper so the
+        // always-on honeypot path (which calls `append_chained`) and
+        // this struct's path can never race the hash chain.
+        let line = append_chained_locked(
+            &self.data_dir,
+            &self.current_date,
+            entry,
+            self.store.as_ref(),
+        )?;
+        // Update the in-memory cache so consecutive writes from the
+        // same struct keep their cheap-prev-hash optimisation.
         self.last_hash = Some(sha256_hex(&line));
-
-        writeln!(self.writer, "{line}").context("failed to write decision entry")?;
-        // Flush immediately - audit trail must survive a crash between decisions
-        self.writer
-            .flush()
-            .context("failed to flush decision entry")?;
-
-        if let Some(ref store) = self.store {
-            mirror_to_sqlite(store, entry, &line);
-        }
         Ok(())
     }
 
@@ -187,6 +172,35 @@ struct ChainedEntry<'a> {
     execution_result: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     prev_hash: Option<&'a str>,
+}
+
+/// Wave 3 (AUDIT-WAVE3-CHAIN-RACE) helper: tight `\d{4}-\d{2}-\d{2}`
+/// validator for the `today` segment of the daily JSONL filename. Pure
+/// 10-char check (4 digit + `-` + 2 digit + `-` + 2 digit) so CodeQL's
+/// taint tracker sees the path component as sanitised. Rejects any
+/// length / non-digit / non-`-` character that would let an attacker
+/// who somehow controlled `today` perform path traversal via `..` or
+/// inject NUL bytes / globs.
+fn is_iso_date(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() != 10 {
+        return false;
+    }
+    for (i, b) in bytes.iter().enumerate() {
+        match i {
+            4 | 7 => {
+                if *b != b'-' {
+                    return false;
+                }
+            }
+            _ => {
+                if !b.is_ascii_digit() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 fn sha256_hex(data: &str) -> String {
@@ -220,11 +234,8 @@ fn open_or_create(data_dir: &Path, date: &str) -> Result<File> {
 }
 
 /// Standalone hash-chained append for code paths that don't own a `DecisionWriter`
-/// (e.g. the always-on honeypot task). Reads the last hash from the file, sets
-/// `prev_hash`, writes the entry, flushes, and — when `store` is `Some` —
-/// mirrors the same canonical JSON line into the SQLite `decisions` table
-/// using the shared [`mirror_to_sqlite`] helper. Callers that pass `None`
-/// (tests) stay JSONL-only.
+/// (e.g. the always-on honeypot task). Routes through [`append_chained_locked`]
+/// so it shares the file-level flock with `DecisionWriter::write`.
 pub fn append_chained(
     data_dir: &Path,
     entry: &DecisionEntry,
@@ -234,7 +245,61 @@ pub fn append_chained(
         .date_naive()
         .format("%Y-%m-%d")
         .to_string();
-    let last_hash = read_last_hash(data_dir, &today);
+    let _ = append_chained_locked(data_dir, &today, entry, store)?;
+    Ok(())
+}
+
+/// Wave 3 (AUDIT-WAVE3-CHAIN-RACE) anchor: hash-chained append with
+/// an exclusive file lock that BOTH the struct-based `DecisionWriter`
+/// path and the standalone `append_chained` path use. The lock spans
+/// from the `read_last_hash` call to the post-flush release, so two
+/// concurrent appenders cannot both compute `prev_hash` from the same
+/// on-disk state and fork the chain.
+///
+/// Returns the canonical JSON line that was written so the caller can
+/// update its in-memory `last_hash` cache (the new line's SHA-256 is
+/// the next entry's `prev_hash`).
+///
+/// Implementation notes:
+/// * `flock(LOCK_EX)` is reaped automatically when the `File` drops
+///   at the end of this function. We do NOT keep the lock across
+///   the SQLite mirror because that ran outside the lock pre-fix
+///   and adding it under-lock would extend the critical section
+///   for no chain-integrity benefit.
+/// * Errors from the `flock` call are wrapped with context so the
+///   caller's error log captures both the syscall + the path.
+fn append_chained_locked(
+    data_dir: &Path,
+    today: &str,
+    entry: &DecisionEntry,
+    store: Option<&Arc<innerwarden_store::Store>>,
+) -> Result<String> {
+    // Defense-in-depth: callers always pass `chrono::Local::now()` formatted
+    // as `%Y-%m-%d`, so `today` is structurally `\d{4}-\d{2}-\d{2}`. Validate
+    // the shape here to (a) reject any future caller that forwards
+    // attacker-controlled input + (b) document the path-construction
+    // contract for CodeQL's taint tracker (CWE-22 path traversal).
+    if !is_iso_date(today) {
+        anyhow::bail!(
+            "decisions append_chained_locked: refusing to construct path with non-ISO-date segment {today:?}"
+        );
+    }
+    let path: PathBuf = data_dir.join(format!("decisions-{today}.jsonl"));
+    let mut f = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+
+    f.lock_exclusive()
+        .with_context(|| format!("flock(LOCK_EX) on {}", path.display()))?;
+
+    // Re-read the last hash from disk INSIDE the lock so we observe
+    // every write that landed before this one and exclude every write
+    // that is still waiting on the lock.
+    let last_hash = read_last_hash(data_dir, today);
+
     let chained = ChainedEntry {
         ts: entry.ts,
         incident_id: &entry.incident_id,
@@ -253,20 +318,16 @@ pub fn append_chained(
         prev_hash: last_hash.as_deref(),
     };
     let line = serde_json::to_string(&chained).context("failed to serialize decision entry")?;
-    let path = data_dir.join(format!("decisions-{today}.jsonl"));
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
+
     use std::io::Write;
     writeln!(f, "{line}").context("failed to write decision entry")?;
     f.flush().context("failed to flush decision entry")?;
+    // Lock released automatically when `f` drops below.
 
     if let Some(store) = store {
         mirror_to_sqlite(store, entry, &line);
     }
-    Ok(())
+    Ok(line)
 }
 
 /// Write a decision row to the SQLite `decisions` table. Shared by
@@ -670,5 +731,365 @@ mod tests {
         assert_eq!(entry.target_ip, None);
         assert_eq!(entry.target_user, None);
         assert_eq!(entry.skill_id, None);
+    }
+
+    // ── Wave 3 anchors (AUDIT-WAVE3-CHAIN-RACE) ────────────────────────
+    //
+    // Pre-fix the struct-based `DecisionWriter::write` and the standalone
+    // `append_chained` both did `read_last_hash` then `writeln!` without
+    // a file lock. Two concurrent appenders (the slow loop + the always-on
+    // honeypot, or the slow loop + a manual operator action) could both
+    // read the same on-disk hash, build entries with the same `prev_hash`,
+    // and fork the chain. The fix routes both writers through
+    // `append_chained_locked` which holds `flock(LOCK_EX)` over the
+    // read-hash + write + flush sequence.
+
+    fn make_test_entry(idx: usize) -> DecisionEntry {
+        DecisionEntry {
+            ts: chrono::Utc::now(),
+            incident_id: format!("inc-{idx}"),
+            host: "test-host".to_string(),
+            ai_provider: "test".to_string(),
+            action_type: "block_ip".to_string(),
+            target_ip: Some(format!("203.0.113.{idx}")),
+            target_user: None,
+            skill_id: None,
+            confidence: 0.9,
+            auto_executed: true,
+            dry_run: false,
+            reason: format!("test entry {idx}"),
+            estimated_threat: "high".to_string(),
+            execution_result: "ok".to_string(),
+            prev_hash: None,
+        }
+    }
+
+    #[test]
+    fn concurrent_append_chained_does_not_fork_the_hash_chain() {
+        // 4 OS threads each call `append_chained` 25 times against the
+        // same data_dir + day. Without flock the writers race and >=2
+        // entries end up sharing a `prev_hash` (forked chain). With
+        // flock the chain is linear: every entry's `prev_hash` matches
+        // the SHA-256 of its predecessor.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().to_path_buf();
+
+        let n_threads = 4;
+        let per_thread = 25;
+        let handles: Vec<_> = (0..n_threads)
+            .map(|t| {
+                let data_dir = data_dir.clone();
+                std::thread::spawn(move || {
+                    for i in 0..per_thread {
+                        let entry = make_test_entry(t * per_thread + i);
+                        append_chained(&data_dir, &entry, None).expect("append must succeed");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        // Read every line from the daily JSONL + verify the chain.
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let path = data_dir.join(format!("decisions-{today}.jsonl"));
+        let content = std::fs::read_to_string(&path).expect("read jsonl");
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            n_threads * per_thread,
+            "all writes must land in the file"
+        );
+
+        // Build (hash, prev_hash) pairs and verify the chain. The first
+        // line has prev_hash = None; every subsequent line must have
+        // prev_hash equal to the SHA-256 of the line BEFORE it.
+        let mut prev_seen: Option<String> = None;
+        let mut prev_hashes_seen = std::collections::HashSet::new();
+        for (i, line) in lines.iter().enumerate() {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            let line_prev = v
+                .get("prev_hash")
+                .and_then(|x| x.as_str())
+                .map(String::from);
+            // Anti-fork: NO two entries should share a non-None prev_hash.
+            // (The first entry has None; all others must have unique prev_hashes.)
+            if let Some(ref ph) = line_prev {
+                assert!(
+                    prev_hashes_seen.insert(ph.clone()),
+                    "fork detected: line {i} duplicates prev_hash {ph} - the chain has split"
+                );
+            }
+            // Linear chain: this line's prev_hash matches the previous
+            // line's computed hash.
+            assert_eq!(
+                line_prev, prev_seen,
+                "chain broken at line {i}: expected prev_hash {prev_seen:?}, got {line_prev:?}"
+            );
+            prev_seen = Some(sha256_hex(line));
+        }
+    }
+
+    #[test]
+    fn is_iso_date_accepts_canonical_today_format() {
+        assert!(is_iso_date("2026-05-04"));
+        assert!(is_iso_date("0001-01-01"));
+        assert!(is_iso_date("9999-12-31"));
+    }
+
+    #[test]
+    fn is_iso_date_rejects_path_traversal_and_garbage() {
+        // Anti-regression: every shape that could let an attacker
+        // who somehow controlled the `today` arg perform path
+        // traversal or inject globs / NUL bytes must be rejected.
+        for evil in &[
+            "",
+            "2026-05-4",       // wrong digit count
+            "2026-5-04",       // wrong digit count
+            "2026/05/04",      // wrong separator
+            "../etc/passwd",   // path traversal classic
+            "2026-05-04/../x", // path traversal smuggled in
+            "2026-05-04\0",    // NUL terminator
+            "2026-05-*",       // glob wildcard
+            "2026-05-04 ",     // trailing space
+            " 2026-05-04",     // leading space
+            "26-05-04",        // wrong year width
+        ] {
+            assert!(
+                !is_iso_date(evil),
+                "is_iso_date must reject {evil:?} but did not"
+            );
+        }
+    }
+
+    #[test]
+    fn append_chained_locked_refuses_non_iso_date_segment() {
+        // Pin the path-construction guard end-to-end: passing a
+        // non-ISO-date segment errors out BEFORE any open()/lock()
+        // syscall, so an attacker-controlled `today` cannot reach
+        // the filesystem layer.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entry = make_test_entry(0);
+        let result = append_chained_locked(dir.path(), "../etc/passwd", &entry, None);
+        let err = result.expect_err("path traversal must be refused");
+        assert!(
+            format!("{err:#}").contains("non-ISO-date segment"),
+            "error must surface the validator's reason; got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn append_chained_persists_entries_in_strict_serialization_order() {
+        // Single-threaded baseline: 5 sequential calls produce 5 lines
+        // forming a strict prev_hash -> hash chain. Anti-regression
+        // for accidentally introducing batching that violates the
+        // one-entry-per-flush invariant the audit-trail consumer
+        // depends on.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().to_path_buf();
+        for i in 0..5 {
+            let entry = make_test_entry(i);
+            append_chained(&data_dir, &entry, None).unwrap();
+        }
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let path = data_dir.join(format!("decisions-{today}.jsonl"));
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 5);
+
+        // First entry: prev_hash absent (the serializer uses
+        // `skip_serializing_if = "Option::is_none"` so the field is
+        // omitted entirely when the value is None).
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert!(
+            first.get("prev_hash").is_none() || first.get("prev_hash").unwrap().is_null(),
+            "first entry must have no prev_hash"
+        );
+
+        // Every subsequent entry: prev_hash matches predecessor's SHA-256.
+        for i in 1..lines.len() {
+            let v: serde_json::Value = serde_json::from_str(lines[i]).unwrap();
+            let prev_hash = v
+                .get("prev_hash")
+                .and_then(|x| x.as_str())
+                .expect("non-first entries must carry a non-null prev_hash");
+            let expected = sha256_hex(lines[i - 1]);
+            assert_eq!(prev_hash, expected, "chain broken at line {i}");
+        }
+    }
+
+    #[test]
+    fn is_iso_date_accepts_well_formed_dates() {
+        assert!(is_iso_date("2026-05-04"));
+        assert!(is_iso_date("0000-01-01"));
+        assert!(is_iso_date("9999-12-31"));
+    }
+
+    #[test]
+    fn is_iso_date_rejects_path_traversal_shapes() {
+        assert!(!is_iso_date("../etc/pwd"));
+        assert!(!is_iso_date("..\\windows"));
+        assert!(!is_iso_date("2026/05/04"));
+        assert!(!is_iso_date("2026-5-04"), "single-digit month rejected");
+        assert!(!is_iso_date("2026-05-4"), "single-digit day rejected");
+        assert!(
+            !is_iso_date("2026-05-04 "),
+            "trailing whitespace breaks length"
+        );
+        assert!(!is_iso_date("2026-05-04\0"), "NUL injection rejected");
+    }
+
+    #[test]
+    fn is_iso_date_rejects_length_drift() {
+        assert!(!is_iso_date(""), "empty string");
+        assert!(!is_iso_date("2026-05-0"), "9 chars too short");
+        assert!(!is_iso_date("2026-05-041"), "11 chars too long");
+        assert!(!is_iso_date("26-05-04"), "2-digit year");
+    }
+
+    #[test]
+    fn is_iso_date_rejects_wrong_separator_positions() {
+        assert!(!is_iso_date("2026_05-04"), "underscore at pos 4");
+        assert!(!is_iso_date("2026-05_04"), "underscore at pos 7");
+        assert!(!is_iso_date("20260-5-04"), "dashes shifted");
+        assert!(!is_iso_date("2026--5-04"), "double dash");
+    }
+
+    #[test]
+    fn is_iso_date_rejects_non_digit_year_month_day() {
+        assert!(!is_iso_date("YYYY-05-04"), "letters in year");
+        assert!(!is_iso_date("2026-MM-04"), "letters in month");
+        assert!(!is_iso_date("2026-05-DD"), "letters in day");
+        assert!(!is_iso_date("2026-05-0a"), "letter in day");
+    }
+
+    #[test]
+    fn append_chained_locked_returns_canonical_line_matching_disk_content() {
+        // The return value of `append_chained_locked` is the exact
+        // line that lands on disk - the caller's in-memory `last_hash`
+        // cache (sha256_hex of the returned line) must match what the
+        // next reader will see in the file. Pin that contract.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entry = make_test_entry(0);
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+
+        let returned_line =
+            append_chained_locked(dir.path(), &today, &entry, None).expect("append must succeed");
+
+        let path = dir.path().join(format!("decisions-{today}.jsonl"));
+        let on_disk = std::fs::read_to_string(&path).expect("read");
+        let on_disk_trimmed = on_disk.trim_end_matches('\n');
+
+        assert_eq!(
+            returned_line, on_disk_trimmed,
+            "returned line must equal the line written to disk byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn append_chained_to_existing_file_chains_from_existing_tail() {
+        // Pre-existing file with N entries: a fresh `append_chained`
+        // call must read the LAST entry's hash and use it as the new
+        // entry's prev_hash. Anti-regression for accidentally
+        // re-anchoring the chain to None when the file is non-empty
+        // (which would silently break audit-trail verification).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path().to_path_buf();
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+
+        // Seed: 3 entries through the same path so the chain is real.
+        for i in 0..3 {
+            append_chained(&data_dir, &make_test_entry(i), None).unwrap();
+        }
+        let path = data_dir.join(format!("decisions-{today}.jsonl"));
+        let seed_lines: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect();
+        let seed_tail_hash = sha256_hex(&seed_lines[seed_lines.len() - 1]);
+
+        // The 4th append must chain from the seed_tail_hash.
+        append_chained(&data_dir, &make_test_entry(99), None).unwrap();
+        let all_lines: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect();
+        assert_eq!(all_lines.len(), 4);
+
+        let fourth: serde_json::Value = serde_json::from_str(&all_lines[3]).unwrap();
+        let fourth_prev = fourth
+            .get("prev_hash")
+            .and_then(|x| x.as_str())
+            .expect("4th entry must carry prev_hash from existing tail");
+        assert_eq!(
+            fourth_prev, seed_tail_hash,
+            "4th entry's prev_hash must equal SHA-256 of the 3rd entry"
+        );
+    }
+
+    #[test]
+    fn struct_writer_and_append_chained_share_one_linear_chain() {
+        // Cross-path race: a long-lived `DecisionWriter` (struct path,
+        // BufWriter cached) interleaves writes with bare `append_chained`
+        // calls (the always-on honeypot's path). Pre-fix the struct
+        // writer's stale BufWriter would lose entries appended through
+        // the bare path between flushes. With the locked-helper routing,
+        // both paths write through the same flock and produce one linear
+        // chain.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut writer = DecisionWriter::new(dir.path()).expect("writer");
+
+        // Interleave: struct, bare, struct, bare, struct.
+        writer.write(&make_test_entry(0)).unwrap();
+        append_chained(dir.path(), &make_test_entry(1), None).unwrap();
+        writer.write(&make_test_entry(2)).unwrap();
+        append_chained(dir.path(), &make_test_entry(3), None).unwrap();
+        writer.write(&make_test_entry(4)).unwrap();
+        writer.flush();
+
+        let today = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let path = dir.path().join(format!("decisions-{today}.jsonl"));
+        let lines: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect();
+        assert_eq!(lines.len(), 5, "all 5 writes must land");
+
+        // Verify strict linear chain across both paths.
+        let mut prev_hash: Option<String> = None;
+        for (i, line) in lines.iter().enumerate() {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            let line_prev = v
+                .get("prev_hash")
+                .and_then(|x| x.as_str())
+                .map(String::from);
+            assert_eq!(
+                line_prev, prev_hash,
+                "chain broken at line {i} (cross-path)"
+            );
+            prev_hash = Some(sha256_hex(line));
+        }
     }
 }
