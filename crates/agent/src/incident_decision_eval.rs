@@ -138,7 +138,16 @@ pub(crate) fn apply_correlation_boost_and_log_decision(
 /// function so the integration site stays readable and the unit tests
 /// can exercise the shadow / enforce branches without spinning up the
 /// full decide pipeline.
-fn apply_kg_decide_modifier(
+///
+/// Spec 043 Phase 1b (2026-05-06): made `pub(crate)` so the
+/// direct-block paths (`repeat-offender:*`, `multi-technique:*` in
+/// `correlation_response.rs`) can also call into this hook. Pre-1b
+/// the hook was wired only on the AI-router decide path, which prod
+/// evidence shows accounts for <5% of actual block decisions on a
+/// busy host (the rest flow through `repeat-offender` direct-blocks
+/// that bypass the AI router entirely). Hooking the high-volume
+/// paths makes the shadow log fill in minutes instead of days.
+pub(crate) fn apply_kg_decide_modifier(
     incident: &innerwarden_core::incident::Incident,
     cfg: &config::AgentConfig,
     state: &AgentState,

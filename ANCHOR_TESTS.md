@@ -447,6 +447,12 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 - `crates/agent/src/bot_helpers.rs::tests::ask_context_deep_respects_budget_cap_drops_subgraph_first` - under tight char budget, SUBGRAPH section is dropped FIRST (most expendable) so RECENT INCIDENTS (highest signal) survives. Anti-regression for accidentally dropping incidents to fit subgraph, which would degrade /ask quality on memory-constrained runs.
 - `crates/agent/src/bot_helpers.rs::tests::ask_context_deep_empty_graph_returns_empty_string` - empty KG produces empty string (no dangling section headers). Pins the same defensive contract as the legacy `graph_last_incidents_raw` helper had.
 
+### Direct-block KG modifier coverage (Spec 043 Phase 1b - AUDIT-SPEC043-PHASE1B)
+
+- `crates/agent/src/correlation_response.rs::tests::phase_1b_repeat_offender_path_invokes_kg_decide_modifier` - Phase 1b headline anchor: `apply_kg_decide_modifier` MUST be called between the repeat-offender `AiDecision` construction and `execute_decision`. Pre-Phase-1b the KG modifier hook fired only on the AI-router decide path, which prod evidence (2026-05-06) shows accounts for <5% of actual block decisions; the bulk flowed through `repeat-offender:*` direct-blocks that bypassed the AI router entirely. The shadow log filled in days instead of minutes. Source-grep anchor — drop the call and the slow-fill regression returns silently.
+- `crates/agent/src/correlation_response.rs::tests::phase_1b_multi_technique_path_invokes_kg_decide_modifier` - mirror anchor for the `multi-technique:*` direct-block path. Same rationale.
+- `crates/agent/src/correlation_response.rs::tests::phase_1b_completed_chain_path_invokes_kg_decide_modifier` - mirror anchor for the `correlation:*` (completed attack chain) direct-block path. Three direct-block sites in `correlation_response.rs` total; all three pinned independently so a future refactor that drops any one is caught.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:

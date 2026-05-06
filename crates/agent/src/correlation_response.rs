@@ -162,7 +162,7 @@ async fn handle_completed_chain(
     };
 
     let skill_id = format!("block-ip-{}", cfg.responder.block_backend);
-    let decision = ai::AiDecision {
+    let mut decision = ai::AiDecision {
         action: ai::AiAction::BlockIp {
             ip: ip.clone(),
             skill_id: skill_id.clone(),
@@ -178,6 +178,19 @@ async fn handle_completed_chain(
         alternatives: vec![],
         estimated_threat: format!("{:?}", chain.severity).to_lowercase(),
     };
+
+    // Spec 043 Phase 1b — direct-block coverage. Same rationale as the
+    // repeat-offender / multi-technique wiring below: completed
+    // correlation chains also bypass the AI-router decide path, so the
+    // KG modifier hook needs to fire here too. Anchor pinned alongside
+    // the other two direct-block anchors at the bottom of this file.
+    crate::incident_decision_eval::apply_kg_decide_modifier(
+        &incident,
+        cfg,
+        state,
+        &mut decision,
+        data_dir,
+    );
 
     let (execution_result, cloudflare_pushed) =
         execute_decision(&decision, &incident, data_dir, cfg, state).await;
@@ -377,7 +390,7 @@ async fn check_repeat_offenders(
         };
 
         let skill_id = format!("block-ip-{}", cfg.responder.block_backend);
-        let decision = ai::AiDecision {
+        let mut decision = ai::AiDecision {
             action: ai::AiAction::BlockIp {
                 ip: ip.clone(),
                 skill_id: skill_id.clone(),
@@ -390,6 +403,24 @@ async fn check_repeat_offenders(
             alternatives: vec![],
             estimated_threat: "high".to_string(),
         };
+
+        // Spec 043 Phase 1b — direct-block coverage. Run the KG modifier
+        // hook here too (not just the AI-decide path) so the shadow log
+        // captures the high-volume direct-block decisions. Pre-1b the
+        // shadow log only saw AI-router decisions (<5% of prod volume on
+        // a busy host); now repeat-offender + multi-technique direct
+        // blocks also flow through. In shadow mode this only writes a
+        // log line; in enforce mode it adjusts decision.confidence
+        // BEFORE execute_decision so a strongly-benign-history entity
+        // can suppress an over-eager repeat-offender extended block.
+        // Critical floor still applies — never suppress real Critical.
+        crate::incident_decision_eval::apply_kg_decide_modifier(
+            &incident,
+            cfg,
+            state,
+            &mut decision,
+            data_dir,
+        );
 
         let (execution_result, _) =
             execute_decision(&decision, &incident, data_dir, cfg, state).await;
@@ -491,7 +522,7 @@ async fn check_multi_technique(data_dir: &Path, cfg: &config::AgentConfig, state
         };
 
         let skill_id = format!("block-ip-{}", cfg.responder.block_backend);
-        let decision = ai::AiDecision {
+        let mut decision = ai::AiDecision {
             action: ai::AiAction::BlockIp {
                 ip: ip.clone(),
                 skill_id: skill_id.clone(),
@@ -505,6 +536,18 @@ async fn check_multi_technique(data_dir: &Path, cfg: &config::AgentConfig, state
             alternatives: vec![],
             estimated_threat: "high".to_string(),
         };
+
+        // Spec 043 Phase 1b — direct-block coverage. See repeat-offender
+        // wiring above for the rationale (KG modifier shadow-logging on
+        // the high-volume direct-block paths so prod data accumulates
+        // in minutes instead of days).
+        crate::incident_decision_eval::apply_kg_decide_modifier(
+            &incident,
+            cfg,
+            state,
+            &mut decision,
+            data_dir,
+        );
 
         let (execution_result, _) =
             execute_decision(&decision, &incident, data_dir, cfg, state).await;
@@ -1033,5 +1076,80 @@ mod tests {
         // Second call: still returns true (invalid is invalid), no panic.
         assert!(drop_invalid_repeat_offender("129.999.0.0", &mut map));
         assert!(!map.contains_key("129.999.0.0"));
+    }
+
+    // ── Spec 043 Phase 1b anchors (AUDIT-SPEC043-PHASE1B) ──────────────
+    //
+    // Pre-Phase-1b the KG modifier hook fired only on the AI-router
+    // decide path. Prod evidence (2026-05-06): on a busy host the
+    // AI-router decide path accounts for <5% of actual block decisions
+    // (the rest flow through `repeat-offender` direct-blocks that
+    // bypass the AI router entirely). The shadow log filled in days
+    // instead of minutes.
+    //
+    // These anchors pin the source-grep contract: the
+    // `apply_kg_decide_modifier` call MUST appear at both direct-block
+    // sites in this file (repeat-offender + multi-technique). A future
+    // refactor that drops either call silently regresses the coverage
+    // and re-creates the slow-fill problem.
+
+    #[test]
+    fn phase_1b_repeat_offender_path_invokes_kg_decide_modifier() {
+        let src = include_str!("correlation_response.rs");
+        let ro_idx = src
+            .find("Repeat offender: {ip} blocked {total_blocks}x — extended block (7 days)")
+            .expect("repeat-offender decision construction marker missing");
+        let exec_idx = src[ro_idx..]
+            .find("execute_decision(&decision, &incident, data_dir, cfg, state)")
+            .expect("execute_decision call missing after repeat-offender block");
+        let between = &src[ro_idx..ro_idx + exec_idx];
+        assert!(
+            between.contains("apply_kg_decide_modifier"),
+            "Spec 043 Phase 1b: apply_kg_decide_modifier MUST be called \
+             between the repeat-offender AiDecision construction and \
+             execute_decision so the KG shadow log captures direct-block \
+             decisions. Pre-Phase-1b the shadow log only saw AI-router \
+             decisions (<5% of prod volume). Drop this call and prod \
+             takes days to fill the log instead of minutes."
+        );
+    }
+
+    #[test]
+    fn phase_1b_multi_technique_path_invokes_kg_decide_modifier() {
+        let src = include_str!("correlation_response.rs");
+        let mt_idx = src
+            .find("Multi-technique: {ip} triggered {count} detectors")
+            .expect("multi-technique decision construction marker missing");
+        let exec_idx = src[mt_idx..]
+            .find("execute_decision(&decision, &incident, data_dir, cfg, state)")
+            .expect("execute_decision call missing after multi-technique block");
+        let between = &src[mt_idx..mt_idx + exec_idx];
+        assert!(
+            between.contains("apply_kg_decide_modifier"),
+            "Spec 043 Phase 1b: apply_kg_decide_modifier MUST be called \
+             between the multi-technique AiDecision construction and \
+             execute_decision (mirror anchor — same rationale as the \
+             repeat-offender anchor above)."
+        );
+    }
+
+    #[test]
+    fn phase_1b_completed_chain_path_invokes_kg_decide_modifier() {
+        let src = include_str!("correlation_response.rs");
+        let chain_idx = src
+            .find("Correlation chain: {} ({} stages,")
+            .expect("completed-chain decision construction marker missing");
+        let exec_idx = src[chain_idx..]
+            .find("execute_decision(&decision, &incident, data_dir, cfg, state)")
+            .expect("execute_decision call missing after completed-chain block");
+        let between = &src[chain_idx..chain_idx + exec_idx];
+        assert!(
+            between.contains("apply_kg_decide_modifier"),
+            "Spec 043 Phase 1b: apply_kg_decide_modifier MUST be called \
+             between the completed-chain AiDecision construction and \
+             execute_decision. Correlation chains bypass the AI-router \
+             decide path same as repeat-offender / multi-technique, so \
+             the KG modifier hook needs to fire here too."
+        );
     }
 }
