@@ -335,6 +335,18 @@ pub(crate) async fn process_incidents(
             continue;
         }
 
+        // Spec 043 Phase 3 (CDN-noise companion fix, 2026-05-06):
+        // suppress proto_anomaly incidents whose primary IP is a known
+        // CDN / cloud-provider edge (Wave-9-followup at the network
+        // layer; the HTTP-layer fix in PR #469 only catches HTTP
+        // events, not raw TCP). Operator-visible delta: 24-of-25
+        // "needs attention" entries from CF edges go to "Dismissed"
+        // and stop polluting the dashboard.
+        if incident_autodismiss::try_dismiss_cdn_noise(incident, state) {
+            handled += 1;
+            continue;
+        }
+
         // VirusTotal enrichment: when YARA scanner detects a binary, check its
         // SHA-256 hash against VT. Result logged for operator context.
         if incident.incident_id.starts_with("yara_scan:") {

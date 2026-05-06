@@ -533,7 +533,12 @@ fn write_graph_stats_or_warn(data_dir: &Path, json: &[u8]) {
 /// future PR that wants to move `kg_tick` off the tick path must pass
 /// a snapshot of the just-ingested graph by value, not the shared
 /// `Arc<RwLock<KnowledgeGraph>>`.
-fn kg_tick(state: &mut AgentState, data_dir: &Path, events: &[innerwarden_core::event::Event]) {
+fn kg_tick(
+    state: &mut AgentState,
+    data_dir: &Path,
+    events: &[innerwarden_core::event::Event],
+    cfg: &config::AgentConfig,
+) {
     // ── Steps 1+2: ingest events, drain real-time triggers ──────────
     // Single WRITE-lock scope: set host label once, ingest each event,
     // then drain. Drain MUST happen under the same lock as ingest so
@@ -762,13 +767,25 @@ fn kg_tick(state: &mut AgentState, data_dir: &Path, events: &[innerwarden_core::
                 service_uids: state.environment_profile.service_uids.clone(),
                 service_user_names: state.environment_profile.service_user_names.clone(),
             };
-            let incidents = knowledge_graph::detectors::run_all_with_calibration(
+            let mut incidents = knowledge_graph::detectors::run_all_with_calibration(
                 &graph,
                 &mut state.graph_detector_state,
                 &host,
                 chrono::Utc::now(),
                 &calibration_ctx,
             );
+            // Spec 043 Phase 3 — yara_match detector. Gated at the
+            // outermost layer (here) so the config check is visible
+            // alongside the other slow-loop wiring; activates a KG
+            // field that was write-only pre-Phase-3.
+            if cfg.kg.yara_match_detector_enabled {
+                incidents.extend(knowledge_graph::detectors::detect_yara_match(
+                    &graph,
+                    &mut state.graph_detector_state,
+                    &host,
+                    chrono::Utc::now(),
+                ));
+            }
             (incidents, host)
         };
         {
@@ -961,7 +978,7 @@ pub(crate) async fn process_narrative_tick(
     // load-bearing — see `kg_tick` doc comment for the full explanation
     // of why these six steps form one unit and why the cross-layer
     // correlation loop below is NOT in the bundle.
-    kg_tick(state, data_dir, &events_entries);
+    kg_tick(state, data_dir, &events_entries, cfg);
 
     // Feed events into cross-layer correlation engine and baseline learning.
     // Events from trusted processes are excluded — they make legitimate
@@ -2386,7 +2403,12 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
             kg_tick_test_event("process.exec", "203.0.113.50"),
             kg_tick_test_event("network.connect", "203.0.113.51"),
         ];
-        kg_tick(&mut state, dir.path(), &events);
+        kg_tick(
+            &mut state,
+            dir.path(),
+            &events,
+            &config::AgentConfig::default(),
+        );
 
         let nodes_after = state.knowledge_graph.read().unwrap().metrics().node_count;
         assert!(
@@ -2407,7 +2429,12 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
         state.last_graph_snapshot = std::time::Instant::now() - Duration::from_secs(90);
 
         let events = vec![kg_tick_test_event("process.exec", "203.0.113.60")];
-        kg_tick(&mut state, dir.path(), &events);
+        kg_tick(
+            &mut state,
+            dir.path(),
+            &events,
+            &config::AgentConfig::default(),
+        );
 
         // Snapshot timer reset proves Scope 3 of the snapshot block
         // reached the end (not interrupted by ingest or detectors).
@@ -2466,7 +2493,7 @@ ops pts/3 2026-04-17 10:03 (203.0.113.8)
         state.last_graph_snapshot = std::time::Instant::now();
 
         let nodes_before = state.knowledge_graph.read().unwrap().metrics().node_count;
-        kg_tick(&mut state, dir.path(), &[]);
+        kg_tick(&mut state, dir.path(), &[], &config::AgentConfig::default());
         let nodes_after = state.knowledge_graph.read().unwrap().metrics().node_count;
 
         // Empty events + no triggers + no detector incidents = the

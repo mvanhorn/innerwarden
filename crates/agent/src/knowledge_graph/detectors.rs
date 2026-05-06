@@ -266,6 +266,11 @@ pub fn run_all_with_calibration(
     // Slow-and-low: 24h lookback for persistent low-rate C2 patterns
     incidents.extend(detect_slow_and_low(graph, state, host, now));
 
+    // Spec 043 Phase 3 — yara_match_detector — NOT called here.
+    // It's gated on `[kg].yara_match_detector_enabled` and called
+    // from slow_loop directly so the config check stays at the
+    // outermost layer. See detect_yara_match below.
+
     // Record detections for sensor dedup
     for inc in &incidents {
         let detector = inc.incident_id.split(':').next().unwrap_or("");
@@ -3125,6 +3130,99 @@ fn detect_slow_and_low(
     incidents
 }
 
+/// Spec 043 Phase 3 — yara_match_detector. Activates a KG field that
+/// was write-only pre-Phase-3 (`File.yara_matches`). The YARA scanner
+/// runs in the sensor (`crates/sensor/src/detectors/yara_scan.rs`)
+/// and writes match-rule names onto File nodes during ingestion. But
+/// no consumer ever read those names — every match was silently
+/// dropped, even on real hits like Cobalt Strike / XMRig / webshells
+/// from `rules/yara/*.yml`.
+///
+/// This detector scans File nodes whose `yara_matches` is non-empty
+/// and emits one High-severity incident per file. The incident_id is
+/// stable on `sha256` so the notification grouping engine deduplicates
+/// re-scans of the same binary across slow-loop ticks.
+///
+/// Disabled by default per Spec 043 promotion gate
+/// (`[kg].yara_match_detector_enabled`); operator opts in on test001
+/// first and observes the rate before promoting to prod. Hooked at
+/// the slow_loop level (not inside `run_all_with_calibration`) so the
+/// config check stays at the outermost layer.
+pub fn detect_yara_match(
+    graph: &KnowledgeGraph,
+    _state: &mut GraphDetectorState,
+    host: &str,
+    now: DateTime<Utc>,
+) -> Vec<Incident> {
+    let mut incidents = Vec::new();
+    for id in graph.nodes_of_type(NodeType::File) {
+        let Some(node) = graph.get_node(id) else {
+            continue;
+        };
+        let (path, sha256, size, entropy, yara_matches) = match node {
+            Node::File {
+                path,
+                sha256,
+                size,
+                entropy,
+                yara_matches,
+                ..
+            } => (path, sha256, size, entropy, yara_matches),
+            _ => continue,
+        };
+        if yara_matches.is_empty() {
+            continue;
+        }
+        // Stable id by sha256 (when present) so the same binary
+        // re-scanned across ticks dedupes; fall back to path otherwise.
+        let stable_key = sha256.as_deref().unwrap_or(path);
+        let first_match = yara_matches
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("unknown_rule");
+        let incident_id = format!(
+            "yara_match:{}:{}",
+            // truncate sha256 for readable id
+            stable_key.chars().take(16).collect::<String>(),
+            first_match
+        );
+        let entropy_label = entropy
+            .map(|e| format!("{:.2}", e))
+            .unwrap_or_else(|| "?".to_string());
+        let size_label = size
+            .map(|s| format!("{} bytes", s))
+            .unwrap_or_else(|| "? bytes".to_string());
+        incidents.push(Incident {
+            ts: now,
+            host: host.to_string(),
+            incident_id,
+            severity: Severity::High,
+            title: format!("YARA match on binary: {}", first_match),
+            summary: format!(
+                "File {} matched {} YARA rule(s): {}. Path: {}, size: {}, entropy: {}.",
+                stable_key,
+                yara_matches.len(),
+                yara_matches.join(", "),
+                path,
+                size_label,
+                entropy_label,
+            ),
+            evidence: serde_json::json!([{
+                "kind": "yara_match",
+                "path": path,
+                "sha256": sha256,
+                "size": size,
+                "entropy": entropy,
+                "yara_matches": yara_matches,
+            }]),
+            recommended_checks: vec![format!("file {path}"), format!("sha256sum {path}")],
+            tags: vec!["yara_match".to_string()],
+            entities: vec![EntityRef::path(path)],
+        });
+    }
+    incidents
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3955,5 +4053,96 @@ mod tests {
             section.contains("user_class_label(user_class)"),
             "evidence JSON must carry user_class for investigator use"
         );
+    }
+
+    // ── Spec 043 Phase 3 yara_match anchors (AUDIT-SPEC043-PHASE3) ──────
+    //
+    // Pre-Phase-3 the YARA scanner in the sensor wrote match-rule
+    // names onto File nodes (`yara_matches: Vec<String>`) but no
+    // consumer ever read them — every match was silently dropped, even
+    // on real hits like Cobalt Strike / XMRig / webshells from
+    // rules/yara/*.yml. These anchors pin the new detector that
+    // activates that field.
+
+    fn make_file_node_with_yara(path: &str, sha256: Option<&str>, yara: Vec<&str>) -> Node {
+        Node::File {
+            path: path.to_string(),
+            sha256: sha256.map(String::from),
+            size: Some(2048),
+            entropy: Some(7.6),
+            is_sensitive: false,
+            yara_matches: yara.into_iter().map(String::from).collect(),
+        }
+    }
+
+    #[test]
+    fn yara_match_detector_emits_incident_when_yara_match_present() {
+        // Headline anchor: a File node with non-empty yara_matches
+        // produces exactly one High incident. Pre-Phase-3 zero
+        // incidents were emitted regardless of how many YARA hits.
+        let mut graph = KnowledgeGraph::new();
+        graph.add_node(make_file_node_with_yara(
+            "/tmp/payload",
+            Some("abcdef0123456789aaaaaaaaaaaa"),
+            vec!["webshell_php"],
+        ));
+        let mut state = GraphDetectorState::new();
+        let incidents = detect_yara_match(&graph, &mut state, "test-host", chrono::Utc::now());
+        assert_eq!(incidents.len(), 1);
+        let inc = &incidents[0];
+        assert_eq!(inc.severity, Severity::High);
+        assert!(inc.title.contains("webshell_php"));
+        assert!(inc.summary.contains("/tmp/payload"));
+        assert!(inc.incident_id.starts_with("yara_match:"));
+    }
+
+    #[test]
+    fn yara_match_detector_emits_nothing_when_yara_matches_empty() {
+        // Anti-regression: a File node with EMPTY yara_matches must
+        // NOT produce an incident. The detector activates a write-only
+        // field; it must not spam every File node in the graph.
+        let mut graph = KnowledgeGraph::new();
+        graph.add_node(make_file_node_with_yara(
+            "/etc/passwd",
+            Some("abcd"),
+            vec![],
+        ));
+        let mut state = GraphDetectorState::new();
+        let incidents = detect_yara_match(&graph, &mut state, "test-host", chrono::Utc::now());
+        assert!(
+            incidents.is_empty(),
+            "File node with empty yara_matches must not emit incident; got {} incidents",
+            incidents.len()
+        );
+    }
+
+    #[test]
+    fn yara_match_detector_emits_one_incident_per_file_for_multiple_matches() {
+        // Multi-match anchor: a single binary that matched 3 YARA
+        // rules produces ONE incident (not 3). The notification
+        // grouping engine downstream dedupes by detector+entity, but
+        // this detector must already do per-file aggregation so the
+        // operator sees one alert per file with all rule names in the
+        // summary, not three separate alerts.
+        let mut graph = KnowledgeGraph::new();
+        graph.add_node(make_file_node_with_yara(
+            "/usr/local/bin/xmrig",
+            Some("ffaabbcc11223344"),
+            vec!["xmrig_miner", "packed_upx", "cryptominer_generic"],
+        ));
+        let mut state = GraphDetectorState::new();
+        let incidents = detect_yara_match(&graph, &mut state, "test-host", chrono::Utc::now());
+        assert_eq!(
+            incidents.len(),
+            1,
+            "one incident per file regardless of rule count"
+        );
+        let inc = &incidents[0];
+        // Title features the FIRST match (most operators read titles only).
+        assert!(inc.title.contains("xmrig_miner"));
+        // Summary lists all three rules.
+        assert!(inc.summary.contains("xmrig_miner"));
+        assert!(inc.summary.contains("packed_upx"));
+        assert!(inc.summary.contains("cryptominer_generic"));
     }
 }

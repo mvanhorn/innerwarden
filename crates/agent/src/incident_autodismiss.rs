@@ -299,6 +299,121 @@ pub(crate) fn try_autodismiss_sensor_self_traffic_fp(
     true
 }
 
+/// Spec 043 Phase 3 (CDN-noise companion fix, 2026-05-06): the
+/// sensor's `proto_anomaly` detector emits "Suspicious connection"
+/// incidents on every TCP-level oddity (slow connect, weird sequence,
+/// SYN flood-shape, etc). On hosts that put nginx behind Cloudflare
+/// (or any cloud LB / CDN), each edge IP in the load-balancer
+/// rotation produces its own incident. Operator's 2026-05-06
+/// dashboard read showed 24 of 25 "needs attention" entries were
+/// individual Cloudflare edge IPs from the same scanner — pure noise.
+///
+/// Wave 9 (PR #469) fixed the HTTP-layer attribution by trusting
+/// `CF-Connecting-IP` for events that carry that header. But
+/// `proto_anomaly` fires from the `tcp_stream` collector — there's
+/// no HTTP header to read; we only see the raw socket peer.
+///
+/// Fix: at agent intake, if a `proto_anomaly` (or threat-intel
+/// "known malicious IP" alike) incident's primary IP is in the
+/// existing `cloud_safelist::is_cloud_provider_ip` set (CF + AWS +
+/// Azure + GCP + OCI + DO + Hetzner — same helper Wave 9g et al
+/// already use), auto-dismiss it. The IP is a known CDN/cloud
+/// edge, not a real attacker; the LLM hadn't promoted them to
+/// auto-block anyway, so the practical effect is "remove from
+/// dashboard noise without losing forensic record" (the dismiss
+/// decision is still in the JSONL audit trail).
+///
+/// Trade-off: CDN edges are theoretically reachable by a determined
+/// attacker who has compromised CF / AWS infra. We accept that risk
+/// because (a) such an attacker has bigger problems than us, (b)
+/// proto_anomaly is a low-fidelity signal anyway (Medium severity
+/// at best), (c) other detectors (kill_chain, reverse_shell,
+/// data_exfil_ebpf) would still fire on the actual exploitation.
+///
+/// Returns true when handled (dismiss written).
+pub(crate) fn try_dismiss_cdn_noise(
+    incident: &innerwarden_core::incident::Incident,
+    state: &mut AgentState,
+) -> bool {
+    // Detector kinds known to over-fire on CDN edges. Conservative
+    // list — only detectors whose entire reason for existing is
+    // "weird TCP behaviour" that CDN load-balancers naturally exhibit.
+    // Adding `threat_intel` here would be wrong: threat_intel feeds
+    // include real malicious IPs that happen to share a CIDR with a
+    // CDN, and we want those visible.
+    const CDN_NOISY_DETECTORS: &[&str] = &["proto_anomaly"];
+    let detector = detector_from_incident_id(&incident.incident_id);
+    if !CDN_NOISY_DETECTORS.contains(&detector) {
+        return false;
+    }
+    let primary_ip_owned = match incident
+        .entities
+        .iter()
+        .find(|e| e.r#type == innerwarden_core::entities::EntityType::Ip)
+        .map(|e| e.value.clone())
+    {
+        Some(ip) => ip,
+        None => return false,
+    };
+    let primary_ip: &str = &primary_ip_owned;
+    let provider = match crate::cloud_safelist::identify_provider(primary_ip) {
+        Some(p) => p,
+        None => return false,
+    };
+    info!(
+        incident_id = %incident.incident_id,
+        detector,
+        ip = %primary_ip,
+        provider,
+        "CDN-noise FP: auto-dismissing proto_anomaly on cloud-provider edge IP \
+         (Wave-9 follow-up — sensor sees raw socket peer, not the real client)"
+    );
+    let reason = format!(
+        "Auto-dismissed: {detector} fired on {provider} edge IP {primary_ip}. \
+         CDN/cloud-provider load-balancer edges naturally exhibit TCP-level \
+         oddities (slow connects, sequence drift) that this detector flags. \
+         Real exploitation through these edges still fires kill_chain / \
+         reverse_shell / data_exfil_ebpf, which are not suppressed by this \
+         path. See Wave 9 (PR #469) for the HTTP-layer companion fix."
+    );
+    let entry = crate::decisions::DecisionEntry {
+        ts: chrono::Utc::now(),
+        incident_id: incident.incident_id.clone(),
+        host: incident.host.clone(),
+        ai_provider: "cdn-noise-fp".to_string(),
+        action_type: "dismiss".to_string(),
+        target_ip: Some(primary_ip_owned.clone()),
+        target_user: None,
+        skill_id: None,
+        confidence: 1.0,
+        auto_executed: true,
+        dry_run: false,
+        reason: reason.clone(),
+        estimated_threat: "none".to_string(),
+        execution_result: "dismissed".to_string(),
+        prev_hash: None,
+    };
+    if let Some(writer) = &mut state.decision_writer {
+        if let Err(e) = writer.write(&entry) {
+            tracing::warn!("failed to write cdn-noise-fp dismiss: {e:#}");
+            return false;
+        }
+    }
+    {
+        let mut graph = state.knowledge_graph.write().unwrap();
+        graph.ingest_decision(
+            &incident.incident_id,
+            "dismiss",
+            None,
+            1.0,
+            &reason,
+            true,
+            chrono::Utc::now(),
+        );
+    }
+    true
+}
+
 fn detector_from_incident_id(incident_id: &str) -> &str {
     incident_id.split(':').next().unwrap_or("")
 }
@@ -571,5 +686,113 @@ mod tests {
         let reason = autodismiss_reason("suspicious_login", &Severity::Low);
         assert!(reason.contains("suspicious_login"));
         assert!(reason.contains("Low"));
+    }
+
+    // ── Spec 043 Phase 3 CDN-noise anchors (AUDIT-SPEC043-CDN-NOISE) ───
+    //
+    // Operator observation 2026-05-06: dashboard "needs attention" had
+    // 24 of 25 entries from individual Cloudflare edge IPs (172.71.x,
+    // 104.23.x, 141.101.76.x, 162.159.x). The proto_anomaly detector
+    // fires per-edge because each TCP connect from a CDN load-balancer
+    // looks like a fresh "Suspicious connection". Wave 9 (PR #469)
+    // covered the HTTP-layer attribution but proto_anomaly fires on
+    // raw TCP — no header to read. These anchors pin the network-layer
+    // companion fix.
+
+    fn make_proto_anomaly_incident(
+        addr: &str,
+        sev: Severity,
+    ) -> innerwarden_core::incident::Incident {
+        use chrono::Utc;
+        use innerwarden_core::entities::EntityRef;
+        use innerwarden_core::incident::Incident;
+        Incident {
+            ts: Utc::now(),
+            host: "test-host".into(),
+            incident_id: format!(
+                "proto_anomaly:SlowConnection:{}:{}",
+                addr,
+                Utc::now().format("%Y-%m-%dT%H:%MZ")
+            ),
+            severity: sev,
+            title: format!("Protocol anomaly from {addr}"),
+            summary: "test".into(),
+            evidence: serde_json::json!([{}]),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![EntityRef::ip(addr)],
+        }
+    }
+
+    #[test]
+    fn try_dismiss_cdn_noise_dismisses_cloudflare_edge() {
+        // The exact prod failure shape: proto_anomaly on a Cloudflare
+        // edge IP (172.71.95.141 was in the operator's dashboard read).
+        // Pre-Phase-3 the agent never auto-dismissed these; they
+        // accumulated in "needs attention" indefinitely.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        crate::cloud_safelist::init();
+        let inc = make_proto_anomaly_incident("172.71.95.141", Severity::Medium);
+        let dismissed = try_dismiss_cdn_noise(&inc, &mut state);
+        assert!(
+            dismissed,
+            "proto_anomaly on Cloudflare edge IP MUST be auto-dismissed"
+        );
+    }
+
+    #[test]
+    fn try_dismiss_cdn_noise_dismisses_aws_edge() {
+        // Mirror anchor for AWS — same helper covers AWS / Azure / GCP /
+        // OCI / Hetzner / DO via cloud_safelist::is_cloud_provider_ip.
+        // Pre-fix this would have escaped the suppression because the
+        // earlier draft (rejected) only checked CLOUDFLARE_RANGES.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        crate::cloud_safelist::init();
+        // 18.200.x.x is in the AWS eu-west-1 ELB range per CLOUD_PROVIDER_RANGES.
+        let inc = make_proto_anomaly_incident("18.200.5.5", Severity::Medium);
+        let dismissed = try_dismiss_cdn_noise(&inc, &mut state);
+        assert!(
+            dismissed,
+            "proto_anomaly on AWS cloud-provider IP MUST be auto-dismissed"
+        );
+    }
+
+    #[test]
+    fn try_dismiss_cdn_noise_does_not_dismiss_real_attacker_ip() {
+        // Anti-regression bound: real attacker IPs (203.0.113.x is
+        // TEST-NET-3, RFC 5737, never on a CDN) MUST stay in
+        // "needs attention". The whole point of the suppression is to
+        // remove CDN noise without losing real attacker visibility.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        crate::cloud_safelist::init();
+        let inc = make_proto_anomaly_incident("203.0.113.42", Severity::Medium);
+        let dismissed = try_dismiss_cdn_noise(&inc, &mut state);
+        assert!(
+            !dismissed,
+            "non-cloud-provider IP MUST NOT be auto-dismissed by CDN-noise filter"
+        );
+    }
+
+    #[test]
+    fn try_dismiss_cdn_noise_does_not_touch_other_detectors() {
+        // Conservative scope: only proto_anomaly is in
+        // CDN_NOISY_DETECTORS. data_exfil_ebpf / kill_chain /
+        // reverse_shell on a CF edge are still real concerns —
+        // those signals carry actual exploitation evidence.
+        // Anti-regression for accidentally widening CDN_NOISY_DETECTORS
+        // and silencing real attacks.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        crate::cloud_safelist::init();
+        let inc = make_data_exfil_ebpf_incident("ssh", "/etc/shadow", "172.71.95.141");
+        let dismissed = try_dismiss_cdn_noise(&inc, &mut state);
+        assert!(
+            !dismissed,
+            "data_exfil_ebpf on a Cloudflare IP MUST still surface — \
+             real exploitation through a CDN edge is still real"
+        );
     }
 }

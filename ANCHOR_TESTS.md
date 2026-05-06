@@ -453,6 +453,19 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 - `crates/agent/src/correlation_response.rs::tests::phase_1b_multi_technique_path_invokes_kg_decide_modifier` - mirror anchor for the `multi-technique:*` direct-block path. Same rationale.
 - `crates/agent/src/correlation_response.rs::tests::phase_1b_completed_chain_path_invokes_kg_decide_modifier` - mirror anchor for the `correlation:*` (completed attack chain) direct-block path. Three direct-block sites in `correlation_response.rs` total; all three pinned independently so a future refactor that drops any one is caught.
 
+### CDN-noise dashboard suppression (Spec 043 Phase 3 - AUDIT-SPEC043-CDN-NOISE)
+
+- `crates/agent/src/incident_autodismiss.rs::tests::try_dismiss_cdn_noise_dismisses_cloudflare_edge` - headline anchor: a `proto_anomaly:SlowConnection:172.71.95.141:*` incident (the exact prod failure shape — 24 of 25 dashboard "needs attention" entries on 2026-05-06 were CF edges) MUST be auto-dismissed. Wave 9 (PR #469) covered the HTTP-layer attribution; this companion fix handles the network-layer noise where there's no HTTP header to read.
+- `crates/agent/src/incident_autodismiss.rs::tests::try_dismiss_cdn_noise_dismisses_aws_edge` - mirror anchor for AWS — pins that the suppression uses the broader `cloud_safelist::identify_provider` (which covers CF/AWS/Azure/GCP/OCI/DO/Hetzner) rather than CF-only. A future refactor that narrows back to CLOUDFLARE_RANGES would silently break AWS/Azure CDN-edge suppression.
+- `crates/agent/src/incident_autodismiss.rs::tests::try_dismiss_cdn_noise_does_not_dismiss_real_attacker_ip` - anti-regression bound: real attacker IPs (TEST-NET-3 `203.0.113.42`) MUST stay in "needs attention". The whole point of the suppression is to remove CDN noise without losing real attacker visibility.
+- `crates/agent/src/incident_autodismiss.rs::tests::try_dismiss_cdn_noise_does_not_touch_other_detectors` - anti-regression bound: `data_exfil_ebpf` / `kill_chain` / `reverse_shell` on a CDN edge IP MUST still surface. Only `proto_anomaly` is in `CDN_NOISY_DETECTORS` — those carry actual exploitation evidence and must not be silenced just because the source happens to be a CDN edge.
+
+### YARA match detector (Spec 043 Phase 3 - AUDIT-SPEC043-PHASE3)
+
+- `crates/agent/src/knowledge_graph/detectors.rs::tests::yara_match_detector_emits_incident_when_yara_match_present` - Phase 3 headline anchor: a File node with non-empty `yara_matches` produces exactly one High incident. Pre-Phase-3 the YARA scanner wrote match-rule names onto File nodes but no consumer ever read them — every match was silently dropped, even on real hits like Cobalt Strike / XMRig / webshells from `rules/yara/*.yml`.
+- `crates/agent/src/knowledge_graph/detectors.rs::tests::yara_match_detector_emits_nothing_when_yara_matches_empty` - anti-regression bound: a File node with EMPTY `yara_matches` MUST NOT produce an incident. The detector activates a write-only field; it must not spam every File node in the graph.
+- `crates/agent/src/knowledge_graph/detectors.rs::tests::yara_match_detector_emits_one_incident_per_file_for_multiple_matches` - aggregation anchor: a single binary that matched 3 YARA rules produces ONE incident (not 3), with all rule names in the summary. Anti-regression for accidentally emitting one-per-rule (would 3x operator alert volume on hits like `xmrig_miner + packed_upx + cryptominer_generic`).
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:

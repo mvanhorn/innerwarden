@@ -176,12 +176,20 @@ pub struct KgConfig {
     /// Modes: "off" | "shadow" | "enforce". Default: "shadow".
     #[serde(default = "default_kg_decide_modifier_mode")]
     pub decide_modifier_mode: String,
+    /// Phase 3: yara_match_detector. When true, the slow loop scans
+    /// File nodes with non-empty `yara_matches` and emits High
+    /// incidents per matched binary. Activates a KG field that was
+    /// write-only pre-Phase-3. Default: false (operator opts in on
+    /// test001 first to observe rate before prod promotion).
+    #[serde(default)]
+    pub yara_match_detector_enabled: bool,
 }
 
 impl Default for KgConfig {
     fn default() -> Self {
         Self {
             decide_modifier_mode: default_kg_decide_modifier_mode(),
+            yara_match_detector_enabled: false,
         }
     }
 }
