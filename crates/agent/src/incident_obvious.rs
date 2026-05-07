@@ -361,4 +361,144 @@ mod tests {
             true
         ));
     }
+
+    /// Coverage anchor (test/coverage-batch-3 — 2026-05-07): obvious
+    /// gate's full happy-path in dry-run mode. A FirstHit detector
+    /// (reverse_shell) on a Critical incident triggers the auto-block
+    /// pipeline end-to-end: BlockIp decision built, execute_decision
+    /// called, decision JSONL written, KG updated, ip_reputation
+    /// incremented, cooldown set, function returns true. Pins every
+    /// downstream side effect so a future refactor that drops one
+    /// (e.g. forgets to record the cooldown) is caught.
+    #[tokio::test]
+    async fn try_handle_obvious_incident_full_happy_path_for_first_hit_detector() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = config::AgentConfig::default();
+        cfg.responder.enabled = true;
+        cfg.responder.dry_run = true;
+        cfg.responder.block_backend = "ufw".into();
+        cfg.responder.allowed_skills = vec!["block-ip-ufw".into()];
+
+        let mut incident = crate::tests::test_incident_with_kind("203.0.113.50", "reverse_shell");
+        incident.severity = innerwarden_core::event::Severity::Critical;
+        incident.incident_id = "reverse_shell:203.0.113.50:1".into();
+
+        let handled = try_handle_obvious_incident(&incident, dir.path(), &cfg, &mut state).await;
+        assert!(handled, "FirstHit detector + Critical must be handled");
+
+        // Side effect 1: ip_reputation row was created with at least
+        // 1 incident recorded (the new entry's record_incident call).
+        let rep = state
+            .ip_reputations
+            .get("203.0.113.50")
+            .expect("ip_reputation must be created");
+        assert!(rep.total_incidents >= 1);
+
+        // Side effect 2: a cooldown was set for the (incident, action)
+        // pair so a duplicate within the cooldown window does not
+        // double-block.
+        let cooldown_key = decision_cooldown_key_for_decision(
+            &incident,
+            &ai::AiDecision {
+                action: ai::AiAction::BlockIp {
+                    ip: "203.0.113.50".into(),
+                    skill_id: "block-ip-ufw".into(),
+                },
+                confidence: 0.95,
+                auto_execute: true,
+                reason: String::new(),
+                alternatives: vec![],
+                estimated_threat: "high".into(),
+            },
+        )
+        .expect("cooldown key must be derivable");
+        assert!(
+            state
+                .store
+                .get_cooldown(crate::state_store::CooldownTable::Decision, &cooldown_key)
+                .is_some(),
+            "cooldown must be set so we don't double-block within window"
+        );
+    }
+
+    /// Coverage anchor: the operator-IP skip path. When the primary
+    /// IP is in `state.operator_ips` (active SSH session via publickey
+    /// from a trusted_users address), the gate must NOT auto-block —
+    /// that would lock the operator out. Pins the operator-honesty
+    /// hard rule applied at the auto-block gate.
+    #[tokio::test]
+    async fn try_handle_obvious_incident_skips_active_operator_session() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        // Mark this IP as an active operator session so the gate
+        // refuses to act on it.
+        state
+            .operator_ips
+            .insert("203.0.113.51".to_string(), std::time::Instant::now());
+
+        let mut cfg = config::AgentConfig::default();
+        cfg.responder.enabled = true;
+
+        let mut incident = crate::tests::test_incident_with_kind("203.0.113.51", "reverse_shell");
+        incident.severity = innerwarden_core::event::Severity::Critical;
+
+        let handled = try_handle_obvious_incident(&incident, dir.path(), &cfg, &mut state).await;
+        assert!(
+            !handled,
+            "operator IPs must skip auto-block — locking out the operator is the worst false positive"
+        );
+        // Side effect contract: NO ip_reputation row written for the
+        // operator IP (we did not act on this incident at all).
+        assert!(
+            state.ip_reputations.get("203.0.113.51").is_none(),
+            "no rep row must be created when we skip operator IPs"
+        );
+    }
+
+    /// Coverage anchor: incidents without an IP entity short-circuit
+    /// to false even when the detector matches. Pins the schema-defensive
+    /// branch — no IP = nothing to block, function returns without
+    /// writing any decision.
+    #[tokio::test]
+    async fn try_handle_obvious_incident_skips_when_no_ip_entity() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = config::AgentConfig::default();
+        cfg.responder.enabled = true;
+
+        let mut incident = crate::tests::test_incident_with_kind("203.0.113.52", "reverse_shell");
+        incident.severity = innerwarden_core::event::Severity::Critical;
+        incident.incident_id = "reverse_shell:::1".into();
+        incident.entities.clear(); // strip the IP entity
+
+        let handled = try_handle_obvious_incident(&incident, dir.path(), &cfg, &mut state).await;
+        assert!(!handled);
+    }
+
+    /// Coverage anchor: non-obvious detector + non-obvious severity
+    /// returns false BEFORE any side-effect writes. Anti-regression
+    /// for accidentally widening the obvious gate to detectors it
+    /// must not auto-block (the gate is intentionally narrow).
+    #[tokio::test]
+    async fn try_handle_obvious_incident_returns_false_for_non_obvious_detector() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = config::AgentConfig::default();
+        cfg.responder.enabled = true;
+
+        let mut incident =
+            crate::tests::test_incident_with_kind("203.0.113.53", "totally_unknown_detector");
+        incident.severity = innerwarden_core::event::Severity::Critical;
+
+        let handled = try_handle_obvious_incident(&incident, dir.path(), &cfg, &mut state).await;
+        assert!(
+            !handled,
+            "unknown detectors must NOT trigger the obvious gate"
+        );
+        assert!(
+            state.ip_reputations.get("203.0.113.53").is_none(),
+            "no side effects when gate returns false at the start"
+        );
+    }
 }

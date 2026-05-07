@@ -179,4 +179,65 @@ mod tests {
 
         maybe_capture_incident_forensics(&incident, &mut state);
     }
+
+    /// Coverage anchor (test/coverage-batch-3 — 2026-05-07): when
+    /// the incident has high severity but no `pid` in evidence,
+    /// the forensics adapter is NEVER invoked; the pcap adapter
+    /// still runs from the IP entity. Pins the missing-PID branch
+    /// (`incident.evidence.get("pid")` returning None).
+    #[test]
+    fn capture_incident_forensics_with_skips_forensics_when_pid_missing() {
+        let mut incident = crate::tests::test_incident("203.0.113.35");
+        incident.severity = innerwarden_core::event::Severity::Critical;
+        // Evidence has no "pid" field
+        incident.evidence = serde_json::json!({ "other_field": "value" });
+        let forensics_calls = Cell::new(0u32);
+        let pcap_calls = Cell::new(0u32);
+
+        capture_incident_forensics_with(
+            &incident,
+            |_pid, _incident_id| {
+                forensics_calls.set(forensics_calls.get() + 1);
+                Some(forensics_report(0, "unused"))
+            },
+            |ip, _incident_id| {
+                pcap_calls.set(pcap_calls.get() + 1);
+                Some(pcap_result(ip))
+            },
+        );
+
+        assert_eq!(forensics_calls.get(), 0, "missing pid must skip forensics");
+        assert_eq!(pcap_calls.get(), 1, "pcap should still fire from IP entity");
+    }
+
+    /// Coverage anchor: when the incident has high severity and a
+    /// PID but no IP entity, the forensics adapter runs and the
+    /// pcap adapter is NEVER invoked. Pins the missing-IP branch
+    /// (`primary_ip` returning None).
+    #[test]
+    fn capture_incident_forensics_with_skips_pcap_when_no_ip_entity() {
+        let mut incident = crate::tests::test_incident("203.0.113.36");
+        incident.severity = innerwarden_core::event::Severity::High;
+        incident.evidence = serde_json::json!({ "pid": 7 });
+        // Strip all IP entities — only a non-IP entity remains so
+        // `find` returns None.
+        incident.entities = vec![];
+        let forensics_calls = Cell::new(0u32);
+        let pcap_calls = Cell::new(0u32);
+
+        capture_incident_forensics_with(
+            &incident,
+            |pid, incident_id| {
+                forensics_calls.set(forensics_calls.get() + 1);
+                Some(forensics_report(pid, incident_id))
+            },
+            |_ip, _incident_id| {
+                pcap_calls.set(pcap_calls.get() + 1);
+                Some(pcap_result("unused"))
+            },
+        );
+
+        assert_eq!(forensics_calls.get(), 1);
+        assert_eq!(pcap_calls.get(), 0, "no IP entity must skip pcap");
+    }
 }

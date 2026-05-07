@@ -426,6 +426,97 @@ mod tests {
         assert_eq!(profile.abuseipdb_score, Some(64));
     }
 
+    /// Coverage anchor (test/coverage-batch-3 — 2026-05-07): when
+    /// `state.threat_feed` is None, `log_threat_feed_match` returns
+    /// immediately without panicking. Pins the early-return branch
+    /// (`let Some(tf) = state.threat_feed.as_ref() else { return; }`).
+    #[test]
+    fn log_threat_feed_match_returns_when_threat_feed_disabled() {
+        let dir = TempDir::new().expect("tempdir");
+        let state = crate::tests::triage_test_state(dir.path());
+        let incident = crate::tests::test_incident("203.0.113.60");
+        // No assertion beyond "does not panic" — the contract is no-op.
+        log_threat_feed_match(&incident, &state);
+    }
+
+    /// Coverage anchor: when `state.geoip_client` is None,
+    /// `lookup_incident_geoip` returns None without attempting any
+    /// network call. Pins the `?` short-circuit on the client option.
+    #[tokio::test]
+    async fn lookup_incident_geoip_returns_none_when_client_disabled() {
+        let dir = TempDir::new().expect("tempdir");
+        let state = crate::tests::triage_test_state(dir.path());
+        let incident = crate::tests::test_incident("203.0.113.61");
+
+        let result = lookup_incident_geoip(&incident, &state).await;
+        assert!(result.is_none(), "no client must return None");
+    }
+
+    /// Coverage anchor: when both `ip_geo` and `ip_reputation` are
+    /// None, `enrich_attacker_identity` short-circuits and never
+    /// touches `attacker_profiles`. Pins the cheap-exit contract on
+    /// the very first line of the function.
+    #[test]
+    fn enrich_attacker_identity_returns_early_when_no_inputs() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let incident = crate::tests::test_incident("203.0.113.62");
+
+        enrich_attacker_identity(&incident, &mut state, None, None);
+
+        assert!(
+            !state.attacker_profiles.contains_key("203.0.113.62"),
+            "no enrichment data must not create a profile"
+        );
+    }
+
+    /// Coverage anchor: when an incident has no IP entity,
+    /// `enrich_attacker_identity` walks the entities list, finds
+    /// nothing, and skips the mutation block — no profile is
+    /// created even with valid GeoIP/AbuseIPDB inputs.
+    #[test]
+    fn enrich_attacker_identity_skips_when_no_ip_entity() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut incident = crate::tests::test_incident("203.0.113.63");
+        incident.entities = vec![]; // strip IP entity
+        let geo = geoip::GeoInfo {
+            country: "Brazil".to_string(),
+            country_code: "BR".to_string(),
+            city: "Sao Paulo".to_string(),
+            isp: "ISP".to_string(),
+            asn: "AS1".to_string(),
+        };
+
+        enrich_attacker_identity(&incident, &mut state, Some(&geo), None);
+
+        assert!(
+            state.attacker_profiles.is_empty(),
+            "no IP entity must skip profile mutation"
+        );
+    }
+
+    /// Coverage anchor: when both `geoip_client` and `abuseipdb` are
+    /// None, `backfill_enrichment` returns immediately without
+    /// touching `attacker_profiles` or SQLite. Pins the
+    /// nothing-to-do early exit at the top of the function.
+    #[tokio::test]
+    async fn backfill_enrichment_returns_early_when_no_clients() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let ip = "8.8.8.8";
+        state.attacker_profiles.insert(
+            ip.to_string(),
+            attacker_intel::new_profile(ip, chrono::Utc::now()),
+        );
+
+        backfill_enrichment(&mut state).await;
+
+        let profile = state.attacker_profiles.get(ip).expect("profile preserved");
+        assert!(profile.geo.is_none(), "no client must skip enrichment");
+        assert!(profile.abuseipdb_score.is_none());
+    }
+
     #[tokio::test]
     async fn backfill_enrichment_respects_daily_abuseipdb_limit() {
         let dir = TempDir::new().expect("tempdir");

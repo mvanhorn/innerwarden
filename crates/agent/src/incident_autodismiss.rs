@@ -904,6 +904,64 @@ mod tests {
         ));
     }
 
+    /// Coverage anchor (test/coverage-batch-3 — 2026-05-07): when
+    /// `cfg.responder.enabled = false`, `try_autodismiss_noise`
+    /// short-circuits and returns false WITHOUT writing a decision
+    /// or touching the knowledge graph. Pins the
+    /// `is_noise_gate_eligible` early return — the operator wants
+    /// to see every low-severity incident in Watch mode.
+    #[test]
+    fn try_autodismiss_noise_returns_false_when_responder_disabled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        let mut cfg = config::AgentConfig::default();
+        cfg.responder.enabled = false;
+        cfg.responder.dry_run = false;
+        let incident = crate::tests::test_incident_with_kind("203.0.113.70", "port_scan");
+
+        let handled = try_autodismiss_noise(&incident, &cfg, &mut state);
+
+        assert!(!handled, "responder disabled must skip auto-dismiss");
+    }
+
+    /// Coverage anchor: when responder is enabled but in dry-run
+    /// mode (Watch/DryRun), the gate is also skipped — operator
+    /// asked for visibility into every incident, so noise gate
+    /// stays off.
+    #[test]
+    fn try_autodismiss_noise_returns_false_when_dry_run() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        let mut cfg = config::AgentConfig::default();
+        cfg.responder.enabled = true;
+        cfg.responder.dry_run = true;
+        let incident = crate::tests::test_incident_with_kind("203.0.113.71", "port_scan");
+
+        let handled = try_autodismiss_noise(&incident, &cfg, &mut state);
+
+        assert!(!handled, "dry_run must skip auto-dismiss");
+    }
+
+    /// Coverage anchor: in Guard mode (responder enabled, not
+    /// dry_run), the gate fires — `try_autodismiss_noise` returns
+    /// true and walks the full body (decision-writer attempt + KG
+    /// ingest_decision call) without panicking, even when the
+    /// incident isn't yet a KG node (ingest_decision then no-ops on
+    /// the missing-incident branch). Pins the Guard-mode happy path.
+    #[test]
+    fn try_autodismiss_noise_returns_true_in_guard_mode() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        let mut cfg = config::AgentConfig::default();
+        cfg.responder.enabled = true;
+        cfg.responder.dry_run = false;
+        let incident = crate::tests::test_incident_with_kind("203.0.113.72", "port_scan");
+
+        let handled = try_autodismiss_noise(&incident, &cfg, &mut state);
+
+        assert!(handled, "Guard mode must auto-dismiss low-severity noise");
+    }
+
     #[test]
     fn try_dismiss_cdn_noise_does_not_dismiss_when_ip_has_other_recent_attack_history() {
         // The exact safety case the operator raised: an Azure / AWS /

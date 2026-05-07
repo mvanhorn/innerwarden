@@ -172,4 +172,66 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].advisory_id, "adv-3");
     }
+
+    /// Coverage anchor (test/coverage-batch-3 — 2026-05-07): when
+    /// telegram_client is Some AND a matching advisory exists, the
+    /// notification-gate verdict is computed and the advisory is
+    /// consumed regardless of the verdict (Drop / DailyBriefingOnly /
+    /// SendNow). Pins the cache-consume contract: even if the alert
+    /// is suppressed by the gate, the matched entry must be removed
+    /// from the cache (otherwise duplicate executions would re-fire
+    /// the same advisory). The HTML send_alert call may fail because
+    /// the test telegram client has no network access; that's
+    /// expected — the function logs a warn and continues, the
+    /// cache-consume runs unconditionally.
+    #[tokio::test]
+    async fn handle_advisory_violation_consumes_advisory_even_when_telegram_client_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let tg = crate::telegram::TelegramClient::new("token", "chat-id", None)
+            .expect("telegram client");
+        state.telegram_client = Some(Arc::new(tg));
+
+        let command = "rm -rf /";
+        let cache = Arc::new(RwLock::new(VecDeque::from([advisory_entry(
+            "adv-tg", command,
+        )])));
+        let mut incident = crate::tests::test_incident("203.0.113.50");
+        incident.tags = vec!["execution".to_string()];
+        incident.evidence = serde_json::json!([{ "command": command }]);
+
+        handle_advisory_violation(&incident, &cache, &state).await;
+
+        let remaining = cache.read().expect("cache read lock");
+        assert!(
+            remaining.is_empty(),
+            "matched advisory must be consumed regardless of telegram outcome"
+        );
+    }
+
+    /// Coverage anchor: incidents with non-array evidence fall through
+    /// to the no-match branch of `check_advisory_match`. Pins the
+    /// schema-defensive Option-chain (`evidence.as_array()?`).
+    #[tokio::test]
+    async fn handle_advisory_violation_skips_when_evidence_is_not_array() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::tests::triage_test_state(dir.path());
+        let cache = Arc::new(RwLock::new(VecDeque::from([advisory_entry(
+            "adv-shape",
+            "whoami",
+        )])));
+        let mut incident = crate::tests::test_incident("203.0.113.51");
+        incident.tags = vec!["execution".to_string()];
+        // Object instead of array — `as_array()` returns None
+        incident.evidence = serde_json::json!({ "command": "whoami" });
+
+        handle_advisory_violation(&incident, &cache, &state).await;
+
+        let remaining = cache.read().expect("cache read lock");
+        assert_eq!(
+            remaining.len(),
+            1,
+            "non-array evidence must not consume the advisory"
+        );
+    }
 }

@@ -753,6 +753,70 @@ Phase 7B (RC-2) introduced the orphan-recovery sweep that auto-dismisses inciden
 - `crates/agent/src/incident_honeypot_suggestion.rs::tests::defers_with_dry_run_flag_propagated_to_audit` — `dry_run` flag preserved end-to-end so post-incident review distinguishes suggested-then-confirmed vs suggested-then-ignored.
 - `crates/agent/src/incident_honeypot_suggestion.rs::tests::defers_without_audit_when_decision_writer_is_none` — defensive: missing writer (early boot/fault) returns true without panic.
 
+### Coverage batch 3 (test/coverage-batch-3 — 2026-05-07)
+
+Same operator hard-rule that drove batches 1+2: "≥70% coverage in the same PR as the code." This batch raises the worst-covered modules in the agent runtime — most of these test the early-exit / gate / disabled-feature branches that ship a lot of dead code paths in production but are rarely exercised by the existing happy-path tests. Together these anchors pin the *gate* contracts so that toggling `responder.enabled`, `correlation.enabled`, or removing optional clients (geoip / abuseipdb / threat_feed / decision_writer) cannot silently change the runtime's behaviour.
+
+#### Decide-skill actions surface
+
+- `crates/agent/src/decision_skill_actions.rs::tests::ignore_action_returns_formatted_reason` — the `Ignore` action emits a stable reason string that the audit log keys off. Anti-regression for any change that drops the reason or wraps it in an Err.
+- `crates/agent/src/decision_skill_actions.rs::tests::dismiss_action_returns_formatted_reason` — same for `Dismiss`. Pins the audit-row shape produced by both no-op verdicts.
+- `crates/agent/src/decision_skill_actions.rs::tests::unhandled_actions_return_none` — actions outside the explicit match table return `None` (caller falls through). Pins the closed-set contract: adding a new variant requires touching this dispatcher.
+- `crates/agent/src/decision_skill_actions.rs::tests::suspend_user_sudo_blocks_when_not_in_allowed_skills` — `suspend_user_sudo` is gated by `allowed_skills`; an empty allowlist must NOT execute. Operator-facing: the safety gate that prevents a misconfigured deployment from auto-sudo-locking users.
+- `crates/agent/src/decision_skill_actions.rs::tests::kill_process_blocks_when_not_in_allowed_skills` — same gate for `kill_process`. Anti-regression for dropping the gate when refactoring the dispatcher.
+- `crates/agent/src/decision_skill_actions.rs::tests::block_container_blocks_when_not_in_allowed_skills` — same gate for `block_container`.
+- `crates/agent/src/decision_skill_actions.rs::tests::suspend_user_sudo_executes_in_dry_run_when_allowed_and_registered` — the happy path: skill in allowlist + registered in registry + responder.dry_run = the dispatcher actually invokes the skill. Pins the registry round-trip.
+- `crates/agent/src/decision_skill_actions.rs::tests::kill_chain_response_skips_when_skill_missing_without_allowlist_gate` — when the kill-chain skill isn't registered, the dispatcher returns `None` instead of panicking. Pins the missing-skill defensive branch.
+- `crates/agent/src/decision_skill_actions.rs::tests::monitor_skips_when_skill_missing` — same for `monitor_ip`.
+
+#### Pre-AI prelude (correlation + LSM auto-enable)
+
+- `crates/agent/src/incident_prelude.rs::tests::correlation_disabled_returns_empty_and_does_not_observe` — when `cfg.correlation.enabled = false` the prelude returns an empty Vec AND must NOT call `correlator.observe()`. Pins the off-state contract: toggling correlation off-then-on cannot silently feed events the operator wanted excluded.
+- `crates/agent/src/incident_prelude.rs::tests::correlation_enabled_observes_even_when_no_related_incidents_yet` — first incident has no relatives but observe() must run, so a second incident with the same pivot can correlate. Pins the "observe early" contract that keeps history consistent across gate-skipped incidents.
+- `crates/agent/src/incident_prelude.rs::tests::lsm_auto_enable_skipped_when_already_enabled` — when `state.lsm_enabled = true` the auto-enable branch is skipped entirely, even for an incident that would normally trigger it. Pins the one-way-only escalation contract.
+
+#### Auto-rule fast path
+
+- `crates/agent/src/incident_auto_rules.rs::tests::try_handle_auto_rule_short_circuits_when_responder_disabled` — Watch mode (responder.enabled = false) suppresses every auto-rule path, even for high-severity detectors. Pins the operator's read-only invariant.
+- `crates/agent/src/incident_auto_rules.rs::tests::try_handle_auto_rule_short_circuits_when_auto_rules_disabled` — operator-tunable kill switch: `auto_rules_enabled = false` disables the path without disabling the responder.
+- `crates/agent/src/incident_auto_rules.rs::tests::try_handle_auto_rule_returns_false_for_non_auto_rule_detector` — only the explicit auto-rule detector list routes through this path. A non-listed detector (e.g. `packet_flood`) returns false. Anti-regression for accidentally widening the trigger set.
+- `crates/agent/src/incident_auto_rules.rs::tests::try_handle_auto_rule_skips_internal_ips` — internal/private IPs are NEVER auto-blocked. Pins the network-attack-surface invariant.
+- `crates/agent/src/incident_auto_rules.rs::tests::try_handle_auto_rule_skips_allowlisted_ips` — IPs on the static `cfg.trusted_ips` list AND the runtime `dynamic_trusted_ips` list are skipped. Pins both halves of the operator allowlist contract.
+- `crates/agent/src/incident_auto_rules.rs::tests::try_handle_auto_rule_skips_active_operator_sessions` — IPs with active operator sessions skip auto-block (matches `incident_obvious` policy). Pins the same-session-no-block contract.
+- `crates/agent/src/incident_auto_rules.rs::tests::try_handle_auto_rule_happy_path_writes_decision_and_sets_cooldown` — happy path: enabled responder + auto-rule detector + external IP + no operator session = block fires AND cooldown is armed. Anti-regression for any change that skips cooldown arming (would cause re-block thrash).
+- `crates/agent/src/incident_auto_rules.rs::tests::try_handle_auto_rule_respects_cooldown_window` — second invocation within cooldown window returns false. Pins the rate-limit contract that prevents block-storm.
+
+#### Obvious-incident fast path
+
+- `crates/agent/src/incident_obvious.rs::tests::try_handle_obvious_incident_full_happy_path_for_first_hit_detector` — first hit on an obvious-detector incident (e.g. `reverse_shell`) writes a decision JSONL row, updates `ip_reputations`, and arms the cooldown. Pins the audit-trail shape produced before the AI router ever runs.
+- `crates/agent/src/incident_obvious.rs::tests::try_handle_obvious_incident_skips_active_operator_session` — incidents from IPs with an active operator session are NEVER auto-blocked, regardless of detector severity. Same-session-no-block invariant mirroring `incident_auto_rules`.
+- `crates/agent/src/incident_obvious.rs::tests::try_handle_obvious_incident_skips_when_no_ip_entity` — incidents missing an IP entity fall through without panicking and without writing decisions. Defensive contract for the entity-extraction step.
+- `crates/agent/src/incident_obvious.rs::tests::try_handle_obvious_incident_returns_false_for_non_obvious_detector` — only the explicit obvious-detector list routes through this fast path. Anti-regression for widening the obvious set without operator review.
+
+#### Forensics capture early-exit
+
+- `crates/agent/src/incident_forensics.rs::tests::capture_incident_forensics_with_skips_forensics_when_pid_missing` — high-severity incidents without `pid` in evidence skip the forensics adapter while pcap still fires from the IP entity. Pins the missing-PID branch (`evidence.get("pid")` returning None).
+- `crates/agent/src/incident_forensics.rs::tests::capture_incident_forensics_with_skips_pcap_when_no_ip_entity` — high-severity incidents without an IP entity skip the pcap adapter while forensics still fires from the PID. Pins the missing-IP branch.
+
+#### Advisory cache consumption
+
+- `crates/agent/src/incident_advisory.rs::tests::handle_advisory_violation_consumes_advisory_even_when_telegram_client_present` — the matched cache entry is removed regardless of whether the Telegram alert succeeded, was rate-limited, or dropped. Pins the cache-consume contract: a stale advisory cannot re-fire the same alert across executions.
+- `crates/agent/src/incident_advisory.rs::tests::handle_advisory_violation_skips_when_evidence_is_not_array` — non-array `incident.evidence` falls through to the no-match branch instead of panicking. Pins the schema-defensive Option-chain (`evidence.as_array()?`).
+
+#### Enrichment optional-client gates
+
+- `crates/agent/src/incident_enrichment.rs::tests::log_threat_feed_match_returns_when_threat_feed_disabled` — `state.threat_feed = None` short-circuits before any IP lookup. Pins the optional-client contract.
+- `crates/agent/src/incident_enrichment.rs::tests::lookup_incident_geoip_returns_none_when_client_disabled` — same for `geoip_client`. The `?` short-circuit must keep the function from synthesising a default GeoInfo.
+- `crates/agent/src/incident_enrichment.rs::tests::enrich_attacker_identity_returns_early_when_no_inputs` — both `ip_geo` and `ip_reputation` None means no profile creation, no `attacker_profiles` mutation. Pins the cheap-exit contract on the very first line.
+- `crates/agent/src/incident_enrichment.rs::tests::enrich_attacker_identity_skips_when_no_ip_entity` — incidents without an IP entity walk the entities list, find nothing, and skip the mutation block — even with valid GeoIP/AbuseIPDB inputs.
+- `crates/agent/src/incident_enrichment.rs::tests::backfill_enrichment_returns_early_when_no_clients` — both clients None = early return without touching `attacker_profiles` or SQLite. Pins the nothing-to-do exit at the top of the function.
+
+#### Auto-dismiss noise gate
+
+- `crates/agent/src/incident_autodismiss.rs::tests::try_autodismiss_noise_returns_false_when_responder_disabled` — Watch mode (responder.enabled = false) keeps every low-severity incident visible. Pins the operator hard rule that auto-dismiss only fires in Guard mode.
+- `crates/agent/src/incident_autodismiss.rs::tests::try_autodismiss_noise_returns_false_when_dry_run` — DryRun mode mirrors Watch mode for the noise gate. Pins the second half of `is_noise_gate_eligible`.
+- `crates/agent/src/incident_autodismiss.rs::tests::try_autodismiss_noise_returns_true_in_guard_mode` — happy path: Guard mode + low-severity = true (auto-dismiss). Pins the body of the function (decision-writer attempt + KG ingest_decision call).
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:

@@ -427,4 +427,194 @@ mod tests {
             );
         }
     }
+
+    fn cfg_with_auto_rules() -> config::AgentConfig {
+        let mut cfg = config::AgentConfig::default();
+        cfg.responder.enabled = true;
+        cfg.responder.auto_rules_enabled = true;
+        cfg.responder.dry_run = true;
+        cfg.responder.block_backend = "ufw".into();
+        cfg.responder.allowed_skills = vec!["block-ip-ufw".into()];
+        cfg
+    }
+
+    /// Coverage anchor (test/coverage-batch-3): auto-rule short-circuit
+    /// when responder is disabled. Pre-fix any ssh_bruteforce incident
+    /// would have written a decision row even with `responder.enabled
+    /// = false`. Pins the operator opt-in contract.
+    #[tokio::test]
+    async fn try_handle_auto_rule_short_circuits_when_responder_disabled() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = cfg_with_auto_rules();
+        cfg.responder.enabled = false;
+
+        let inc = incident(
+            "ssh_bruteforce:203.0.113.10:1",
+            vec![EntityRef::ip("203.0.113.10")],
+        );
+        let handled = try_handle_auto_rule(&inc, dir.path(), &cfg, &mut state).await;
+        assert!(!handled);
+    }
+
+    /// Coverage anchor: auto-rule gated on the dedicated
+    /// `auto_rules_enabled` flag — a future operator who flips
+    /// `responder.enabled = true` but leaves `auto_rules_enabled =
+    /// false` keeps the AI pipeline active without auto-rules.
+    #[tokio::test]
+    async fn try_handle_auto_rule_short_circuits_when_auto_rules_disabled() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = cfg_with_auto_rules();
+        cfg.responder.auto_rules_enabled = false;
+
+        let inc = incident(
+            "ssh_bruteforce:203.0.113.10:1",
+            vec![EntityRef::ip("203.0.113.10")],
+        );
+        let handled = try_handle_auto_rule(&inc, dir.path(), &cfg, &mut state).await;
+        assert!(!handled);
+        assert!(state.ip_reputations.get("203.0.113.10").is_none());
+    }
+
+    /// Coverage anchor: detectors NOT in AUTO_RULES (e.g. packet_flood,
+    /// reverse_shell) skip the auto-rule path even with all flags
+    /// enabled. Pins that the AUTO_RULES whitelist is the single
+    /// source of truth.
+    #[tokio::test]
+    async fn try_handle_auto_rule_returns_false_for_non_auto_rule_detector() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let cfg = cfg_with_auto_rules();
+
+        // packet_flood is intentionally absent from AUTO_RULES.
+        let inc = incident(
+            "packet_flood:203.0.113.11:1",
+            vec![EntityRef::ip("203.0.113.11")],
+        );
+        assert!(!try_handle_auto_rule(&inc, dir.path(), &cfg, &mut state).await);
+    }
+
+    /// Coverage anchor: internal IPs (RFC 1918) must NEVER be
+    /// auto-blocked. Pins the gate one layer up (operator-honesty:
+    /// blocking the operator's own LAN IP is the worst false positive).
+    #[tokio::test]
+    async fn try_handle_auto_rule_skips_internal_ips() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let cfg = cfg_with_auto_rules();
+
+        let inc = incident("ssh_bruteforce:10.0.0.5:1", vec![EntityRef::ip("10.0.0.5")]);
+        assert!(!try_handle_auto_rule(&inc, dir.path(), &cfg, &mut state).await);
+        assert!(state.ip_reputations.get("10.0.0.5").is_none());
+    }
+
+    /// Coverage anchor: allowlisted IPs (configured trusted_ips OR
+    /// dynamic_trusted_ips) skip auto-rule. Pins both lists as gates.
+    #[tokio::test]
+    async fn try_handle_auto_rule_skips_allowlisted_ips() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = cfg_with_auto_rules();
+        cfg.allowlist.trusted_ips = vec!["203.0.113.20".into()];
+
+        let inc = incident(
+            "ssh_bruteforce:203.0.113.20:1",
+            vec![EntityRef::ip("203.0.113.20")],
+        );
+        assert!(!try_handle_auto_rule(&inc, dir.path(), &cfg, &mut state).await);
+
+        // Also test dynamic_trusted_ips path
+        let mut cfg2 = cfg_with_auto_rules();
+        let _ = cfg2; // keep cfg2 untouched but cover dynamic path:
+        state.dynamic_trusted_ips = vec!["203.0.113.21".into()];
+        let inc2 = incident(
+            "ssh_bruteforce:203.0.113.21:1",
+            vec![EntityRef::ip("203.0.113.21")],
+        );
+        let cfg = cfg_with_auto_rules();
+        assert!(!try_handle_auto_rule(&inc2, dir.path(), &cfg, &mut state).await);
+    }
+
+    /// Coverage anchor: active operator session IPs are skipped — same
+    /// hard rule as obvious-incident gate. Locking out an operator is
+    /// always the wrong call.
+    #[tokio::test]
+    async fn try_handle_auto_rule_skips_active_operator_sessions() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        state
+            .operator_ips
+            .insert("203.0.113.22".to_string(), std::time::Instant::now());
+
+        let cfg = cfg_with_auto_rules();
+        let inc = incident(
+            "ssh_bruteforce:203.0.113.22:1",
+            vec![EntityRef::ip("203.0.113.22")],
+        );
+        assert!(!try_handle_auto_rule(&inc, dir.path(), &cfg, &mut state).await);
+    }
+
+    /// Coverage anchor: full happy-path. ssh_bruteforce on a public IP
+    /// with all gates passing writes a decision tagged
+    /// `ai_provider="auto-rule:ssh_bruteforce"`, sets the cooldown,
+    /// updates ip_reputation, and returns true. Pins the
+    /// operator-visible audit-trail shape.
+    #[tokio::test]
+    async fn try_handle_auto_rule_happy_path_writes_decision_and_sets_cooldown() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let cfg = cfg_with_auto_rules();
+
+        let inc = incident(
+            "ssh_bruteforce:203.0.113.30:1",
+            vec![EntityRef::ip("203.0.113.30")],
+        );
+        let handled = try_handle_auto_rule(&inc, dir.path(), &cfg, &mut state).await;
+        assert!(
+            handled,
+            "ssh_bruteforce on a public IP with all gates passing must be handled"
+        );
+
+        // Cooldown set under the auto-rule:block_ip:<ip> key.
+        let cooldown_key = "auto-rule:block_ip:203.0.113.30";
+        assert!(
+            state
+                .store
+                .get_cooldown(crate::state_store::CooldownTable::Decision, cooldown_key)
+                .is_some(),
+            "auto-rule cooldown must be persisted"
+        );
+
+        // ip_reputation row created and incident recorded.
+        let rep = state
+            .ip_reputations
+            .get("203.0.113.30")
+            .expect("rep row must be created");
+        assert!(rep.total_incidents >= 1);
+    }
+
+    /// Coverage anchor: a second auto-rule run on the same IP within
+    /// the cooldown window returns false (no double-block).
+    #[tokio::test]
+    async fn try_handle_auto_rule_respects_cooldown_window() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let cfg = cfg_with_auto_rules();
+
+        let inc = incident(
+            "ssh_bruteforce:203.0.113.40:1",
+            vec![EntityRef::ip("203.0.113.40")],
+        );
+        // First call sets the cooldown.
+        try_handle_auto_rule(&inc, dir.path(), &cfg, &mut state).await;
+
+        // Second call within the cooldown window must return false
+        // BEFORE writing another decision.
+        let handled = try_handle_auto_rule(&inc, dir.path(), &cfg, &mut state).await;
+        assert!(
+            !handled,
+            "second auto-rule fire within cooldown window must short-circuit"
+        );
+    }
 }

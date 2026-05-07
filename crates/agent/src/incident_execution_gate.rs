@@ -126,4 +126,56 @@ mod tests {
             panic!("expected skip");
         }
     }
+
+    /// Coverage anchor (test/coverage-batch-3 — 2026-05-07): exercise
+    /// the skip path of `execute_or_skip_decision` end-to-end. With
+    /// `auto_execute = false`, no trust rule, and `responder.enabled =
+    /// false`, the gate returns Skip BEFORE calling execute_decision —
+    /// which means no telemetry observation, no audit row, and the
+    /// returned `(reason, false)` carries the responder-disabled
+    /// message. Anti-regression for accidentally swapping the order
+    /// of gate checks (any swap that lets the responder-disabled
+    /// branch fall through to execute would auto-block on hosts that
+    /// explicitly opted out).
+    #[tokio::test]
+    async fn execute_or_skip_decision_returns_skip_when_responder_disabled() {
+        use innerwarden_core::incident::Incident;
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = config::AgentConfig::default();
+        cfg.responder.enabled = false; // primary gate
+        cfg.ai.confidence_threshold = 0.5;
+
+        let incident = Incident {
+            ts: chrono::Utc::now(),
+            host: "h".into(),
+            incident_id: "ssh_bruteforce:198.51.100.1:1".into(),
+            severity: innerwarden_core::event::Severity::High,
+            title: "SSH brute force".into(),
+            summary: "many failed logins".into(),
+            tags: vec![],
+            entities: vec![innerwarden_core::entities::EntityRef::ip("198.51.100.1")],
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+        };
+        let decision = ai::AiDecision {
+            action: ai::AiAction::BlockIp {
+                ip: "198.51.100.1".into(),
+                skill_id: "block-ip-ufw".into(),
+            },
+            confidence: 0.95,
+            reason: "test".into(),
+            auto_execute: true, // would normally execute; gated by responder.enabled=false
+            alternatives: vec![],
+            estimated_threat: "high".into(),
+        };
+
+        let (reason, executed) =
+            execute_or_skip_decision(&incident, &decision, dir.path(), &cfg, &mut state).await;
+        assert!(!executed, "responder.enabled=false must short-circuit");
+        assert!(
+            reason.contains("responder disabled"),
+            "reason should explicitly mention responder gate, got: {reason}"
+        );
+    }
 }
