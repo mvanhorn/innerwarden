@@ -115,7 +115,15 @@ pub(crate) async fn execute_block_ip_decision(
         &state.operator_ips,
         state.recent_blocks.len(),
         crate::MAX_BLOCKS_PER_MINUTE,
-        crate::cloud_safelist::identify_provider,
+        // 2026-05-08 (fix/repeat-offender-safelist-bypass): use the
+        // CIDR-accurate `safelist_label`, not the first-octet
+        // heuristic `identify_provider`. The heuristic missed
+        // 208.95.112.0/24 (ip-api.com), 91.189.88.0/21 (Canonical),
+        // 199.232.0.0/16 (Fastly) — all in CLOUD_RANGES but with
+        // first octets the heuristic didn't tag — so the gate
+        // returned None and the block proceeded against the agent's
+        // own infrastructure.
+        crate::cloud_safelist::safelist_label,
     ) {
         if reason.starts_with("skipped:") {
             info!(ip, "{}", reason);

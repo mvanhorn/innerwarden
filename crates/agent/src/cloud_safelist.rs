@@ -108,8 +108,13 @@ const AGENT_SERVICE_RANGES: &[&str] = &[
     "3.248.0.0/13",  // AWS eu-west-1 ELB range (covers 3.248-255.x)
     // ip-api.com (GeoIP enrichment used by crate::geoip)
     "208.95.112.0/24",
-    // Canonical / Ubuntu archive + snapcraft + livepatch
-    "185.125.188.0/23",
+    // Canonical / Ubuntu archive + snapcraft + livepatch.
+    // 2026-05-08 (fix/repeat-offender-safelist-bypass): widened
+    // 185.125.188.0/23 → /22 so it covers .190 + .191 too. Operator's
+    // prod 2026-05-08 had `185.125.190.48` auto-blocked 7x by the
+    // repeat-offender path because the /23 only covered .188 + .189.
+    // Canonical's actual RIPE allocation is `185.125.188.0/22`.
+    "185.125.188.0/22",
     "91.189.88.0/21",
     "162.213.32.0/22",
 ];
@@ -466,6 +471,44 @@ pub fn is_cloudflare_edge_ip(ip_str: &str) -> bool {
 }
 
 /// Returns true if the IP should NOT be auto-blocked.
+/// CIDR-accurate label for IPs the agent must NEVER auto-block.
+///
+/// Returns:
+/// - `Some(provider_label)` when the IP falls in any safelisted CIDR
+///   (`CLOUDFLARE_RANGES`, `CLOUD_PROVIDER_RANGES`, `AGENT_SERVICE_RANGES`,
+///   `ORACLE_PEER_RANGES`, `LINK_LOCAL_RANGES`). The label is best-effort:
+///   it favours the granular `identify_provider` heuristic when that
+///   heuristic agrees with the CIDR walk, and falls back to a generic
+///   "Cloud Safelist" / "Agent Service" / "Link-local" tag otherwise.
+/// - `None` when the IP is not in any safelist.
+///
+/// 2026-05-08 (fix/repeat-offender-safelist-bypass): operator's prod
+/// audit found `208.95.112.1` (ip-api.com — the agent's OWN GeoIP
+/// service), `91.189.91.{102,104}` (Canonical Ubuntu archive), and
+/// `199.232.58.137` (Fastly) auto-blocked dozens of times each by
+/// the repeat-offender path. Root cause: both
+/// `decision_block_ip::execute_block_ip_decision` and
+/// `correlation_response::check_repeat_offenders` were gating on
+/// `identify_provider` — the FIRST-OCTET HEURISTIC, not the CIDR
+/// walk. First-octet 208 / 91 / 199 are not in the heuristic's
+/// match arms, so the gate returned None and the block proceeded
+/// even though `is_cloud_provider_ip` (the CIDR walker that powers
+/// `CLOUD_RANGES`) would have returned `true`.
+///
+/// This helper is the canonical gate predicate. Callers that need
+/// just the boolean keep using `is_cloud_provider_ip`; callers that
+/// need a label for the audit log + the gate together use this.
+pub fn safelist_label(ip_str: &str) -> Option<&'static str> {
+    if !is_cloud_provider_ip(ip_str) {
+        return None;
+    }
+    // Prefer the granular heuristic label when it agrees that the IP
+    // is provider-tagged. For first octets the heuristic doesn't cover
+    // (208 / 91 / 199 / etc) the CIDR walk above already proved
+    // safelisted, so fall back to a generic "Cloud Safelist" label.
+    identify_provider(ip_str).or(Some("Cloud Safelist"))
+}
+
 pub fn is_cloud_provider_ip(ip_str: &str) -> bool {
     let Ok(ip) = ip_str.parse::<IpAddr>() else {
         return false;
@@ -642,6 +685,67 @@ mod tests {
             is_cloud_provider_ip("34.95.197.36"),
             "34.95.197.36 (GCP) must remain in the safelist"
         );
+    }
+
+    /// 2026-05-08 anchor (fix/repeat-offender-safelist-bypass): the
+    /// exact prod-audit IPs that were blocked dozens of times each
+    /// because the gate predicate used the first-octet heuristic
+    /// instead of the CIDR walk. `safelist_label` is the canonical
+    /// gate predicate — it walks `CLOUD_RANGES` (which includes
+    /// `AGENT_SERVICE_RANGES`) and falls back to the heuristic only
+    /// when the CIDR walk already proved safelisted.
+    ///
+    /// Pin the four IPs the operator's prod was wrongly blocking:
+    ///   - 208.95.112.1 (ip-api.com — the agent's OWN GeoIP service,
+    ///     blocked 37x in prod)
+    ///   - 91.189.91.102 (Canonical Ubuntu archive, blocked 6x)
+    ///   - 199.232.58.137 (Fastly CDN, blocked 7x)
+    ///   - 185.125.190.48 (Canonical livepatch, blocked 7x — this
+    ///     also pinned the AGENT_SERVICE_RANGES /23 → /22 widening)
+    #[test]
+    fn safelist_label_returns_some_for_prod_audit_ips_that_were_wrongly_blocked() {
+        init();
+        // ip-api.com — first octet 208 not in heuristic, but
+        // 208.95.112.0/24 is in AGENT_SERVICE_RANGES.
+        assert!(
+            safelist_label("208.95.112.1").is_some(),
+            "208.95.112.1 (ip-api.com — agent's own GeoIP) MUST be safelisted"
+        );
+        // Canonical Ubuntu archive — first octet 91 not in heuristic,
+        // but 91.189.88.0/21 is in AGENT_SERVICE_RANGES.
+        assert!(
+            safelist_label("91.189.91.102").is_some(),
+            "91.189.91.102 (Canonical archive) MUST be safelisted"
+        );
+        // Fastly — first octet 199 not in heuristic, but
+        // 199.232.0.0/16 is in CLOUD_PROVIDER_RANGES.
+        assert!(
+            safelist_label("199.232.58.137").is_some(),
+            "199.232.58.137 (Fastly) MUST be safelisted"
+        );
+        // Canonical livepatch — was outside the /23, now in the /22.
+        // This anchors the AGENT_SERVICE_RANGES widening.
+        assert!(
+            safelist_label("185.125.190.48").is_some(),
+            "185.125.190.48 (Canonical livepatch) MUST be safelisted \
+             (anchors the /23 → /22 widening)"
+        );
+        assert!(
+            safelist_label("185.125.191.255").is_some(),
+            "185.125.191.255 (top of Canonical /22) MUST be safelisted"
+        );
+    }
+
+    /// Mirror anchor: a real-attacker IP outside any safelist range
+    /// must return `None` from `safelist_label`. Pins the cheap-exit
+    /// contract so the new gate doesn't accidentally tag everything.
+    #[test]
+    fn safelist_label_returns_none_for_real_attacker_ips() {
+        init();
+        // TEST-NET-3 (RFC 5737) — never on a CDN, never in any safelist.
+        assert!(safelist_label("203.0.113.42").is_none());
+        // Random unassigned-to-major-cloud space.
+        assert!(safelist_label("1.2.3.4").is_none());
     }
 
     /// Mirror anchor: `identify_provider` for the same prod IP must

@@ -907,6 +907,21 @@ Fix: drop `hour_distribution` from the hash inputs; it stays in the `AttackerDna
 - `crates/agent/src/attacker_intel.rs::tests::dna_hash_distinguishes_profiles_by_target_ports` — two `port_scan` profiles with different `target_ports` produce different DNAs. Pins the new `target_ports` symmetry contract added in this PR.
 - `crates/agent/src/attacker_intel.rs::tests::dna_hash_is_stable_across_hour_distribution_changes` — wholesale-shifting the `hour_distribution` array does NOT change the DNA. Anti-regression that locks the temporal field out of identity computation; a future "include timing in fingerprint" refactor would have to update this test on purpose.
 
+### Repeat-offender safelist bypass (fix/repeat-offender-safelist-bypass — 2026-05-08)
+
+Operator's prod audit 2026-05-08 found that the agent had been auto-blocking its OWN infrastructure for weeks via the repeat-offender path:
+  * `208.95.112.1` — ip-api.com, the agent's GeoIP service — blocked **37 times**
+  * `91.189.91.{102,104}` — Canonical Ubuntu archive — blocked **6x and 14x**
+  * `199.232.58.137` — Fastly CDN — blocked **7 times**
+  * `185.125.190.48` — Canonical livepatch — blocked **7 times**
+
+Root cause: both `decision_block_ip::execute_block_ip_decision` and `correlation_response::check_repeat_offenders` were gating on `cloud_safelist::identify_provider` — the FIRST-OCTET HEURISTIC, not the CIDR walk. First octets 208 / 91 / 199 are not in the heuristic's match arms, so the gate returned None and the block proceeded against IPs that were absolutely in `CLOUD_RANGES` via `is_cloud_provider_ip`. Plus a separate gap: `185.125.188.0/23` (Canonical) only covered .188-.189; .190 wasn't in any list.
+
+Fix: new `cloud_safelist::safelist_label(ip)` walks the CIDR set first (using `is_cloud_provider_ip`) then falls back to the heuristic for the granular label, returning a generic "Cloud Safelist" tag when the heuristic doesn't recognise a provider it just confirmed via CIDR. Both gate sites now use `safelist_label` instead of `identify_provider`. Plus widened Canonical AGENT_SERVICE_RANGES from `/23` to `/22` to cover .188-.191.
+
+- `crates/agent/src/cloud_safelist.rs::tests::safelist_label_returns_some_for_prod_audit_ips_that_were_wrongly_blocked` — uses the four exact prod IPs (208.95.112.1, 91.189.91.102, 199.232.58.137, 185.125.190.48) and confirms each is now safelisted. Pins the gate predicate AND the Canonical /22 widening.
+- `crates/agent/src/cloud_safelist.rs::tests::safelist_label_returns_none_for_real_attacker_ips` — TEST-NET-3 (RFC 5737) and random unassigned space return None. Pins the cheap-exit contract so the new gate doesn't tag everything.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:

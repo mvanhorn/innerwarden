@@ -342,12 +342,22 @@ async fn check_repeat_offenders(
         if crate::incident_auto_rules::is_internal_ip_pub(&ip) {
             continue;
         }
-        // Cloud-provider / CDN safelist — drop the reputation entry outright
-        // so the next correlation burst cannot bump this IP back above the
-        // escalation threshold. Production data from 2026-04-18 showed
-        // repeat-offender compounding on Cloudflare CIDRs after CL-008
-        // kept refiring on legitimate outbound traffic.
-        if let Some(provider) = crate::cloud_safelist::identify_provider(&ip) {
+        // Cloud-provider / CDN / agent-service safelist — drop the
+        // reputation entry outright so the next correlation burst
+        // cannot bump this IP back above the escalation threshold.
+        // Production data from 2026-04-18 showed repeat-offender
+        // compounding on Cloudflare CIDRs after CL-008 kept refiring
+        // on legitimate outbound traffic.
+        //
+        // 2026-05-08 (fix/repeat-offender-safelist-bypass): switched
+        // from `identify_provider` (first-octet heuristic) to
+        // `safelist_label` (CIDR walk via `is_cloud_provider_ip`).
+        // The heuristic missed 208.95.112.0/24 (ip-api.com — the
+        // agent's OWN GeoIP service, blocked 37x in prod),
+        // 91.189.88.0/21 (Canonical archive, blocked 14x),
+        // 199.232.0.0/16 (Fastly, blocked 7x). The CIDR walk
+        // catches all of them.
+        if let Some(provider) = crate::cloud_safelist::safelist_label(&ip) {
             info!(
                 ip = %ip,
                 provider,
