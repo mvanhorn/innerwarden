@@ -64,6 +64,24 @@ impl StateStore {
         }
     }
 
+    /// Delete the SQLite kv_state row for an IP's reputation.
+    ///
+    /// 2026-05-08 (fix/ai-router-cidr-guard-and-zombie-purge): callers
+    /// that purge an IP from the in-memory `state.ip_reputations` map
+    /// (e.g. `correlation_response::check_repeat_offenders` purging
+    /// cloud-safelisted IPs, or `drop_invalid_repeat_offender` purging
+    /// CIDR / malformed targets) must ALSO delete the SQLite row, or
+    /// the next agent restart re-loads the zombie entry from
+    /// `load_ip_reputations_from_store` and the purge has to fire all
+    /// over again. Operator's prod 2026-05-08 had `136.216.0.0/16`
+    /// still in `kv_state` minutes after PR #497 dropped it from
+    /// memory — confirming the gap.
+    pub fn delete_ip_reputation(&self, ip: &str) {
+        if let Err(e) = self.store.kv_delete(NS_IP_REPUTATIONS, ip) {
+            warn!(error = %e, ip, "delete_ip_reputation failed");
+        }
+    }
+
     pub fn all_ip_reputations(&self) -> Vec<(String, serde_json::Value)> {
         match self.store.kv_list(NS_IP_REPUTATIONS) {
             Ok(entries) => entries
@@ -848,5 +866,35 @@ mod tests {
         assert_eq!(store.ip_reputations_len(), 5);
         store.trim_ip_reputations(3);
         assert_eq!(store.ip_reputations_len(), 3);
+    }
+
+    /// 2026-05-08 anchor (fix/ai-router-cidr-guard-and-zombie-purge):
+    /// `delete_ip_reputation` must remove the kv_state row so a zombie
+    /// entry doesn't get reloaded on the next agent restart. Operator's
+    /// prod 2026-05-08 had `136.216.0.0/16` still in `kv_state` after
+    /// PR #497 dropped it from the in-memory map — confirming the gap.
+    /// Pin the round-trip: set + delete + read-after-delete returns None.
+    #[test]
+    fn delete_ip_reputation_removes_the_row_so_load_returns_none() {
+        let (_dir, store) = make_store();
+        let val = serde_json::json!({"total_blocks": 3});
+        store.set_ip_reputation("136.216.0.0/16", &val);
+        assert_eq!(
+            store.ip_reputations_len(),
+            1,
+            "set must persist the row first"
+        );
+
+        store.delete_ip_reputation("136.216.0.0/16");
+        assert_eq!(
+            store.ip_reputations_len(),
+            0,
+            "delete must remove the row from kv_state — the prod regression \
+             was that this didn't happen, leaving the CIDR available for \
+             load_ip_reputations_from_store on next boot"
+        );
+
+        // Idempotent — re-deleting a missing row must not panic.
+        store.delete_ip_reputation("136.216.0.0/16");
     }
 }

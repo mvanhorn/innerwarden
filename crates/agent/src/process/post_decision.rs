@@ -19,6 +19,35 @@ pub(crate) async fn execute_decision(
 ) -> (String, bool) {
     use ai::AiAction;
 
+    // 2026-05-08 (fix/ai-router-cidr-guard): defensive guard at the
+    // boundary between AI providers (Local Warden / OpenAI / Anthropic)
+    // and the executor. PR #497 added `is_single_ip_block_target` to
+    // the *automated* paths (repeat-offender, multi-technique). This
+    // closes the AI router gap: if a model hallucinates a CIDR or
+    // mis-parses an IP from prompt context, the BlockIp action gets
+    // refused here BEFORE any reputation counter, blocklist mutation,
+    // or firewall call. Operator-visible: the audit trail records a
+    // `skipped:` outcome with the bad target, instead of a real block
+    // against a /16 of public IPs.
+    if let AiAction::BlockIp { ip, .. } = &decision.action {
+        if !decision_block_ip::is_single_ip_block_target(ip) {
+            warn!(
+                ip = %ip,
+                provider = ?decision.action,
+                "AI router: refusing BlockIp on invalid or CIDR target — \
+                 most likely an LLM hallucination or malformed parse. \
+                 Decision downgraded to skipped at the execute boundary."
+            );
+            return (
+                format!(
+                    "skipped: AI router emitted BlockIp on invalid or CIDR target {ip} — \
+                     refused at execute_decision boundary"
+                ),
+                false,
+            );
+        }
+    }
+
     if let Some(result) = decision_skill_actions::execute_simple_action(
         &decision.action,
         incident,
@@ -478,5 +507,73 @@ mod tests {
 
         assert!(message.contains("not in allowed_skills"));
         assert!(!cloudflare_pushed);
+    }
+
+    /// 2026-05-08 anchor (fix/ai-router-cidr-guard-and-zombie-purge):
+    /// AI providers (Local Warden / OpenAI / Anthropic) sometimes
+    /// hallucinate CIDR targets in their `BlockIp` action — the
+    /// prompt may have included a CIDR somewhere, the model
+    /// pattern-matches and emits `BlockIp { ip: "X.Y.Z.W/N" }`. PR #497
+    /// added the guard at the *automated* paths (repeat-offender,
+    /// multi-technique). This pins the guard at the AI-router boundary:
+    /// `execute_decision` refuses BlockIp on CIDR targets BEFORE any
+    /// downstream mutation. The bad action becomes a `skipped:` row
+    /// in the audit trail instead of a real /16 ban.
+    #[tokio::test]
+    async fn execute_decision_refuses_block_ip_on_cidr_target_with_skipped_outcome() {
+        let dir = TempDir::new().unwrap();
+        let cfg = config::AgentConfig::default();
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let incident = crate::tests::test_incident("203.0.113.10");
+
+        let decision = test_decision(ai::AiAction::BlockIp {
+            ip: "136.216.0.0/16".to_string(),
+            skill_id: "block-ip-ufw".to_string(),
+        });
+
+        let (message, cloudflare_pushed) =
+            execute_decision(&decision, &incident, dir.path(), &cfg, &mut state).await;
+
+        assert!(
+            message.starts_with("skipped:"),
+            "CIDR target must produce a skipped outcome (got: {message})"
+        );
+        assert!(
+            message.contains("CIDR") || message.contains("invalid"),
+            "skipped reason must mention the cause (got: {message})"
+        );
+        assert!(!cloudflare_pushed);
+        // Anti-regression: the in-memory blocklist MUST NOT have
+        // grown — the guard fired before any state mutation.
+        assert!(
+            !state.blocklist.contains("136.216.0.0/16"),
+            "guard MUST run before state.blocklist mutation — pre-fix the AI \
+             could push a /16 into the blocklist via the safeguards path"
+        );
+    }
+
+    /// Mirror anchor: a plain IP target still flows through normally
+    /// (the new guard only intercepts CIDR / invalid targets, not
+    /// every BlockIp). Pins that the cheap-exit path doesn't break
+    /// the happy-path semantics.
+    #[tokio::test]
+    async fn execute_decision_allows_block_ip_on_plain_ip_target() {
+        let dir = TempDir::new().unwrap();
+        let cfg = config::AgentConfig::default();
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let incident = crate::tests::test_incident("203.0.113.10");
+
+        let decision = test_decision(ai::AiAction::BlockIp {
+            ip: "203.0.113.10".to_string(),
+            skill_id: "block-ip-ufw".to_string(),
+        });
+
+        let (message, _) =
+            execute_decision(&decision, &incident, dir.path(), &cfg, &mut state).await;
+
+        assert!(
+            !message.starts_with("skipped: AI router emitted BlockIp on invalid"),
+            "plain IP must NOT trip the new CIDR guard (got: {message})"
+        );
     }
 }

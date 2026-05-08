@@ -941,6 +941,18 @@ The Decision and Notification cooldown tables now have separate retention horizo
 
 - `crates/agent/src/decision_cooldown.rs::tests::decision_cooldown_retention_covers_longest_consumer` — pins `DECISION_COOLDOWN_RETENTION_SECS >= 86400s` (the repeat-offender cooldown_cutoff) AND `NOTIFICATION_COOLDOWN_RETENTION_SECS >= NOTIFICATION_COOLDOWN_SECS`. Pre-fix retention was 2h for both tables; this anchor would have caught the regression.
 
+### AI router CIDR guard + ip_reputations zombie purge (fix/ai-router-cidr-guard-and-zombie-purge — 2026-05-08)
+
+Two related defenses bundled. Both close gaps from the 2026-05-08 prod audit cleanup chain (PRs #492-#498).
+
+**(a) AI router CIDR guard**: PR #497 added `is_single_ip_block_target` to the *automated* paths (repeat-offender, multi-technique). But AI providers (Local Warden / OpenAI / Anthropic) can still hallucinate a CIDR target — if the prompt mentions a /16 anywhere, the model may emit `BlockIp { ip: "X.Y.Z.W/N" }`. The guard now also fires at the `execute_decision` boundary so the bad action becomes a `skipped:` row in the audit trail instead of a real /16 ban.
+
+**(b) Zombie purge**: PR #496 + PR #497 purged cloud-safelisted and CIDR IPs from in-memory `state.ip_reputations`, but the SQLite `kv_state` row was left alone — meaning a restart re-loaded the same zombie via `load_ip_reputations_from_store`. The fix mirrors the in-memory remove into a `delete_ip_reputation` SQLite delete.
+
+- `crates/agent/src/process/post_decision.rs::tests::execute_decision_refuses_block_ip_on_cidr_target_with_skipped_outcome` — pins that an AI-emitted `BlockIp { ip: "136.216.0.0/16" }` produces a skipped outcome at `execute_decision` and never mutates `state.blocklist`.
+- `crates/agent/src/process/post_decision.rs::tests::execute_decision_allows_block_ip_on_plain_ip_target` — mirror anchor for the cheap-exit; a plain IP target flows through normally so the guard doesn't break happy-path semantics.
+- `crates/agent/src/state_store.rs::tests::delete_ip_reputation_removes_the_row_so_load_returns_none` — pins the round-trip: set + delete + read returns None. Pre-fix prod left `136.216.0.0/16` in `kv_state` minutes after the in-memory purge had already fired.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:

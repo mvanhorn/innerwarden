@@ -295,6 +295,7 @@ async fn handle_completed_chain(
 pub(crate) fn drop_invalid_repeat_offender(
     ip: &str,
     ip_reputations: &mut std::collections::HashMap<String, crate::ip_reputation::LocalIpReputation>,
+    sqlite_store: Option<&crate::state_store::StateStore>,
 ) -> bool {
     // 2026-05-08 (fix/automated-block-paths-reject-cidr): use the
     // stricter `is_single_ip_block_target` so CIDR keys get pruned
@@ -305,12 +306,21 @@ pub(crate) fn drop_invalid_repeat_offender(
     // happily re-emitted BlockIp on the /16. A real UFW rule of
     // `deny from 136.216.0.0/16` would have banned a public /16
     // (~65k IPs).
+    //
+    // 2026-05-08 (fix/ai-router-cidr-guard-and-zombie-purge): also
+    // mirror the purge into SQLite so a restart doesn't re-load the
+    // zombie entry from kv_state. Optional `sqlite_store` keeps the
+    // helper unit-testable without a full AgentState (existing
+    // tests pass `None` and only assert the in-memory behaviour).
     if !crate::decision_block_ip::is_single_ip_block_target(ip) {
         warn!(
             ip = %ip,
             "repeat-offender: skipping invalid or CIDR target — removing from ip_reputations"
         );
         ip_reputations.remove(ip);
+        if let Some(sq) = sqlite_store {
+            sq.delete_ip_reputation(ip);
+        }
         return true;
     }
     false
@@ -332,7 +342,7 @@ async fn check_repeat_offenders(
 
     for (ip, total_blocks) in repeat_ips {
         // Guard: never feed a malformed target into the block pipeline.
-        if drop_invalid_repeat_offender(&ip, &mut state.ip_reputations) {
+        if drop_invalid_repeat_offender(&ip, &mut state.ip_reputations, Some(&state.store)) {
             continue;
         }
 
@@ -374,6 +384,9 @@ async fn check_repeat_offenders(
                 "repeat-offender: purging cloud-provider IP from reputation state"
             );
             state.ip_reputations.remove(&ip);
+            // Mirror the in-memory purge into SQLite so a restart
+            // doesn't re-load the same zombie entry from kv_state.
+            state.store.delete_ip_reputation(&ip);
             continue;
         }
         if allowlist::is_ip_allowlisted(&ip, &cfg.allowlist.trusted_ips)
@@ -698,7 +711,7 @@ mod tests {
 
         let mut map: HashMap<String, LocalIpReputation> = HashMap::new();
         map.insert("129.950.5.0".to_string(), LocalIpReputation::new());
-        let dropped = drop_invalid_repeat_offender("129.950.5.0", &mut map);
+        let dropped = drop_invalid_repeat_offender("129.950.5.0", &mut map, None);
         assert!(dropped);
         assert!(!map.contains_key("129.950.5.0"));
     }
@@ -710,7 +723,7 @@ mod tests {
 
         let mut map: HashMap<String, LocalIpReputation> = HashMap::new();
         map.insert("8.8.8.8".to_string(), LocalIpReputation::new());
-        let dropped = drop_invalid_repeat_offender("8.8.8.8", &mut map);
+        let dropped = drop_invalid_repeat_offender("8.8.8.8", &mut map, None);
         assert!(!dropped);
         assert!(map.contains_key("8.8.8.8"));
     }
@@ -735,7 +748,7 @@ mod tests {
 
         let mut map: HashMap<String, LocalIpReputation> = HashMap::new();
         map.insert("136.216.0.0/16".to_string(), LocalIpReputation::new());
-        let dropped = drop_invalid_repeat_offender("136.216.0.0/16", &mut map);
+        let dropped = drop_invalid_repeat_offender("136.216.0.0/16", &mut map, None);
         assert!(
             dropped,
             "CIDR target MUST be dropped from the automated path (prod regression IP)"
@@ -768,7 +781,7 @@ mod tests {
             let mut map: HashMap<String, LocalIpReputation> = HashMap::new();
             map.insert(bad.to_string(), LocalIpReputation::new());
             assert!(
-                drop_invalid_repeat_offender(bad, &mut map),
+                drop_invalid_repeat_offender(bad, &mut map, None),
                 "'{bad}' must be classified as invalid"
             );
             assert!(map.is_empty(), "'{bad}' must be removed from reputations");
@@ -784,7 +797,7 @@ mod tests {
         // true/false based on validity, and remove() is a no-op.
         let mut map: HashMap<String, LocalIpReputation> = HashMap::new();
         map.insert("1.2.3.4".to_string(), LocalIpReputation::new());
-        let dropped = drop_invalid_repeat_offender("129.950.5.0", &mut map);
+        let dropped = drop_invalid_repeat_offender("129.950.5.0", &mut map, None);
         assert!(dropped);
         assert_eq!(map.len(), 1); // unchanged
         assert!(map.contains_key("1.2.3.4"));
@@ -1097,7 +1110,7 @@ mod tests {
         let mut map: HashMap<String, LocalIpReputation> = HashMap::new();
         map.insert("1.1.1.1".to_string(), LocalIpReputation::new());
         map.insert("2.2.2.2".to_string(), LocalIpReputation::new());
-        let dropped = drop_invalid_repeat_offender("bogus-ip", &mut map);
+        let dropped = drop_invalid_repeat_offender("bogus-ip", &mut map, None);
         assert!(dropped, "malformed ip must be reported as dropped");
         assert_eq!(map.len(), 2, "unrelated entries must survive");
         assert!(map.contains_key("1.1.1.1"));
@@ -1111,7 +1124,7 @@ mod tests {
 
         let mut map: HashMap<String, LocalIpReputation> = HashMap::new();
         map.insert("203.0.113.55".to_string(), LocalIpReputation::new());
-        let dropped = drop_invalid_repeat_offender("203.0.113.55", &mut map);
+        let dropped = drop_invalid_repeat_offender("203.0.113.55", &mut map, None);
         assert!(!dropped, "valid public ip must not be dropped");
         assert!(map.contains_key("203.0.113.55"));
     }
@@ -1125,11 +1138,11 @@ mod tests {
         map.insert("129.999.0.0".to_string(), LocalIpReputation::new());
 
         // First call: evicts.
-        assert!(drop_invalid_repeat_offender("129.999.0.0", &mut map));
+        assert!(drop_invalid_repeat_offender("129.999.0.0", &mut map, None));
         assert!(!map.contains_key("129.999.0.0"));
 
         // Second call: still returns true (invalid is invalid), no panic.
-        assert!(drop_invalid_repeat_offender("129.999.0.0", &mut map));
+        assert!(drop_invalid_repeat_offender("129.999.0.0", &mut map, None));
         assert!(!map.contains_key("129.999.0.0"));
     }
 
