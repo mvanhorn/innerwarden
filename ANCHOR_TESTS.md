@@ -953,6 +953,27 @@ Two related defenses bundled. Both close gaps from the 2026-05-08 prod audit cle
 - `crates/agent/src/process/post_decision.rs::tests::execute_decision_allows_block_ip_on_plain_ip_target` — mirror anchor for the cheap-exit; a plain IP target flows through normally so the guard doesn't break happy-path semantics.
 - `crates/agent/src/state_store.rs::tests::delete_ip_reputation_removes_the_row_so_load_returns_none` — pins the round-trip: set + delete + read returns None. Pre-fix prod left `136.216.0.0/16` in `kv_state` minutes after the in-memory purge had already fired.
 
+### Chains tab honesty bundle (fix/chains-tab-honesty-bundle — 2026-05-08)
+
+Operator audited the Intelligence > Chains tab on prod 2026-05-08 and found **five** issues fitting one cohesive theme: the page was lying about the agent's actual state.
+
+1. **`0 Critical` KPI vs visible critical badges** — JS filtered `c.severity === 'Critical'` (capitalised) but backend serialises `"critical"` (lowercase). Filter never matched. Same Wave 10 honesty class as the briefing's "All clear" lie.
+2. **`kill_chain DATA_EXFIL (PID NNN, https) <cloud-IP>` surfacing as Critical** — PR #491's auto-dismiss required `c2_port == 0` but operator self-traffic to cloud edges goes over HTTPS port 443 / HTTP port 80 / SSH port 22. Plus libcurl renames its worker-thread comm to `https` / `http`, which weren't in NSS_INIT_TOOL_PREFIXES.
+3. **Negative chain duration** — summary strings like `"...: 2 stages across 1 layers in -2s"` because `matched_events.first()` / `.last()` walked vec order, not chronological order, so when stage 2's event arrived earlier in time than stage 1's, `last_ts - start_ts` went negative.
+4. **6 separate Multi-Persistence chains in 37 seconds** — frontend dedup keyed on `(rule_id, summary)` but `summary` includes the duration ("...in 1s" vs "...in 17s"), so the same rule firing 6 times in 37s rendered as 6 groups. Dedup key relaxed to `rule_id` alone.
+5. **Stray `0` next to "Sort: Risk Score"** — the `<input type="number" value="0">` for "Min risk" displayed the default 0 instead of the placeholder; operator read it as a UI glitch.
+
+#### Anchors
+
+- `crates/agent/src/incident_autodismiss.rs::tests::try_autodismiss_sensor_self_traffic_fp_dismisses_kill_chain_https_to_cloud_safelisted_ip` — pins that the kill_chain DATA_EXFIL suppression dismisses HTTPS-to-cloud-safelisted-IP shape (the prod regression on Azure UK 20.26.156.215). Uses non-zero `c2_port=443` to prove the cloud_safelist OR-branch fires independent of port.
+- `crates/agent/src/incident_autodismiss.rs::tests::try_autodismiss_sensor_self_traffic_fp_does_not_dismiss_kill_chain_real_attacker_ip` — mirror anchor: same bare-2-bit + non-zero c2_port shape but to a non-safelisted IP (TEST-NET-3) keeps reaching the AI router. Pins the gate so the cloud_safelist OR-branch can't accidentally swallow real attackers.
+- `crates/agent/src/correlation_engine.rs::tests::complete_chain_summary_duration_is_nonnegative_with_out_of_order_stage_events` — pins that the chain duration in the summary string is never negative even when `matched_events` arrives out of chronological order. Anti-regression for the "in -2s" / "in -29s" rendering on prod.
+
+#### Frontend changes (no anchor — JS is operator-visible after build)
+
+- `intel.js`: case-insensitive severity comparison + relaxed dedup key.
+- `index.html`: dropped `value="0"` from Min risk input so placeholder renders.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:

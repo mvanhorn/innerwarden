@@ -510,7 +510,13 @@
         <option value="last_seen">Sort: Last Seen</option>
         <option value="incidents">Sort: Incidents</option>
       </select>
-      <input type="number" id="intelMinRisk" placeholder="Min risk" min="0" max="100" value="0" onchange="loadIntel()" style="margin-left:8px;width:80px;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);">
+      <!-- 2026-05-08 (fix/chains-tab-honesty-bundle): dropped
+           `value="0"` so the placeholder "Min risk" actually
+           renders. Pre-fix, the input showed a bare `0` floating
+           next to the Sort dropdown, which the operator read as a
+           UI glitch. The min="0" attribute still pins the lower
+           bound at zero so the filter semantics are unchanged. -->
+      <input type="number" id="intelMinRisk" placeholder="Min risk" min="0" max="100" onchange="loadIntel()" style="margin-left:8px;width:80px;padding:4px 8px;border-radius:4px;border:1px solid var(--border);background:var(--card-bg);color:var(--text);">
       <span id="intelViewStatus" class="report-status"></span>
     </div>
     <div id="intelContent" class="report-content" style="padding:16px;">

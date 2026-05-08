@@ -211,7 +211,7 @@ impl CorrelationEngine {
         }
 
         // Emit completed chains
-        for pc in newly_completed {
+        for mut pc in newly_completed {
             let rule = match self.rules.iter().find(|r| r.id == pc.rule_id) {
                 Some(r) => r,
                 None => continue,
@@ -246,6 +246,19 @@ impl CorrelationEngine {
                 0.70
             };
 
+            // 2026-05-08 (fix/chains-tab-honesty-bundle): sort by
+            // event timestamp before computing start/last so the
+            // duration in the chain summary can never go negative.
+            // Operator's prod 2026-05-08 dashboard showed multiple
+            // chains with summaries like
+            // `"...: 2 stages across 1 layers in -2s"` — that
+            // happened when the second stage's event arrived in
+            // the matched_events vec earlier than the first stage
+            // (rule order independence + event-delivery race).
+            // `.first()` / `.last()` walked vec order, not time
+            // order — sorting here pins the contract that duration
+            // is the actual chronological window.
+            pc.matched_events.sort_by_key(|e| e.ts);
             let start_ts = pc.matched_events.first().map(|e| e.ts).unwrap_or(now);
             let last_ts = pc.matched_events.last().map(|e| e.ts).unwrap_or(now);
 
@@ -2143,6 +2156,57 @@ mod tests {
         // Should have started CL-001 and CL-004 (both start with firmware.*)
         assert!(engine.pending_count() >= 1);
         assert!(engine.drain_completed().is_empty());
+    }
+
+    /// 2026-05-08 anchor (fix/chains-tab-honesty-bundle): when the
+    /// engine completes a chain whose stage events arrived in the
+    /// `matched_events` vec out of chronological order (rule order
+    /// independence + event-delivery race), the duration in the
+    /// summary string MUST NOT go negative. Operator's prod
+    /// 2026-05-08 dashboard had multiple chains with summaries like
+    /// `"...: 2 stages across 1 layers in -2s"`. The fix sorts
+    /// `matched_events` by `ts` before computing `start_ts` and
+    /// `last_ts` so the duration is the actual chronological window.
+    #[test]
+    fn complete_chain_summary_duration_is_nonnegative_with_out_of_order_stage_events() {
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.1";
+        let later = Utc::now();
+        let earlier = later - chrono::Duration::seconds(10);
+
+        // Feed stage 2's event FIRST (earlier in time), then stage 1
+        // arriving LATER but with an EARLIER timestamp. The ordering
+        // here mimics what happens when events of the same logical
+        // attack arrive on parallel channels and the second one to
+        // be observed has the earlier wall-clock ts.
+        let mut e2 = make_event_at(Layer::Userspace, "ssh_bruteforce", ip, later);
+        e2.severity = Severity::High;
+        engine.observe(make_event_at(Layer::Network, "port_scan", ip, later));
+        let _ = engine.drain_completed();
+        engine.observe(make_event_at(
+            Layer::Network,
+            "data_exfiltration",
+            ip,
+            earlier,
+        ));
+
+        for chain in engine.drain_completed() {
+            let secs = (chain.last_ts - chain.start_ts).num_seconds();
+            assert!(
+                secs >= 0,
+                "chain duration MUST NOT go negative — got {} seconds for rule {} \
+                 (summary: {:?})",
+                secs,
+                chain.rule_id,
+                chain.summary
+            );
+            // Summary string must also reflect the non-negative duration.
+            assert!(
+                !chain.summary.contains("in -"),
+                "chain summary must not contain a negative duration token: {:?}",
+                chain.summary
+            );
+        }
     }
 
     #[test]

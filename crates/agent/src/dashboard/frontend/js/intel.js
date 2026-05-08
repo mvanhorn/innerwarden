@@ -290,23 +290,37 @@ async function loadChains() {
       if (status) status.textContent = '0 chains';
       return;
     }
+    // 2026-05-08 (fix/chains-tab-honesty-bundle): severity comes from
+    // the backend lower-cased ("critical"/"high"/...). The previous
+    // filter compared `=== 'Critical'` and `sevRank[c.severity]`
+    // expected capitalised keys — both never matched, so the
+    // "Critical" KPI showed `0` even when the list was full of
+    // critical badges. Normalise via toLowerCase() at every comparison
+    // point.
+    const sevOf = (c) => (c.severity || '').toLowerCase();
+    const criticalCount = data.chains.filter(c => sevOf(c) === 'critical').length;
     let html = `<div class="kpi-grid" style="grid-template-columns:repeat(3,1fr);margin-bottom:16px;">
       <div class="kpi-card"><div class="kpi-value">${data.total}</div><div class="kpi-label">Attack Chains</div></div>
-      <div class="kpi-card"><div class="kpi-value">${data.chains.filter(c=>c.severity==='Critical').length}</div><div class="kpi-label">Critical</div></div>
+      <div class="kpi-card"><div class="kpi-value">${criticalCount}</div><div class="kpi-label">Critical</div></div>
       <div class="kpi-card"><div class="kpi-value">${new Set(data.chains.flatMap(c=>c.layers_involved||[])).size}</div><div class="kpi-label">Layers Involved</div></div>
     </div>`;
     // 2026-05-01 (audit finding 3.4): the chains list rendered every
     // hit individually, producing 100 identical rows when the same
     // rule fired repeatedly ("Data Exfiltration eBPF Sequence: 2
-    // stages 2 layers 5s, 85% confidence, ×100"). Dedup by
-    // `(rule_id, summary)` so each fingerprint shows once with a
-    // multiplicity count and the time range. Operator can still
-    // drill into individual chain_ids by following the link in the
-    // expanded view (future surface — for now the deduplication
-    // alone removes the wall-of-rows complaint).
+    // stages 2 layers 5s, 85% confidence, ×100"). Original dedup
+    // keyed on `(rule_id, summary)` but `summary` includes the
+    // duration ("...in 1s" vs "...in 17s") so the same rule firing
+    // 6 times in 37s rendered as 6 separate groups (operator's prod
+    // 2026-05-08 had `Multi-Persistence Installation` chains
+    // CHAIN-0137-0142+0001 all in one 37-second window).
+    //
+    // 2026-05-08 (fix/chains-tab-honesty-bundle): tighten the dedup
+    // key to `rule_id` ALONE. Same rule firing repeatedly → one
+    // row with `×N` count + the full time range. Operator can still
+    // drill into the sample chain_id when needed.
     const groups = new Map();
     for (const c of data.chains) {
-      const key = (c.rule_id || '') + '|' + (c.summary || '');
+      const key = c.rule_id || '';
       let g = groups.get(key);
       if (!g) {
         g = {
@@ -320,15 +334,17 @@ async function loadChains() {
       }
       g.count += 1;
       // Track most severe colour across the group; Critical > High > Medium > else.
-      const sevRank = { Critical: 4, High: 3, Medium: 2, Low: 1 };
-      if ((sevRank[c.severity] || 0) > (sevRank[g.severity] || 0)) g.severity = c.severity;
+      // Lower-cased keys to match the backend's lower-cased severity.
+      const sevRank = { critical: 4, high: 3, medium: 2, low: 1 };
+      if ((sevRank[sevOf(c)] || 0) > (sevRank[sevOf(g)] || 0)) g.severity = c.severity;
       // Track time range across the group.
       if (c.start_ts) g.first_ts = (!g.first_ts || c.start_ts < g.first_ts) ? c.start_ts : g.first_ts;
       if (c.last_ts)  g.last_ts  = (!g.last_ts  || c.last_ts  > g.last_ts)  ? c.last_ts  : g.last_ts;
     }
     const grouped = Array.from(groups.values()).sort((a, b) => b.count - a.count);
     for (const g of grouped) {
-      const sevColor = g.severity === 'Critical' ? '#e74c3c' : g.severity === 'High' ? '#f39c12' : '#27ae60';
+      const sev = (g.severity || '').toLowerCase();
+      const sevColor = sev === 'critical' ? '#e74c3c' : sev === 'high' ? '#f39c12' : '#27ae60';
       const layers = (g.layers_involved||[]).map(l=>`<span style="padding:1px 6px;border-radius:3px;background:#1a2634;color:#3498db;font-size:0.65rem;">${l}</span>`).join(' → ');
       const countLabel = g.count > 1 ? ` ×${g.count}` : '';
       const sampleLabel = g.count > 1 ? ` (sample: ${g.first_chain_id})` : ` ${g.first_chain_id}`;

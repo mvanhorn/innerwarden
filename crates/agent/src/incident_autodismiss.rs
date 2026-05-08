@@ -172,6 +172,17 @@ pub(crate) fn try_autodismiss_sensor_self_traffic_fp(
         "composer",
         "mvn",
         "gradle",
+        // 2026-05-08 (fix/chains-tab-honesty-bundle): libcurl in some
+        // package managers / runtimes (apt, snap, pip, snap-update-ns,
+        // chromium) renames its worker thread comm to the URL scheme
+        // (`http`, `https`) at connect time. The kill_chain detector
+        // captures THAT thread name, not the parent process name.
+        // Operator's prod 2026-05-08 dashboard had multiple
+        // `kill_chain DATA_EXFIL (PID NNNN, https) <cloud-IP>` rows
+        // surfacing as Critical because comm=https wasn't in this
+        // list. Both schemes added.
+        "http",
+        "https",
     ];
     let detector = detector_from_incident_id(&incident.incident_id);
     if !SENSOR_NSS_INIT_DETECTORS.contains(&detector) {
@@ -232,13 +243,26 @@ pub(crate) fn try_autodismiss_sensor_self_traffic_fp(
             //   * pattern == DATA_EXFIL (not C2_BEACON, not PRIVESC)
             //   * chain_bits exact = [socket, sensitive_read] (no
             //     escalation, no privesc, no c2_callback)
-            //   * c2_port == 0 (the kill_chain didn't observe an
-            //     attacker-flavored connect; just any outbound)
+            //   * destination is operator-self-traffic — either a
+            //     cloud_safelisted IP (the agent's own gate would
+            //     refuse to autoblock it anyway) OR `c2_port == 0`
+            //     (the kill_chain didn't observe an attacker-flavored
+            //     connect, classic NSS-init signature with port 0).
             //
-            // Real exfil chains pick up additional bits before
-            // emitting (privesc, c2_callback, lateral_move). A bare
-            // 2-bit chain on a known-fetcher comm is the wget/curl/
-            // apt/cargo startup pattern.
+            // 2026-05-08 (fix/chains-tab-honesty-bundle): the original
+            // PR #491 condition required `c2_port == 0` — which only
+            // covered the wget+/etc/passwd shape. Operator's prod
+            // 2026-05-08 had `kill_chain DATA_EXFIL (PID NNN, https)
+            // <cloud-IP>` rows surfacing as Critical because the
+            // libcurl-thread-renamed comm + HTTPS port 443 escaped
+            // both halves of the original gate. Adding cloud_safelist
+            // as the OR branch catches every operator outbound to
+            // cloud edges (apt, snap, cargo registry, GitHub release,
+            // ip-api enrichment, etc.) without weakening the real-
+            // attacker shape: real exfil chains pick up additional
+            // chain_bits (privesc / c2_callback / lateral_move)
+            // before emitting, so the bare-2-bit gate still rejects
+            // them.
             let pattern = evidence
                 .get("pattern")
                 .and_then(|v| v.as_str())
@@ -260,7 +284,15 @@ pub(crate) fn try_autodismiss_sensor_self_traffic_fp(
                     .get("c2_port")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
-                chain_bits_exact && c2_port == 0
+                let c2_ip = evidence
+                    .get("c2_ip")
+                    .or_else(|| evidence.get("dst_ip"))
+                    .or_else(|| evidence.get("target_ip"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let dest_is_cloud_safelisted =
+                    !c2_ip.is_empty() && crate::cloud_safelist::is_cloud_provider_ip(c2_ip);
+                chain_bits_exact && (c2_port == 0 || dest_is_cloud_safelisted)
             }
         }
         _ => false,
@@ -1182,6 +1214,60 @@ mod tests {
         assert!(
             !dismissed,
             "kill_chain with c2_port != 0 must reach AI router (attacker-flagged port)"
+        );
+    }
+
+    /// 2026-05-08 anchor (fix/chains-tab-honesty-bundle): the
+    /// extended kill_chain DATA_EXFIL suppression also dismisses
+    /// when `c2_ip` is in cloud_safelist, regardless of c2_port.
+    /// Operator's prod 2026-05-08 dashboard had `kill_chain DATA_EXFIL
+    /// (PID NNN, https) <Azure/AWS-IP>` rows still surfacing as
+    /// Critical because PR #491 required `c2_port == 0` strictly.
+    /// The HTTPS / HTTP / SSH operator-self-traffic path uses ports
+    /// 443/80/22 — not 0 — so the original gate missed them.
+    /// Pin the new branch: bare-2-bit chain on a fetcher comm to a
+    /// cloud-safelisted IP (with non-zero c2_port) is dismissed.
+    #[test]
+    fn try_autodismiss_sensor_self_traffic_fp_dismisses_kill_chain_https_to_cloud_safelisted_ip() {
+        crate::cloud_safelist::init();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        // Microsoft Azure UK (the prod IP we worked on this morning).
+        let inc = make_kill_chain_data_exfil_incident(
+            "https",
+            &["socket", "sensitive_read"],
+            "20.26.156.215",
+            443, // non-zero port — the case the original PR #491 missed
+        );
+        let dismissed = try_autodismiss_sensor_self_traffic_fp(&inc, &mut state);
+        assert!(
+            dismissed,
+            "kill_chain DATA_EXFIL on cloud-safelisted IP MUST be auto-dismissed \
+             even when c2_port != 0 (the prod regression IP shape)"
+        );
+    }
+
+    /// Mirror anchor: the same bare-2-bit shape to a NON-safelisted
+    /// real-attacker IP with non-zero c2_port still escapes the
+    /// suppression. Pins the gate so the cloud_safelist OR-branch
+    /// doesn't accidentally swallow real attackers.
+    #[test]
+    fn try_autodismiss_sensor_self_traffic_fp_does_not_dismiss_kill_chain_real_attacker_ip() {
+        crate::cloud_safelist::init();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        // TEST-NET-3 (RFC 5737) — real attacker test IP, never on a CDN.
+        let inc = make_kill_chain_data_exfil_incident(
+            "https",
+            &["socket", "sensitive_read"],
+            "203.0.113.42",
+            443,
+        );
+        let dismissed = try_autodismiss_sensor_self_traffic_fp(&inc, &mut state);
+        assert!(
+            !dismissed,
+            "kill_chain DATA_EXFIL to non-cloud-safelisted IP with non-zero \
+             c2_port MUST reach AI router (this is the real attacker shape)"
         );
     }
 
