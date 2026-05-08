@@ -885,6 +885,16 @@ PR #492 closed the write-side of the inline-decision-vs-AI-router race so no new
 - `crates/agent/src/dashboard/intelligence.rs::tests::enrich_with_cloud_provider_tags_known_clouds_and_leaves_others_null` — `enrich_with_cloud_provider` adds `cloud_provider = Some(label)` for AWS / Azure / Cloudflare IPs (uses the prod-data IPs `34.253.181.30`, `20.26.156.215`, `104.26.12.38`) and `null` for real attacker IPs. Pins the contract that the dashboard view never disagrees with the autoblock gate.
 - `crates/agent/src/dashboard/intelligence.rs::tests::enrich_then_filter_exclude_cloud_drops_only_cloud_rows` — when the API caller passes `?exclude_cloud=true`, the response retains only rows where `cloud_provider` is null. Pins the operator-opt-in filter so the page can render a clean "real attackers only" view without losing the underlying data (the unfiltered view stays available by default).
 
+### ASN-cluster geo consolidation (fix/profiles-asn-geo-consolidation — 2026-05-08)
+
+Operator's prod audit 2026-05-08 found `92.118.39.23` listed as **US** while its five ASN-siblings `92.118.39.{195,196,197,235,236}` (all `AS47890 Unmanaged LTD` / Hosting24 NL bulletproof) listed as **NL**. Same ASN + same ISP + different country = ip-api.com returned bad data for the outlier at first-seen, and the agent never re-queried (`backfill_enrichment` only fills `geo.is_none()` profiles, not stale ones). The dashboard rendered the outlier under a US flag, contradicting the four siblings on the same page.
+
+The fix consolidates at READ time inside `api_attacker_profiles`. When ≥3 profiles share an ASN AND ≥80% agree on a country, outlier profiles get their `geo.country_code` / `geo.country` rewritten to the majority and marked with `geo_consolidated_from_asn = true` so the dashboard / API consumer can surface the override. The persisted JSON keeps the original lookup for forensic record. Threshold ≥80% prevents over-correction on legitimately multi-region ASNs (AWS / GCP).
+
+- `crates/agent/src/dashboard/intelligence.rs::tests::consolidate_geo_by_asn_overrides_outlier_country_in_clear_majority_asn` — uses the exact prod-audit scenario (4×NL + 1×US in `AS47890`) to pin the override + flag contract. The outlier US is rewritten to NL, the four siblings stay untouched, and only the overridden profile carries the `geo_consolidated_from_asn` flag.
+- `crates/agent/src/dashboard/intelligence.rs::tests::consolidate_geo_by_asn_does_not_consolidate_below_threshold` — an ASN with only 2 profiles is below the `≥3` floor and must NOT trigger the override. Pins the floor that prevents one-off lookups from getting steamrolled by a single sibling.
+- `crates/agent/src/dashboard/intelligence.rs::tests::consolidate_geo_by_asn_keeps_real_split_asns_intact` — a 60/40 split (3 NL + 2 US) in one ASN must stay intact (below the 80% agreement threshold). Pins the over-correction guard so legit multi-country ASNs (AWS / GCP) are not flattened.
+
 ## Adding a new anchor
 
 When fixing a bug that fits any of these shapes, add the anchor here in the same PR:

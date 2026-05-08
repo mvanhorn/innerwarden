@@ -39,7 +39,8 @@ pub(super) async fn api_attacker_profiles(
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
-    let enriched = enrich_with_cloud_provider(profiles);
+    let consolidated = consolidate_geo_by_asn(profiles);
+    let enriched = enrich_with_cloud_provider(consolidated);
     let mut filtered = sort_attacker_profiles(enriched, min_risk, sort);
     if exclude_cloud {
         filtered.retain(|p| p.get("cloud_provider").is_some_and(|v| v.is_null()));
@@ -63,6 +64,141 @@ pub(super) struct AttackerProfilesQuery {
     sort: Option<String>,
     min_risk: Option<u8>,
     exclude_cloud: Option<bool>,
+}
+
+/// Override an outlier profile's `geo.country` / `geo.country_code`
+/// when ≥3 profiles share an ASN AND ≥80% of them agree on a country
+/// that disagrees with this profile's stored value.
+///
+/// 2026-05-08 (fix/profiles-asn-geo-consolidation): operator's prod
+/// audit found `92.118.39.23` listed as US while its five siblings
+/// `92.118.39.{195,196,197,235}` from the SAME `AS47890 Unmanaged LTD`
+/// (Hosting24 NL bulletproof) listed as NL. Same ASN + same ISP +
+/// different country = ip-api.com returned bad data for the outlier
+/// at first-seen time, and the agent never re-queried (the
+/// `backfill_enrichment` slow-loop only fills `geo.is_none()`
+/// profiles, not stale ones).
+///
+/// The fix consolidates at READ time, not WRITE time — the
+/// underlying `attacker-profiles.json` keeps the original lookup
+/// for forensic record. Profiles whose country was overridden carry
+/// `geo_consolidated_from_asn = true` so the dashboard / API
+/// consumer can flag them.
+///
+/// Threshold of 80% agreement (with floor of 3 profiles) avoids
+/// over-correction on multi-region ASNs (e.g. AWS / GCP) where a
+/// real attacker IP genuinely lives in a different country than
+/// the bulk of the ASN's profile set.
+pub(super) fn consolidate_geo_by_asn(
+    mut profiles: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    use std::collections::HashMap;
+
+    // Pass 1: count countries per ASN. We key on the raw ASN string
+    // because that's the only stable identifier the profile carries
+    // (ASN labels include human text like "AS47890 UNMANAGED LTD").
+    let mut asn_country_tally: HashMap<String, HashMap<String, usize>> = HashMap::new();
+    for p in &profiles {
+        let asn = p
+            .get("geo")
+            .and_then(|g| g.get("asn"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let cc = p
+            .get("geo")
+            .and_then(|g| g.get("country_code"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if asn.is_empty() || cc.is_empty() {
+            continue;
+        }
+        *asn_country_tally
+            .entry(asn.to_string())
+            .or_default()
+            .entry(cc.to_string())
+            .or_default() += 1;
+    }
+
+    // Pass 2: for each ASN with ≥3 profiles AND a clear majority
+    // (≥80% agreement), record (majority_cc, majority_country_label).
+    // The country label comes from any one profile that already
+    // has the majority country, so the override carries a
+    // human-readable "Netherlands" not just "NL".
+    let mut asn_majority: HashMap<String, (String, String)> = HashMap::new();
+    for (asn, counts) in &asn_country_tally {
+        let total: usize = counts.values().sum();
+        if total < 3 {
+            continue;
+        }
+        if let Some((winner_cc, winner_count)) = counts.iter().max_by_key(|(_, n)| **n) {
+            if *winner_count * 100 / total >= 80 {
+                // Find a profile in this ASN that already has the
+                // majority country, copy its country label.
+                let label = profiles
+                    .iter()
+                    .find(|p| {
+                        p.get("geo")
+                            .and_then(|g| g.get("asn"))
+                            .and_then(|v| v.as_str())
+                            == Some(asn)
+                            && p.get("geo")
+                                .and_then(|g| g.get("country_code"))
+                                .and_then(|v| v.as_str())
+                                == Some(winner_cc)
+                    })
+                    .and_then(|p| p.get("geo"))
+                    .and_then(|g| g.get("country"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                asn_majority.insert(asn.clone(), (winner_cc.clone(), label));
+            }
+        }
+    }
+
+    // Pass 3: rewrite outlier profiles in-place.
+    for p in &mut profiles {
+        let asn = p
+            .get("geo")
+            .and_then(|g| g.get("asn"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let cc = p
+            .get("geo")
+            .and_then(|g| g.get("country_code"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let Some((majority_cc, majority_label)) = asn_majority.get(&asn) else {
+            continue;
+        };
+        if cc == *majority_cc {
+            continue;
+        }
+        // Rewrite this profile's country to the ASN majority and
+        // mark the override so consumers know.
+        if let Some(geo) = p.get_mut("geo").and_then(|v| v.as_object_mut()) {
+            geo.insert(
+                "country_code".to_string(),
+                serde_json::Value::String(majority_cc.clone()),
+            );
+            if !majority_label.is_empty() {
+                geo.insert(
+                    "country".to_string(),
+                    serde_json::Value::String(majority_label.clone()),
+                );
+            }
+        }
+        if let Some(obj) = p.as_object_mut() {
+            obj.insert(
+                "geo_consolidated_from_asn".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+    }
+
+    profiles
 }
 
 /// Add a `cloud_provider` field to every profile in `profiles`.
@@ -877,6 +1013,131 @@ mod tests {
             enriched[3]["cloud_provider"].is_null(),
             "203.0.113.42 (real-attacker test net) must have null cloud_provider"
         );
+    }
+
+    /// 2026-05-08 anchor (fix/profiles-asn-geo-consolidation): the
+    /// exact prod-audit scenario. AS47890 (Unmanaged LTD / Hosting24
+    /// NL bulletproof) had five profiles on the operator's box —
+    /// `92.118.39.{195,196,197,235}` correctly tagged NL, but
+    /// `92.118.39.23` showed US (ip-api.com returned bad data at
+    /// first-seen and the agent never re-queried). Pin the
+    /// consolidation that overrides the outlier US to NL, sets
+    /// `geo_consolidated_from_asn = true`, and leaves untouched
+    /// profiles alone.
+    #[test]
+    fn consolidate_geo_by_asn_overrides_outlier_country_in_clear_majority_asn() {
+        let profiles = vec![
+            // Outlier — wrong country.
+            serde_json::json!({
+                "ip": "92.118.39.23",
+                "geo": {"country": "United States", "country_code": "US",
+                        "city": "?", "isp": "Unmanaged LTD",
+                        "asn": "AS47890 UNMANAGED LTD"}
+            }),
+            // Four siblings agreeing on NL.
+            serde_json::json!({
+                "ip": "92.118.39.195",
+                "geo": {"country": "Netherlands", "country_code": "NL",
+                        "city": "Amsterdam", "isp": "Unmanaged LTD",
+                        "asn": "AS47890 UNMANAGED LTD"}
+            }),
+            serde_json::json!({
+                "ip": "92.118.39.196",
+                "geo": {"country": "Netherlands", "country_code": "NL",
+                        "city": "Amsterdam", "isp": "Unmanaged LTD",
+                        "asn": "AS47890 UNMANAGED LTD"}
+            }),
+            serde_json::json!({
+                "ip": "92.118.39.197",
+                "geo": {"country": "Netherlands", "country_code": "NL",
+                        "city": "Amsterdam", "isp": "Unmanaged LTD",
+                        "asn": "AS47890 UNMANAGED LTD"}
+            }),
+            serde_json::json!({
+                "ip": "92.118.39.235",
+                "geo": {"country": "Netherlands", "country_code": "NL",
+                        "city": "Amsterdam", "isp": "Unmanaged LTD",
+                        "asn": "AS47890 UNMANAGED LTD"}
+            }),
+        ];
+        let consolidated = consolidate_geo_by_asn(profiles);
+        let outlier = consolidated
+            .iter()
+            .find(|p| p["ip"] == "92.118.39.23")
+            .unwrap();
+        assert_eq!(
+            outlier["geo"]["country_code"], "NL",
+            "outlier US must be overridden to ASN-majority NL"
+        );
+        assert_eq!(outlier["geo"]["country"], "Netherlands");
+        assert_eq!(
+            outlier["geo_consolidated_from_asn"], true,
+            "overridden profile must carry the consolidation flag"
+        );
+        // Sibling profiles must NOT carry the flag (no override).
+        let sibling = consolidated
+            .iter()
+            .find(|p| p["ip"] == "92.118.39.195")
+            .unwrap();
+        assert!(
+            sibling.get("geo_consolidated_from_asn").is_none()
+                || sibling["geo_consolidated_from_asn"] != true,
+            "non-outlier profile must not carry consolidation flag"
+        );
+    }
+
+    /// Anti-regression: an ASN with only 2 profiles is BELOW the
+    /// `>=3` minimum and must NOT trigger consolidation. Pins the
+    /// floor that prevents one-off lookups (e.g. a single outbound
+    /// from a low-volume IP) from getting steamrolled by another
+    /// IP that happens to share the ASN.
+    #[test]
+    fn consolidate_geo_by_asn_does_not_consolidate_below_threshold() {
+        let profiles = vec![
+            serde_json::json!({
+                "ip": "1.2.3.4",
+                "geo": {"country": "US", "country_code": "US",
+                        "city": "?", "isp": "X", "asn": "AS1 X"}
+            }),
+            serde_json::json!({
+                "ip": "1.2.3.5",
+                "geo": {"country": "Netherlands", "country_code": "NL",
+                        "city": "?", "isp": "X", "asn": "AS1 X"}
+            }),
+        ];
+        let consolidated = consolidate_geo_by_asn(profiles);
+        // Both profiles unchanged.
+        assert_eq!(consolidated[0]["geo"]["country_code"], "US");
+        assert_eq!(consolidated[1]["geo"]["country_code"], "NL");
+        for p in &consolidated {
+            assert!(
+                p.get("geo_consolidated_from_asn").is_none()
+                    || p["geo_consolidated_from_asn"] != true,
+                "below-threshold ASN must not trigger consolidation"
+            );
+        }
+    }
+
+    /// Anti-regression: a multi-region ASN (e.g. AWS) with split
+    /// 60/40 country mix must NOT be consolidated — the 80%
+    /// agreement threshold prevents the override. Pins the
+    /// over-correction guard for legitimate multi-country ASNs.
+    #[test]
+    fn consolidate_geo_by_asn_keeps_real_split_asns_intact() {
+        let profiles = vec![
+            // 3 NL + 2 US — 60% agreement, below the 80% floor.
+            serde_json::json!({"ip": "1.1.1.1", "geo": {"country_code": "NL", "country": "NL", "asn": "AS9 SPLIT"}}),
+            serde_json::json!({"ip": "1.1.1.2", "geo": {"country_code": "NL", "country": "NL", "asn": "AS9 SPLIT"}}),
+            serde_json::json!({"ip": "1.1.1.3", "geo": {"country_code": "NL", "country": "NL", "asn": "AS9 SPLIT"}}),
+            serde_json::json!({"ip": "1.1.1.4", "geo": {"country_code": "US", "country": "US", "asn": "AS9 SPLIT"}}),
+            serde_json::json!({"ip": "1.1.1.5", "geo": {"country_code": "US", "country": "US", "asn": "AS9 SPLIT"}}),
+        ];
+        let consolidated = consolidate_geo_by_asn(profiles);
+        let us_count = consolidated
+            .iter()
+            .filter(|p| p["geo"]["country_code"] == "US")
+            .count();
+        assert_eq!(us_count, 2, "60/40 split must NOT be consolidated");
     }
 
     /// Mirror anchor: when `?exclude_cloud=true` is passed, the API
