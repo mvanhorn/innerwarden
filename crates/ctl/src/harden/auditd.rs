@@ -161,10 +161,31 @@ pub(super) fn check_auditd(env: &impl HardenEnv) -> CheckResult {
              Recipe + full ruleset: https://github.com/InnerWarden/innerwarden/wiki/Operations#auditd\n\
              Missing rules:"
         ));
+        // 2026-05-09 prod fix: the suggestion line used to prefix every
+        // fragment with `-a always,exit -F arch=b64 …`, which is correct
+        // for syscall rules (`-S execve`) but auditctl rejects when
+        // mixed with watch rules (`-w /etc/passwd`) because watch and
+        // syscall are different rule families ("watch option can't be
+        // given with a syscall"). Operator copy-pasted the suggestions
+        // from `harden --verbose` and got 9/10 rules silently rejected.
+        // The fix: detect the rule family per fragment and emit the
+        // canonical install line for each.
         for (rule_fragment, title, _description) in &missing_rules {
-            fix.push_str(&format!(
-                "\n   • {title}:  -a always,exit -F arch=b64 {rule_fragment} -k innerwarden"
-            ));
+            let install_line = if rule_fragment.starts_with("-w ") {
+                // Watch rule. If the fragment already specifies `-p` (e.g.
+                // `-w /tmp -p x`), keep it; otherwise default to `wa`
+                // (write+attribute) which is the canonical permission
+                // set for /etc/passwd-style files.
+                if rule_fragment.contains(" -p ") {
+                    format!("{rule_fragment} -k innerwarden")
+                } else {
+                    format!("{rule_fragment} -p wa -k innerwarden")
+                }
+            } else {
+                // Syscall rule.
+                format!("-a always,exit -F arch=b64 {rule_fragment} -k innerwarden")
+            };
+            fix.push_str(&format!("\n   • {title}:  {install_line}"));
         }
 
         findings.push(Finding {
@@ -391,6 +412,70 @@ mod tests {
             "fix must mention augenrules reload, got: {}",
             f.fix
         );
+    }
+
+    /// 2026-05-09 prod anchor: the previous suggestion line mixed
+    /// `-w` (watch) and `-a … -F arch=b64 -S` (syscall) prefixes,
+    /// which auditctl rejects with "watch option can't be given with
+    /// a syscall". Operator copy-pasted the suggestions from
+    /// `harden --verbose` → 9/10 rules silently rejected on load.
+    /// Anchor that watch fragments emit watch-form lines (with `-p`
+    /// permission) and syscall fragments emit `-a always,exit -F
+    /// arch=b64 …` lines. Auditctl must accept every emitted line.
+    #[test]
+    fn check_auditd_missing_rules_emits_valid_auditctl_syntax() {
+        let env = MockEnv {
+            auditd_installed: true,
+            auditd_active: true,
+            rules_content: "".to_string(),
+        };
+        let res = check_auditd(&env);
+        let f = res
+            .findings
+            .iter()
+            .find(|f| f.title.contains("rules missing"))
+            .expect("missing-rules finding");
+
+        // Watch fragments (path-based) must NOT carry `-a always,exit`
+        // — that prefix is the syscall family and auditctl rejects
+        // mixing them with `-w`.
+        for path in [
+            "-w /etc/passwd",
+            "-w /etc/shadow",
+            "-w /etc/sudoers",
+            "-w /etc/cron",
+            "-w /etc/ssh",
+        ] {
+            // Locate the bullet line for this path and check it does
+            // not contain the syscall prefix.
+            let line =
+                f.fix.lines().find(|l| l.contains(path)).unwrap_or_else(|| {
+                    panic!("expected {path} to appear in fix text, got: {}", f.fix)
+                });
+            assert!(
+                !line.contains("-a always,exit"),
+                "watch rule for {path} must NOT carry the syscall prefix \
+                 (auditctl rejects `-a … -w`). got line: {line}"
+            );
+            assert!(
+                line.contains("-p "),
+                "watch rule for {path} must include a `-p` permission \
+                 set (default to `-p wa`). got line: {line}"
+            );
+        }
+
+        // Syscall fragments must keep the canonical syscall prefix.
+        for sc in ["-S connect", "-S ptrace", "-S init_module", "-S execve"] {
+            let line =
+                f.fix.lines().find(|l| l.contains(sc)).unwrap_or_else(|| {
+                    panic!("expected {sc} to appear in fix text, got: {}", f.fix)
+                });
+            assert!(
+                line.contains("-a always,exit -F arch=b64"),
+                "syscall rule for {sc} must include `-a always,exit -F arch=b64`. \
+                 got line: {line}"
+            );
+        }
     }
 
     /// Bug 10 anchor (2026-05-06): the previous fix text mentioned

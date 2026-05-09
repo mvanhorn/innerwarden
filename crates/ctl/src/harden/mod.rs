@@ -766,6 +766,92 @@ LISTEN 0 128 :::3307 users:(\"custom\")\n\
             .any(|passed| passed == "Inner Warden agent is active"));
     }
 
+    /// 2026-05-09 prod anchor: on the proprietary watchdog setup the
+    /// agent runs as a child of `innerwarden-watchdog.service` and the
+    /// `innerwarden-agent.service` unit is intentionally disabled, so
+    /// `systemctl is-active innerwarden-agent` returns `inactive` while
+    /// the agent process is alive. Pre-fix the operator's prod harden
+    /// emitted "Inner Warden agent is not running [medium]" while
+    /// pid 868514 was processing events. The fix: when systemctl says
+    /// the agent unit is inactive, also check whether the watchdog is
+    /// active AND a process named `innerwarden-age` is visible to
+    /// pgrep. If both, classify as Active and emit the passed line.
+    #[test]
+    fn check_services_active_when_watchdog_runs_agent_under_disabled_unit() {
+        let env = TestEnv::default()
+            .with_command(
+                "ss",
+                &["-tlnp"],
+                "LISTEN 0 128 0.0.0.0:22 users:(\"sshd\")\n",
+            )
+            // Disabled / inactive unit because watchdog manages the
+            // process directly.
+            .with_command(
+                "systemctl",
+                &["is-active", "innerwarden-agent"],
+                "inactive\n",
+            )
+            // Watchdog itself is the active service.
+            .with_command(
+                "systemctl",
+                &["is-active", "innerwarden-watchdog"],
+                "active\n",
+            )
+            // pgrep finds the agent process (Linux truncates the comm
+            // to 15 chars, so `innerwarden-age` is what `pgrep -x`
+            // matches).
+            .with_command("pgrep", &["-x", "innerwarden-age"], "868514\n");
+
+        let result = check_services(&env);
+
+        assert!(
+            !has_title(&result, "Inner Warden agent is not running"),
+            "2026-05-09 prod regression: harden must not claim the agent \
+             is down when the watchdog is running it"
+        );
+        assert!(
+            result
+                .passed
+                .iter()
+                .any(|p| p == "Inner Warden agent is active"),
+            "watchdog-running case must emit the same passed line as a \
+             plain systemd-active case"
+        );
+    }
+
+    /// Counter-test: when both systemctl (agent unit) AND the watchdog
+    /// say nothing is running AND no agent process is visible, the
+    /// finding is correct and must still fire. Anchors that the
+    /// watchdog promote-to-Active logic does not silently swallow
+    /// genuine "agent down" cases.
+    #[test]
+    fn check_services_finding_when_neither_systemd_nor_watchdog_runs_agent() {
+        let env = TestEnv::default()
+            .with_command(
+                "ss",
+                &["-tlnp"],
+                "LISTEN 0 128 0.0.0.0:22 users:(\"sshd\")\n",
+            )
+            .with_command(
+                "systemctl",
+                &["is-active", "innerwarden-agent"],
+                "inactive\n",
+            )
+            .with_command(
+                "systemctl",
+                &["is-active", "innerwarden-watchdog"],
+                "inactive\n",
+            )
+            .with_command("pgrep", &["-x", "innerwarden-age"], "");
+
+        let result = check_services(&env);
+
+        assert!(
+            has_title(&result, "Inner Warden agent is not running"),
+            "agent genuinely down → finding must fire"
+        );
+    }
+
     /// Bug 8 anchor (2026-05-06): when the operator's session lacks
     /// `DBUS_SESSION_BUS_ADDRESS`, `systemctl is-active` prints
     /// `unknown` to stdout while the agent is in fact alive. Harden

@@ -79,8 +79,42 @@ pub(super) fn check_services(env: &impl HardenEnv) -> CheckResult {
     // health section uses telemetry-freshness to answer the question
     // honestly. Producing a false "is not running" finding here
     // double-tanks the score in that case.
+    //
+    // 2026-05-09 prod fix: the proprietary `innerwarden-watchdog`
+    // setup runs the agent as a child process (not via the
+    // `innerwarden-agent.service` unit, which is intentionally
+    // disabled in that mode). On those hosts `systemctl is-active
+    // innerwarden-agent` returns `inactive`, the harden classifier
+    // calls it Inactive, and the score gets penalised even though
+    // the agent is alive. Pre-fix: operator's prod harden output
+    // emitted "Inner Warden agent is not running [medium]" while
+    // pid 868514 was processing events under the watchdog wrap.
+    //
+    // The fix probes a second source of truth: if the watchdog
+    // service is active AND a process named `innerwarden-agent` is
+    // visible in `pgrep`, treat that as Active. Only when systemd
+    // says inactive AND watchdog is missing AND no agent process is
+    // running do we emit the finding.
     let stdout_owned = env.command_stdout("systemctl", &["is-active", "innerwarden-agent"]);
     let presence = classify_service_active(stdout_owned.as_deref());
+    let presence = if presence == ServicePresence::Inactive {
+        // Promote to Active if the watchdog model is in use.
+        let watchdog_stdout =
+            env.command_stdout("systemctl", &["is-active", "innerwarden-watchdog"]);
+        let watchdog_active =
+            classify_service_active(watchdog_stdout.as_deref()) == ServicePresence::Active;
+        let agent_process_alive = env
+            .command_stdout("pgrep", &["-x", "innerwarden-age"])
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if watchdog_active && agent_process_alive {
+            ServicePresence::Active
+        } else {
+            presence
+        }
+    } else {
+        presence
+    };
     match presence {
         ServicePresence::Active => {
             passed.push("Inner Warden agent is active".into());
