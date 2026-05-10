@@ -460,6 +460,7 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             abuseipdb_enabled: cfg.abuseipdb.enabled,
             abuseipdb_auto_block_threshold: cfg.abuseipdb.auto_block_threshold,
             honeypot_mode: cfg.honeypot.mode.clone(),
+            honeypot_port: cfg.honeypot.port,
             telegram_enabled: cfg.telegram.enabled,
             slack_enabled: cfg.slack.enabled,
             cloudflare_enabled: cfg.cloudflare.enabled,

@@ -8,6 +8,7 @@
 //! - `LlmShell` - accepts password auth and serves an AI-backed interactive shell.
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,6 +34,27 @@ const MIN_ATTEMPTS_BEFORE_ACCEPT: usize = 2;
 // be a honeypot". 80 ms is below the 200 ms ssh_interact connection
 // budget but above the floor that line-rate scanners measure.
 const AUTH_REJECT_DELAY_MS: u64 = 80;
+
+/// Spec 046 Phase A.5 — adaptive-accept threshold for human-direct
+/// attackers. A connection that cycles through ≥ this many DISTINCT
+/// passwords is exhibiting interactive guessing behaviour (not
+/// dictionary scanning) and gets accepted on the next attempt
+/// regardless of weakness. Set to 3 because it is the smallest count
+/// that meaningfully discriminates "tried a couple of organisational
+/// guesses" from "single-shot scanner". A bot cycling through a
+/// hardcoded dictionary of size > 3 will hit the KNOWN_WEAK_CREDENTIALS
+/// path first and never reach this branch — so this rule does NOT
+/// double-fire on bots, it only opens the trap for humans.
+///
+/// Strategic note: this threshold is the operator-visible knob that
+/// trades "catch more humans" against "weaker poisoning signal".
+/// Lower → more humans captured but the credential the scanner
+/// records as "valid" becomes whatever they happened to type 3rd
+/// (less coordinated poison). Higher → fewer humans but the
+/// poisoning stays concentrated on the KNOWN_WEAK list. 3 is the
+/// midpoint that catches the obvious cases without diluting the
+/// canonical poison set.
+const MIN_UNIQUE_CREDS_FOR_ADAPTIVE_ACCEPT: usize = 3;
 
 /// Curated list of well-known weak SSH credentials that real Mirai-class
 /// droppers expect to succeed on a compromised IoT/server target. The
@@ -175,6 +197,16 @@ enum HandlerMode {
         accepted_user: Option<String>,
         /// Number of password attempts so far (reject first N before accepting).
         auth_attempt_count: usize,
+        /// Spec 046 Phase A.5 — distinct passwords seen so far on
+        /// this connection. Used by the adaptive-accept rule to
+        /// catch human-direct attackers who try unique credentials
+        /// not on the KNOWN_WEAK list. After
+        /// `MIN_UNIQUE_CREDS_FOR_ADAPTIVE_ACCEPT` distinct entries
+        /// the next attempt accepts regardless of weakness — the
+        /// reasoning is that a connection cycling through ≥3 unique
+        /// guesses is exhibiting human-direct behaviour, not
+        /// dictionary scanning, and we want to capture commands.
+        seen_passwords: HashSet<String>,
         /// Raw bytes buffered since the last newline.
         input_buf: Vec<u8>,
         /// Rolling history of (command, response) pairs sent to the AI as context.
@@ -253,10 +285,13 @@ impl Handler for HoneypotSshHandler {
             HandlerMode::LlmShell {
                 accepted_user,
                 auth_attempt_count,
+                seen_passwords,
                 ..
             } => {
                 *auth_attempt_count += 1;
                 let attempt_n = *auth_attempt_count;
+                seen_passwords.insert(password.to_string());
+                let unique_cred_count = seen_passwords.len();
 
                 // Spec 046 Phase A — tiered acceptance. The shell
                 // door only opens when the connection profile matches
@@ -311,8 +346,27 @@ impl Handler for HoneypotSshHandler {
                         partial_success: false,
                     });
                 }
-                if !is_known_weak_credential(user, password) {
-                    debug!(user, "honeypot: rejected non-weak credential");
+                // Spec 046 Phase A.5 — adaptive accept for human-direct
+                // attackers. If the credential is NOT on the curated
+                // weak list, we still accept when the connection has
+                // shown ≥ MIN_UNIQUE_CREDS_FOR_ADAPTIVE_ACCEPT distinct
+                // passwords — that's the signature of a human typing
+                // org-specific guesses (`Welcome2024!`, `OracleVM!`,
+                // ...). Bots cycling through dictionaries hit
+                // KNOWN_WEAK first and never enter this branch, so
+                // adaptive accept does not double-fire on bots and
+                // does not weaken poisoning of canonical scanner
+                // wordlists. Anchor:
+                // `human_direct_three_unique_creds_opens_shell`.
+                let known_weak = is_known_weak_credential(user, password);
+                let adaptive_accept =
+                    !known_weak && unique_cred_count >= MIN_UNIQUE_CREDS_FOR_ADAPTIVE_ACCEPT;
+                if !known_weak && !adaptive_accept {
+                    debug!(
+                        user,
+                        unique_cred_count,
+                        "honeypot: rejected non-weak credential below adaptive threshold"
+                    );
                     tokio::time::sleep(Duration::from_millis(AUTH_REJECT_DELAY_MS)).await;
                     return Ok(Auth::Reject {
                         proceed_with_methods: Some(MethodSet::all()),
@@ -321,7 +375,10 @@ impl Handler for HoneypotSshHandler {
                 }
                 info!(
                     user,
-                    attempt_n, "honeypot: accepted dropper-style auth (shell open)"
+                    attempt_n,
+                    unique_cred_count,
+                    via_adaptive = adaptive_accept,
+                    "honeypot: accepted dropper-style auth (shell open)"
                 );
                 *accepted_user = Some(user.to_string());
                 Ok(Auth::Accept)
@@ -752,6 +809,7 @@ pub(crate) async fn handle_connection(
             hostname,
             accepted_user: None,
             auth_attempt_count: 0,
+            seen_passwords: HashSet::new(),
             input_buf: Vec::new(),
             history: Vec::new(),
         },
@@ -909,6 +967,7 @@ mod tests {
                 hostname: "srv-prod-01".to_string(),
                 accepted_user: None,
                 auth_attempt_count: 0,
+                seen_passwords: HashSet::new(),
                 input_buf: Vec::new(),
                 history: Vec::new(),
             },
@@ -1041,6 +1100,57 @@ mod tests {
         }
     }
 
+    /// Spec 046 Phase A.5 anchor — adaptive accept on N unique
+    /// passwords. After `MIN_UNIQUE_CREDS_FOR_ADAPTIVE_ACCEPT` (=3)
+    /// distinct passwords on a single connection, the NEXT attempt
+    /// accepts even when the credential is not on the weak list.
+    /// This catches human-direct attackers typing org-specific
+    /// guesses. Must NOT fire on bots cycling through ≥ 3 entries
+    /// of a known dictionary because they hit KNOWN_WEAK first.
+    #[tokio::test]
+    async fn human_direct_three_unique_creds_opens_shell() {
+        let bucket = empty_bucket();
+        let mut h = make_llm_shell_handler(&bucket);
+        // Three distinct non-weak credentials. Last one triggers
+        // adaptive accept (3rd unique cred + past threshold).
+        let creds = [
+            ("ubuntu", "Welcome2024!"),
+            ("ubuntu", "OracleVM!"),
+            ("ubuntu", "Inn3rWarden_admin"),
+        ];
+        let mut last = None;
+        for (u, p) in creds.iter() {
+            last = Some(h.auth_password(u, p).await.unwrap());
+        }
+        match last.unwrap() {
+            Auth::Accept => {} // ok — adaptive branch fired
+            other => panic!(
+                "3rd unique non-weak credential MUST accept via adaptive branch; got {other:?}"
+            ),
+        }
+    }
+
+    /// Spec 046 Phase A.5 anchor — `seen_passwords` deduplicates.
+    /// A connection that submits the SAME wrong cred N times still
+    /// has `unique_cred_count = 1`, so adaptive accept must NOT fire.
+    /// This guards against buggy scanners that retry the same string
+    /// hammering through the gate by accident.
+    #[tokio::test]
+    async fn repeated_same_password_does_not_trigger_adaptive_accept() {
+        let bucket = empty_bucket();
+        let mut h = make_llm_shell_handler(&bucket);
+        // Same non-weak credential 5 times — far above attempt
+        // threshold but only 1 unique credential.
+        for _ in 0..5 {
+            let r = h.auth_password("ubuntu", "MyOrg!2024").await.unwrap();
+            assert!(
+                matches!(r, Auth::Reject { .. }),
+                "repeated same non-weak credential MUST always reject — \
+                 adaptive accept depends on UNIQUE cred count, not attempt count"
+            );
+        }
+    }
+
     /// Spec 046 anchor #5 — Inv. 3 (no count-only acceptance).
     /// Even after many attempts, a non-weak credential MUST stay
     /// rejected. Removing this guard would let an attacker bypass
@@ -1146,11 +1256,16 @@ mod tests {
             other => panic!("under-threshold reject must carry Some(methods); got {other:?}"),
         }
 
-        // Pump past threshold; non-weak credential reject branch.
+        // Pump past threshold while keeping unique_cred_count low so
+        // Phase A.5 adaptive accept does NOT fire — we want the
+        // non-weak reject branch. Using the SAME non-weak placeholder
+        // password keeps `seen_passwords.len() == 2` (admin from r1
+        // above, plus this placeholder), below the
+        // MIN_UNIQUE_CREDS_FOR_ADAPTIVE_ACCEPT threshold.
         for _ in 0..MIN_ATTEMPTS_BEFORE_ACCEPT {
-            let _ = h.auth_password("nobody", "ignore").await.unwrap();
+            let _ = h.auth_password("nobody", "placeholder").await.unwrap();
         }
-        let r3 = h.auth_password("nobody", "qP9wKzLm8ntx").await.unwrap();
+        let r3 = h.auth_password("nobody", "placeholder").await.unwrap();
         match r3 {
             Auth::Reject {
                 proceed_with_methods: Some(methods),
@@ -1246,6 +1361,7 @@ mod tests {
                 hostname: "srv-prod-01".to_string(),
                 accepted_user: Some("root".to_string()),
                 auth_attempt_count: 3,
+                seen_passwords: HashSet::new(),
                 input_buf: Vec::new(),
                 history: Vec::new(),
             },

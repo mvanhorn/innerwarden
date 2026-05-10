@@ -1473,4 +1473,230 @@ mod tests {
         assert!(features.first_seen_age_days >= 9);
         assert_eq!(features.prior_incidents_24h, 0);
     }
+
+    // ── Spec 046 — three real-world scenario integration tests ──
+    //
+    // These boot a fresh always-on listener on an ephemeral port with an
+    // empty blocklist + a noop AI provider, then drive a real russh
+    // client through three attacker profiles. They prove what Phase A
+    // captures (bots with known-weak credentials) and DOCUMENT the
+    // intentional gap (human-direct attackers typing unique creds), so
+    // future PRs that close the gap have a regression line to flip.
+    //
+    // The handle each scenario is "did the russh client successfully
+    // open a session channel after auth?" — the binary signal that
+    // discriminates accept-vs-reject without needing the full LLM
+    // shell roundtrip.
+    //
+    // The noop AI provider returns Ok("") for every chat call. The
+    // fake_shell deterministic path covers the common reconnaissance
+    // commands attackers run; LLM only fires for novel commands. For
+    // these scenarios the LLM never fires (we just open the channel
+    // and close it).
+
+    /// Noop AI provider for scenario tests. Real LLM calls are not
+    /// made — the scenarios assert the auth gate, not the shell I/O.
+    struct ScenarioNoopAi;
+
+    #[async_trait::async_trait]
+    impl ai::AiProvider for ScenarioNoopAi {
+        fn name(&self) -> &'static str {
+            "scenario-noop"
+        }
+        async fn decide(&self, _ctx: &ai::DecisionContext<'_>) -> anyhow::Result<ai::AiDecision> {
+            anyhow::bail!("noop")
+        }
+        async fn chat(&self, _system_prompt: &str, _user_message: &str) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    /// Boot a fresh listener for one scenario. Returns
+    /// (port, blocklist, cancellation_token, listener_join_handle).
+    /// All callers MUST cancel the token + await the handle in the
+    /// same `tokio::test` (drop alone leaks the listener task).
+    async fn boot_scenario_listener(
+        data_dir: std::path::PathBuf,
+    ) -> (
+        u16,
+        Arc<Mutex<HashSet<String>>>,
+        tokio_util::sync::CancellationToken,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let port = unused_local_port();
+        let blocklist = Arc::new(Mutex::new(HashSet::new()));
+        let token = tokio_util::sync::CancellationToken::new();
+        let token_for_task = token.clone();
+        let bl = blocklist.clone();
+        let ai: Arc<dyn ai::AiProvider> = Arc::new(ScenarioNoopAi);
+        let handle = tokio::spawn(async move {
+            run_always_on_honeypot(
+                port,
+                "127.0.0.1".to_string(),
+                10, // generous max_auth_attempts
+                bl,
+                Some(ai),                    // LlmShell needs an AI provider
+                None,                        // telegram_client
+                Arc::new(AtomicU64::new(0)), // gate_suppressed_counter
+                None,                        // abuseipdb_client
+                0,                           // abuseipdb_threshold (off)
+                data_dir,
+                None,  // sqlite_store
+                false, // responder_enabled — no auto-block
+                true,  // dry_run
+                "ufw".to_string(),
+                vec![],                  // allowed_skills
+                "llm_shell".to_string(), // <-- LlmShell mode
+                token_for_task,
+            )
+            .await;
+        });
+        (port, blocklist, token, handle)
+    }
+
+    /// Drive one scenario: connect via russh client, try each password
+    /// in order, return Ok(accepted_password) on first success or
+    /// Err(()) if all rejected. Caller controls the password list.
+    async fn drive_scenario(port: u16, username: &str, passwords: &[&str]) -> Result<String, ()> {
+        let addr = format!("127.0.0.1:{port}");
+        // Wait for the listener to bind.
+        for _ in 0..20 {
+            if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let mut client = russh::client::connect(
+            Arc::new(russh::client::Config::default()),
+            addr.as_str(),
+            AcceptAnyServerKey,
+        )
+        .await
+        .expect("scenario client should connect");
+        for pw in passwords {
+            let auth = client
+                .authenticate_password(username, *pw)
+                .await
+                .expect("auth response");
+            if auth.success() {
+                let _ = client
+                    .disconnect(russh::Disconnect::ByApplication, "test ok", "")
+                    .await;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(1), client).await;
+                return Ok((*pw).to_string());
+            }
+        }
+        let _ = client
+            .disconnect(russh::Disconnect::ByApplication, "all rejected", "")
+            .await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), client).await;
+        Err(())
+    }
+
+    /// Scenario A — Mirai-class bot.
+    /// Tries 3 garbage passwords, then `admin` on attempt 3.
+    /// `admin/admin` is on KNOWN_WEAK_CREDENTIALS.
+    /// Expected on Phase A: ACCEPT on attempt 3 (the wow moment).
+    #[tokio::test]
+    async fn scenario_a_mirai_bot_with_known_weak_password_opens_shell() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (port, _bl, token, handle) = boot_scenario_listener(dir.path().to_path_buf()).await;
+
+        let result = drive_scenario(port, "admin", &["password123", "qwerty789", "admin"]).await;
+
+        token.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+
+        let accepted = result.expect(
+            "Mirai-class scenario MUST accept admin/admin on attempt 3 — \
+             this is the wow path Spec 046 Phase A is built for",
+        );
+        assert_eq!(
+            accepted, "admin",
+            "Mirai-class bot must succeed on the well-known cred admin/admin"
+        );
+    }
+
+    /// Scenario B — Root brute bot. Tries 2 garbage passwords, then
+    /// `root` on attempt 3. `root/root` is on KNOWN_WEAK_CREDENTIALS.
+    #[tokio::test]
+    async fn scenario_b_root_brute_bot_with_known_weak_password_opens_shell() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (port, _bl, token, handle) = boot_scenario_listener(dir.path().to_path_buf()).await;
+
+        let result = drive_scenario(port, "root", &["abc123", "iloveyou", "root"]).await;
+
+        token.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+
+        let accepted = result.expect("root/root scenario must succeed on attempt 3");
+        assert_eq!(accepted, "root");
+    }
+
+    /// Scenario C — Human-direct attacker. Three unique passwords,
+    /// NONE on KNOWN_WEAK_CREDENTIALS (org-specific guesses). Spec
+    /// 046 Phase A.5 closes this: after MIN_UNIQUE_CREDS_FOR_ADAPTIVE_ACCEPT
+    /// (= 3) distinct creds on a single connection, the next attempt
+    /// accepts via the adaptive branch. The 3rd attempt here triggers
+    /// the rule (3 distinct entries seen → adaptive accept).
+    #[tokio::test]
+    async fn scenario_c_human_direct_three_unique_creds_opens_shell_via_adaptive_accept() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (port, _bl, token, handle) = boot_scenario_listener(dir.path().to_path_buf()).await;
+
+        let result = drive_scenario(
+            port,
+            "ubuntu",
+            &["Welcome2024!", "OracleVM!", "Inn3rWarden_admin"],
+        )
+        .await;
+
+        token.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+
+        let accepted = result.expect(
+            "Spec 046 Phase A.5 — human-direct attacker with 3 unique creds \
+             MUST open shell on the 3rd attempt. If this fails, adaptive accept \
+             regressed — re-check MIN_UNIQUE_CREDS_FOR_ADAPTIVE_ACCEPT and the \
+             `seen_passwords` set in HandlerMode::LlmShell.",
+        );
+        assert_eq!(
+            accepted, "Inn3rWarden_admin",
+            "adaptive accept should fire on the 3rd unique credential"
+        );
+    }
+
+    /// Scenario C-anti — Human attacker who repeats the SAME wrong
+    /// credential 5 times must NOT open shell. Otherwise a buggy
+    /// scanner stuck in a retry loop would defeat the trap. The
+    /// adaptive rule depends on UNIQUE creds, not attempt count.
+    #[tokio::test]
+    async fn scenario_c_anti_repeated_same_password_does_not_open_shell() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (port, _bl, token, handle) = boot_scenario_listener(dir.path().to_path_buf()).await;
+
+        // Same non-weak credential 5 times. unique_cred_count stays 1.
+        let result = drive_scenario(
+            port,
+            "ubuntu",
+            &[
+                "MyOrg!2024",
+                "MyOrg!2024",
+                "MyOrg!2024",
+                "MyOrg!2024",
+                "MyOrg!2024",
+            ],
+        )
+        .await;
+
+        token.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+
+        assert!(
+            result.is_err(),
+            "Adaptive accept must depend on UNIQUE creds, not attempt count. \
+             A buggy scanner repeating the same wrong password 5× must NOT \
+             trigger shell open."
+        );
+    }
 }

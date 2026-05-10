@@ -52,14 +52,39 @@ pub(super) fn llm_unavailable_error(feature: &str) -> serde_json::Value {
 /// (Home briefing, Threats explain, Telegram /ask) speak in one voice,
 /// layered with the plain-English simplification guidance.
 pub(super) fn explain_system_prompt(personality: &str) -> String {
-    let simplifier = "FORMAT: you are explaining one incident to the operator. \
-        Base your answer strictly on the incident data provided. \
-        2-3 sentences. No jargon. No generic advice. \
-        Only call it dangerous if the attacker got past initial contact \
-        (successful authentication, shell access, data exfil).";
+    // Feynman-style explainer (Spec 046 follow-up, 2026-05-10).
+    // Operator complaint: AI explanations were either "No data found"
+    // or generic 2-sentence summaries that didn't help a non-technical
+    // person understand "is this scary or not?". Feynman technique:
+    // explain by analogy + tell the story + answer the worry directly.
+    let simplifier = "FORMAT — Feynman technique:\n\
+        1. STORY (1-2 sentences): tell what happened as a story. \
+           Use a real-world analogy where useful (a fake door, a wrong key, \
+           someone shouting gibberish through a mailbox). Be SPECIFIC about what \
+           the attacker actually did, in plain language a non-technical person \
+           understands. NEVER start with jargon like 'proto_anomaly' or 'TCP'.\n\
+        2. WHY IT HAPPENED (1 sentence): explain WHY this is in the operator's \
+           threat list. Was it caught by a honeypot? A real service? A dropper bot? \
+           A scanner? Help them know if this is a known class of noise or a \
+           real threat.\n\
+        3. THREAT VERDICT (1 sentence): answer 'should I worry?' directly. \
+           Only call it dangerous if the attacker got past initial contact \
+           (successful auth, shell access, data exfil). Probes that fail at \
+           the door are NOISE — say so plainly. If it's noise, also say what \
+           WOULD make this concerning (e.g., 'come back to worry only if this IP \
+           also shows up in <other detector>').\n\n\
+        Constraints: total length 4-6 sentences. No bullet points. No markdown. \
+        Base your story strictly on the incident data provided — no invented \
+        details. If the data says 'malformed SSH banner', do not say 'tried \
+        admin/admin' (that's a different attack). When the incident hit the \
+        honeypot port (the operator-controlled trap), say so explicitly — \
+        that's the wow moment.";
     if personality.trim().is_empty() {
         format!(
-            "You are a security assistant explaining threats to a non-technical person.\n\n{simplifier}"
+            "You are a security guide explaining threats to a non-technical \
+             person who runs InnerWarden on their own server. Your job is to \
+             make them feel oriented: did something bad happen, what was it, \
+             and what (if anything) they should do.\n\n{simplifier}"
         )
     } else {
         format!("{}\n\n{simplifier}", personality.trim_end())
@@ -1478,97 +1503,25 @@ pub(super) async fn api_ai_explain(
 
     // Build context from the knowledge graph: incidents, decisions,
     // events linked to this entity. Keep it compact for the LLM.
-    let context = {
-        use crate::knowledge_graph::types::*;
-        let graph = state.knowledge_graph.read().unwrap();
-
-        // Find the entity node
-        let target_node = match subject_type {
-            "ip" => graph
-                .nodes_of_type(NodeType::Ip)
-                .iter()
-                .find(|&&id| {
-                    matches!(graph.get_node(id), Some(Node::Ip { addr, .. }) if addr == subject_value)
-                })
-                .copied(),
-            _ => None,
-        };
-
-        let Some(node_id) = target_node else {
-            return Json(serde_json::json!({
-                "explanation": format!("No data found for {} '{}'.", subject_type, subject_value)
-            }));
-        };
-
-        // Collect incidents linked to this entity
-        let mut incident_lines: Vec<String> = Vec::new();
-        let mut decision_lines: Vec<String> = Vec::new();
-
-        for edge in graph.incoming_edges(node_id) {
-            if edge.relation != Relation::TriggeredBy {
-                continue;
-            }
-            if let Some(Node::Incident {
-                detector,
-                severity,
-                title,
-                summary,
-                decision,
-                decision_reason,
-                research_only,
-                auto_executed,
-                ts,
-                ..
-            }) = graph.get_node(edge.from)
-            {
-                if *research_only {
-                    continue;
-                }
-                incident_lines.push(format!(
-                    "- [{}] {}: {} (detector: {}, ts: {})",
-                    severity.to_uppercase(),
-                    title,
-                    summary,
-                    detector,
-                    ts.format("%H:%M:%S")
-                ));
-                if let Some(dec) = decision {
-                    let reason = decision_reason.as_deref().unwrap_or("no reason recorded");
-                    let executed = if *auto_executed {
-                        "executed"
-                    } else {
-                        "recommended"
-                    };
-                    decision_lines.push(format!("- AI {} {}: {}", executed, dec, reason));
-                }
-            }
+    //
+    // Spec 046 follow-up (2026-05-10): operator surfaced an IP that
+    // existed in incidents but NOT as a `Node::Ip` in the KG, hitting
+    // the "No data found" fallback even though there was real
+    // incident data to explain. The fix: when the KG lookup misses,
+    // walk the incident nodes directly and pick up any incident whose
+    // entities list includes this IP. That covers the gap caused by
+    // the IP not being graph-promoted yet (e.g., ephemeral connections
+    // that never reached the per-IP enrichment phase).
+    let context = match build_explain_context(
+        &state.knowledge_graph.read().unwrap(),
+        subject_type,
+        subject_value,
+        state.action_cfg.honeypot_port,
+    ) {
+        ExplainContext::Built(s) => s,
+        ExplainContext::NoData(msg) => {
+            return Json(serde_json::json!({ "explanation": msg }));
         }
-
-        // Count events
-        let event_count = graph
-            .all_edges(node_id)
-            .iter()
-            .filter(|e| e.relation == Relation::ConnectedTo || e.relation == Relation::AcceptedFrom)
-            .count();
-
-        format!(
-            "Entity: {} {}\nEvent count: {}\n\nIncidents ({}):\n{}\n\nAI Decisions ({}):\n{}",
-            subject_type,
-            subject_value,
-            event_count,
-            incident_lines.len(),
-            if incident_lines.is_empty() {
-                "None".to_string()
-            } else {
-                incident_lines.join("\n")
-            },
-            decision_lines.len(),
-            if decision_lines.is_empty() {
-                "None".to_string()
-            } else {
-                decision_lines.join("\n")
-            },
-        )
     };
 
     let system = explain_system_prompt(&state.action_cfg.ai_personality);
@@ -1583,6 +1536,209 @@ pub(super) async fn api_ai_explain(
         Err(e) => Json(serde_json::json!({
             "error": format!("AI call failed: {}", e)
         })),
+    }
+}
+
+/// Spec 046 follow-up — outcome of `build_explain_context`. `Built`
+/// carries the LLM-ready context string. `NoData` carries the
+/// user-facing fallback message (returned to the dashboard verbatim
+/// when there's nothing to explain).
+pub(super) enum ExplainContext {
+    Built(String),
+    NoData(String),
+}
+
+/// Pure helper extracted from `api_ai_explain` for direct unit
+/// testing. Walks the knowledge graph for incidents linked to
+/// `subject_value`, with a fallback path that scans every Incident
+/// node by `decision_target` / title / summary text match. Returns
+/// `NoData` (with a useful message — NOT the legacy "No data found")
+/// only when both paths produce nothing.
+///
+/// `honeypot_port` is threaded through so the rendered context can
+/// call out the honeypot in operator-facing terms ("port 2222 by
+/// default").
+pub(super) fn build_explain_context(
+    graph: &crate::knowledge_graph::KnowledgeGraph,
+    subject_type: &str,
+    subject_value: &str,
+    honeypot_port: u16,
+) -> ExplainContext {
+    use crate::knowledge_graph::types::*;
+
+    // Try the fast path: a Node::Ip exists for this address.
+    let target_node = match subject_type {
+        "ip" => graph
+            .nodes_of_type(NodeType::Ip)
+            .iter()
+            .find(|&&id| {
+                matches!(graph.get_node(id), Some(Node::Ip { addr, .. }) if addr == subject_value)
+            })
+            .copied(),
+        _ => None,
+    };
+
+    let mut incident_lines: Vec<String> = Vec::new();
+    let mut decision_lines: Vec<String> = Vec::new();
+    let mut event_count: usize = 0;
+    let mut likely_honeypot_hit = false;
+
+    if let Some(node_id) = target_node {
+        for edge in graph.incoming_edges(node_id) {
+            if edge.relation != Relation::TriggeredBy {
+                continue;
+            }
+            if let Some(node) = graph.get_node(edge.from) {
+                absorb_incident_for_explain(
+                    node,
+                    &mut incident_lines,
+                    &mut decision_lines,
+                    &mut likely_honeypot_hit,
+                );
+            }
+        }
+        event_count = graph
+            .all_edges(node_id)
+            .iter()
+            .filter(|e| e.relation == Relation::ConnectedTo || e.relation == Relation::AcceptedFrom)
+            .count();
+    }
+
+    // Fallback: if we got nothing from the KG node lookup, walk every
+    // incident and pull any whose `decision_target` matches this IP
+    // or whose summary/title text references it. Bounded — KG holds
+    // at most ~today + yesterday's incidents.
+    if incident_lines.is_empty() && subject_type == "ip" {
+        for &id in graph.nodes_of_type(NodeType::Incident).iter() {
+            if let Some(node) = graph.get_node(id) {
+                if let Node::Incident {
+                    decision_target,
+                    title,
+                    summary,
+                    ..
+                } = node
+                {
+                    let target_match = decision_target
+                        .as_deref()
+                        .map(|t| t == subject_value)
+                        .unwrap_or(false);
+                    let text_match =
+                        title.contains(subject_value) || summary.contains(subject_value);
+                    if target_match || text_match {
+                        absorb_incident_for_explain(
+                            node,
+                            &mut incident_lines,
+                            &mut decision_lines,
+                            &mut likely_honeypot_hit,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Final fallback: still nothing → return a useful message instead
+    // of the generic "No data found" (which is what operator hit on
+    // 2026-05-10).
+    if incident_lines.is_empty() {
+        return ExplainContext::NoData(format!(
+            "No incidents on record for {subject_type} {subject_value}. The \
+             threats list may be showing this entity because an incident was \
+             very recent and hasn't been ingested into the knowledge graph \
+             yet, or because the entity was already auto-dismissed. Refresh \
+             in a minute and try again, or click the incident row to see \
+             the raw data."
+        ));
+    }
+
+    let honeypot_note = if likely_honeypot_hit {
+        format!(
+            "\n\nHoneypot context: at least one of these incidents looks \
+             like it hit the InnerWarden honeypot (port {honeypot_port} \
+             by default — a fake SSH service set up to bait scanners and \
+             dropper bots). Probes here that fail at protocol level \
+             (e.g., 'Malformed SSH version') are EXPECTED — they're the \
+             listener doing its job, not real threats. Call this out \
+             plainly when explaining."
+        )
+    } else {
+        String::new()
+    };
+
+    ExplainContext::Built(format!(
+        "Entity: {} {}\nEvent count: {}{}\n\nIncidents ({}):\n{}\n\nAI Decisions ({}):\n{}",
+        subject_type,
+        subject_value,
+        event_count,
+        honeypot_note,
+        incident_lines.len(),
+        incident_lines.join("\n"),
+        decision_lines.len(),
+        if decision_lines.is_empty() {
+            "None".to_string()
+        } else {
+            decision_lines.join("\n")
+        },
+    ))
+}
+
+/// Pure helper for `build_explain_context`: extract context lines
+/// from one incident node. Inlined as a free function (not a closure)
+/// so the caller doesn't have to reason about closure-borrow
+/// lifetimes for the surrounding mutable Vecs (the closure form
+/// tripped E0502 in earlier iterations).
+fn absorb_incident_for_explain(
+    inc_node: &crate::knowledge_graph::types::Node,
+    incident_lines: &mut Vec<String>,
+    decision_lines: &mut Vec<String>,
+    likely_honeypot_hit: &mut bool,
+) {
+    use crate::knowledge_graph::types::Node;
+    if let Node::Incident {
+        detector,
+        severity,
+        title,
+        summary,
+        decision,
+        decision_reason,
+        research_only,
+        auto_executed,
+        ts,
+        ..
+    } = inc_node
+    {
+        if *research_only {
+            return;
+        }
+        incident_lines.push(format!(
+            "- [{}] {}: {} (detector: {}, ts: {})",
+            severity.to_uppercase(),
+            title,
+            summary,
+            detector,
+            ts.format("%H:%M:%S")
+        ));
+        if let Some(dec) = decision {
+            let reason = decision_reason.as_deref().unwrap_or("no reason recorded");
+            let executed = if *auto_executed {
+                "executed"
+            } else {
+                "recommended"
+            };
+            decision_lines.push(format!("- AI {} {}: {}", executed, dec, reason));
+        }
+        // Heuristically detect honeypot hits via title/summary so the
+        // Feynman prompt can call it out. KG `Node::Incident` doesn't
+        // carry `evidence.dst_port`, so we infer from text.
+        let lower_title = title.to_lowercase();
+        let lower_summary = summary.to_lowercase();
+        if lower_title.contains("malformed ssh")
+            || lower_summary.contains("malformed ssh")
+            || lower_title.contains("honeypot")
+            || lower_summary.contains("honeypot")
+        {
+            *likely_honeypot_hit = true;
+        }
     }
 }
 
@@ -1882,16 +2038,200 @@ mod tests {
     #[test]
     fn explain_system_prompt_falls_back_when_personality_blank() {
         let out = explain_system_prompt("");
-        assert!(out.starts_with("You are a security assistant explaining threats"));
-        assert!(out.contains("FORMAT: you are explaining one incident"));
+        assert!(out.starts_with("You are a security guide"));
+        assert!(out.contains("Feynman technique"));
     }
 
     #[test]
     fn explain_system_prompt_uses_personality_when_set() {
         let out = explain_system_prompt("You are InnerWarden. Bouncer voice.");
         assert!(out.starts_with("You are InnerWarden. Bouncer voice."));
-        assert!(!out.contains("security assistant explaining threats"));
+        assert!(!out.contains("You are a security guide"));
         assert!(out.contains("Only call it dangerous"));
+    }
+
+    // ── Spec 046 follow-up — `build_explain_context` helper anchors ──
+    //
+    // Operator surfaced 2026-05-10: "Ask AI to explain" returned just
+    // "No data found for ip" even when incidents existed. The fix
+    // refactored the inner block of api_ai_explain into the pure
+    // `build_explain_context` helper with a fallback that walks
+    // incidents directly. These anchors pin the helper's contract.
+
+    fn explain_test_graph_with_ip_node_and_incident(
+        ip: &str,
+        title: &str,
+    ) -> crate::knowledge_graph::KnowledgeGraph {
+        use crate::knowledge_graph::types::*;
+        use chrono::Utc;
+        let mut g = crate::knowledge_graph::KnowledgeGraph::new();
+        let ip_id = g.add_node(Node::Ip {
+            addr: ip.to_string(),
+            is_internal: false,
+            datasets: vec![],
+            risk_score: 50,
+            is_tor: false,
+            first_seen: Utc::now(),
+            last_seen: Utc::now(),
+            attempted_usernames: vec![],
+        });
+        let inc_id = g.add_node(Node::Incident {
+            incident_id: format!("test:{ip}"),
+            detector: "proto_anomaly".into(),
+            severity: "low".into(),
+            title: title.into(),
+            summary: format!("test incident from {ip}"),
+            ts: Utc::now(),
+            mitre_ids: vec![],
+            decision: None,
+            confidence: None,
+            decision_reason: None,
+            decision_target: None,
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        g.add_edge(Edge::new(
+            inc_id,
+            ip_id,
+            Relation::TriggeredBy,
+            chrono::Utc::now(),
+        ));
+        g
+    }
+
+    #[test]
+    fn build_explain_context_returns_no_data_when_kg_empty() {
+        let g = crate::knowledge_graph::KnowledgeGraph::new();
+        match build_explain_context(&g, "ip", "175.110.112.8", 2222) {
+            ExplainContext::NoData(msg) => {
+                assert!(msg.contains("175.110.112.8"));
+                assert!(
+                    !msg.starts_with("No data found"),
+                    "must not return the legacy generic message — \
+                     operator complained about exactly that wording"
+                );
+            }
+            ExplainContext::Built(_) => panic!("empty KG must yield NoData"),
+        }
+    }
+
+    #[test]
+    fn build_explain_context_finds_via_kg_node_lookup() {
+        let g =
+            explain_test_graph_with_ip_node_and_incident("203.0.113.50", "Suspicious connection");
+        match build_explain_context(&g, "ip", "203.0.113.50", 2222) {
+            ExplainContext::Built(ctx) => {
+                assert!(ctx.contains("203.0.113.50"));
+                assert!(ctx.contains("Suspicious connection"));
+                assert!(ctx.contains("proto_anomaly"));
+            }
+            ExplainContext::NoData(_) => panic!("KG node lookup must succeed"),
+        }
+    }
+
+    #[test]
+    fn build_explain_context_fallback_walks_incidents_when_no_ip_node() {
+        // Build a KG with an Incident but NO Ip node (the operator's
+        // 2026-05-10 case). The helper's fallback path must still find
+        // it via decision_target / text match.
+        use crate::knowledge_graph::types::*;
+        use chrono::Utc;
+        let mut g = crate::knowledge_graph::KnowledgeGraph::new();
+        g.add_node(Node::Incident {
+            incident_id: "test:fallback".into(),
+            detector: "proto_anomaly".into(),
+            severity: "low".into(),
+            title: "Malformed SSH version string".into(),
+            summary: "SSH client from 175.110.112.8 sent malformed version".into(),
+            ts: Utc::now(),
+            mitre_ids: vec![],
+            decision: None,
+            confidence: None,
+            decision_reason: None,
+            decision_target: Some("175.110.112.8".into()),
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        });
+        match build_explain_context(&g, "ip", "175.110.112.8", 2222) {
+            ExplainContext::Built(ctx) => {
+                assert!(ctx.contains("175.110.112.8"));
+                assert!(ctx.contains("Malformed SSH version"));
+            }
+            ExplainContext::NoData(_) => {
+                panic!("fallback walk must surface incidents matching by decision_target / text")
+            }
+        }
+    }
+
+    #[test]
+    fn build_explain_context_marks_honeypot_hit_on_malformed_ssh_title() {
+        let g = explain_test_graph_with_ip_node_and_incident(
+            "203.0.113.51",
+            "Malformed SSH version string",
+        );
+        match build_explain_context(&g, "ip", "203.0.113.51", 2222) {
+            ExplainContext::Built(ctx) => {
+                assert!(
+                    ctx.contains("Honeypot context:"),
+                    "Malformed-SSH title must trigger honeypot context section"
+                );
+                assert!(ctx.contains("port 2222"));
+            }
+            ExplainContext::NoData(_) => panic!("must build context"),
+        }
+    }
+
+    #[test]
+    fn build_explain_context_does_not_mark_honeypot_for_unrelated_titles() {
+        let g = explain_test_graph_with_ip_node_and_incident(
+            "203.0.113.52",
+            "Generic suspicious activity",
+        );
+        match build_explain_context(&g, "ip", "203.0.113.52", 2222) {
+            ExplainContext::Built(ctx) => {
+                assert!(
+                    !ctx.contains("Honeypot context:"),
+                    "non-honeypot titles must NOT trigger the honeypot section — \
+                     would mislead the LLM into wrongly calling everything a probe"
+                );
+            }
+            ExplainContext::NoData(_) => panic!("must build context"),
+        }
+    }
+
+    /// Spec 046 follow-up — Feynman prompt structure anchor.
+    /// The prompt must mandate the three story-telling pieces
+    /// (story / why / threat verdict) and explicitly call out
+    /// the honeypot context awareness. A refactor that strips
+    /// any of these turns the AI explanation back into the
+    /// generic 2-sentence summary that operator complained about.
+    #[test]
+    fn explain_system_prompt_carries_feynman_structure() {
+        let out = explain_system_prompt("");
+        // Three load-bearing parts of the Feynman explainer.
+        for marker in [
+            "STORY",
+            "WHY IT HAPPENED",
+            "THREAT VERDICT",
+            "analogy",
+            "honeypot",
+        ] {
+            assert!(
+                out.contains(marker),
+                "explain prompt missing required Feynman piece '{marker}'"
+            );
+        }
+        // Anti-regression on the boundary: must explicitly forbid
+        // calling probes 'dangerous' just because they fired.
+        assert!(out.contains("got past initial contact"));
     }
 
     #[test]

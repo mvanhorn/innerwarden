@@ -59,6 +59,11 @@ pub struct DashboardActionConfig {
     pub abuseipdb_auto_block_threshold: u8,
     /// Honeypot mode: "off" | "demo" | "listener".
     pub honeypot_mode: String,
+    /// Honeypot listener port (Spec 046 follow-up). Threaded into the
+    /// AI explanation pipeline so the Feynman prompt can call out
+    /// "this hit the honeypot port" when the incident's `dst_port`
+    /// matches.
+    pub honeypot_port: u16,
     /// Whether Telegram notifications are enabled.
     pub telegram_enabled: bool,
     /// Whether Slack notifications are enabled.
@@ -118,6 +123,7 @@ impl Default for DashboardActionConfig {
             abuseipdb_enabled: false,
             abuseipdb_auto_block_threshold: 0,
             honeypot_mode: "off".to_string(),
+            honeypot_port: 2222,
             telegram_enabled: false,
             slack_enabled: false,
             cloudflare_enabled: false,

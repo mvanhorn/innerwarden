@@ -550,6 +550,153 @@ pub(crate) fn try_dismiss_cdn_noise(
     true
 }
 
+/// Spec 046 Phase A.5 follow-up: auto-dismiss `proto_anomaly`
+/// incidents whose `dst_port` matches the configured honeypot port
+/// AND whose anomaly_type is `SshVersionAnomaly` ("Malformed SSH
+/// version string"). When the honeypot listener is running on
+/// `[honeypot] port = 2222`, every garbage-banner probe (vuln scanners,
+/// curl-as-ssh, telnet-on-2222) generates a `proto_anomaly` incident
+/// flagged Low severity — and the dashboard surfaces them as "needs
+/// attention" because the AI gate (`min_severity = medium`) skips them
+/// without writing a decision.
+///
+/// Operator surfaced this on 2026-05-10 looking at IP 175.110.112.8 in
+/// the threats tab — a textbook honeypot probe (one TCP connect, one
+/// malformed banner, no auth attempt) was wasting an operator-review
+/// slot. By definition: a malformed banner on the honeypot port is the
+/// honeypot doing its job (the listener was hit by a scanner that
+/// didn't even speak SSH cleanly). Auto-dismiss with reason
+/// `"honeypot-probe-fp"`.
+///
+/// Same KG-hardening pattern as `try_dismiss_cdn_noise`: if the IP has
+/// any non-proto_anomaly incident in the last 24h, KEEP the
+/// proto_anomaly visible — the protocol oddity might be the noisy
+/// half of a real attack chain.
+///
+/// Returns true when handled (dismiss written).
+pub(crate) fn try_dismiss_honeypot_probe_proto_anomaly(
+    incident: &innerwarden_core::incident::Incident,
+    honeypot_port: u16,
+    state: &mut AgentState,
+) -> bool {
+    let detector = detector_from_incident_id(&incident.incident_id);
+    if detector != "proto_anomaly" {
+        return false;
+    }
+    // Only the SshVersionAnomaly variant on the honeypot port. Other
+    // proto_anomaly variants (e.g. SlowConnect on real services) MUST
+    // stay visible — they're not honeypot probes.
+    let anomaly_type = incident
+        .evidence
+        .get("anomaly_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if anomaly_type != "SshVersionAnomaly" {
+        return false;
+    }
+    let dst_port = incident
+        .evidence
+        .get("dst_port")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if dst_port != honeypot_port as u64 {
+        return false;
+    }
+    let primary_ip_owned = match incident
+        .entities
+        .iter()
+        .find(|e| e.r#type == innerwarden_core::entities::EntityType::Ip)
+        .map(|e| e.value.clone())
+    {
+        Some(ip) => ip,
+        None => return false,
+    };
+    let primary_ip: &str = &primary_ip_owned;
+    // Same hardening as cdn-noise: keep visible if other detectors hit
+    // the same IP in last 24h.
+    let other_hits = match state.knowledge_graph.read() {
+        Ok(kg) => crate::kg_decide_features::incidents_24h_excluding_detectors(
+            &kg,
+            primary_ip,
+            &["proto_anomaly"],
+            chrono::Utc::now(),
+        ),
+        Err(e) => {
+            tracing::warn!(
+                "honeypot-probe-fp: knowledge_graph lock poisoned: {e}; \
+                 skipping hardening check"
+            );
+            0
+        }
+    };
+    if other_hits > 0 {
+        info!(
+            incident_id = %incident.incident_id,
+            ip = %primary_ip,
+            other_hits,
+            "honeypot-probe-fp: NOT dismissing — IP has {other_hits} non-proto_anomaly \
+             incident(s) in last 24h; the malformed banner might be reconnaissance \
+             before a real attack chain"
+        );
+        return false;
+    }
+    info!(
+        incident_id = %incident.incident_id,
+        ip = %primary_ip,
+        port = honeypot_port,
+        "honeypot-probe-fp: auto-dismissing proto_anomaly malformed-SSH on \
+         honeypot port (the listener exists exactly to catch this — the probe \
+         hitting the door is signal, not an alert that needs attention)"
+    );
+    let reason = format!(
+        "Auto-dismissed: proto_anomaly SshVersionAnomaly fired on honeypot port \
+         {honeypot_port} from {primary_ip}. A malformed SSH banner on the \
+         honeypot port IS the honeypot working as designed — scanners that \
+         don't speak SSH cleanly hit the listener, get classified as a probe, \
+         and never reach an auth attempt. Real attackers who DO speak SSH still \
+         flow through the tiered acceptance path (Spec 046 Phase A) and either \
+         fall into the KNOWN_WEAK / adaptive accept branches or stay rejected. \
+         The probe is logged in the JSONL audit trail; only the dashboard \
+         'needs attention' tile is suppressed."
+    );
+    let entry = crate::decisions::DecisionEntry {
+        ts: chrono::Utc::now(),
+        incident_id: incident.incident_id.clone(),
+        host: incident.host.clone(),
+        ai_provider: "honeypot-probe-fp".to_string(),
+        action_type: "dismiss".to_string(),
+        target_ip: Some(primary_ip_owned.clone()),
+        target_user: None,
+        skill_id: None,
+        confidence: 1.0,
+        auto_executed: true,
+        dry_run: false,
+        reason: reason.clone(),
+        estimated_threat: "none".to_string(),
+        execution_result: "dismissed".to_string(),
+        prev_hash: None,
+    };
+    if let Some(writer) = &mut state.decision_writer {
+        if let Err(e) = writer.write(&entry) {
+            tracing::warn!("failed to write honeypot-probe-fp dismiss: {e:#}");
+            return false;
+        }
+    }
+    {
+        let mut graph = state.knowledge_graph.write().unwrap();
+        graph.ingest_decision(
+            &incident.incident_id,
+            "dismiss",
+            None,
+            1.0,
+            &reason,
+            true,
+            chrono::Utc::now(),
+        );
+    }
+    true
+}
+
 fn detector_from_incident_id(incident_id: &str) -> &str {
     incident_id.split(':').next().unwrap_or("")
 }
@@ -909,6 +1056,107 @@ mod tests {
         assert!(
             !dismissed,
             "non-cloud-provider IP MUST NOT be auto-dismissed by CDN-noise filter"
+        );
+    }
+
+    // ── Spec 046 follow-up — honeypot-probe-fp anchors ──
+    //
+    // Operator surfaced 2026-05-10: a malformed SSH banner from
+    // 175.110.112.8 hit the honeypot port and showed up as "needs
+    // attention" with no AI decision. The auto-dismiss helper
+    // identifies these by detector + anomaly_type + dst_port match.
+
+    fn make_honeypot_probe_incident(
+        addr: &str,
+        dst_port: u16,
+        anomaly_type: &str,
+    ) -> innerwarden_core::incident::Incident {
+        use chrono::Utc;
+        use innerwarden_core::entities::EntityRef;
+        use innerwarden_core::incident::Incident;
+        Incident {
+            ts: Utc::now(),
+            host: "test-host".into(),
+            incident_id: format!(
+                "proto_anomaly:{}:{}:{}",
+                anomaly_type,
+                addr,
+                Utc::now().format("%Y-%m-%dT%H:%MZ")
+            ),
+            severity: Severity::Low,
+            title: "Malformed SSH version string".into(),
+            summary: format!("SSH client from {addr} sent malformed version"),
+            evidence: serde_json::json!({
+                "anomaly_type": anomaly_type,
+                "src_ip": addr,
+                "dst_ip": "10.0.0.5",
+                "dst_port": dst_port,
+            }),
+            recommended_checks: vec![],
+            tags: vec!["protocol_anomaly".into()],
+            entities: vec![EntityRef::ip(addr)],
+        }
+    }
+
+    #[test]
+    fn try_dismiss_honeypot_probe_dismisses_malformed_ssh_on_honeypot_port() {
+        // Happy path: malformed SSH banner on configured honeypot port → dismissed.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        let inc = make_honeypot_probe_incident("175.110.112.8", 2222, "SshVersionAnomaly");
+        let dismissed = try_dismiss_honeypot_probe_proto_anomaly(&inc, 2222, &mut state);
+        assert!(
+            dismissed,
+            "Malformed SSH on honeypot port MUST be auto-dismissed — \
+             that's exactly what the honeypot is for"
+        );
+    }
+
+    #[test]
+    fn try_dismiss_honeypot_probe_does_not_touch_real_ssh_port() {
+        // Anti-regression: a malformed SSH banner on the REAL SSH port
+        // (22 in many setups) is NOT a honeypot probe — that's an
+        // attacker fumbling on the actual service. Must stay visible.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        let inc = make_honeypot_probe_incident("175.110.112.8", 22, "SshVersionAnomaly");
+        let dismissed = try_dismiss_honeypot_probe_proto_anomaly(&inc, 2222, &mut state);
+        assert!(
+            !dismissed,
+            "proto_anomaly on the REAL SSH port (22) MUST NOT be \
+             auto-dismissed — only the honeypot port (2222) is the trap"
+        );
+    }
+
+    #[test]
+    fn try_dismiss_honeypot_probe_does_not_touch_other_anomaly_types() {
+        // Anti-regression: only the SshVersionAnomaly variant is a
+        // confirmed-protocol-fail honeypot probe. Other variants
+        // (SlowConnection, etc) on the honeypot port might be real
+        // probes and stay visible.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        let inc = make_honeypot_probe_incident("175.110.112.8", 2222, "SlowConnection");
+        let dismissed = try_dismiss_honeypot_probe_proto_anomaly(&inc, 2222, &mut state);
+        assert!(
+            !dismissed,
+            "Only SshVersionAnomaly is in the auto-dismiss scope — \
+             other proto_anomaly variants stay visible"
+        );
+    }
+
+    #[test]
+    fn try_dismiss_honeypot_probe_does_not_touch_other_detectors() {
+        // Anti-regression: ssh_bruteforce / kill_chain on port 2222
+        // are real signals — the listener captured an actual auth
+        // attempt or shell engagement. MUST stay visible.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(tmp.path());
+        let inc = make_data_exfil_ebpf_incident("ssh", "/etc/passwd", "175.110.112.8");
+        let dismissed = try_dismiss_honeypot_probe_proto_anomaly(&inc, 2222, &mut state);
+        assert!(
+            !dismissed,
+            "data_exfil_ebpf must stay visible regardless of honeypot port"
         );
     }
 

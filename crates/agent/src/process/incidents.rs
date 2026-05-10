@@ -347,6 +347,23 @@ pub(crate) async fn process_incidents(
             continue;
         }
 
+        // Spec 046 Phase A.5 follow-up: a malformed SSH banner on the
+        // honeypot port is BY DEFINITION the honeypot doing its job
+        // (scanner hits the listener, fails at protocol level, never
+        // reaches auth). Operator surfaced this 2026-05-10 looking at
+        // 175.110.112.8 in threats — Low-severity proto_anomaly with
+        // no AI decision was wasting an "needs attention" slot. The
+        // helper has the same KG-hardening as cdn-noise: keep visible
+        // if the IP has other (non-proto_anomaly) incidents in 24h.
+        if incident_autodismiss::try_dismiss_honeypot_probe_proto_anomaly(
+            incident,
+            cfg.honeypot.port,
+            state,
+        ) {
+            handled += 1;
+            continue;
+        }
+
         // Spec 043 Phase 7 — KG-based FP suppression (shadow-first).
         // Generic suppression that runs AFTER the targeted
         // self-traffic-FP and CDN-noise paths so those keep their
