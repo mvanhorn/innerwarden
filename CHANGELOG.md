@@ -23,7 +23,11 @@ Hotfix release for the silent Local Warden Model regression that affected every 
 
 ### Known caveat (v0.13.0 – v0.13.2 GHA-released binaries)
 
-- The agent binaries on the GitHub release pages for v0.13.0, v0.13.1, and v0.13.2 were all built without `--features local-classifier`, so the **Local Warden Model is inert** on those binaries — the agent silently falls back to whichever cloud provider is configured (or runs without AI if none is). They also segfault when launched with `MALLOC_CONF=prof:true,...` (the jemalloc heap-profile symbols are missing or unreachable). **Operators on those releases should either re-install once v0.13.3 is published or build locally via `scripts/deploy-prod.sh`** (which always passed the right feature flags). The next release (v0.13.3) is the first to verify both via the binary feature-parity guard above; subsequent releases inherit the gate.
+- The agent binaries on the GitHub release pages for v0.13.0, v0.13.1, and v0.13.2 were all built without `--features local-classifier`, so the **Local Warden Model is inert** on those binaries — the agent silently falls back to whichever cloud provider is configured (or runs without AI if none is). **v0.13.3 is the first release where the GHA-released binary has Local Warden actually linked in.** Operators on the older releases should re-install via `curl | sudo bash` or build locally via `scripts/deploy-prod.sh`.
+
+### Known caveat (jemalloc heap profiling on GHA-released binaries — all v0.13.x)
+
+- The `cargo zigbuild` cross-compile path used by the release workflow does NOT propagate the `--enable-prof` C flag to `jemalloc-sys`, so the `_rjem_je_opt_prof` symbol is absent from every GHA-released agent binary. **Effect:** operators who manually wire the spec-030 jeprof systemd drop-in (`Environment="MALLOC_CONF=prof:true,..."` in `/etc/systemd/system/innerwarden-watchdog.service.d/jeprof.conf`) will see the agent segfault on every spawn. **Workaround:** build via `scripts/deploy-prod.sh` (native `cargo build --release`) which produces the symbol correctly. **Not affected:** new users installing via `curl | sudo bash` who do not set `MALLOC_CONF`. The binary feature-parity guard treats this as a WARN (informational) rather than a hard FAIL until the zigbuild build path is fixed in a follow-up release.
 
 ## [0.13.2] - 2026-05-10
 
