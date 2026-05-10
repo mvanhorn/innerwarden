@@ -73,16 +73,39 @@ jobs:
           ls -la target/bpfel-unknown-none/release/innerwarden-ebpf
 
       # ── Build x86_64 ───────────────────────────────────────────────────────
+      #
+      # Agent ships with `--features local-classifier` so the on-device
+      # Local Warden Model (spec 029, distilled SecureBERT student) is
+      # linked into the released binary. Pre-fix the release.yml omitted
+      # the feature, so every v0.13.x release shipped a binary that logged
+      # `local_warden provider requires building innerwarden-agent with
+      # --features local-classifier` at startup and silently fell back
+      # to whatever cloud provider was configured (Azure OpenAI / OpenAI /
+      # Ollama / Anthropic) — the on-device classifier advertised in the
+      # README/CLAUDE.md was inert. Operators using `scripts/deploy-prod.sh`
+      # always got the right binary because that script passes the feature
+      # explicitly; only GHA-released binaries (curl|sh installers and
+      # `innerwarden upgrade`) were degraded. Caught 2026-05-10 by PR #520's
+      # binary feature-parity guard.
       - name: Build (x86_64-unknown-linux-gnu)
         run: |
           # Sensor with embedded eBPF bytecode
           cargo zigbuild --release \
             --target x86_64-unknown-linux-gnu \
             -p innerwarden-sensor --features ebpf-embedded
-          # Agent + CTL (no eBPF features needed)
+          # Agent — `--features local-classifier` pulls in tract-onnx
+          # (pure-Rust ONNX inference) + tokenizers (with the `onig`
+          # regex feature). onig has C deps that historically required
+          # native gcc; zigbuild bundles its own clang and should compile
+          # them cross-target. If this step fails on onig, the
+          # alternative is to swap tokenizers to a pure-Rust regex
+          # feature (default-features = false) and confirm the
+          # SecureBERT tokenizer still matches expected behaviour.
           cargo zigbuild --release \
             --target x86_64-unknown-linux-gnu \
-            -p innerwarden-agent \
+            -p innerwarden-agent --features local-classifier
+          cargo zigbuild --release \
+            --target x86_64-unknown-linux-gnu \
             -p innerwarden-ctl
 
       # ── Build aarch64 ──────────────────────────────────────────────────────
@@ -92,10 +115,13 @@ jobs:
           cargo zigbuild --release \
             --target aarch64-unknown-linux-gnu \
             -p innerwarden-sensor --features ebpf-embedded
-          # Agent + CTL
+          # Agent — see x86_64 comment above for why local-classifier
+          # is required for every release.
           cargo zigbuild --release \
             --target aarch64-unknown-linux-gnu \
-            -p innerwarden-agent \
+            -p innerwarden-agent --features local-classifier
+          cargo zigbuild --release \
+            --target aarch64-unknown-linux-gnu \
             -p innerwarden-ctl
 
       # ── Stage assets with SHA-256 sidecars ────────────────────────────────
@@ -169,14 +195,14 @@ jobs:
             # crates/agent/src/ai/local_classifier.rs, only compiled when
             # `--features local-classifier` is set. Without it the agent
             # silently falls back to whatever cloud provider is configured.
-            #
-            # NOTE: this guard is gated on whether the build was meant to
-            # include the feature. Until release.yml passes the feature flag
-            # the line stays informational (warn, not fail) so the gate can
-            # land before the build change.
+            # Hard fail since the build commands above now pass the feature
+            # explicitly — if it disappears again, the release should
+            # refuse to publish rather than ship a degraded binary.
             if ! strings "$agent" | grep -q "local_classifier"; then
-              echo "WARN: $agent missing local-classifier symbols (Local Warden inert)"
-              echo "      Operators must use scripts/deploy-prod.sh for production."
+              echo "FAIL: $agent missing local-classifier symbols"
+              echo "      Local Warden Model would be inert; agent silently falls back to cloud provider."
+              echo "      Verify --features local-classifier is on the cargo zigbuild command."
+              fail=1
             fi
           done
 
