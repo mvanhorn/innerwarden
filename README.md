@@ -245,7 +245,7 @@ When a threat is confirmed, Inner Warden picks the right tool.
 | **Suspend sudo** | Revokes sudo for a user via sudoers drop-in. Auto-expires after TTL. |
 | **Kill process** | Terminates all processes for a compromised user. TTL-bounded. |
 | **Block container** | Pauses a Docker container. Auto-unpauses after TTL. |
-| **Deploy honeypot** | SSH/HTTP decoy with LLM-powered interactive shell that captures credentials and behavior |
+| **Deploy honeypot** | SSH/HTTP decoy with tiered authentication (rejects single-shot scanners, accepts Mirai-class bots on known-weak credentials, adaptive accept on 3+ unique guesses to catch human-direct attackers) and LLM-powered interactive shell. OpenSSH banner masquerade so scanners don't fingerprint it. Captures credentials, commands, and IOCs. |
 | **Rate limit nginx** | Blocks abusive HTTP traffic at the nginx layer with TTL |
 | **Monitor IP** | Bounded tcpdump capture for forensic analysis |
 | **Block IP (Cloudflare)** | Edge-level blocking via Cloudflare API, stops traffic before it reaches your server |
@@ -253,6 +253,20 @@ When a threat is confirmed, Inner Warden picks the right tool.
 | **Kill chain response** | Kills process tree + blocks C2 IP via XDP + captures forensics (ss, /proc) |
 
 Blocking is **layered**: a single block decision triggers XDP (instant kernel drop) + firewall (persists reboot) + mesh broadcast (peer nodes block too) + Cloudflare edge (stops traffic upstream) + AbuseIPDB report (community intelligence). Kill chain incidents trigger the `kill-chain-response` skill: kill process tree + block C2 via XDP + capture forensics. All skills are bounded, audited, and reversible.
+
+### Posture-aware alerting (v0.13.1)
+
+Inner Warden snapshots your host's defensive posture every 10 minutes (sshd config, sudoers, services, firewall) and downgrades incident severity for attack vectors the host already neutralised. An `ssh_bruteforce` against a host with `PasswordAuthentication=no` becomes Low instead of High; the operator stops getting paged for things the kernel was always going to refuse anyway. Hard invariant: never demote when the attacker actually established a session, executed a process, or wrote a file. Read the live posture via `innerwarden get posture` or the dashboard panel; ask Telegram with `/posture`.
+
+### Honeypot that actually traps (v0.13.1)
+
+The default `[honeypot] interaction = "llm_shell"` ships a tiered SSH listener that:
+
+- Rejects the first 2 password attempts unconditionally so single-shot credential scanners disconnect with cred-only intel.
+- Then accepts ONLY when `(user, password)` matches a curated list of Mirai canonical defaults + classic root defaults + appliance defaults. This is what makes a real dropper bot open the shell and run its payload.
+- After 3 distinct guesses on a single connection, accepts adaptively to catch human-direct attackers typing org-specific passwords.
+- Masquerades as `SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6` so scanners don't fingerprint the listener.
+- Drops the trapped payload commands + IOCs into the dashboard's Honeypot tab, paginated and engaged-only by default.
 
 ---
 

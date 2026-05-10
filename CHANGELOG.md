@@ -9,6 +9,91 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-05-10
+
+Honeypot effectiveness, posture-aware alerting, and infrastructure honesty release. The headline shift is the honeypot turning from a credential mirror with the door always open into a real behavioural trap that captures Mirai-class bots, manual brute-forcers, and human-direct attackers, without giving away what it is. 50 commits since 0.13.0.
+
+### Added — Spec 046 honeypot effectiveness (PRs #508, #509, #510)
+
+- **Tiered SSH authentication** (`crates/agent/src/skills/builtin/honeypot/ssh_interact.rs`). Reject the first `MIN_ATTEMPTS_BEFORE_ACCEPT = 2` password attempts unconditionally, single-shot credential scanners disconnect on the first reject, dropper bots iterate. Then accept ONLY when `(user, password)` matches `KNOWN_WEAK_CREDENTIALS` (38 entries: classic root defaults + Mirai canonical defaults + appliance defaults). Random brute-force NEVER accepted; single-shot scanners NEVER accepted. Credential capture is unconditional and runs BEFORE any branch.
+- **Phase A.5 adaptive accept**: after `MIN_UNIQUE_CREDS_FOR_ADAPTIVE_ACCEPT = 3` distinct passwords on a single connection, the next attempt accepts regardless of weakness. Catches human-direct attackers typing org-specific guesses (`Welcome2024!`, `OracleVM!`, `MyHost_admin`) without double-firing on bots (which hit `KNOWN_WEAK` first).
+- **OpenSSH banner masquerade**. The russh default `SSH-2.0-russh_*` was a one-token honeypot fingerprint; replaced with `SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6` via `Config::server_id`. 80 ms `tokio::time::sleep` per rejected attempt simulates real OpenSSH timing.
+- **Dashboard pagination + engaged-only default**: `GET /api/honeypot/sessions` accepts `?page=N&size=M&engaged_only=true|false`. Default `engaged_only=true` makes the tab open to the wow-surface (sessions with auth attempts or commands), not the wall of port-scan probes. Page size clamped `[1, 100]`. Three distinct empty states.
+- **Per-session transcript expand**: engaged sessions get an "Expand transcript" button revealing full attacker activity inline.
+- **Auto-dismiss honeypot probe noise**: `proto_anomaly` (`SshVersionAnomaly`) on the honeypot port writes a `dismiss` decision with reason `honeypot-probe-fp` and removes from "needs attention". KG-hardened: keeps the proto_anomaly visible if the same IP has any non-`proto_anomaly` incident in the last 24h.
+- **Feynman-style AI explanations** (`crates/agent/src/dashboard/data_api.rs::explain_system_prompt`): "Ask AI to explain" returned generic 2-sentence summaries that did not help non-technical operators understand "should I worry?". Rewrote the prompt around the Feynman technique (story, why, threat verdict, with explicit honeypot-context awareness). New `build_explain_context` helper extracts as a pure function with KG fallback (walks Incident nodes by `decision_target` / title / summary text when the IP has no `Node::Ip`), retiring the legacy "No data found for IP X" message.
+
+### Added — Spec 044 posture-aware alerting (PRs #502, #503, #504)
+
+- **`HostPosture` snapshot module** (`crates/agent/src/posture/`): every 10 min, the slow loop reads `sshd_config`, `sudoers`, `services`, `firewall`, persists to `data_dir/posture.json`. New CLI subcommand `innerwarden get posture`.
+- **Severity downgrade engine** (`effective_severity`): incidents whose severity is dictated by an attack vector the host's posture has already neutralised get demoted (e.g., `ssh_bruteforce method=password` on a host with `PasswordAuthentication=no` becomes Low instead of High). Hard invariant: NEVER demote when `session_established | process_executed | file_written` (you only suppress severity for things the posture provably bounds).
+- **Telegram `/posture` command + dashboard panel**: operator can read the live posture from either surface.
+- **Daily briefing rewrite**: the dishonest "0/100 server health score" was retired (formula was `100 − critical*20 − high*5` clamped 0..100, dropped to zero on routine activity). Replaced with posture-aware narrative.
+
+### Added — Spec 043 KG justification follow-ups (PRs #472–#481)
+
+- **Decide path reads KG** (`kg_decide_features`): 6 features extracted at decision time (risk_score, prior_incidents_24h, first_seen_age_days, etc.), 4 modifier bands, Critical floor preserved, JSONL shadow log.
+- **`/ask` deep context**: Telegram and dashboard `/ask` surfaces now reference KG features and threat-feed datasets directly when the question mentions an IP. 8000-char prompt budget, subgraph triggered by IP regex.
+- **KG modifier on direct-block paths**: `apply_kg_decide_modifier` wired into repeat-offender, multi-technique, completed-chain code paths.
+- **Four "zona morta" detectors activated**: `yara_match`, `sysctl_drift`, `packed_binary`, `short_lived_process`. Default ON via `[kg]` config.
+- **KG-based FP suppression (shadow-first)**: `kg_fp_suppression` module; `fp_likelihood = 0.7×history + 0.3-cap-bonus`; Critical floor hardcoded; `suppress_threshold=0.80`.
+- **Akamai/Fastly/CloudFront-specific CIDRs** added to cloud safelist.
+- **KG audit hook on AbuseIPDB-gate**: captures the IP's KG snapshot at block time for forensics.
+
+### Added — Kill chain fast-path (PR #507)
+
+- Deterministic strong patterns (`reverse_shell`, `bind_shell`, `code_inject`, `inject_shell` and their sensor-detector aliases `ebpf_reverse_shell`, `ebpf_bind_shell`) bypass the AI router and trigger `decision_block_ip::execute_block_ip_decision` directly. AI verdict was 100% deterministic for these patterns, so the AI call latency (~100 ms local / 1-3 s cloud LLM) was pure overhead. `data_exfil` and `exploit_c2` deliberately stay in the AI path so the codex/openclaw dismiss helpers continue to fire. 10 anchor tests pin every fast-path boundary.
+
+### Fixed
+
+- **Honeypot: russh strips `Password` from method list after reject** (PR #509). Caught during prod smoke. `Auth::Reject { proceed_with_methods: None }` triggers `auth_request.methods.remove(MethodKind::Password)` inside russh-0.60.1. After the first reject, the OpenSSH client saw only `publickey,hostbased,keyboard-interactive` and disconnected, the dropper bot never reached attempt #2 on the same connection. Fix: send `Some(MethodSet::all())` on every reject branch.
+- **Honeypot off-by-one in threshold guard** (PR #508 review). First push used `attempt_n < MIN_ATTEMPTS_BEFORE_ACCEPT`, leaking attempt #2 with `admin/admin` through to accept on the second try. Fixed to `<=`. New anchor `weak_credential_on_second_attempt_still_rejects`.
+- **Honeypot `max_auth_attempts` floor** (PR #508 review). Caller passing `1` or `2` made the shell unreachable even for perfect Mirai matches (russh closes session before our accept branch runs). New `floor_max_auth_attempts` clamps below-floor values up to `MIN_ATTEMPTS_BEFORE_ACCEPT + 1`.
+- **CIDR auto-block** (PRs #496, #497, #498). Three paths (automated decision flow, repeat-offender, safelist gate, AI router execute boundary) still allowed CIDR targets in automated decisions. Closed in layered fashion. ip_reputations zombie cleanup.
+- **Decision-cooldown retention** (PR #499). Window was 2h; the longest consumer needed 24h. Raised retention so cooldowns survive the slow path window.
+- **AI router suppression when inline path already decided** (PR #500). Avoids double-decisions when kill_chain fast-path or other inline routes already wrote a decision before AI router runs.
+- **AbuseIPDB autoblock honesty** (PR #495). Multiple bypass paths fixed; AWS CIDR gap closed; kill_chain `wget` FP eliminated.
+- **XDP infrastructure honesty** (PR #494). Three cascading bugs from prod 2026-05-08 audit: cleanup state drift between local set and kernel map, parse failures dropping local entries, adaptive TTL expiry signalling.
+- **Profiles dashboard geo** (PRs #492, #493). Cloud-provider IPs now badged + operator can opt-in to exclude; ASN majority drives geo consolidation when WHOIS and ip-api disagree.
+- **Threat-DNA hour_distribution drift** (PR #491). Same-actor cross-day clusters were splitting because the hour-of-day distribution changed across midnight. Dropped from the DNA hash.
+- **Operator-FP attack chain suppression** (PR #501). Suppress at persistence boundary so the chain UI does not show transient operator-self traffic as "active attack chain".
+- **Chains tab honesty bundle** (PR #500). Five lies on the Intelligence > Chains panel fixed: window scope, count cardinality, severity distribution, "active" semantics, attribution.
+- **Wave 2-10 audit fixes** (PRs #461-#469): IPv6/IPv4 entity holes, `flock(LOCK_EX)` on hash-chain append, in-batch AbuseIPDB counter prevents burst bypass, agent-guard pipe detector evasion, Cloudflare real-client-behind-edge attribution, blocks counted via non-incident paths.
+- **Dashboard label honesty (Wave 8)** (PR #460): every operator-visible counter now declares its window, scope, and cardinality explicitly. Removed implicit "today" / "all" labels that drifted between surfaces.
+- **SECURITY.md + THREAT_MODEL.md drift fix (Wave 7)** (PR #461): two of the operator-facing security docs had aged out of sync with the implementation. Synced + added anti-drift anchors that fail CI when prose disagrees with the code.
+- **Notification noise + Top-5 leftovers** (PR #470): bundle-fix for the `Top 5 attackers` widget showing duplicate IPs across rows, plus three Telegram digest noise sources (idle-hour kernel-module event spam, stale honeypot session re-emit, briefing redundancy).
+- **Briefing "all clear" honesty** (PR #482): suppressed when High+ activity exists.
+
+### Fixed — CTL + harden surface (operator self-audit)
+
+- **Watchdog-aware harden score** (PR #505): `innerwarden harden` was reading `systemctl is-active innerwarden-agent` and reporting "agent not running" because in the new watchdog deploy model the agent is a child process of `innerwarden-watchdog` and `innerwarden-agent.service` is intentionally inactive. New detection logic walks the watchdog process tree. Combined with auditctl rule-syntax fix (the harden-suggested `-w` mixed with `-a -F arch -S` was rejected by auditctl), prod harden score went from 59 → 89 on the operator's box.
+- **CTL `nginx error log` discovery + soft-warn** (PR #486, Bug 4 from prod audit): `innerwarden scan` was hard-failing when nginx error.log existed at a non-default path. Now soft-warns + suggests the canonical path; harden continues.
+- **CTL `auditd category score` recalibration** (PR #485): auditd rules had a 30-pt bonus that was double-counted across two categories, inflating clean-system scores by ~25 pts.
+- **CTL `systemctl bus failure` cascade** (PR #484): a single missing systemd bus connection cascaded the entire harden run into "unknown" status. Split into a tri-state (`active` / `inactive` / `bus-unreachable`) so operator sees the actual problem.
+
+### Performance
+
+- **`Arc<str>` interning** on hot Event-kind/source paths, telemetry counters, baseline HashMap keys (PRs #463, #464, #465). KG telemetry counter keys now share allocations across threads.
+
+### Tests
+
+- **2954 / 2954 pass + 2 ignored**. Net add of ~50 anchor tests across honeypot, posture, KG, CIDR-guard, dismiss helpers.
+- **Coverage batches 2 + 3** (PRs #487, #488): 16 files lifted to ≥ 70% with gate-contract anchors. CI fuzz workflow fix.
+- **4 new honeypot integration scenarios** (Mirai-class bot, root brute bot, human-direct attacker, retry-loop anti-regression) via real `russh::client` against ephemeral listeners.
+
+### Changed
+
+- Cargo workspace version → `0.13.1`.
+- Default honeypot `interaction = "llm_shell"` is now the canonical "trap that captures behaviour" path; `medium` (`RejectAll`) preserved unchanged for credential-only deployments.
+
+### Operator-visible
+
+- Honeypot tab opens to the engaged-only first page by default. Pagination at top + bottom. Engagement banner explains the engaged-vs-unengaged split with Spec 046 context.
+- "Ask AI to explain" returns a coherent narrative even when the IP is not yet in the KG node table (operator's 2026-05-10 case for `175.110.112.8`).
+- Daily Telegram briefing reflects host posture and dropped the dishonest 0/100 score line.
+
+---
+
 ## [0.13.0] - 2026-05-03
 
 Operator-trust release. Closes the recurring "the dashboard says one number, the site says another, JSONL says a third" class of bug. Adds the persistent IP→geo cache that keeps the site map honest at scale (138+ unique attackers/day on the operator's prod host). Removes the half-shipped playbook engine (deferred to Spec 042).
