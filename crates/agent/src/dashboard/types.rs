@@ -616,6 +616,15 @@ pub(crate) struct JourneyResponse {
     /// no single IP to query against xdp_block_times.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) block_state: Option<crate::dashboard::threat_contract::BlockState>,
+    /// Spec 049 PR10 — Cases drill-down recurrence block. Populated
+    /// only when `subject_type == "ip"` AND the agent has an
+    /// `AttackerProfile` for that IP in `attacker_profiles` SQLite
+    /// blob. User and detector pivots have no single IP to look up;
+    /// they emit `None`. Frontend renders the block on the journey
+    /// detail view above the timeline so the operator never loses
+    /// sight of "is this attacker new or has it visited before?".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) recurrence: Option<crate::dashboard::case_recurrence::RecurrenceBlock>,
 }
 
 #[derive(Debug, Serialize)]

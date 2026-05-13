@@ -541,6 +541,8 @@ pub(super) async fn api_journey(
             chapters: vec![],
             entries: vec![],
             block_state: None,
+            // Spec 049 PR10: empty subject → no profile to look up.
+            recurrence: None,
         });
     }
 
@@ -553,6 +555,11 @@ pub(super) async fn api_journey(
     let sqlite = state.sqlite_store.clone();
     let date_for_fallback = date.clone();
     let subject_for_fallback = subject.clone();
+    // Clone the sqlite handle a second time so we still have access
+    // after the spawn_blocking move below — the PR10 recurrence
+    // overlay needs to read `attacker_profiles` blob post-build.
+    let sqlite_for_recurrence = state.sqlite_store.clone();
+    let subject_for_recurrence = subject.clone();
     let response = tokio::task::spawn_blocking(move || {
         build_journey_from_graph(
             &kg,
@@ -567,7 +574,51 @@ pub(super) async fn api_journey(
     })
     .await
     .unwrap_or_else(|_| empty_journey(subject_type, &subject_for_fallback, &date_for_fallback));
+    // Spec 049 PR10: attach the recurrence block from attacker_profiles
+    // for IP subjects. Read directly from SQLite (same blob the
+    // Intelligence > Profiles tab uses). Failures fall through to
+    // `None` — the drill-down keeps working, the block just hides.
+    let response = overlay_recurrence_block(
+        response,
+        subject_type,
+        &subject_for_recurrence,
+        sqlite_for_recurrence.as_ref(),
+    );
     Json(response)
+}
+
+/// Spec 049 PR10 — look up the AttackerProfile for `subject` (when
+/// it is an IP) in the SQLite `attacker_profiles` blob, derive the
+/// recurrence block via `case_recurrence::recurrence_from_profile`,
+/// and attach to the response. No-op for non-IP subjects (user /
+/// detector pivots have no single IP to query) and for missing or
+/// unreadable profiles — the drill-down keeps working without the
+/// block in those cases.
+fn overlay_recurrence_block(
+    mut response: JourneyResponse,
+    subject_type: PivotKind,
+    subject: &str,
+    sqlite: Option<&std::sync::Arc<innerwarden_store::Store>>,
+) -> JourneyResponse {
+    if subject_type != PivotKind::Ip {
+        return response;
+    }
+    let Some(store) = sqlite else {
+        return response;
+    };
+    let Ok(Some(blob)) = store.get_blob("attacker_profiles") else {
+        return response;
+    };
+    let Ok(profiles) = serde_json::from_str::<Vec<crate::attacker_intel::AttackerProfile>>(&blob)
+    else {
+        return response;
+    };
+    if let Some(profile) = profiles.iter().find(|p| p.ip == subject) {
+        response.recurrence = Some(crate::dashboard::case_recurrence::recurrence_from_profile(
+            profile,
+        ));
+    }
+    response
 }
 
 pub(super) async fn api_export(
@@ -2085,6 +2136,11 @@ pub(super) fn build_journey_from_sqlite(
         chapters,
         entries,
         block_state,
+        // Spec 049 PR10: this builder stays profile-agnostic. The
+        // `api_journey` handler overlays the recurrence block from
+        // `attacker_profiles` SQLite blob AFTER spawn_blocking
+        // returns. Keeps the builder free of I/O it does not need.
+        recurrence: None,
     })
 }
 
@@ -2568,6 +2624,10 @@ pub(super) fn build_journey_from_graph(
         chapters,
         entries,
         block_state,
+        // Spec 049 PR10: builder stays I/O-free. api_journey
+        // overlays the recurrence block from attacker_profiles
+        // SQLite blob after spawn_blocking returns.
+        recurrence: None,
     }
 }
 
@@ -2603,6 +2663,8 @@ pub(super) fn empty_journey(subject_type: PivotKind, subject: &str, date: &str) 
         chapters: vec![],
         entries: vec![],
         block_state: None,
+        // Spec 049 PR10: empty journey → no profile to look up.
+        recurrence: None,
     }
 }
 
@@ -2787,6 +2849,8 @@ pub(super) fn build_journey(
         chapters,
         entries,
         block_state: None,
+        // Spec 049 PR10: test fixture path.
+        recurrence: None,
     }
 }
 
@@ -3656,6 +3720,9 @@ fn build_detector_journey(
         chapters,
         entries,
         block_state: None,
+        // Spec 049 PR10: detector subject has no single IP — no
+        // attacker profile to look up.
+        recurrence: None,
     }
 }
 

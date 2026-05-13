@@ -1547,6 +1547,79 @@
     .cases-band-label.cases-band-period {
       margin-top: 14px;
     }
+    /* Spec 049 PR10 — Recurrence block on the journey detail page.
+       Sits between the journey subtitle and the timeline so the
+       operator reads "is this attacker new or has it visited
+       before?" before scrolling into events. Neutral chrome — per-
+       pattern colour-coding (`recurrence-pattern-targeted` etc.)
+       reserved for a future PR. */
+    .recurrence-block {
+      margin: 10px 0;
+      padding: 12px 14px;
+      border-radius: 10px;
+      background: rgba(120, 229, 255, 0.04);
+      border-left: 3px solid var(--accent);
+    }
+    .recurrence-block .recurrence-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+    .recurrence-block .recurrence-eyebrow {
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-size: 0.62rem;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .recurrence-block .recurrence-pattern-badge {
+      padding: 3px 10px;
+      border-radius: 999px;
+      background: var(--card);
+      border: 1px solid var(--line);
+      color: var(--text);
+      font-weight: 600;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.72rem;
+    }
+    .recurrence-block .recurrence-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
+    .recurrence-block .recurrence-pill {
+      padding: 3px 10px;
+      border-radius: 999px;
+      background: var(--card);
+      border: 1px solid var(--line);
+    }
+    .recurrence-block .recurrence-pill strong {
+      color: var(--text);
+      font-weight: 700;
+    }
+    .recurrence-block .recurrence-returned {
+      border-color: rgba(244, 164, 64, 0.4);
+      color: rgba(244, 164, 64, 1);
+    }
+    .recurrence-block .recurrence-returned small {
+      opacity: 0.7;
+      margin-left: 4px;
+    }
+    .recurrence-block .recurrence-footer {
+      margin-top: 8px;
+      font-size: 0.74rem;
+    }
+    .recurrence-block .recurrence-profile-link {
+      color: var(--accent);
+      text-decoration: none;
+    }
+    .recurrence-block .recurrence-profile-link:hover {
+      text-decoration: underline;
+    }
+
     /* Spec 049 PR9 — Decision provenance block on the journey
        decision-card drill-down. Sits between title and meta so the
        operator reads "who decided" first. Each layer carries the

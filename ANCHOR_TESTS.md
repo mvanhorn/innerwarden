@@ -480,6 +480,24 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/dashboard/mod.rs::tests::app_css_defines_decision_provenance_block_styles` — `.decision-provenance` + label/badge/detail selectors. Without them the block renders unstyled.
 
+- `crates/agent/src/dashboard/case_recurrence.rs::tests::recurrence_pattern_serializes_as_snake_case` — spec 049 PR10 wire-format contract. All 5 `RecurrencePattern` variants serialize to fixed snake_case strings (`single_burst` / `opportunistic` / `regular_scanner` / `targeted` / `unknown`). Frontend keys on these; changing any is a breaking change.
+
+- `crates/agent/src/dashboard/case_recurrence.rs::tests::agent_unknown_with_one_visit_promotes_to_single_burst` — the agent's `classify_pattern` returns `unknown` on `visit_count < 2` (early-return). The drill-down promotes that to `SingleBurst` — more honest operator-facing label. Anti-regression for a future "just pass-through the agent label" simplification.
+
+- `crates/agent/src/dashboard/case_recurrence.rs::tests::future_agent_label_falls_through_to_unknown` — forward-compat guard. A new agent classifier label (e.g. `swarm`) without updating this module's map renders as `Unknown` — visible, not silently misclassified.
+
+- `crates/agent/src/dashboard/case_recurrence.rs::tests::returns_after_unblock_caps_at_visit_count_minus_one` — even with many retries (`total_blocks = 99`), `returns_after_unblock` is capped at `visit_count - 1`. Anti-inflation guard.
+
+- `crates/agent/src/dashboard/mod.rs::tests::journey_js_renders_recurrence_block` — frontend defines `renderRecurrenceBlock` and the journey template invokes it with `j.recurrence`.
+
+- `crates/agent/src/dashboard/mod.rs::tests::journey_js_recurrence_block_reads_backend_fields_directly` — render helper reads strictly from `rec.*` (backend-emitted), never derives from journey entries. Single source of truth: agent + `case_recurrence` own the math.
+
+- `crates/agent/src/dashboard/mod.rs::tests::journey_js_recurrence_block_returns_empty_when_field_missing` — non-IP subjects / missing profiles render '' (nothing), NOT a fake "0 visits" panel. Honest absence.
+
+- `crates/agent/src/dashboard/mod.rs::tests::investigation_journey_overlays_recurrence_block_for_ip_subjects` — `api_journey` invokes `overlay_recurrence_block` after spawn_blocking. Without the overlay, the builder's `recurrence: None` would stay in place and the frontend would never see the data.
+
+- `crates/agent/src/dashboard/mod.rs::tests::app_css_defines_recurrence_block_styles` — `.recurrence-block` + eyebrow / badge / pill / returned / profile-link selectors. Without them the block renders unstyled.
+
 - `crates/agent/src/dashboard/mod.rs::tests::home_strip_reads_backend_counters_not_frontend_bucket_sum` — `renderActivityStrip` reads `overview.flagged_by_system_count` / `warden_decisions_count` / `filtered_out_count` directly. Pre-spec-049 the frontend summed `snap.buckets.X.unique_attackers` itself, which drifted across refactors and silently dropped dismissed. Backend now owns the math contract (case_metrics.rs); a future revert to frontend math fails this anchor.
 
 - `crates/agent/src/dashboard/mod.rs::tests::home_strip_breakdown_chips_render_leaf_outcome_counters` — the three sub-breakdown chips (Contained · Observing · Filtered out) read the leaf counters whose backend-guaranteed sum equals `warden_decisions_count`. Pin prevents a future rewire from breaking the visible reconciliation (chip total != big number above).

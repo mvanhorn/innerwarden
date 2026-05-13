@@ -15,6 +15,7 @@ mod actions;
 mod agent_api;
 mod auth;
 mod case_metrics;
+mod case_recurrence;
 mod compliance;
 mod data_api;
 mod decision_provenance;
@@ -1428,6 +1429,108 @@ mod tests {
             !INDEX_HTML.contains("Unresolved Threats"),
             "Cases panel header MUST NOT revert to `Unresolved Threats`"
         );
+    }
+
+    // ── Spec 049 PR10 anchors ───────────────────────────────────────
+    // Recurrence block on the Cases drill-down. Backend overlays
+    // `RecurrenceBlock` on `JourneyResponse` for IP subjects from
+    // `attacker_profiles` SQLite blob. Frontend renders the block
+    // above the timeline so the operator reads "is this attacker
+    // new or has it visited before?" before scrolling.
+
+    #[test]
+    fn journey_js_renders_recurrence_block() {
+        // The render helper MUST be defined and the journey detail
+        // template MUST call it. Without these, the spec 049
+        // §8.2.E item 6 contract goes invisible.
+        assert!(
+            JS_JOURNEY.contains("function renderRecurrenceBlock("),
+            "journey.js must define renderRecurrenceBlock helper (spec 049 PR10)"
+        );
+        assert!(
+            JS_JOURNEY.contains("${renderRecurrenceBlock(j.recurrence)}"),
+            "journey detail template MUST invoke renderRecurrenceBlock with j.recurrence (spec 049 PR10)"
+        );
+    }
+
+    #[test]
+    fn journey_js_recurrence_block_reads_backend_fields_directly() {
+        // Reads strictly from `rec.*` (backend-emitted) rather than
+        // deriving from journey entries. Single source of truth —
+        // the agent's `classify_pattern` + `case_recurrence::recurrence_from_profile`
+        // own the math.
+        for field in [
+            "rec.pattern_label",
+            "rec.visit_count",
+            "rec.total_days_active",
+            "rec.first_seen",
+            "rec.last_seen",
+            "rec.returns_after_unblock",
+            "rec.profile_link",
+        ] {
+            assert!(
+                JS_JOURNEY.contains(field),
+                "renderRecurrenceBlock must read {field} (backend-emitted)"
+            );
+        }
+    }
+
+    #[test]
+    fn journey_js_recurrence_block_returns_empty_when_field_missing() {
+        // Non-IP subjects + missing-profile cases emit `recurrence:
+        // None` on the backend; the JS must render '' (nothing) for
+        // those, NOT a fake "0 visits" panel. Anchor pins the
+        // early-return.
+        let start = JS_JOURNEY
+            .find("function renderRecurrenceBlock(")
+            .expect("renderRecurrenceBlock defined");
+        let end = JS_JOURNEY[start..]
+            .find("\n}\n")
+            .expect("end of renderRecurrenceBlock")
+            + start;
+        let body = &JS_JOURNEY[start..end];
+        assert!(
+            body.contains("if (!rec || typeof rec !== 'object') return '';"),
+            "renderRecurrenceBlock must early-return '' when rec is missing (spec 049 PR10)"
+        );
+    }
+
+    #[test]
+    fn investigation_journey_overlays_recurrence_block_for_ip_subjects() {
+        // The api_journey handler must call `overlay_recurrence_block`
+        // after spawn_blocking returns. Without the overlay, the
+        // builder's `recurrence: None` stays in place and the
+        // frontend never sees the data.
+        let src = include_str!("investigation.rs");
+        assert!(
+            src.contains("fn overlay_recurrence_block("),
+            "investigation.rs must define overlay_recurrence_block (spec 049 PR10)"
+        );
+        assert!(
+            src.contains("overlay_recurrence_block("),
+            "api_journey must invoke overlay_recurrence_block"
+        );
+        assert!(
+            src.contains("\"attacker_profiles\""),
+            "overlay must read from the `attacker_profiles` SQLite blob"
+        );
+    }
+
+    #[test]
+    fn app_css_defines_recurrence_block_styles() {
+        for selector in [
+            ".recurrence-block",
+            ".recurrence-block .recurrence-eyebrow",
+            ".recurrence-block .recurrence-pattern-badge",
+            ".recurrence-block .recurrence-pill",
+            ".recurrence-block .recurrence-returned",
+            ".recurrence-block .recurrence-profile-link",
+        ] {
+            assert!(
+                APP_CSS.contains(selector),
+                "app.css must define {selector} (spec 049 PR10 recurrence block styling)"
+            );
+        }
     }
 
     // ── Spec 049 PR9 anchors ────────────────────────────────────────
@@ -3429,6 +3532,9 @@ mod tests {
                 chapters: vec![],
                 entries: vec![],
                 block_state: None,
+                // Spec 049 PR10: export test fixture — no profile
+                // to look up.
+                recurrence: None,
             }),
         };
 

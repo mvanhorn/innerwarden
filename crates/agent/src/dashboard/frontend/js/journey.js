@@ -367,6 +367,62 @@ function renderEvidenceCard(entry, idx) {
     </div>`;
 }
 
+// Spec 049 PR10 — Recurrence block on the Cases drill-down. Reads
+// `j.recurrence` (backend-emitted from attacker_intel for IP
+// subjects) and renders an operator-facing summary: pattern badge
+// + visit count + first/last seen + returns-after-unblock + a
+// link back to the full attacker profile in Intel > Profiles.
+//
+// Returns '' when the backend did not emit the field (non-IP
+// subjects, missing profile, sqlite unavailable). Operator sees
+// no block in that case — better than a fake "0 visits" panel.
+function renderRecurrenceBlock(rec) {
+  if (!rec || typeof rec !== 'object') return '';
+  var label = rec.pattern_label || rec.pattern || 'Unknown';
+  var visits = rec.visit_count != null ? rec.visit_count : 0;
+  var days = rec.total_days_active != null ? rec.total_days_active : 0;
+  // fmtDateTime (date + time) defined in api.js; fall back to a raw
+  // ISO-date slice if it is unavailable for any reason (script load
+  // order edge case).
+  var fmt = (typeof fmtDateTime === 'function')
+    ? fmtDateTime
+    : function(ts) { return (ts || '').slice(0, 10); };
+  var first = rec.first_seen ? fmt(rec.first_seen) : '—';
+  var last = rec.last_seen ? fmt(rec.last_seen) : '—';
+  var returnsRaw = rec.returns_after_unblock != null ? rec.returns_after_unblock : 0;
+  var returnsLine = returnsRaw > 0
+    ? '<span class="recurrence-pill recurrence-returned">' +
+        '↻ ' + esc(String(returnsRaw)) + ' return(s) after unblock <small>(approx.)</small>' +
+      '</span>'
+    : '<span class="recurrence-pill">No returns after unblock</span>';
+  var profileHref = rec.profile_link
+    ? '<a href="#intel" class="recurrence-profile-link" ' +
+        'onclick="event.preventDefault();showView(\'intel\')">' +
+        'View full profile →</a>'
+    : '';
+  // Snake-case wire string for CSS hooks (per-pattern styling can
+  // land in a future PR; PR10 keeps chrome neutral). Sanitize defensively.
+  var patternKey = String(rec.pattern || 'unknown').replace(/[^a-z0-9_]/gi, '');
+  return (
+    '<div class="recurrence-block recurrence-pattern-' + esc(patternKey) + '">' +
+      '<div class="recurrence-header">' +
+        '<span class="recurrence-eyebrow">Recurrence</span>' +
+        '<span class="recurrence-pattern-badge">' + esc(label) + '</span>' +
+      '</div>' +
+      '<div class="recurrence-meta">' +
+        '<span class="recurrence-pill"><strong>' + esc(String(visits)) +
+          '</strong> visit' + (visits === 1 ? '' : 's') + '</span>' +
+        '<span class="recurrence-pill"><strong>' + esc(String(days)) +
+          '</strong> day' + (days === 1 ? '' : 's') + ' active</span>' +
+        '<span class="recurrence-pill">First seen: ' + esc(first) + '</span>' +
+        '<span class="recurrence-pill">Last seen: ' + esc(last) + '</span>' +
+        returnsLine +
+      '</div>' +
+      (profileHref ? '<div class="recurrence-footer">' + profileHref + '</div>' : '') +
+    '</div>'
+  );
+}
+
 // Spec 049 PR9 — Decision provenance block. Renders WHICH layer
 // decided (algorithm gate / killchain fast-path / correlation rule
 // / AI Local Warden / AI LLM / auto-rule / honeypot post-session /
@@ -758,6 +814,7 @@ async function loadJourney(subjectType, subjectValue, focusIncidentId) {
         <span class="journey-time">${esc(first)} → ${esc(last)}</span>
       </div>
       <div class="journey-subtitle">${esc((j.subject_type || subjectType).toUpperCase())} journey · ${j.entries.length} timeline entries · click any row to expand</div>
+      ${renderRecurrenceBlock(j.recurrence)}
       <div class="journey-actions">
         <button type="button" class="journey-btn" onclick="downloadSnapshot('json')">Export JSON</button>
         <button type="button" class="journey-btn" onclick="downloadSnapshot('md')">Export Markdown</button>
