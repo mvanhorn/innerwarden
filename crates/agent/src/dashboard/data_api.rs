@@ -918,6 +918,9 @@ pub(super) async fn api_overview(
             // it even in sleeping mode so the picker has a useful
             // initial render before the first non-sleeping refresh.
             timezone: operator_timezone(),
+            // Spec 049 PR6 — sleeping default: empty Current state
+            // (no live counters available without compute).
+            current_state: crate::dashboard::types::CurrentStateBlock::default(),
             severity_breakdown: std::collections::HashMap::new(),
             allowlisted_count: 0,
             top_detectors: vec![],
@@ -969,6 +972,38 @@ pub(super) async fn api_overview(
     let hour_filter = parse_hour_filter(query.hour_from, query.hour_to);
     let now = chrono::Utc::now();
     let degraded = read_degraded_signals(&state);
+    // Spec 049 PR6 — `Current state` band. Computed ONCE against
+    // today's data with NO hour filter, regardless of what the
+    // request asked for. The operator can pick `Yesterday 14h-16h`
+    // in the scope picker without losing situational awareness for
+    // what is alive right now in the product.
+    //
+    // Cost: one extra SQLite compute pass per /api/overview call. On
+    // a request that already matches today + no hour filter (the
+    // default load), this is wasted work — a future PR may add a
+    // short-circuit but for now correctness wins.
+    let today_for_current_state = resolve_date(None);
+    let current_state = state
+        .sqlite_store
+        .as_ref()
+        .and_then(|store| {
+            compute_overview_counts_from_sqlite(
+                store,
+                &today_for_current_state,
+                0,
+                None,
+                None,
+                now,
+                &degraded,
+                &state.data_dir,
+            )
+        })
+        .map(|c| crate::dashboard::types::CurrentStateBlock {
+            currently_blocked: c.blocked_count,
+            currently_observing: c.observing_count,
+            needs_review_now: c.attention_count,
+        })
+        .unwrap_or_default();
     let sqlite_counts = state.sqlite_store.as_ref().and_then(|store| {
         compute_overview_counts_from_sqlite(
             store,
@@ -1032,6 +1067,7 @@ pub(super) async fn api_overview(
             flagged_by_system_count: c.flagged_by_system_count,
             warden_decisions_count: c.warden_decisions_count,
             timezone: operator_timezone(),
+            current_state: current_state.clone(),
             severity_breakdown: c.severity_breakdown,
             // Phase 7: now populated from the persisted is_allowlisted
             // column. Pre-Phase-7 returned 0 because the flag only
@@ -1252,6 +1288,7 @@ pub(super) async fn api_overview(
         flagged_by_system_count: case_metrics.flagged_by_system(),
         warden_decisions_count: case_metrics.warden_decisions(),
         timezone: operator_timezone(),
+        current_state,
         severity_breakdown,
         allowlisted_count,
         top_detectors,
@@ -2070,6 +2107,12 @@ pub(super) fn compute_overview_from_graph(
         flagged_by_system_count: case_metrics.flagged_by_system(),
         warden_decisions_count: case_metrics.warden_decisions(),
         timezone: operator_timezone(),
+        // Spec 049 PR6 — static helper (no `&AgentState`); cannot
+        // compute Current state here. The `api_overview` handler
+        // overlays the live band when it has SQLite access; static
+        // / test-only helpers like this emit an empty default so
+        // the response schema stays consistent.
+        current_state: crate::dashboard::types::CurrentStateBlock::default(),
         severity_breakdown,
         allowlisted_count,
         top_detectors,
@@ -2176,6 +2219,12 @@ pub(super) fn compute_overview(data_dir: &Path, date: &str) -> OverviewResponse 
         flagged_by_system_count: case_metrics.flagged_by_system(),
         warden_decisions_count: case_metrics.warden_decisions(),
         timezone: operator_timezone(),
+        // Spec 049 PR6 — static helper (no `&AgentState`); cannot
+        // compute Current state here. The `api_overview` handler
+        // overlays the live band when it has SQLite access; static
+        // / test-only helpers like this emit an empty default so
+        // the response schema stays consistent.
+        current_state: crate::dashboard::types::CurrentStateBlock::default(),
         severity_breakdown: std::collections::HashMap::new(),
         allowlisted_count: 0,
         top_detectors,

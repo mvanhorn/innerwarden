@@ -1531,6 +1531,23 @@
       .activity-strip .activity-cell { flex-basis: calc(50% - 5px); }
     }
 
+    /* Spec 049 PR6 — Cases header duplo band label. Two stacked
+       kpi-grids on the Cases tab: `Current state` (live, ignores
+       picker) and `Selected period` (follows picker). The label
+       sits above each grid as a small UPPERCASE caption so the
+       operator can never confuse the two bands. */
+    .cases-band-label {
+      font-size: 0.62rem;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin: 0 0 4px 2px;
+      font-weight: 600;
+    }
+    .cases-band-label.cases-band-period {
+      margin-top: 14px;
+    }
+
     /* Spec 049 PR5 — hour-of-day scope picker on Cases tab. Sits
        directly under the date input so the operator does not have
        to dig under "Advanced filters" to answer their primary audit

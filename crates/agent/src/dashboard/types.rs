@@ -108,6 +108,28 @@ pub(crate) struct ActionResponse {
 // Query structs
 // ---------------------------------------------------------------------------
 
+/// Spec 049 PR6 — `Current state` band counters. Distinct from the
+/// flat `OverviewResponse` counters because Current state IGNORES
+/// the request's date/hour filter — it always reflects today's
+/// live product state so the operator never loses situational
+/// awareness while auditing a historical window. The three fields
+/// mirror the three Selected-period leaf counters but read from a
+/// today-only no-hour-filter compute pass.
+#[derive(Debug, Clone, Default, Serialize)]
+pub(crate) struct CurrentStateBlock {
+    /// Unique attacker IPs in `Contained` outcome today (= blocked +
+    /// honeypot). PR6 approximation: today's count from
+    /// `compute_overview_counts_from_sqlite` with no hour filter.
+    /// A future PR may swap this for live `xdp_block_times` reads
+    /// so the "blocked from yesterday with 48h TTL still active"
+    /// case shows correctly.
+    pub(crate) currently_blocked: usize,
+    /// Today's `Observing` outcome count.
+    pub(crate) currently_observing: usize,
+    /// Today's `Needs review` outcome count.
+    pub(crate) needs_review_now: usize,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct ListQuery {
     pub(super) limit: Option<usize>,
@@ -403,6 +425,17 @@ pub(crate) struct OverviewResponse {
     /// follow-up PR may add operator-TZ conversion at the picker
     /// layer.
     pub(super) timezone: String,
+    /// Spec 049 PR6 — `Current state` band on the Cases tab header.
+    /// ALWAYS reflects today's full-day counts, regardless of the
+    /// request's `date` / `hour_from` / `hour_to` query params.
+    /// Operator can pick `Yesterday 14h-16h` in the scope picker and
+    /// the `Selected period` band reads those counters (flat
+    /// `blocked_count` / `observing_count` / `attention_count`),
+    /// while the `Current state` band keeps showing what is alive
+    /// right now in the product. The two bands are deliberately
+    /// independent (spec 049 §8.2.A) so the operator can audit a
+    /// historical window without losing situational awareness.
+    pub(super) current_state: CurrentStateBlock,
     /// Breakdown by severity level: {"critical": N, "high": N, ...}
     pub(super) severity_breakdown: std::collections::HashMap<String, usize>,
     /// Incidents from allowlisted IPs/users (can be hidden in dashboard).

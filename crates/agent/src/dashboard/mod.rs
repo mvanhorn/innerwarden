@@ -1429,6 +1429,119 @@ mod tests {
         );
     }
 
+    // ── Spec 049 PR6 anchors ────────────────────────────────────────
+    // Cases tab header duplo: `Current state` band (live, ignores
+    // scope picker) + `Selected period` band (follows scope picker).
+    // The two bands MUST stay independently semantic — operator
+    // picks `Yesterday 14h-16h` and Current state keeps showing live
+    // counters. Frontend reads `overview.current_state.*` (PR6
+    // backend) for the live band; existing flat counters drive the
+    // Selected period band.
+
+    #[test]
+    fn cases_tab_renders_header_duplo_with_band_labels() {
+        // Both band labels must be present, and the kpi-card IDs
+        // for each band must be distinct (live IDs prefixed
+        // `kpi-now-`, period IDs use the legacy `kpi-*` names).
+        assert!(
+            INDEX_HTML.contains(">Current state · now<"),
+            "Cases tab must label the live band `Current state · now` (spec 049 PR6 §8.2.A)"
+        );
+        assert!(
+            INDEX_HTML.contains(">Selected period<"),
+            "Cases tab must label the picker-scoped band `Selected period` (spec 049 PR6 §8.2.A)"
+        );
+        for id in [
+            "kpi-now-blocked",
+            "kpi-now-observing",
+            "kpi-now-needs-review",
+        ] {
+            assert!(
+                INDEX_HTML.contains(&format!("id=\"{id}\"")),
+                "Cases tab must carry id={id} for the Current state band (spec 049 PR6)"
+            );
+        }
+        // Legacy IDs survive — they back the Selected period band now.
+        for id in ["kpi-confirmed", "kpi-responded", "kpi-noise"] {
+            assert!(
+                INDEX_HTML.contains(&format!("id=\"{id}\"")),
+                "Cases tab MUST keep legacy id={id} (now drives Selected period band)"
+            );
+        }
+    }
+
+    #[test]
+    fn cases_tab_current_state_band_carries_now_label_not_period_label() {
+        // The window labels in the Current state band's kpi-cards
+        // must say `now` (live), and the Selected period band's
+        // window labels must say `period` (scope-dependent). A
+        // future refactor that flips them silently would invert
+        // the bands' semantics.
+        let html = INDEX_HTML;
+        let now_cards = [
+            "kpi-now-blocked",
+            "kpi-now-observing",
+            "kpi-now-needs-review",
+        ];
+        for id in now_cards {
+            let card_idx = html.find(&format!("id=\"{id}\"")).expect("id present");
+            let tail = &html[card_idx..card_idx + 400];
+            assert!(
+                tail.contains(">now<"),
+                "Current state card {id} must carry `>now<` window label (spec 049 PR6)"
+            );
+        }
+        for id in ["kpi-confirmed", "kpi-responded", "kpi-noise"] {
+            let card_idx = html.find(&format!("id=\"{id}\"")).expect("id present");
+            let tail = &html[card_idx..card_idx + 400];
+            assert!(
+                tail.contains(">period<"),
+                "Selected period card {id} must carry `>period<` window label (spec 049 PR6)"
+            );
+        }
+    }
+
+    #[test]
+    fn threats_js_renders_current_state_band_from_backend() {
+        // `renderCurrentStateBand` must be defined and called from
+        // BOTH refresh paths (refreshLeft + refreshLeftLive) so the
+        // live band updates on every dashboard tick, not just SSE
+        // pushes. Reads strictly from `overview.current_state.*`;
+        // never derives from selected-period counters (which would
+        // make the live band wrongly track the scope picker).
+        assert!(
+            JS_THREATS.contains("function renderCurrentStateBand("),
+            "renderCurrentStateBand helper must be defined (spec 049 PR6)"
+        );
+        let invocations = JS_THREATS
+            .matches("renderCurrentStateBand(ov && ov.current_state)")
+            .count();
+        assert_eq!(
+            invocations, 2,
+            "renderCurrentStateBand must be invoked from BOTH refreshLeft and refreshLeftLive (saw {invocations})"
+        );
+        for id in [
+            "kpi-now-blocked",
+            "kpi-now-observing",
+            "kpi-now-needs-review",
+        ] {
+            assert!(
+                JS_THREATS.contains(&format!("setNum('{id}',")),
+                "renderCurrentStateBand must write into {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_css_defines_cases_band_label_styles() {
+        for selector in [".cases-band-label", ".cases-band-label.cases-band-period"] {
+            assert!(
+                APP_CSS.contains(selector),
+                "app.css must define {selector} (spec 049 PR6 band-label styling)"
+            );
+        }
+    }
+
     // ── Spec 049 PR5 anchors ────────────────────────────────────────
     // Scope picker on Cases tab. Operator picks date + hour-from +
     // hour-to and the Cases tab queries `/api/overview` with the
@@ -2121,9 +2234,16 @@ mod tests {
             INDEX_HTML.contains("<div class=\"kpi-label\">Block actions</div>"),
             "KPI tile must read 'Block actions' (Wave 10) to disambiguate aggregate decisions from snapshot list 'Currently blocked attackers'"
         );
+        // Spec 049 PR6: the Block actions tile sits in the Selected
+        // period band now, so its window label says `period` (tracks
+        // the picker), not `today` (Wave 10 default). The Wave 10
+        // intent — make the aggregation window explicit on the tile
+        // — survives the rename. A separate Current state band on
+        // the same tab carries the live `Currently blocked` tile
+        // with window=`now`, pinned by spec 049 PR6 anchors.
         assert!(
-            INDEX_HTML.contains("<div class=\"kpi-window\">today</div>"),
-            "KPI window must read 'today' (lowercase, since-midnight-UTC) to match the action's aggregation period"
+            INDEX_HTML.contains("<div class=\"kpi-window\">period</div>"),
+            "KPI window must read 'period' (Selected period band tracks the scope picker, spec 049 PR6)"
         );
         assert!(
             JS_THREATS.contains("label: 'Currently blocked attackers'"),
@@ -3031,6 +3151,10 @@ mod tests {
                 warden_decisions_count: 0,
                 // Spec 049 PR4: TZ label.
                 timezone: "UTC".to_string(),
+                // Spec 049 PR6: empty live band for export fixture
+                // (export does not need live counters — it's an
+                // audit snapshot of a selected period).
+                current_state: crate::dashboard::types::CurrentStateBlock::default(),
                 severity_breakdown: std::collections::HashMap::new(),
                 allowlisted_count: 0,
                 top_detectors: vec![],

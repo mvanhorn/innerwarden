@@ -444,6 +444,14 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/dashboard/mod.rs::tests::app_css_defines_hour_scope_picker_styles` — `.flt-hour-row` + chip / label / number / TZ-label selectors must exist. Without them the picker renders as inline plain text.
 
+- `crates/agent/src/dashboard/mod.rs::tests::cases_tab_renders_header_duplo_with_band_labels` — spec 049 PR6 §8.2.A header duplo. Cases tab carries both `Current state · now` and `Selected period` band labels + 3 new live IDs (`kpi-now-blocked`, `kpi-now-observing`, `kpi-now-needs-review`). Legacy IDs survive and back the Selected period band.
+
+- `crates/agent/src/dashboard/mod.rs::tests::cases_tab_current_state_band_carries_now_label_not_period_label` — anti-flip guard for the two bands' semantics. Each Current state kpi-card carries `>now<` window label; each Selected period card carries `>period<`. A future refactor that swaps the labels would invert the bands' meaning.
+
+- `crates/agent/src/dashboard/mod.rs::tests::threats_js_renders_current_state_band_from_backend` — `renderCurrentStateBand` defined + called from BOTH refresh paths + writes into the 3 Current state IDs. Reads strictly from `overview.current_state.*` (PR6 backend-emitted, ignores scope picker).
+
+- `crates/agent/src/dashboard/mod.rs::tests::app_css_defines_cases_band_label_styles` — `.cases-band-label` + `.cases-band-label.cases-band-period` selectors. Without them the bands stack with no visual caption.
+
 - `crates/agent/src/dashboard/mod.rs::tests::home_strip_reads_backend_counters_not_frontend_bucket_sum` — `renderActivityStrip` reads `overview.flagged_by_system_count` / `warden_decisions_count` / `filtered_out_count` directly. Pre-spec-049 the frontend summed `snap.buckets.X.unique_attackers` itself, which drifted across refactors and silently dropped dismissed. Backend now owns the math contract (case_metrics.rs); a future revert to frontend math fails this anchor.
 
 - `crates/agent/src/dashboard/mod.rs::tests::home_strip_breakdown_chips_render_leaf_outcome_counters` — the three sub-breakdown chips (Contained · Observing · Filtered out) read the leaf counters whose backend-guaranteed sum equals `warden_decisions_count`. Pin prevents a future rewire from breaking the visible reconciliation (chip total != big number above).

@@ -9,6 +9,23 @@ function renderTzLabel(tz) {
   el.textContent = 'TZ: ' + label;
 }
 
+// Spec 049 PR6: render the `Current state` band on Cases. ALWAYS
+// reads from `overview.current_state.*` — backend-computed against
+// today's full-day window regardless of the scope picker. The
+// operator can pick `Yesterday 14h-16h` and this band keeps
+// reporting what is alive RIGHT NOW.
+function renderCurrentStateBand(currentState) {
+  var cs = currentState || {};
+  var setNum = function(id, val) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = (val == null ? 0 : val);
+  };
+  setNum('kpi-now-blocked', cs.currently_blocked);
+  setNum('kpi-now-observing', cs.currently_observing);
+  setNum('kpi-now-needs-review', cs.needs_review_now);
+}
+
 var DETECTOR_PRIORITY = {
   reverse_shell: 100, fileless_exec: 95, container_escape: 90,
   rootkit: 85, data_exfil_cmd: 80, sudo_abuse: 75,
@@ -581,6 +598,11 @@ async function refreshLeftLive() {
     // never browser-derived (which drifts across analysts).
     renderTzLabel(ov && ov.timezone);
 
+    // Spec 049 PR6: render the `Current state` band — live counters
+    // that IGNORE the scope picker. Operator never loses situational
+    // awareness while auditing a historical window.
+    renderCurrentStateBand(ov && ov.current_state);
+
     // 2026-04-29 (audit Phase 2): KPIs read from `/api/overview`
     // backend-computed fields, identical to `refreshLeft`. The live
     // SSE path used to derive counts locally from `items.outcome`,
@@ -691,6 +713,11 @@ async function refreshLeft(forceRefreshJourney = false) {
 
     // Spec 049 PR5: render operator TZ on the scope picker label.
     renderTzLabel(ov && ov.timezone);
+
+    // Spec 049 PR6: render the `Current state` band — live counters
+    // that IGNORE the scope picker. Operator never loses situational
+    // awareness while auditing a historical window.
+    renderCurrentStateBand(ov && ov.current_state);
 
     // Spec 037 Threats UX bundle: read the three KPIs from the
     // backend-computed `/api/overview` fields instead of summing
