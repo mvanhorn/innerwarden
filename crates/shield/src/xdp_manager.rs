@@ -19,6 +19,7 @@ pub struct BlocklistEntry {
 /// Manages an XDP BPF map for wire-speed IP blocking.
 pub struct XdpManager {
     bpf_path: String,
+    bpftool_bin: String,
     /// Internal in-memory mirror of the blocklist.
     blocklist: Vec<BlocklistEntry>,
     /// When true, skip actual bpftool calls (for tests / dry-run).
@@ -29,6 +30,7 @@ impl XdpManager {
     pub fn new(bpf_path: &str) -> Self {
         Self {
             bpf_path: bpf_path.to_string(),
+            bpftool_bin: "bpftool".into(),
             blocklist: Vec::new(),
             dry_run: false,
         }
@@ -36,6 +38,11 @@ impl XdpManager {
 
     pub fn with_dry_run(mut self, dry_run: bool) -> Self {
         self.dry_run = dry_run;
+        self
+    }
+
+    pub fn with_bpftool_bin(mut self, bpftool_bin: impl Into<String>) -> Self {
+        self.bpftool_bin = bpftool_bin.into();
         self
     }
 
@@ -48,20 +55,10 @@ impl XdpManager {
 
         if !self.dry_run {
             let (map_name, key_hex) = ip_to_bpf_map_and_key(ip)?;
-            let output = Command::new("bpftool")
-                .args([
-                    "map",
-                    "update",
-                    "pinned",
-                    &format!("{}/{}", self.bpf_path, map_name),
-                    "key",
-                    &key_hex,
-                    "value",
-                    "0x01",
-                    "0x00",
-                    "0x00",
-                    "0x00",
-                ])
+            let pinned = pinned_map_path(&self.bpf_path, map_name);
+            let args = bpftool_update_args(&pinned, &key_hex);
+            let output = Command::new(&self.bpftool_bin)
+                .args(args.iter().map(String::as_str))
                 .output()
                 .context("Failed to execute bpftool map update")?;
 
@@ -90,15 +87,10 @@ impl XdpManager {
 
         if !self.dry_run {
             if let Ok((map_name, key_hex)) = ip_to_bpf_map_and_key(ip) {
-                let output = Command::new("bpftool")
-                    .args([
-                        "map",
-                        "delete",
-                        "pinned",
-                        &format!("{}/{}", self.bpf_path, map_name),
-                        "key",
-                        &key_hex,
-                    ])
+                let pinned = pinned_map_path(&self.bpf_path, map_name);
+                let args = bpftool_delete_args(&pinned, &key_hex);
+                let output = Command::new(&self.bpftool_bin)
+                    .args(args.iter().map(String::as_str))
                     .output()
                     .context("Failed to execute bpftool map delete")?;
 
@@ -187,6 +179,27 @@ fn ip_to_bpf_map_and_key(ip: &str) -> Result<(&'static str, String)> {
     }
 }
 
+fn pinned_map_path(bpf_path: &str, map_name: &str) -> String {
+    format!("{bpf_path}/{map_name}")
+}
+
+fn bpftool_update_args(pinned_map: &str, key_hex: &str) -> Vec<String> {
+    [
+        "map", "update", "pinned", pinned_map, "key", key_hex, "value", "0x01", "0x00", "0x00",
+        "0x00",
+    ]
+    .iter()
+    .map(|arg| (*arg).to_string())
+    .collect()
+}
+
+fn bpftool_delete_args(pinned_map: &str, key_hex: &str) -> Vec<String> {
+    ["map", "delete", "pinned", pinned_map, "key", key_hex]
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect()
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -194,6 +207,28 @@ fn ip_to_bpf_map_and_key(ip: &str) -> Result<(&'static str, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(unix)]
+    fn fake_bpftool(exit_code: i32, stderr: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let args_file = dir.path().join("args.txt");
+        let script_path = dir.path().join("bpftool");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s ' \"$@\" > '{}'\nprintf '{}' >&2\nexit {}\n",
+            args_file.display(),
+            stderr,
+            exit_code
+        );
+        std::fs::write(&script_path, script).expect("write fake bpftool");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("script metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod fake bpftool");
+        (dir, script_path)
+    }
 
     #[test]
     fn add_and_list_dry_run() {
@@ -260,5 +295,180 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].ip, "10.0.0.5");
         assert_eq!(entries[0].reason, "escalation");
+    }
+
+    #[test]
+    fn manager_accessors_track_path_membership_and_count() {
+        let mut mgr = XdpManager::new("/sys/fs/bpf/innerwarden").with_dry_run(true);
+        assert_eq!(mgr.bpf_path(), "/sys/fs/bpf/innerwarden");
+        assert!(!mgr.is_blocked("203.0.113.7"));
+
+        mgr.add_to_blocklist("203.0.113.7", "test").unwrap();
+
+        assert!(mgr.is_blocked("203.0.113.7"));
+        assert_eq!(mgr.blocklist_count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_dry_run_add_invokes_configured_bpftool_and_records_entry() {
+        let (dir, script_path) = fake_bpftool(0, "");
+        let args_file = dir.path().join("args.txt");
+        let mut mgr =
+            XdpManager::new("/pins").with_bpftool_bin(script_path.to_string_lossy().to_string());
+
+        mgr.add_to_blocklist("203.0.113.7", "manual").unwrap();
+
+        let args = std::fs::read_to_string(args_file).expect("args file");
+        assert!(args.contains("map update pinned /pins/blocklist key 0xcb 0x00 0x71 0x07"));
+        assert!(mgr.is_blocked("203.0.113.7"));
+        assert_eq!(mgr.get_blocklist_entries()[0].reason, "manual");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_dry_run_add_returns_error_without_mutating_when_bpftool_fails() {
+        let (_dir, script_path) = fake_bpftool(2, "denied");
+        let mut mgr =
+            XdpManager::new("/pins").with_bpftool_bin(script_path.to_string_lossy().to_string());
+
+        let err = mgr
+            .add_to_blocklist("203.0.113.7", "manual")
+            .expect_err("bpftool failure should bubble");
+
+        assert!(err.to_string().contains("bpftool map update failed"));
+        assert_eq!(mgr.blocklist_count(), 0);
+    }
+
+    #[test]
+    fn non_dry_run_add_validates_ip_before_running_bpftool() {
+        let mut mgr = XdpManager::new("/pins").with_bpftool_bin("/definitely/missing/bpftool");
+
+        let err = mgr
+            .add_to_blocklist("not-an-ip", "manual")
+            .expect_err("invalid IP should fail before subprocess");
+
+        assert!(err.to_string().contains("invalid IP address"));
+        assert_eq!(mgr.blocklist_count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn duplicate_add_skips_bpftool_even_when_not_dry_run() {
+        let (dir, script_path) = fake_bpftool(2, "should not run");
+        let args_file = dir.path().join("args.txt");
+        let mut mgr =
+            XdpManager::new("/pins").with_bpftool_bin(script_path.to_string_lossy().to_string());
+        mgr.blocklist.push(BlocklistEntry {
+            ip: "203.0.113.7".to_string(),
+            added_at: chrono::Utc::now(),
+            reason: "first".to_string(),
+        });
+
+        mgr.add_to_blocklist("203.0.113.7", "second").unwrap();
+
+        assert_eq!(mgr.blocklist_count(), 1);
+        assert_eq!(mgr.get_blocklist_entries()[0].reason, "first");
+        assert!(!args_file.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_dry_run_remove_invokes_bpftool_and_removes_even_on_delete_failure() {
+        let (dir, script_path) = fake_bpftool(2, "delete denied");
+        let args_file = dir.path().join("args.txt");
+        let mut mgr =
+            XdpManager::new("/pins").with_bpftool_bin(script_path.to_string_lossy().to_string());
+        mgr.blocklist.push(BlocklistEntry {
+            ip: "2001:db8::1".to_string(),
+            added_at: chrono::Utc::now(),
+            reason: "test".to_string(),
+        });
+
+        mgr.remove_from_blocklist("2001:db8::1").unwrap();
+
+        let args = std::fs::read_to_string(args_file).expect("args file");
+        assert!(args.contains("map delete pinned /pins/blocklist_v6 key"));
+        assert!(!mgr.is_blocked("2001:db8::1"));
+    }
+
+    #[test]
+    fn cleanup_stale_removes_only_entries_older_than_cutoff() {
+        let now = chrono::Utc::now();
+        let mut mgr = XdpManager::new("/sys/fs/bpf/innerwarden").with_dry_run(true);
+        mgr.blocklist.push(BlocklistEntry {
+            ip: "10.0.0.1".to_string(),
+            added_at: now - chrono::Duration::seconds(601),
+            reason: "old".to_string(),
+        });
+        mgr.blocklist.push(BlocklistEntry {
+            ip: "10.0.0.2".to_string(),
+            added_at: now - chrono::Duration::seconds(100),
+            reason: "fresh".to_string(),
+        });
+
+        mgr.cleanup_stale(std::time::Duration::from_secs(300), now);
+
+        assert!(!mgr.is_blocked("10.0.0.1"));
+        assert!(mgr.is_blocked("10.0.0.2"));
+    }
+
+    #[test]
+    fn cleanup_stale_uses_default_age_when_duration_overflows_chrono() {
+        let now = chrono::Utc::now();
+        let mut mgr = XdpManager::new("/sys/fs/bpf/innerwarden").with_dry_run(true);
+        mgr.blocklist.push(BlocklistEntry {
+            ip: "10.0.0.3".to_string(),
+            added_at: now - chrono::Duration::seconds(301),
+            reason: "old".to_string(),
+        });
+
+        mgr.cleanup_stale(std::time::Duration::MAX, now);
+
+        assert!(!mgr.is_blocked("10.0.0.3"));
+    }
+
+    #[test]
+    fn bpftool_argument_builders_use_pinned_map_and_key() {
+        let pinned = pinned_map_path("/sys/fs/bpf/innerwarden", "blocklist");
+        assert_eq!(pinned, "/sys/fs/bpf/innerwarden/blocklist");
+
+        let update = bpftool_update_args(&pinned, "0xcb 0x00 0x71 0x07");
+        assert_eq!(
+            update,
+            vec![
+                "map",
+                "update",
+                "pinned",
+                "/sys/fs/bpf/innerwarden/blocklist",
+                "key",
+                "0xcb 0x00 0x71 0x07",
+                "value",
+                "0x01",
+                "0x00",
+                "0x00",
+                "0x00",
+            ]
+        );
+
+        let delete = bpftool_delete_args(&pinned, "0xcb 0x00 0x71 0x07");
+        assert_eq!(
+            delete,
+            vec![
+                "map",
+                "delete",
+                "pinned",
+                "/sys/fs/bpf/innerwarden/blocklist",
+                "key",
+                "0xcb 0x00 0x71 0x07",
+            ]
+        );
+    }
+
+    #[test]
+    fn ipv6_key_contains_all_sixteen_octets() {
+        let (_map, key) = ip_to_bpf_map_and_key("2001:db8::1").unwrap();
+        assert_eq!(key.split_whitespace().count(), 16);
+        assert!(key.ends_with("0x00 0x01"));
     }
 }

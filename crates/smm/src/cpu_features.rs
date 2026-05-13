@@ -281,7 +281,11 @@ pub enum FeatureDiffKind {
 
 /// Audit CPU security features.
 pub fn check_cpu_security_features() -> CheckResult {
-    let Some(features) = CpuFeatures::capture() else {
+    check_cpu_security_features_from(CpuFeatures::capture())
+}
+
+fn check_cpu_security_features_from(features: Option<CpuFeatures>) -> CheckResult {
+    let Some(features) = features else {
         return CheckResult {
             id: "CPU-001",
             name: "CPU Security Features",
@@ -291,37 +295,7 @@ pub fn check_cpu_security_features() -> CheckResult {
         };
     };
 
-    let sf = &features.security_features;
-    let mut missing = Vec::new();
-
-    match features.arch.as_str() {
-        "x86_64" => {
-            if !sf.smep {
-                missing.push("SMEP");
-            }
-            if !sf.smap {
-                missing.push("SMAP");
-            }
-            if !sf.nx {
-                missing.push("NX");
-            }
-            if !sf.spectre_mitigations {
-                missing.push("Spectre mitigations");
-            }
-            if !sf.pti {
-                missing.push("PTI (Meltdown)");
-            }
-        }
-        "aarch64" => {
-            if !sf.pan {
-                missing.push("PAN");
-            }
-            if !sf.bti {
-                missing.push("BTI");
-            }
-        }
-        _ => {}
-    }
+    let missing = missing_security_features(&features);
 
     if !missing.is_empty() {
         return CheckResult {
@@ -353,7 +327,11 @@ pub fn check_cpu_security_features() -> CheckResult {
 
 /// Check for hidden hypervisor (Blue Pill detection).
 pub fn check_hypervisor() -> CheckResult {
-    let Some(features) = CpuFeatures::capture() else {
+    check_hypervisor_from(CpuFeatures::capture())
+}
+
+fn check_hypervisor_from(features: Option<CpuFeatures>) -> CheckResult {
+    let Some(features) = features else {
         return CheckResult {
             id: "CPU-002",
             name: "Hypervisor Detection",
@@ -394,6 +372,42 @@ pub fn check_hypervisor() -> CheckResult {
             detail: "no hypervisor detected — running on bare metal.".into(),
         }
     }
+}
+
+fn missing_security_features(features: &CpuFeatures) -> Vec<&'static str> {
+    let sf = &features.security_features;
+    let mut missing = Vec::new();
+
+    match features.arch.as_str() {
+        "x86_64" => {
+            if !sf.smep {
+                missing.push("SMEP");
+            }
+            if !sf.smap {
+                missing.push("SMAP");
+            }
+            if !sf.nx {
+                missing.push("NX");
+            }
+            if !sf.spectre_mitigations {
+                missing.push("Spectre mitigations");
+            }
+            if !sf.pti {
+                missing.push("PTI (Meltdown)");
+            }
+        }
+        "aarch64" => {
+            if !sf.pan {
+                missing.push("PAN");
+            }
+            if !sf.bti {
+                missing.push("BTI");
+            }
+        }
+        _ => {}
+    }
+
+    missing
 }
 
 #[cfg(test)]
@@ -471,5 +485,147 @@ Features	: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid
         assert_eq!(r1.id, "CPU-001");
         let r2 = check_hypervisor();
         assert_eq!(r2.id, "CPU-002");
+    }
+
+    fn cpu_features_for_test(
+        arch: &str,
+        flags: &[&str],
+        security_features: SecurityFeatures,
+    ) -> CpuFeatures {
+        CpuFeatures {
+            arch: arch.to_string(),
+            flags: flags.iter().map(|flag| (*flag).to_string()).collect(),
+            hypervisor_detected: false,
+            hypervisor_vendor: None,
+            security_features,
+        }
+    }
+
+    fn secure_x86_features() -> SecurityFeatures {
+        SecurityFeatures {
+            smep: true,
+            smap: true,
+            nx: true,
+            umip: true,
+            cet: true,
+            spectre_mitigations: true,
+            pti: true,
+            pan: false,
+            bti: false,
+            mte: false,
+        }
+    }
+
+    #[test]
+    fn security_feature_check_reports_unavailable_without_cpuinfo() {
+        let result = check_cpu_security_features_from(None);
+        assert_eq!(result.status, CheckStatus::Unavailable);
+        assert!(result.detail.contains("cannot read /proc/cpuinfo"));
+    }
+
+    #[test]
+    fn security_feature_check_reports_missing_x86_controls() {
+        let mut sf = secure_x86_features();
+        sf.smep = false;
+        sf.smap = false;
+        sf.spectre_mitigations = false;
+        let result = check_cpu_security_features_from(Some(cpu_features_for_test(
+            "x86_64",
+            &["nx", "umip"],
+            sf,
+        )));
+        assert_eq!(result.status, CheckStatus::Warning);
+        assert!(result.detail.contains("SMEP"));
+        assert!(result.detail.contains("SMAP"));
+        assert!(result.detail.contains("Spectre mitigations"));
+    }
+
+    #[test]
+    fn security_feature_check_reports_secure_when_required_controls_present() {
+        let result = check_cpu_security_features_from(Some(cpu_features_for_test(
+            "x86_64",
+            &["smep", "smap", "nx", "ibrs"],
+            secure_x86_features(),
+        )));
+        assert_eq!(result.status, CheckStatus::Secure);
+        assert!(result
+            .detail
+            .contains("All critical security features present"));
+    }
+
+    #[test]
+    fn missing_security_features_handles_arm_controls() {
+        let features = cpu_features_for_test(
+            "aarch64",
+            &["ssbs"],
+            SecurityFeatures {
+                smep: false,
+                smap: false,
+                nx: true,
+                umip: false,
+                cet: false,
+                spectre_mitigations: true,
+                pti: false,
+                pan: false,
+                bti: true,
+                mte: false,
+            },
+        );
+        assert_eq!(missing_security_features(&features), vec!["PAN"]);
+    }
+
+    #[test]
+    fn security_feature_check_ignores_unknown_arch_requirements() {
+        let result = check_cpu_security_features_from(Some(cpu_features_for_test(
+            "unknown",
+            &[],
+            SecurityFeatures {
+                smep: false,
+                smap: false,
+                nx: false,
+                umip: false,
+                cet: false,
+                spectre_mitigations: false,
+                pti: false,
+                pan: false,
+                bti: false,
+                mte: false,
+            },
+        )));
+        assert_eq!(result.status, CheckStatus::Secure);
+    }
+
+    #[test]
+    fn hypervisor_check_covers_unavailable_known_unknown_and_bare_metal() {
+        let unavailable = check_hypervisor_from(None);
+        assert_eq!(unavailable.status, CheckStatus::Unavailable);
+
+        let mut known = cpu_features_for_test("x86_64", &["hypervisor"], secure_x86_features());
+        known.hypervisor_detected = true;
+        known.hypervisor_vendor = Some("KVM/QEMU".into());
+        let known_result = check_hypervisor_from(Some(known));
+        assert_eq!(known_result.status, CheckStatus::Secure);
+        assert!(known_result.detail.contains("KVM/QEMU"));
+
+        let mut unknown = cpu_features_for_test("x86_64", &["hypervisor"], secure_x86_features());
+        unknown.hypervisor_detected = true;
+        let unknown_result = check_hypervisor_from(Some(unknown));
+        assert_eq!(unknown_result.status, CheckStatus::Warning);
+        assert!(unknown_result.detail.contains("NO known vendor"));
+
+        let bare = check_hypervisor_from(Some(cpu_features_for_test(
+            "x86_64",
+            &["smep", "smap"],
+            secure_x86_features(),
+        )));
+        assert_eq!(bare.status, CheckStatus::Secure);
+        assert!(bare.detail.contains("bare metal"));
+    }
+
+    #[test]
+    fn security_critical_flag_catalog_distinguishes_operational_flags() {
+        assert!(is_security_critical("smep"));
+        assert!(is_security_critical("mte"));
+        assert!(!is_security_critical("avx2"));
     }
 }

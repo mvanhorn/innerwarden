@@ -96,16 +96,14 @@ impl CloudflareFailover {
             return false;
         }
 
-        let state_name = format!("{state:?}");
-        let should_activate = self.config.activate_on.contains(&state_name);
+        let state_name = escalation_state_name(state);
+        let should_activate = should_activate_for_state(&self.config, state);
 
         if should_activate && !self.proxy_active {
             // Activate proxy
             match self.set_proxy(true).await {
                 Ok(()) => {
-                    self.proxy_active = true;
-                    self.proxy_activated_at = Some(Utc::now());
-                    self.activation_count += 1;
+                    self.mark_proxy_activated(Utc::now());
                     info!(
                         state = %state_name,
                         activations = self.activation_count,
@@ -119,19 +117,19 @@ impl CloudflareFailover {
             }
         } else if !should_activate && self.proxy_active {
             // Check minimum duration before deactivating
-            if let Some(activated_at) = self.proxy_activated_at {
-                let elapsed = (Utc::now() - activated_at).num_seconds() as u64;
-                if elapsed < self.config.min_proxy_duration_secs {
-                    // Too soon to deactivate — wait
-                    return false;
-                }
+            if !can_deactivate_proxy(
+                self.proxy_activated_at,
+                Utc::now(),
+                self.config.min_proxy_duration_secs,
+            ) {
+                // Too soon to deactivate — wait
+                return false;
             }
 
             // Deactivate proxy
             match self.set_proxy(false).await {
                 Ok(()) => {
-                    self.proxy_active = false;
-                    self.proxy_deactivated_at = Some(Utc::now());
+                    self.mark_proxy_deactivated(Utc::now());
                     info!(
                         state = %state_name,
                         "Cloudflare proxy DEACTIVATED — direct access restored"
@@ -149,17 +147,15 @@ impl CloudflareFailover {
 
     /// Call Cloudflare API to set proxy state.
     pub async fn set_proxy(&self, proxied: bool) -> Result<()> {
-        let url = format!(
-            "https://api.cloudflare.com/client/v4/zones/{}/dns_records/{}",
-            self.config.zone_id, self.config.record_id
-        );
+        let url = cloudflare_record_url(&self.config.zone_id, &self.config.record_id);
+        let payload = cloudflare_proxy_payload(proxied);
 
         let resp = self
             .client
             .patch(&url)
             .header("Authorization", format!("Bearer {}", self.config.api_token))
             .header("Content-Type", "application/json")
-            .json(&serde_json::json!({"proxied": proxied}))
+            .json(&payload)
             .send()
             .await
             .context("Cloudflare API request failed")?;
@@ -197,6 +193,45 @@ impl CloudflareFailover {
     pub fn is_active(&self) -> bool {
         self.proxy_active
     }
+
+    fn mark_proxy_activated(&mut self, now: DateTime<Utc>) {
+        self.proxy_active = true;
+        self.proxy_activated_at = Some(now);
+        self.activation_count += 1;
+    }
+
+    fn mark_proxy_deactivated(&mut self, now: DateTime<Utc>) {
+        self.proxy_active = false;
+        self.proxy_deactivated_at = Some(now);
+    }
+}
+
+fn escalation_state_name(state: EscalationState) -> String {
+    format!("{state:?}")
+}
+
+fn should_activate_for_state(config: &CloudflareFailoverConfig, state: EscalationState) -> bool {
+    let state_name = escalation_state_name(state);
+    config.activate_on.contains(&state_name)
+}
+
+fn can_deactivate_proxy(
+    activated_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    min_proxy_duration_secs: u64,
+) -> bool {
+    activated_at.is_none_or(|activated_at| {
+        let elapsed = (now - activated_at).num_seconds().max(0) as u64;
+        elapsed >= min_proxy_duration_secs
+    })
+}
+
+fn cloudflare_record_url(zone_id: &str, record_id: &str) -> String {
+    format!("https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}")
+}
+
+fn cloudflare_proxy_payload(proxied: bool) -> serde_json::Value {
+    serde_json::json!({ "proxied": proxied })
 }
 
 // ---------------------------------------------------------------------------
@@ -294,5 +329,75 @@ mod tests {
         assert!(!failover.is_active());
         failover.proxy_active = true;
         assert!(failover.is_active());
+    }
+
+    #[test]
+    fn should_activate_for_state_respects_configured_state_names() {
+        let config = make_config(true);
+        assert!(should_activate_for_state(
+            &config,
+            EscalationState::UnderAttack
+        ));
+        assert!(should_activate_for_state(
+            &config,
+            EscalationState::Critical
+        ));
+        assert!(!should_activate_for_state(&config, EscalationState::Normal));
+        assert!(!should_activate_for_state(
+            &config,
+            EscalationState::Elevated
+        ));
+    }
+
+    #[test]
+    fn can_deactivate_proxy_enforces_minimum_duration_and_handles_clock_skew() {
+        let now = Utc::now();
+        assert!(can_deactivate_proxy(None, now, 300));
+        assert!(!can_deactivate_proxy(
+            Some(now - chrono::Duration::seconds(299)),
+            now,
+            300
+        ));
+        assert!(can_deactivate_proxy(
+            Some(now - chrono::Duration::seconds(300)),
+            now,
+            300
+        ));
+        assert!(!can_deactivate_proxy(
+            Some(now + chrono::Duration::seconds(5)),
+            now,
+            1
+        ));
+    }
+
+    #[test]
+    fn mark_proxy_transitions_update_status_metadata() {
+        let mut failover = CloudflareFailover::new(make_config(true));
+        let activated = Utc::now();
+        failover.mark_proxy_activated(activated);
+        assert!(failover.is_active());
+        assert_eq!(failover.activation_count, 1);
+        assert_eq!(failover.proxy_activated_at, Some(activated));
+
+        let deactivated = activated + chrono::Duration::seconds(301);
+        failover.mark_proxy_deactivated(deactivated);
+        assert!(!failover.is_active());
+        assert_eq!(failover.proxy_deactivated_at, Some(deactivated));
+    }
+
+    #[test]
+    fn cloudflare_url_and_payload_are_stable() {
+        assert_eq!(
+            cloudflare_record_url("zone", "record"),
+            "https://api.cloudflare.com/client/v4/zones/zone/dns_records/record"
+        );
+        assert_eq!(
+            cloudflare_proxy_payload(true),
+            serde_json::json!({"proxied": true})
+        );
+        assert_eq!(
+            cloudflare_proxy_payload(false),
+            serde_json::json!({"proxied": false})
+        );
     }
 }

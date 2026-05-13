@@ -89,6 +89,105 @@ impl InterruptStats {
     }
 }
 
+fn interrupt_analysis_unavailable() -> CheckResult {
+    CheckResult {
+        id: "HV-005",
+        name: "Interrupt Analysis",
+        status: CheckStatus::Unavailable,
+        confidence: 0.0,
+        detail: "cannot read /proc/interrupts".into(),
+    }
+}
+
+fn has_hypervisor_interrupt_source(notable_sources: &[(String, u64)]) -> bool {
+    notable_sources
+        .iter()
+        .any(|(name, _)| name.contains("HYP") || name.contains("virt"))
+}
+
+fn interrupt_imbalance_detail(per_cpu: &BTreeMap<u32, u64>) -> (f64, String) {
+    let cpu_counts: Vec<u64> = per_cpu.values().copied().collect();
+    if cpu_counts.len() <= 1 {
+        return (1.0, "single CPU".into());
+    }
+
+    let max = cpu_counts.iter().max().copied().unwrap_or(1);
+    let min = cpu_counts.iter().min().copied().unwrap_or(1);
+    let ratio = if min > 0 {
+        max as f64 / min as f64
+    } else {
+        0.0
+    };
+
+    (
+        ratio,
+        format!("CPU interrupt balance: {ratio:.1}x (max={max}, min={min})"),
+    )
+}
+
+fn notable_interrupt_summary(notable_sources: &[(String, u64)]) -> String {
+    let notable: Vec<String> = notable_sources
+        .iter()
+        .take(5)
+        .map(|(name, count)| format!("{name}={count}"))
+        .collect();
+
+    if notable.is_empty() {
+        "none".into()
+    } else {
+        notable.join(", ")
+    }
+}
+
+fn check_interrupt_analysis_from_stats(stats: Option<InterruptStats>) -> CheckResult {
+    let Some(stats) = stats else {
+        return interrupt_analysis_unavailable();
+    };
+
+    let has_hyp_irq = has_hypervisor_interrupt_source(&stats.notable_sources);
+    let (imbalance, detail_imbalance) = interrupt_imbalance_detail(&stats.per_cpu);
+    let notable_str = notable_interrupt_summary(&stats.notable_sources);
+
+    let detail = format!(
+        "{} total interrupts, {} sources, {} CPUs. {detail_imbalance}. \
+         Notable: {}.",
+        stats.total,
+        stats.source_count,
+        stats.per_cpu.len(),
+        notable_str,
+    );
+
+    if has_hyp_irq {
+        return CheckResult {
+            id: "HV-005",
+            name: "Interrupt Analysis",
+            status: CheckStatus::Secure,
+            confidence: confidence(0.5, 0.9),
+            detail: format!("VIRTUALIZED — hypervisor interrupt source found. {detail}"),
+        };
+    }
+
+    if imbalance > 10.0 {
+        return CheckResult {
+            id: "HV-005",
+            name: "Interrupt Analysis",
+            status: CheckStatus::Warning,
+            confidence: confidence(0.4, 0.6),
+            detail: format!(
+                "CPU interrupt imbalance {imbalance:.1}x — may indicate vCPU pinning. {detail}"
+            ),
+        };
+    }
+
+    CheckResult {
+        id: "HV-005",
+        name: "Interrupt Analysis",
+        status: CheckStatus::Secure,
+        confidence: confidence(0.3, 0.7),
+        detail: format!("interrupt patterns normal. {detail}"),
+    }
+}
+
 // ── x86 Descriptor Table Reading ────────────────────────────────────────
 
 /// IDTR value (base + limit) — x86 only.
@@ -124,97 +223,7 @@ fn read_gdtr() -> (u64, u16) {
 
 /// Analyze interrupt delivery patterns for VM indicators.
 pub fn check_interrupt_analysis() -> CheckResult {
-    let Some(stats) = InterruptStats::read() else {
-        return CheckResult {
-            id: "HV-005",
-            name: "Interrupt Analysis",
-            status: CheckStatus::Unavailable,
-            confidence: 0.0,
-            detail: "cannot read /proc/interrupts".into(),
-        };
-    };
-
-    // Look for hypervisor-specific interrupt sources.
-    let has_hyp_irq = stats
-        .notable_sources
-        .iter()
-        .any(|(name, _)| name.contains("HYP") || name.contains("virt"));
-
-    // Look for unusually high IPI count (VM migration, vCPU scheduling).
-    let ipi_count: u64 = stats
-        .notable_sources
-        .iter()
-        .filter(|(name, _)| name.contains("RES") || name.contains("IWI"))
-        .map(|(_, count)| count)
-        .sum();
-
-    // Check CPU interrupt balance — uneven distribution may indicate vCPU pinning.
-    let cpu_counts: Vec<u64> = stats.per_cpu.values().copied().collect();
-    let (imbalance, detail_imbalance) = if cpu_counts.len() > 1 {
-        let max = cpu_counts.iter().max().copied().unwrap_or(1);
-        let min = cpu_counts.iter().min().copied().unwrap_or(1);
-        let ratio = if min > 0 {
-            max as f64 / min as f64
-        } else {
-            0.0
-        };
-        (
-            ratio,
-            format!("CPU interrupt balance: {ratio:.1}x (max={max}, min={min})",),
-        )
-    } else {
-        (1.0, "single CPU".into())
-    };
-
-    let notable_str: Vec<String> = stats
-        .notable_sources
-        .iter()
-        .take(5)
-        .map(|(n, c)| format!("{n}={c}"))
-        .collect();
-
-    let detail = format!(
-        "{} total interrupts, {} sources, {} CPUs. {detail_imbalance}. \
-         Notable: {}.",
-        stats.total,
-        stats.source_count,
-        stats.per_cpu.len(),
-        if notable_str.is_empty() {
-            "none".into()
-        } else {
-            notable_str.join(", ")
-        },
-    );
-
-    if has_hyp_irq {
-        return CheckResult {
-            id: "HV-005",
-            name: "Interrupt Analysis",
-            status: CheckStatus::Secure,
-            confidence: confidence(0.5, 0.9),
-            detail: format!("VIRTUALIZED — hypervisor interrupt source found. {detail}"),
-        };
-    }
-
-    if imbalance > 10.0 {
-        return CheckResult {
-            id: "HV-005",
-            name: "Interrupt Analysis",
-            status: CheckStatus::Warning,
-            confidence: confidence(0.4, 0.6),
-            detail: format!(
-                "CPU interrupt imbalance {imbalance:.1}x — may indicate vCPU pinning. {detail}"
-            ),
-        };
-    }
-
-    CheckResult {
-        id: "HV-005",
-        name: "Interrupt Analysis",
-        status: CheckStatus::Secure,
-        confidence: confidence(0.3, 0.7),
-        detail: format!("interrupt patterns normal. {detail}"),
-    }
+    check_interrupt_analysis_from_stats(InterruptStats::read())
 }
 
 /// Descriptor table check (x86 only — SIDT/SGDT Red Pill variant).
@@ -269,6 +278,18 @@ pub fn check_descriptor_tables() -> CheckResult {
 mod tests {
     use super::*;
 
+    fn stats(per_cpu: &[(u32, u64)], notable_sources: &[(&str, u64)]) -> InterruptStats {
+        InterruptStats {
+            total: per_cpu.iter().map(|(_, count)| count).sum::<u64>(),
+            per_cpu: per_cpu.iter().copied().collect(),
+            source_count: notable_sources.len(),
+            notable_sources: notable_sources
+                .iter()
+                .map(|(name, count)| ((*name).to_string(), *count))
+                .collect(),
+        }
+    }
+
     #[test]
     fn interrupt_stats_runs() {
         let stats = InterruptStats::read();
@@ -280,6 +301,78 @@ mod tests {
     fn check_interrupts_runs() {
         let r = check_interrupt_analysis();
         assert_eq!(r.id, "HV-005");
+    }
+
+    #[test]
+    fn interrupt_analysis_reports_unavailable_when_stats_are_missing() {
+        let result = check_interrupt_analysis_from_stats(None);
+
+        assert_eq!(result.status, CheckStatus::Unavailable);
+        assert_eq!(result.confidence, 0.0);
+        assert_eq!(result.detail, "cannot read /proc/interrupts");
+    }
+
+    #[test]
+    fn interrupt_analysis_reports_virtualized_for_hypervisor_source() {
+        let result =
+            check_interrupt_analysis_from_stats(Some(stats(&[(0, 50), (1, 50)], &[("HYP", 7)])));
+
+        assert_eq!(result.status, CheckStatus::Secure);
+        assert_eq!(result.confidence, confidence(0.5, 0.9));
+        assert!(result.detail.contains("VIRTUALIZED"));
+        assert!(result.detail.contains("HYP=7"));
+    }
+
+    #[test]
+    fn interrupt_analysis_warns_on_large_cpu_imbalance() {
+        let result = check_interrupt_analysis_from_stats(Some(stats(&[(0, 1), (1, 20)], &[])));
+
+        assert_eq!(result.status, CheckStatus::Warning);
+        assert_eq!(result.confidence, confidence(0.4, 0.6));
+        assert!(result.detail.contains("imbalance 20.0x"));
+    }
+
+    #[test]
+    fn interrupt_analysis_reports_normal_balanced_interrupts() {
+        let result = check_interrupt_analysis_from_stats(Some(stats(&[(0, 10), (1, 20)], &[])));
+
+        assert_eq!(result.status, CheckStatus::Secure);
+        assert_eq!(result.confidence, confidence(0.3, 0.7));
+        assert!(result.detail.contains("interrupt patterns normal"));
+        assert!(result.detail.contains("Notable: none"));
+    }
+
+    #[test]
+    fn interrupt_imbalance_treats_single_cpu_as_balanced() {
+        let (ratio, detail) = interrupt_imbalance_detail(&[(0, 42)].into_iter().collect());
+
+        assert_eq!(ratio, 1.0);
+        assert_eq!(detail, "single CPU");
+    }
+
+    #[test]
+    fn interrupt_imbalance_handles_zero_minimum_without_dividing() {
+        let (ratio, detail) = interrupt_imbalance_detail(&[(0, 0), (1, 10)].into_iter().collect());
+
+        assert_eq!(ratio, 0.0);
+        assert!(detail.contains("max=10"));
+        assert!(detail.contains("min=0"));
+    }
+
+    #[test]
+    fn notable_interrupt_summary_limits_to_first_five_sources() {
+        let notable = [
+            ("NMI".to_string(), 1),
+            ("LOC".to_string(), 2),
+            ("PMI".to_string(), 3),
+            ("IWI".to_string(), 4),
+            ("RES".to_string(), 5),
+            ("TLB".to_string(), 6),
+        ];
+
+        let summary = notable_interrupt_summary(&notable);
+
+        assert_eq!(summary, "NMI=1, LOC=2, PMI=3, IWI=4, RES=5");
     }
 
     #[test]
@@ -330,5 +423,22 @@ mod tests {
         let stats = InterruptStats::parse(content).expect("should parse");
         // NMI count is zero — should NOT appear in notable.
         assert!(stats.notable_sources.is_empty());
+    }
+
+    #[test]
+    fn parse_interrupt_stats_ignores_non_cpu_fields_after_header_count() {
+        let content = "            CPU0       CPU1
+   0:        100        200   PCI-MSI edge      eth0
+";
+        let stats = InterruptStats::parse(content).expect("should parse");
+
+        assert_eq!(stats.total, 300);
+        assert_eq!(stats.per_cpu[&0], 100);
+        assert_eq!(stats.per_cpu[&1], 200);
+    }
+
+    #[test]
+    fn parse_interrupt_stats_returns_none_for_empty_content() {
+        assert!(InterruptStats::parse("").is_none());
     }
 }

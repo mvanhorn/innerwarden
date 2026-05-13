@@ -24,9 +24,12 @@ pub struct DetectedAgent {
 
 /// Scan running processes for known AI agents.
 pub fn scan_processes(index: &SignatureIndex) -> Vec<DetectedAgent> {
+    scan_processes_in_dir(index, Path::new("/proc"))
+}
+
+fn scan_processes_in_dir(index: &SignatureIndex, proc: &Path) -> Vec<DetectedAgent> {
     let mut found: HashMap<String, DetectedAgent> = HashMap::new();
 
-    let proc = Path::new("/proc");
     if !proc.exists() {
         warn!("agent-guard: /proc not available, cannot scan processes");
         return vec![];
@@ -94,6 +97,10 @@ pub fn scan_processes(index: &SignatureIndex) -> Vec<DetectedAgent> {
 
 /// Scan for MCP config files in user home directories.
 pub fn scan_mcp_configs() -> Vec<PathBuf> {
+    scan_mcp_configs_in_roots(Path::new("/home"), Path::new("/root"))
+}
+
+fn scan_mcp_configs_in_roots(home_root: &Path, root_home: &Path) -> Vec<PathBuf> {
     let mut configs = vec![];
 
     // Common MCP config locations
@@ -109,7 +116,7 @@ pub fn scan_mcp_configs() -> Vec<PathBuf> {
     ];
 
     // Scan /home/*/
-    if let Ok(entries) = std::fs::read_dir("/home") {
+    if let Ok(entries) = std::fs::read_dir(home_root) {
         for entry in entries.flatten() {
             if !entry.path().is_dir() {
                 continue;
@@ -126,7 +133,7 @@ pub fn scan_mcp_configs() -> Vec<PathBuf> {
 
     // Scan /root/
     for pattern in &patterns {
-        let path = PathBuf::from("/root").join(pattern);
+        let path = root_home.join(pattern);
         if path.exists() {
             info!(path = %path.display(), "agent-guard: found MCP config");
             configs.push(path);
@@ -138,20 +145,23 @@ pub fn scan_mcp_configs() -> Vec<PathBuf> {
 
 /// Full detection: scan processes + MCP configs, match them together.
 pub fn detect_all(index: &SignatureIndex) -> Vec<DetectedAgent> {
-    let mut agents = scan_processes(index);
-    let configs = scan_mcp_configs();
+    detect_all_from_sources(
+        index,
+        Path::new("/proc"),
+        Path::new("/home"),
+        Path::new("/root"),
+    )
+}
 
-    // Associate MCP configs with detected agents
-    for agent in &mut agents {
-        // MCP configs are associated by presence in user home dirs
-        for config in &configs {
-            let config_str = config.to_string_lossy().to_lowercase();
-            let agent_lower = agent.name.to_lowercase();
-            if config_str.contains(&agent_lower) {
-                agent.mcp_configs.push(config.clone());
-            }
-        }
-    }
+fn detect_all_from_sources(
+    index: &SignatureIndex,
+    proc: &Path,
+    home_root: &Path,
+    root_home: &Path,
+) -> Vec<DetectedAgent> {
+    let mut agents = scan_processes_in_dir(index, proc);
+    let configs = scan_mcp_configs_in_roots(home_root, root_home);
+    associate_mcp_configs(&mut agents, &configs);
 
     let official = agents
         .iter()
@@ -170,6 +180,19 @@ pub fn detect_all(index: &SignatureIndex) -> Vec<DetectedAgent> {
     agents
 }
 
+fn associate_mcp_configs(agents: &mut [DetectedAgent], configs: &[PathBuf]) {
+    for agent in agents.iter_mut() {
+        // MCP configs are associated by presence in user home dirs
+        for config in configs {
+            let config_str = config.to_string_lossy().to_lowercase();
+            let agent_lower = agent.name.to_lowercase();
+            if config_str.contains(&agent_lower) {
+                agent.mcp_configs.push(config.clone());
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +207,116 @@ mod tests {
     fn detect_all_returns_vec() {
         let index = SignatureIndex::new();
         let _agents = detect_all(&index);
+    }
+
+    #[test]
+    fn scan_processes_in_dir_detects_known_agents_and_deduplicates_by_name() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for (pid, comm) in [
+            ("100", "claude\n"),
+            ("101", "claude-code\n"),
+            ("abc", "codex\n"),
+        ] {
+            let proc_dir = temp.path().join(pid);
+            std::fs::create_dir(&proc_dir).expect("pid dir");
+            std::fs::write(proc_dir.join("comm"), comm).expect("comm file");
+        }
+        std::fs::create_dir(temp.path().join("102")).expect("pid dir");
+        std::fs::write(temp.path().join("102").join("comm"), "notepad\n").expect("comm file");
+
+        let index = SignatureIndex::new();
+        let agents = scan_processes_in_dir(&index, temp.path());
+
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "Claude Code");
+        assert_eq!(agents[0].vendor, "Anthropic");
+        assert_eq!(agents[0].integration, "official");
+    }
+
+    #[test]
+    fn scan_processes_in_dir_returns_empty_for_missing_or_unreadable_layouts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index = SignatureIndex::new();
+        assert!(scan_processes_in_dir(&index, &temp.path().join("missing")).is_empty());
+
+        std::fs::create_dir(temp.path().join("200")).expect("pid dir");
+        assert!(scan_processes_in_dir(&index, temp.path()).is_empty());
+    }
+
+    #[test]
+    fn scan_mcp_configs_in_roots_finds_user_and_root_configs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home_root = temp.path().join("home");
+        let root_home = temp.path().join("root");
+        let alice_claude = home_root.join("alice/.claude/mcp.json");
+        let bob_codex = home_root.join("bob/.codex/mcp.json");
+        let root_goose = root_home.join(".config/goose/mcp.json");
+        std::fs::create_dir_all(alice_claude.parent().unwrap()).expect("alice dirs");
+        std::fs::create_dir_all(bob_codex.parent().unwrap()).expect("bob dirs");
+        std::fs::create_dir_all(root_goose.parent().unwrap()).expect("root dirs");
+        std::fs::write(&alice_claude, "{}").expect("alice config");
+        std::fs::write(&bob_codex, "{}").expect("bob config");
+        std::fs::write(&root_goose, "{}").expect("root config");
+
+        let configs = scan_mcp_configs_in_roots(&home_root, &root_home);
+
+        assert!(configs.contains(&alice_claude));
+        assert!(configs.contains(&bob_codex));
+        assert!(configs.contains(&root_goose));
+        assert_eq!(configs.len(), 3);
+    }
+
+    #[test]
+    fn associate_mcp_configs_matches_agent_name_in_config_path() {
+        let mut agents = vec![
+            DetectedAgent {
+                name: "Claude Code".into(),
+                vendor: "Anthropic".into(),
+                pid: 1,
+                comm: "claude".into(),
+                integration: "official".into(),
+                mcp_configs: vec![],
+            },
+            DetectedAgent {
+                name: "Codex CLI".into(),
+                vendor: "OpenAI".into(),
+                pid: 2,
+                comm: "codex".into(),
+                integration: "official".into(),
+                mcp_configs: vec![],
+            },
+        ];
+        let configs = vec![
+            PathBuf::from("/home/alice/claude code/.mcp.json"),
+            PathBuf::from("/home/alice/other/mcp.json"),
+            PathBuf::from("/home/alice/codex cli/mcp.json"),
+        ];
+
+        associate_mcp_configs(&mut agents, &configs);
+
+        assert_eq!(agents[0].mcp_configs, vec![configs[0].clone()]);
+        assert_eq!(agents[1].mcp_configs, vec![configs[2].clone()]);
+    }
+
+    #[test]
+    fn detect_all_from_sources_combines_process_and_mcp_config_scans() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let proc = temp.path().join("proc");
+        let home_root = temp.path().join("home");
+        let root_home = temp.path().join("root");
+        let pid_dir = proc.join("300");
+        let claude_config = home_root.join("claude code/.claude/mcp.json");
+        std::fs::create_dir_all(&pid_dir).expect("pid dir");
+        std::fs::write(pid_dir.join("comm"), "claude\n").expect("comm file");
+        std::fs::create_dir_all(claude_config.parent().unwrap()).expect("config dir");
+        std::fs::write(&claude_config, "{}").expect("config");
+        std::fs::create_dir_all(&root_home).expect("root home");
+
+        let index = SignatureIndex::new();
+        let agents = detect_all_from_sources(&index, &proc, &home_root, &root_home);
+
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "Claude Code");
+        assert_eq!(agents[0].mcp_configs, vec![claude_config]);
     }
 }

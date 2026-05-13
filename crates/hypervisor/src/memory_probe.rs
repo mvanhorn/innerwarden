@@ -68,6 +68,40 @@ pub struct MemoryProbeResult {
     pub total_accesses: usize,
 }
 
+fn summarize_memory_deltas(mut all_deltas: Vec<u64>) -> MemoryProbeResult {
+    if all_deltas.is_empty() {
+        return MemoryProbeResult {
+            median_cycles: 0,
+            p95_cycles: 0,
+            p99_cycles: 0,
+            max_cycles: 0,
+            tail_ratio: 0.0,
+            total_accesses: 0,
+        };
+    }
+
+    all_deltas.sort_unstable();
+    let n = all_deltas.len();
+    let median = all_deltas[n / 2];
+    let p95 = all_deltas[(n as f64 * 0.95) as usize];
+    let p99 = all_deltas[(n as f64 * 0.99) as usize];
+    let max = all_deltas[n - 1];
+    let tail_ratio = if median > 0 {
+        p95 as f64 / median as f64
+    } else {
+        0.0
+    };
+
+    MemoryProbeResult {
+        median_cycles: median,
+        p95_cycles: p95,
+        p99_cycles: p99,
+        max_cycles: max,
+        tail_ratio,
+        total_accesses: n,
+    }
+}
+
 /// Run the memory TLB probe.
 pub fn probe_tlb_overhead() -> MemoryProbeResult {
     // Allocate a large buffer. Use vec to ensure it's heap-allocated
@@ -98,48 +132,20 @@ pub fn probe_tlb_overhead() -> MemoryProbeResult {
         }
     }
 
-    if all_deltas.is_empty() {
-        return MemoryProbeResult {
-            median_cycles: 0,
-            p95_cycles: 0,
-            p99_cycles: 0,
-            max_cycles: 0,
-            tail_ratio: 0.0,
-            total_accesses: 0,
-        };
-    }
-
-    all_deltas.sort_unstable();
-    let n = all_deltas.len();
-    let median = all_deltas[n / 2];
-    let p95 = all_deltas[(n as f64 * 0.95) as usize];
-    let p99 = all_deltas[(n as f64 * 0.99) as usize];
-    let max = all_deltas[n - 1];
-    let tail_ratio = if median > 0 {
-        p95 as f64 / median as f64
-    } else {
-        0.0
-    };
-
     // Free the buffer explicitly to not hold 64MB during the rest of the audit.
     drop(buf);
 
-    MemoryProbeResult {
-        median_cycles: median,
-        p95_cycles: p95,
-        p99_cycles: p99,
-        max_cycles: max,
-        tail_ratio,
-        total_accesses: n,
-    }
+    summarize_memory_deltas(all_deltas)
 }
 
 // ── Check function ──────────────────────────────────────────────────────
 
 /// Detect VM via memory access overhead (EPT/stage-2 page table).
 pub fn check_memory_vm_detection() -> CheckResult {
-    let result = probe_tlb_overhead();
+    check_memory_vm_detection_from_result(probe_tlb_overhead())
+}
 
+fn check_memory_vm_detection_from_result(result: MemoryProbeResult) -> CheckResult {
     if result.total_accesses == 0 {
         return CheckResult {
             id: "HV-004",
@@ -203,6 +209,17 @@ pub fn check_memory_vm_detection() -> CheckResult {
 mod tests {
     use super::*;
 
+    fn result_with_tail_ratio(tail_ratio: f64, total_accesses: usize) -> MemoryProbeResult {
+        MemoryProbeResult {
+            median_cycles: 100,
+            p95_cycles: (100.0 * tail_ratio) as u64,
+            p99_cycles: (110.0 * tail_ratio) as u64,
+            max_cycles: (120.0 * tail_ratio) as u64,
+            tail_ratio,
+            total_accesses,
+        }
+    }
+
     #[test]
     fn probe_runs() {
         let result = probe_tlb_overhead();
@@ -228,30 +245,60 @@ mod tests {
 
     #[test]
     fn memory_probe_result_format_empty() {
-        // By bypassing the probe and checking the fallback branch logic we ensure
-        // empty datasets correctly compute 0 tail ratios rather than crashing.
-        let mut all_deltas: Vec<u64> = vec![];
-        if all_deltas.is_empty() {
-            let res = MemoryProbeResult {
-                median_cycles: 0,
-                p95_cycles: 0,
-                p99_cycles: 0,
-                max_cycles: 0,
-                tail_ratio: 0.0,
-                total_accesses: 0,
-            };
-            assert_eq!(res.tail_ratio, 0.0);
-        }
+        let res = summarize_memory_deltas(vec![]);
 
-        let all_deltas: Vec<u64> = vec![0, 0, 0];
-        let n = all_deltas.len();
-        let median = all_deltas[n / 2];
-        let p95 = all_deltas[(n as f64 * 0.95) as usize];
-        let tail_ratio = if median > 0 {
-            p95 as f64 / median as f64
-        } else {
-            0.0
-        };
-        assert_eq!(tail_ratio, 0.0);
+        assert_eq!(res.median_cycles, 0);
+        assert_eq!(res.p95_cycles, 0);
+        assert_eq!(res.p99_cycles, 0);
+        assert_eq!(res.max_cycles, 0);
+        assert_eq!(res.tail_ratio, 0.0);
+        assert_eq!(res.total_accesses, 0);
+    }
+
+    #[test]
+    fn summarize_memory_deltas_sorts_and_computes_percentiles() {
+        let res = summarize_memory_deltas(vec![50, 10, 40, 20, 30]);
+
+        assert_eq!(res.median_cycles, 30);
+        assert_eq!(res.p95_cycles, 50);
+        assert_eq!(res.p99_cycles, 50);
+        assert_eq!(res.max_cycles, 50);
+        assert_eq!(res.tail_ratio, 50.0 / 30.0);
+        assert_eq!(res.total_accesses, 5);
+    }
+
+    #[test]
+    fn summarize_memory_deltas_handles_zero_median_without_dividing() {
+        let res = summarize_memory_deltas(vec![0, 0, 0]);
+
+        assert_eq!(res.median_cycles, 0);
+        assert_eq!(res.tail_ratio, 0.0);
+    }
+
+    #[test]
+    fn check_from_result_reports_unavailable_when_probe_collects_nothing() {
+        let result = check_memory_vm_detection_from_result(result_with_tail_ratio(0.0, 0));
+
+        assert_eq!(result.status, CheckStatus::Unavailable);
+        assert_eq!(result.confidence, 0.0);
+        assert!(result.detail.contains("cycle counter not available"));
+    }
+
+    #[test]
+    fn check_from_result_classifies_high_moderate_and_low_tail_ratios() {
+        let high = check_memory_vm_detection_from_result(result_with_tail_ratio(9.0, 10));
+        assert_eq!(high.status, CheckStatus::Secure);
+        assert_eq!(high.confidence, confidence(0.6, 0.8));
+        assert!(high.detail.contains("VIRTUALIZED"));
+
+        let moderate = check_memory_vm_detection_from_result(result_with_tail_ratio(4.0, 10));
+        assert_eq!(moderate.status, CheckStatus::Warning);
+        assert_eq!(moderate.confidence, confidence(0.5, 0.6));
+        assert!(moderate.detail.contains("AMBIGUOUS"));
+
+        let low = check_memory_vm_detection_from_result(result_with_tail_ratio(2.0, 10));
+        assert_eq!(low.status, CheckStatus::Secure);
+        assert_eq!(low.confidence, confidence(0.5, 0.8));
+        assert!(low.detail.contains("BARE METAL"));
     }
 }
