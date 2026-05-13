@@ -132,14 +132,80 @@ var ICON_ALERT_CIRCLE = '<svg ' + SVG_ATTRS + '><circle cx="12" cy="12" r="10"/>
 var ICON_HANDSHAKE    = '<svg ' + SVG_ATTRS + '><path d="m11 17 2 2a1 1 0 1 0 3-3"/><path d="m14 14 2.5 2.5a1 1 0 1 0 3-3l-3.88-3.88a3 3 0 0 0-4.24 0l-.88.88a1 1 0 1 1-3-3l2.81-2.81a5.79 5.79 0 0 1 7.06-.87l.47.28a2 2 0 0 0 1.42.25L21 4"/><path d="m21 3 1 11h-2"/><path d="M3 3 2 14l6.5 6.5a1 1 0 1 0 3-3"/><path d="M3 4h8"/></svg>';
 var ICON_CHECK        = '<svg ' + SVG_ATTRS + '><path d="M20 6 9 17l-5-5"/></svg>';
 
+// Spec 049 PR13: dismissed → Filtered out completes the §5.5 rename
+// (PR3 covered Home strip + KPI tiles; the AI Defense Log group
+// header still read `Dismissed`). Labels carry "today" semantics
+// here; scope-aware variants live in `groupLabelForScope()`.
 var OUTCOME_META = {
   blocked:         { icon: ICON_BAN,          label: 'Currently blocked attackers', cls: 'outcome-blocked' },
   honeypot:        { icon: ICON_BUG,          label: 'Honeypot',               cls: 'outcome-honeypot' },
   monitoring:      { icon: ICON_EYE,          label: 'Observing',              cls: 'outcome-observing' },
   needs_attention: { icon: ICON_ALERT_CIRCLE, label: 'Needs your attention',   cls: 'outcome-attention' },
   allowlisted:     { icon: ICON_HANDSHAKE,    label: 'Allowlisted (silenced)', cls: 'outcome-allowlisted' },
-  dismissed:       { icon: ICON_CHECK,        label: 'Dismissed',              cls: 'outcome-dismissed' },
+  filtered_out:    { icon: ICON_CHECK,        label: 'Filtered out',           cls: 'outcome-dismissed' },
+  // Backwards-compat alias: backend still emits `outcome: "dismissed"`
+  // on some legacy paths. Frontend treats both as the same bucket.
+  dismissed:       { icon: ICON_CHECK,        label: 'Filtered out',           cls: 'outcome-dismissed' },
 };
+
+// Spec 049 PR13 — scope-aware group labels. When the operator picks
+// a past date, "Currently blocked attackers" is misleading (those
+// IPs may have been unblocked since). Switch to "Blocked during
+// selected period" to honour the spec 049 §8.2.D contract.
+//
+// Returns the label string for the given outcome + scope. Scope is
+// derived from `state.filters.date` — empty / today → 'today',
+// otherwise 'past'.
+function casesScopeFromDate(filterDate) {
+  if (!filterDate) return 'today';
+  var today = new Date().toISOString().slice(0, 10);
+  return filterDate === today ? 'today' : 'past';
+}
+
+function groupLabelForScope(outcome, scope) {
+  if (scope === 'today') {
+    return (OUTCOME_META[outcome] || { label: outcome }).label;
+  }
+  // Past-scope labels — spec 049 §8.2.D.
+  switch (outcome) {
+    case 'blocked':         return 'Blocked during selected period';
+    case 'honeypot':        return 'Honeypot during selected period';
+    case 'monitoring':      return 'Observed during selected period';
+    case 'needs_attention': return 'Needed review during selected period';
+    case 'allowlisted':     return 'Allowlisted during selected period';
+    case 'filtered_out':
+    case 'dismissed':       return 'Filtered out during selected period';
+    default: return (OUTCOME_META[outcome] || { label: outcome }).label;
+  }
+}
+
+// Spec 049 PR13 — unit disambiguation helper. Each group header
+// counts unique attackers (one row per IP). The Home strip counts
+// cases (one per incident, multiple per IP possible). When they
+// diverge, the group header surfaces BOTH so the operator can
+// reconcile "170 flagged by system" on Home with the smaller
+// attacker count on Cases.
+//
+// Returns:
+//   { attackers: N, cases: M, label: "N attackers · M cases" }
+// or { attackers: N, cases: N, label: "N" } when they match
+// (one incident per attacker — no disambiguation needed).
+function unitDisambigFromItems(items) {
+  var attackers = items.length;
+  var cases = items.reduce(function(s, it) {
+    var inc = (it && (it.inc || it.incident_count)) || 0;
+    return s + (typeof inc === 'number' ? inc : 0);
+  }, 0);
+  if (cases === 0 || cases === attackers) {
+    return { attackers: attackers, cases: cases || attackers, label: String(attackers) };
+  }
+  return {
+    attackers: attackers,
+    cases: cases,
+    label: attackers + (attackers === 1 ? ' attacker · ' : ' attackers · ') +
+           cases + (cases === 1 ? ' case' : ' cases')
+  };
+}
 
 function outcomeOf(item) {
   // 2026-04-29 (audit Phase 2): mirror the backend's
@@ -208,6 +274,20 @@ function buildGroupedList(items) {
   }
   // Filter by outcome if set (e.g. from Home CTA click)
   var titleEl = document.getElementById('entityTitle');
+  // Spec 049 PR13 \u2014 unit-disambiguation subtitle.
+  //
+  // The list section counts UNIQUE ATTACKERS (one row per IP). The
+  // Home strip counts CASES (one per incident; multiple per IP
+  // possible). When operator sees `170 Flagged by system` on Home
+  // but only ~50 rows here, the gap is real and confusing without
+  // a label that names both units. This computes both totals so
+  // the operator can reconcile "170 cases \u2248 50 attackers" at a
+  // glance.
+  var totalDisambig = unitDisambigFromItems(items);
+  var subtitleHtml = totalDisambig.cases !== totalDisambig.attackers
+    ? ' <span style="font-size:0.62rem;color:var(--muted);font-weight:500;letter-spacing:0.04em;margin-left:8px">' +
+      '\u00b7 ' + esc(totalDisambig.label) + '</span>'
+    : '';
   if (state.filterOutcome === 'contained') {
     items = items.filter(function(item) {
       var o = (item.outcome || '').toLowerCase();
@@ -215,7 +295,7 @@ function buildGroupedList(items) {
     });
     if (titleEl) titleEl.innerHTML = 'Blocked threats <span style="font-size:0.6rem;color:var(--muted);cursor:pointer;margin-left:6px" onclick="state.filterOutcome=null;refreshLeft(false)">\u2715 show all</span>';
   } else {
-    if (titleEl) titleEl.textContent = 'AI Defense Log';
+    if (titleEl) titleEl.innerHTML = 'AI Defense Log' + subtitleHtml;
   }
   // Audit 2.6 partial: status dropdown filter. Restricts the
   // grouped list to a single outcome bucket. Country / campaign /
@@ -254,6 +334,11 @@ function buildGroupedList(items) {
     });
   });
 
+  // Spec 049 PR13: read scope once for all group headers below.
+  // `state.filters.date` is the picker value (empty / today => live,
+  // past date => scope-aware labels).
+  var scope = casesScopeFromDate(state.filters.date);
+
   var html = '';
   OUTCOME_ORDER.forEach(function(o, idx) {
     var g = groups[o];
@@ -266,9 +351,15 @@ function buildGroupedList(items) {
     if (count === 0 && o !== 'needs_attention') return;
 
     var startOpen = count > 0 && (o === 'needs_attention' || o === 'blocked' || idx === 0);
-    var countLabel = o === 'needs_attention' && count === 0
-      ? '<span style="color:var(--ok);font-weight:700">0</span>'
-      : count + '';
+    // Spec 049 PR13 — scope-aware labels + unit disambiguation.
+    var labelText = groupLabelForScope(o, scope);
+    var disambig = unitDisambigFromItems(g.items);
+    var countLabel;
+    if (o === 'needs_attention' && count === 0) {
+      countLabel = '<span style="color:var(--ok);font-weight:700">0</span>';
+    } else {
+      countLabel = disambig.label;
+    }
 
     // Audit 4.2/4.3/4.4: attach glossary tooltip to the group header
     // so the operator sees the canonical definition for the bucket
@@ -278,7 +369,7 @@ function buildGroupedList(items) {
     html += '<div class="threat-group ' + meta.cls + '">' +
       '<div class="threat-group-header" onclick="toggleThreatGroup(this)"' + groupTitle + '>' +
       '<span class="threat-group-chevron' + (startOpen ? ' open' : '') + '">\u25B8</span>' +
-      '<span class="threat-group-label">' + meta.icon + '<span>' + meta.label + '</span></span>' +
+      '<span class="threat-group-label">' + meta.icon + '<span>' + esc(labelText) + '</span></span>' +
       '<span class="threat-group-meta">' + countLabel + '</span>' +
       '</div>' +
       '<div class="threat-group-body' + (startOpen ? ' open' : '') + '">' +

@@ -1437,6 +1437,105 @@ mod tests {
         );
     }
 
+    // ── Spec 049 PR13 anchors ───────────────────────────────────────
+    // Unit disambiguation + scope-aware AI Defense Log labels.
+    // Resolves operator-reported gap (2026-05-13): Home strip showed
+    // 170 cases, Cases AI Defense Log showed ~50 unique attackers —
+    // operator could not reconcile. Group labels also failed the
+    // spec 049 §8.2.D contract for past-scope ("Currently blocked
+    // attackers" persisted even when picker = yesterday).
+
+    #[test]
+    fn threats_js_outcome_meta_renames_dismissed_to_filtered_out() {
+        // Spec 049 §5.5 rename finished: `dismissed` group label now
+        // reads `Filtered out`. The wire key `dismissed` is kept as
+        // a backwards-compat alias (backend still emits it on some
+        // legacy paths); BOTH map to the same operator-facing label.
+        assert!(
+            JS_THREATS.contains("filtered_out:    { icon: ICON_CHECK,        label: 'Filtered out'"),
+            "OUTCOME_META.filtered_out must define the canonical Filtered out label (spec 049 §5.5 rename completion)"
+        );
+        assert!(
+            JS_THREATS.contains("dismissed:       { icon: ICON_CHECK,        label: 'Filtered out'"),
+            "Legacy OUTCOME_META.dismissed must echo 'Filtered out' label too — backwards-compat alias"
+        );
+        assert!(
+            !JS_THREATS.contains("label: 'Dismissed'"),
+            "`Dismissed` label must NOT come back — spec 049 §5.5 vocabulary contract"
+        );
+    }
+
+    #[test]
+    fn threats_js_group_label_for_scope_returns_past_period_variants() {
+        // Past-scope group titles per spec 049 §8.2.D.
+        assert!(
+            JS_THREATS.contains("function groupLabelForScope("),
+            "groupLabelForScope helper must be defined (spec 049 PR13)"
+        );
+        for past_label in [
+            "'Blocked during selected period'",
+            "'Observed during selected period'",
+            "'Honeypot during selected period'",
+            "'Needed review during selected period'",
+            "'Filtered out during selected period'",
+        ] {
+            assert!(
+                JS_THREATS.contains(past_label),
+                "groupLabelForScope must map past-scope to {past_label}"
+            );
+        }
+    }
+
+    #[test]
+    fn threats_js_unit_disambig_emits_both_units_when_diverge() {
+        // The disambiguation helper emits `N attackers · M cases`
+        // when the two counts diverge, and just `N` when they match.
+        // Singular/plural pinned — operator-readable copy.
+        assert!(
+            JS_THREATS.contains("function unitDisambigFromItems("),
+            "unitDisambigFromItems helper must be defined"
+        );
+        assert!(
+            JS_THREATS.contains("attackers === 1 ? ' attacker \u{00b7} ' : ' attackers \u{00b7} '"),
+            "unitDisambigFromItems must handle singular vs plural for `attacker`"
+        );
+        assert!(
+            JS_THREATS.contains("cases === 1 ? ' case' : ' cases'"),
+            "unitDisambigFromItems must handle singular vs plural for `case`"
+        );
+    }
+
+    #[test]
+    fn threats_js_ai_defense_log_title_carries_unit_disambig_subtitle() {
+        // AI Defense Log title gains a subtitle like
+        // `· 50 attackers · 170 cases` when units diverge so the
+        // operator reconciles Home's `170 Flagged by system` at a
+        // glance. Operator-reported gap 2026-05-13.
+        assert!(
+            JS_THREATS.contains("totalDisambig.cases !== totalDisambig.attackers"),
+            "AI Defense Log subtitle must check unit divergence before rendering"
+        );
+        assert!(
+            JS_THREATS.contains("'AI Defense Log' + subtitleHtml"),
+            "AI Defense Log title must concatenate the unit-disambig subtitle when units diverge"
+        );
+    }
+
+    #[test]
+    fn threats_js_group_header_uses_scope_aware_label_in_render() {
+        // Render loop pulls group title via `groupLabelForScope(o, scope)`
+        // rather than hard-coding `meta.label`. Anti-regression for a
+        // future simplification that reverts to always-now labels.
+        assert!(
+            JS_THREATS.contains("var labelText = groupLabelForScope(o, scope);"),
+            "render loop must read group label via groupLabelForScope(o, scope)"
+        );
+        assert!(
+            JS_THREATS.contains("var scope = casesScopeFromDate(state.filters.date);"),
+            "render loop must derive scope from state.filters.date before iterating groups"
+        );
+    }
+
     // ── Spec 049 PR12 anchors ───────────────────────────────────────
     // Detached ed25519 signing for the audit CSV export. Every
     // operator-facing CSV carries a signature over the

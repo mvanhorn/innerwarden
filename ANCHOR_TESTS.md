@@ -536,6 +536,16 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/dashboard/mod.rs::tests::investigation_audit_signing_public_key_handler_defined` — `api_audit_signing_public_key` handler exists and uses the canonical `innerwarden-audit-signing.pub` filename in the Content-Disposition.
 
+- `crates/agent/src/dashboard/mod.rs::tests::threats_js_outcome_meta_renames_dismissed_to_filtered_out` — spec 049 §5.5 rename completion. AI Defense Log group label reads `Filtered out` (not `Dismissed`). Both wire keys (`filtered_out`, `dismissed`) map to the same operator-facing label so backwards-compat with backend that still emits `outcome: "dismissed"` survives. Operator-reported gap 2026-05-13.
+
+- `crates/agent/src/dashboard/mod.rs::tests::threats_js_group_label_for_scope_returns_past_period_variants` — spec 049 §8.2.D contract. When scope ≠ today, group titles read `Blocked during selected period` / `Observed during selected period` / `Honeypot during selected period` / `Needed review during selected period` / `Filtered out during selected period`. Operator-reported gap: "Currently blocked attackers" was lying when picker = yesterday.
+
+- `crates/agent/src/dashboard/mod.rs::tests::threats_js_unit_disambig_emits_both_units_when_diverge` — `unitDisambigFromItems` emits `N attackers · M cases` only when the two counts diverge; singular/plural handled (1 attacker · 1 case, not 1 attackers · 1 cases). Resolves operator-reported reconciliation gap 2026-05-13: Home strip shows cases, Cases AI Defense Log shows unique attackers, no disambiguation visible.
+
+- `crates/agent/src/dashboard/mod.rs::tests::threats_js_ai_defense_log_title_carries_unit_disambig_subtitle` — AI Defense Log title gains `· 50 attackers · 170 cases` subtitle when units diverge so operator reconciles Home's "170 Flagged by system" against the smaller attacker count at a glance.
+
+- `crates/agent/src/dashboard/mod.rs::tests::threats_js_group_header_uses_scope_aware_label_in_render` — render loop reads group label via `groupLabelForScope(o, scope)` rather than hard-coding `meta.label`. Anti-regression for a simplification that reverts to always-now labels even when scope = past.
+
 - `crates/agent/src/dashboard/mod.rs::tests::home_strip_reads_backend_counters_not_frontend_bucket_sum` — `renderActivityStrip` reads `overview.flagged_by_system_count` / `warden_decisions_count` / `filtered_out_count` directly. Pre-spec-049 the frontend summed `snap.buckets.X.unique_attackers` itself, which drifted across refactors and silently dropped dismissed. Backend now owns the math contract (case_metrics.rs); a future revert to frontend math fails this anchor.
 
 - `crates/agent/src/dashboard/mod.rs::tests::home_strip_breakdown_chips_render_leaf_outcome_counters` — the three sub-breakdown chips (Contained · Observing · Filtered out) read the leaf counters whose backend-guaranteed sum equals `warden_decisions_count`. Pin prevents a future rewire from breaking the visible reconciliation (chip total != big number above).
