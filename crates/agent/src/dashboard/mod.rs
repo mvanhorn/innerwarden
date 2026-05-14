@@ -7116,4 +7116,32 @@ mod tests {
              contributor sees the intent before re-adding."
         );
     }
+
+    #[test]
+    fn pr24_monthly_report_regenerates_for_current_month() {
+        // Operator-reported 2026-05-14: May Monthly report claimed "2
+        // blocks" for the whole month even though the prior day alone
+        // had 40+ blocks. Cause: `api_threat_report` served the
+        // on-disk JSON whenever it existed; once it was created on
+        // 1/May (boot path side-effect or first dashboard click) it
+        // never refreshed.
+        //
+        // PR24 contract: PAST months serve cached (frozen snapshot);
+        // CURRENT month regenerates on every request. This anchor
+        // pins both halves of the contract.
+        const INTEL_SRC: &str = include_str!("intelligence.rs");
+        assert!(
+            INTEL_SRC.contains("let is_current_month = month == current_month;"),
+            "PR24 — api_threat_report must distinguish the current \
+             month from past months. Without this the May report \
+             freezes on May-1 data through to May-31."
+        );
+        assert!(
+            INTEL_SRC.contains(
+                "if !is_current_month {\n        if let Some(content) = safe_read_data_file"
+            ),
+            "PR24 — only PAST months may serve cached JSON. Current \
+             month must always regenerate."
+        );
+    }
 }

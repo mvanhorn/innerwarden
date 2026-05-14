@@ -301,14 +301,28 @@ pub(super) async fn api_threat_report(
     if !is_valid_month(&month) {
         return Json(serde_json::json!({"error": "invalid month format"}));
     }
+
+    // Spec 049 PR24 — for PAST months the on-disk JSON is the
+    // canonical frozen snapshot (data won't change anymore once the
+    // month closes), so we serve cached. For the CURRENT month the
+    // file is a stale point-in-time snapshot the operator should not
+    // see — pre-PR24 it froze on the day the first request hit the
+    // endpoint (typically the boot tick on day 1 of the month),
+    // showing "2 blocks for the whole month" through to month-end.
+    // Operator-reported 2026-05-14: May report claimed 2 blocks total
+    // when prod had 40+ blocks the prior day alone.
+    let current_month = chrono::Local::now().format("%Y-%m").to_string();
+    let is_current_month = month == current_month;
     let filename = format!("monthly-report-{month}.json");
-    if let Some(content) = safe_read_data_file(&state.data_dir, &filename) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-            return Json(val);
+    if !is_current_month {
+        if let Some(content) = safe_read_data_file(&state.data_dir, &filename) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                return Json(val);
+            }
         }
     }
 
-    // Report doesn't exist - generate on demand
+    // Current month, or report doesn't exist - generate fresh.
     let data_dir = state.data_dir.clone();
     let month_clone = month.clone();
     let sq_store = state.sqlite_store.clone();
@@ -1232,5 +1246,138 @@ mod tests {
         // Sorting an empty profile list should be stable and panic-free.
         let filtered = sort_attacker_profiles(Vec::new(), 0, "risk_score");
         assert!(filtered.is_empty());
+    }
+
+    // ── Spec 049 PR24 — Monthly report cache contract ───────────────
+    //
+    // Operator-reported on 2026-05-14: the May report claimed "2
+    // blocks" for the whole month because the JSON file froze on
+    // 1/May. PR24 splits caching by month: past months serve cached
+    // (frozen historical), current month always regenerates.
+    //
+    // These tests exercise the actual handler (not just source-grep)
+    // so a refactor that breaks the runtime path fails CI.
+
+    use axum::extract::{Query, State};
+
+    /// Write a fake cached monthly-report JSON with a recognizable
+    /// `total_blocks` value the test can assert against.
+    fn write_cached_monthly(data_dir: &std::path::Path, month: &str, total_blocks: u64) {
+        let path = data_dir.join(format!("monthly-report-{month}.json"));
+        let json = serde_json::json!({
+            "month": month,
+            "executive_summary": {
+                "total_events": 0,
+                "total_incidents": 0,
+                "total_blocks": total_blocks,
+                "total_attackers": 0,
+                "countries_seen": 0,
+            },
+            "generated_at": "2026-05-01T03:37:25+00:00",
+            "top_attackers": [],
+            "mitre_coverage": {
+                "techniques": [],
+                "tactics": {}
+            },
+            "geographic_distribution": [],
+            "campaigns": [],
+            "weekly_trends": [],
+            "honeypot_intelligence": {
+                "total_sessions": 0,
+                "unique_ips": 0,
+                "top_credentials": [],
+                "top_commands": []
+            }
+        });
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).expect("write fixture");
+    }
+
+    #[tokio::test]
+    async fn api_threat_report_serves_cached_for_past_month() {
+        // Past months are frozen historical. Cached JSON must be
+        // returned verbatim, no regeneration.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::dashboard::state::test_dashboard_state(dir.path());
+        // Cache a 2024-12 report claiming `total_blocks = 999` — a
+        // value impossible from fresh generation against an empty
+        // store, so we can prove the cache path served it.
+        write_cached_monthly(dir.path(), "2024-12", 999);
+
+        let q = Query(ThreatReportQuery {
+            month: Some("2024-12".to_string()),
+        });
+        let Json(out) = api_threat_report(State(state), q).await;
+        assert_eq!(
+            out["executive_summary"]["total_blocks"], 999,
+            "PR24 — past months MUST serve cached JSON (no regeneration)"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_threat_report_ignores_cache_for_current_month() {
+        // Current month is still accumulating. Stale cached JSON must
+        // NOT be served — operator needs live counts. The fresh
+        // generation against an empty store will produce
+        // `total_blocks = 0`, so we prove cache was BYPASSED by
+        // asserting we got 0 instead of the cached 999.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::dashboard::state::test_dashboard_state(dir.path());
+        let current_month = chrono::Local::now().format("%Y-%m").to_string();
+        // Plant a "stale" cache that, if served, would lie about
+        // today's count.
+        write_cached_monthly(dir.path(), &current_month, 999);
+
+        let q = Query(ThreatReportQuery {
+            month: Some(current_month.clone()),
+        });
+        let Json(out) = api_threat_report(State(state), q).await;
+        assert_ne!(
+            out["executive_summary"]["total_blocks"], 999,
+            "PR24 — current-month request must regenerate, NEVER serve \
+             the stale cache. The 2026-05-14 bug ('2 blocks for the \
+             whole month') was exactly this: stale cache from day 1 \
+             served on day 14."
+        );
+    }
+
+    #[tokio::test]
+    async fn api_threat_report_generates_for_past_month_when_cache_missing() {
+        // No cache, past month — must fall through to fresh
+        // generation. Without the fallback the operator gets an
+        // empty/error JSON instead of a real (if zero-data) report.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::dashboard::state::test_dashboard_state(dir.path());
+        // No write_cached_monthly call — file does NOT exist.
+
+        let q = Query(ThreatReportQuery {
+            month: Some("2024-12".to_string()),
+        });
+        let Json(out) = api_threat_report(State(state), q).await;
+        // The fresh report serializes successfully even on empty
+        // data; the shape must include `executive_summary`.
+        assert!(
+            out.get("executive_summary").is_some() || out.get("error").is_some(),
+            "PR24 — past-month with no cache must either generate or \
+             return a structured error (NOT panic or empty JSON). \
+             Got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_threat_report_rejects_invalid_month_format() {
+        // Path-traversal guard from the existing `is_valid_month`
+        // check. Anchoring here so a refactor that drops the
+        // validator surfaces immediately.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::dashboard::state::test_dashboard_state(dir.path());
+
+        let q = Query(ThreatReportQuery {
+            month: Some("../../../etc/passwd".to_string()),
+        });
+        let Json(out) = api_threat_report(State(state), q).await;
+        assert_eq!(
+            out["error"], "invalid month format",
+            "month-format validator must reject path-traversal attempts"
+        );
     }
 }
