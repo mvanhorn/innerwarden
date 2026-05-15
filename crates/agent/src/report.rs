@@ -340,7 +340,13 @@ fn populate_counters_from_graph(
 ) {
     use crate::knowledge_graph::types::*;
 
-    // Events: count non-snapshot edges
+    // Events: count non-snapshot edges as a FALLBACK only. The KG edge
+    // count is a 30×-inflation proxy for events (each event creates
+    // multiple edges: incident → ip, incident → process, etc), same
+    // bug PR22/PR23 chased for the Home strip. Callers that have
+    // access to SQLite OVERWRITE this field with
+    // `Store::events_count_for_date(date)`; this fallback only
+    // survives for in-memory test fixtures that never built a store.
     counters.total_events = graph
         .edges_slice()
         .iter()
@@ -499,6 +505,19 @@ pub fn compute_for_date_from_graph(
 
     // Populate counters from graph
     populate_counters_from_graph(graph, &mut counters);
+
+    // PR28 — overwrite `total_events` with the canonical SQLite count
+    // for the date. The KG-edges-as-events proxy in
+    // populate_counters_from_graph inflates by ~30× (each event
+    // creates multiple edges); same Gap 1 fix PR23 applied to the
+    // Home strip. Only overwrites when the store is reachable AND
+    // returns a non-error count — test fixtures without a store keep
+    // the legacy proxy via the populate path.
+    if let Ok(store) = innerwarden_store::Store::open(data_dir) {
+        if let Ok(count) = store.events_count_for_date(&analyzed_date) {
+            counters.total_events = count;
+        }
+    }
 
     // If SQLite DB exists, data files are present (JSONL no longer required)
     // Canonicalize data_dir to prevent path traversal (CodeQL: path-injection).
@@ -1359,7 +1378,7 @@ fn compute_day_counters(data_dir: &Path, date: &str) -> Counters {
     }
 
     // Try SQLite store first, then dated file snapshot, then JSONL
-    let counters = {
+    let mut counters = {
         let from_store = innerwarden_store::Store::open(data_dir)
             .ok()
             .and_then(|store| {
@@ -1380,6 +1399,17 @@ fn compute_day_counters(data_dir: &Path, date: &str) -> Counters {
             counters_from_jsonl(data_dir, date)
         }
     };
+
+    // PR28 — same SQLite-events override as compute_for_date_from_graph.
+    // The dated-graph path counts edges as a proxy for events; the
+    // SQLite `events` table is the canonical source per spec 016.
+    // Without this the Report's Trend showed `Events 146,887` while
+    // the Home strip showed `~213,000` for the SAME day.
+    if let Ok(store) = innerwarden_store::Store::open(data_dir) {
+        if let Ok(count) = store.events_count_for_date(date) {
+            counters.total_events = count;
+        }
+    }
 
     if let Ok(mut cache) = cache_handle().lock() {
         // Cap cache size to prevent unbounded growth
@@ -2981,7 +3011,13 @@ mod tests {
 
         let report = compute_for_date_from_graph(dir.path(), Some(date), &graph);
         assert_eq!(report.analyzed_date, date);
-        assert_eq!(report.detection_summary.total_events, 2);
+        // PR28: total_events now reads from SQLite events table (the
+        // canonical source per spec 016). This fixture builds a KG
+        // with 2 edges but writes ZERO rows to the events table, so
+        // the SQLite override correctly yields 0. The dedicated test
+        // `compute_for_date_from_graph_reads_events_count_from_sqlite`
+        // exercises the populated-store happy path.
+        assert_eq!(report.detection_summary.total_events, 0);
         assert_eq!(report.detection_summary.total_incidents, 1);
         assert_eq!(
             report
@@ -3002,6 +3038,92 @@ mod tests {
         );
         assert_eq!(report.data_quality.incidents_without_entities, 0);
         assert!(report.operational_health.expected_files_present);
+    }
+
+    #[test]
+    fn compute_for_date_from_graph_reads_events_count_from_sqlite() {
+        // 2026-05-14 — Report Trend showed `Events 146,887` (KG edge
+        // count, ~30× inflated) while Home strip showed ~213,000 for
+        // the same day (SQLite). PR28 makes compute_for_date_from_graph
+        // OVERWRITE the KG-edges proxy with the canonical SQLite
+        // `events` table count for the date.
+        //
+        // This runtime test plants:
+        //   * 7 fake events in SQLite for the target date
+        //   * 100 graph edges (the legacy proxy would yield 100)
+        //   * 1 graph edge for a different date (must be excluded)
+        // and asserts the report's total_events is **7**, proving
+        // the SQLite path wins over the inflated proxy.
+        use innerwarden_core::event::{Event, Severity};
+
+        let dir = TempDir::new().unwrap();
+        let date = "2026-05-13";
+        let day_ts = format!("{date}T08:00:00+00:00");
+
+        // SQLite: 7 events on the target date, 1 on a different date.
+        let store = innerwarden_store::Store::open(dir.path()).expect("open store");
+        for i in 0..7 {
+            let ev = Event {
+                ts: chrono::DateTime::parse_from_rfc3339(&day_ts)
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+                    + chrono::Duration::seconds(i),
+                host: "h".into(),
+                source: "auditd".into(),
+                kind: "exec".into(),
+                severity: Severity::Info,
+                summary: "fixture".into(),
+                details: serde_json::json!({}),
+                tags: vec![],
+                entities: vec![],
+            };
+            store.insert_event(&ev).unwrap();
+        }
+        // Different date — must be filtered.
+        let other = Event {
+            ts: chrono::DateTime::parse_from_rfc3339("2026-05-10T08:00:00+00:00")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            host: "h".into(),
+            source: "auditd".into(),
+            kind: "exec".into(),
+            severity: Severity::Info,
+            summary: "old day".into(),
+            details: serde_json::json!({}),
+            tags: vec![],
+            entities: vec![],
+        };
+        store.insert_event(&other).unwrap();
+
+        // KG: add 100 non-snapshot edges to verify the proxy would
+        // have produced an inflated count. The override must win.
+        let mut graph = crate::knowledge_graph::KnowledgeGraph::new();
+        let a = graph.add_node(Node::Ip {
+            addr: "1.2.3.4".to_string(),
+            is_internal: false,
+            datasets: vec![],
+            risk_score: 0,
+            is_tor: false,
+            first_seen: Utc::now(),
+            last_seen: Utc::now(),
+            attempted_usernames: vec![],
+        });
+        let b = graph.add_node(Node::User {
+            name: "root".to_string(),
+            uid: Some(0),
+        });
+        for _ in 0..100 {
+            graph.add_edge(Edge::new(a, b, Relation::TriggeredBy, Utc::now()));
+        }
+
+        let report = compute_for_date_from_graph(dir.path(), Some(date), &graph);
+        assert_eq!(
+            report.detection_summary.total_events, 7,
+            "PR28 — Report's total_events must come from SQLite \
+             events_count_for_date (7 on target date), NOT from KG \
+             edge count (would be 100). The KG proxy inflated this \
+             surface ~30× pre-PR28."
+        );
     }
 
     #[test]
