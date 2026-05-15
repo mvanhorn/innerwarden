@@ -112,6 +112,10 @@ fn incidents_today_agrees_across_all_dashboard_surfaces() {
         &kg,
         dir.path(),
         Some(&snap),
+        // PR30: no canonical events counter for this fixture — fixture
+        // exercises the incidents axis, the KG fallback for events is
+        // fine (graph is empty so it yields 0).
+        None,
     );
     assert_eq!(
         sensors_payload["total_incidents"].as_u64(),
@@ -193,6 +197,10 @@ fn snapshot_zero_incidents_propagates_zero_to_every_surface() {
         &kg,
         dir.path(),
         Some(&snap),
+        // PR30: explicitly thread the zero canonical counter so the
+        // assertion `total_events == 0` reflects the canonical path,
+        // not the legacy KG fallback.
+        Some(0),
     );
     assert_eq!(sensors_payload["total_incidents"].as_u64(), Some(0));
     assert_eq!(sensors_payload["total_events"].as_u64(), Some(0));
@@ -205,5 +213,93 @@ fn snapshot_zero_incidents_propagates_zero_to_every_surface() {
     assert!(
         context.contains("Human attention needed: NONE"),
         "Briefing must say NONE when no attention items in snapshot"
+    );
+}
+
+#[test]
+fn pr30_events_today_agrees_between_overview_and_sensors_payloads() {
+    // PR30 cross-endpoint contract.
+    //
+    // Operator-reported on 2026-05-13: Home tile says "130k events
+    // today", Sensors HUD says "3.7k events today", same screen
+    // reload. The two surfaces had drifted: Home read SQLite per-date
+    // (correct after PR28), Sensors HUD read `graph.total_events_ingested`
+    // (process-lifetime, off by ~35× on a week-old process).
+    //
+    // PR30 routes both surfaces through `canonical_counts::compute`.
+    // This test seeds SQLite with N events for today's date, drives
+    // both code paths against the same store + KG, and asserts they
+    // return the same number.
+    //
+    // If this test ever fails:
+    //   * Diff the canonical events_today vs. the sensors payload's
+    //     `total_events` field. Whichever is wrong is the surface
+    //     that re-introduced an inline read.
+    //   * Re-read PR22's docstring on canonical_counts.rs — the rule
+    //     is "every dashboard endpoint reads canonical_counts" and
+    //     `pr30_every_dashboard_endpoint_reads_canonical_counts`
+    //     greps the handlers for compliance.
+    use chrono::{TimeZone, Utc};
+    let store = innerwarden_store::Store::open_memory().expect("open_memory");
+    let kg = Arc::new(RwLock::new(KnowledgeGraph::new()));
+    // Seed the KG counter to a deliberately wrong value so a regression
+    // back to `graph.total_events_ingested` would surface as a 7-vs-9999 mismatch.
+    {
+        let mut g = kg.write().unwrap();
+        g.total_events_ingested = 9_999;
+    }
+
+    let date_str = "2026-05-13";
+    let day = Utc.with_ymd_and_hms(2026, 5, 13, 12, 0, 0).unwrap();
+    let mk_event = |ts: chrono::DateTime<Utc>| innerwarden_core::event::Event {
+        ts,
+        host: "h".into(),
+        source: "auth_log".into(),
+        kind: "ssh.login".into(),
+        severity: innerwarden_core::event::Severity::Info,
+        summary: String::new(),
+        details: serde_json::json!({}),
+        tags: vec![],
+        entities: vec![],
+    };
+    for i in 0..7 {
+        store
+            .insert_event(&mk_event(day + chrono::Duration::seconds(i)))
+            .unwrap();
+    }
+
+    // Surface A: canonical_counts::compute — the source /api/overview reads.
+    let canonical = crate::dashboard::canonical_counts::compute(
+        &store,
+        &kg,
+        date_str,
+        &crate::dashboard::canonical_counts::CountFilters::default(),
+        day,
+    );
+    assert_eq!(
+        canonical.events_today, 7,
+        "canonical_counts::compute must read SQLite per-date (got {}), \
+         not the KG counter (9999). PR30 regression — see canonical_counts.rs",
+        canonical.events_today
+    );
+
+    // Surface B: build_sensors_payload threaded with the canonical
+    // events_today — what /api/sensors paints.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sensors_payload = crate::dashboard::sensors::tests_only_call_build_sensors_payload(
+        &kg,
+        dir.path(),
+        None,
+        Some(canonical.events_today),
+    );
+    assert_eq!(
+        sensors_payload["total_events"].as_u64(),
+        Some(canonical.events_today),
+        "Sensors HUD total_events must equal canonical events_today \
+         (canonical={}, sensors={}). PR30 cross-endpoint contract broken — \
+         either build_sensors_payload ignored the threaded number, or a \
+         caller stopped threading it.",
+        canonical.events_today,
+        sensors_payload["total_events"]
     );
 }

@@ -7063,11 +7063,49 @@ mod tests {
              from this, not from any in-memory counter that can be \
              zero-after-restart or lifetime-cumulative."
         );
+        // PR30: data_api.rs now reaches `events_count_for_date`
+        // indirectly via `canonical_counts::compute`. Anchor the
+        // canonical call site instead of the raw store helper.
         assert!(
-            DATA_API_SRC.contains("s.events_count_for_date(&date_for_events)"),
-            "PR23 — the api_overview SQLite path must call \
-             `events_count_for_date` so the events surface agrees \
-             with the canonical source."
+            DATA_API_SRC.contains("super::canonical_counts::compute(")
+                && DATA_API_SRC.contains(".events_today"),
+            "PR30 — the api_overview SQLite path must read events_today \
+             via `canonical_counts::compute` (which internally calls \
+             `Store::events_count_for_date`) so the overview surface \
+             agrees with /api/sensors and any future consumer."
+        );
+    }
+
+    #[test]
+    fn pr30_every_dashboard_endpoint_reads_canonical_counts() {
+        // Cross-endpoint anchor for PR30.
+        //
+        // The whole point of the `canonical_counts` module is that
+        // every dashboard surface that needs a per-date count reads
+        // from the same function. A handler that inlines its own
+        // SQLite/KG read for events_today resurrects the divergence
+        // pattern (the 130k-vs-3.7k drift PR22 was created to kill).
+        //
+        // This test source-greps each handler file for the canonical
+        // call. If a future PR removes the call or replaces it with a
+        // bespoke path, this test fails with an actionable message
+        // pointing at the new offending consumer.
+        const DATA_API_SRC: &str = include_str!("data_api.rs");
+        const SENSORS_SRC: &str = include_str!("sensors.rs");
+
+        assert!(
+            DATA_API_SRC.contains("canonical_counts::compute("),
+            "PR30 — `/api/overview` handler in data_api.rs must read \
+             events_today via `canonical_counts::compute`. Inlining a \
+             bespoke SQLite or KG read here resurrects the cross-surface \
+             divergence that PR22 set out to kill."
+        );
+        assert!(
+            SENSORS_SRC.contains("canonical_counts::compute("),
+            "PR30 — `/api/sensors` handler in sensors.rs must read \
+             total_events via `canonical_counts::compute`. Reading \
+             `graph.total_events_ingested` directly drifts from \
+             /api/overview because the KG counter is process-lifetime."
         );
     }
 
@@ -7090,10 +7128,13 @@ mod tests {
              the canonical entry point."
         );
         assert!(
-            CANONICAL.contains("graph.total_events_ingested"),
-            "PR22 — the canonical events counter must come from \
-             `graph.total_events_ingested`, NOT from `metrics.edge_count` \
-             or `count_file_lines` (the dead events-*.jsonl path)."
+            CANONICAL.contains("store.events_count_for_date(date)"),
+            "PR30 — the canonical events counter must come from \
+             `Store::events_count_for_date(date)` (per-date SQLite query). \
+             PR22 originally pinned `graph.total_events_ingested` but \
+             that is a process-lifetime counter (resets on restart, \
+             aggregates every uptime day). PR28 already moved \
+             /api/overview to SQLite; PR30 made canonical_counts agree."
         );
     }
 

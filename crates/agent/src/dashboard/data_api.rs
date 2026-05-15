@@ -1063,11 +1063,15 @@ pub(super) async fn api_overview(
                 top_detectors: Vec::new(),
             }
         });
-        // PR23: events_count for the date comes from SQLite, the only
-        // source that gives an honest "events today" number.
+        // PR23 + PR30: events_count for the date comes from SQLite,
+        // the only source that gives an honest "events today" number.
         // graph.total_events_ingested is uptime-cumulative (zero after
         // restart, multi-million after weeks); metrics.edge_count was
         // ~30× inflated. SQLite's `events` table is the ground truth.
+        //
+        // PR30 routes the call through `canonical_counts::compute` so
+        // /api/overview and /api/sensors read the same canonical
+        // source — anchored by `every_dashboard_endpoint_reads_canonical_counts`.
         let date_for_events = c
             .snapshot
             .as_ref()
@@ -1076,7 +1080,16 @@ pub(super) async fn api_overview(
         let events_today_count = state
             .sqlite_store
             .as_ref()
-            .and_then(|s| s.events_count_for_date(&date_for_events).ok())
+            .map(|store| {
+                super::canonical_counts::compute(
+                    store,
+                    &state.knowledge_graph,
+                    &date_for_events,
+                    &super::canonical_counts::CountFilters::default(),
+                    now,
+                )
+                .events_today
+            })
             .unwrap_or(0) as usize;
         return Json(OverviewResponse {
             date,

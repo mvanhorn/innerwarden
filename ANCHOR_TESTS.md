@@ -634,9 +634,13 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/dashboard/sensors.rs::tests::api_status_files_no_longer_advertises_dead_jsonl_streams` — same contract, struct-level. Replaces the legacy `test_sensors_system_status_mapping` test which pinned the OPPOSITE direction (asserting the dead probes existed).
 
-- `crates/agent/src/dashboard/mod.rs::tests::pr22_overview_events_count_reads_canonical_counter_not_edge_count` — spec 049 PR22 anti-regression: `/api/overview.events_count` must NOT use `metrics.edge_count` (the ~30× inflation proxy from the pre-PR22 era). Source: `graph.total_events_ingested`, matching `/api/sensors.total_events`. Operator-reported 2026-05-13: 130k vs 3.7k for the same KG.
+- `crates/agent/src/dashboard/mod.rs::tests::pr22_overview_events_count_reads_canonical_counter_not_edge_count` — spec 049 PR22+PR30 anti-regression: `/api/overview.events_count` must NOT use `metrics.edge_count` (the ~30× inflation proxy from the pre-PR22 era) and must reach `Store::events_count_for_date` via `canonical_counts::compute` (PR30 path, not directly). Operator-reported 2026-05-13: 130k vs 3.7k for the same KG.
 
-- `crates/agent/src/dashboard/mod.rs::tests::pr22_canonical_counts_module_exists_and_is_wired` — source-grep on `canonical_counts.rs` asserting `CanonicalCounts` struct + `compute()` entry point + canonical events counter. Removing the module fails this anchor.
+- `crates/agent/src/dashboard/mod.rs::tests::pr22_canonical_counts_module_exists_and_is_wired` — source-grep on `canonical_counts.rs` asserting `CanonicalCounts` struct + `compute()` entry point + canonical events counter (PR30 pins the SQLite per-date source).
+
+- `crates/agent/src/dashboard/mod.rs::tests::pr30_every_dashboard_endpoint_reads_canonical_counts` — cross-endpoint source-grep: `data_api.rs` and `sensors.rs` must both reach events_today via `canonical_counts::compute`. A future handler that inlines a bespoke SQLite/KG read for `events_today` re-introduces the cross-surface divergence pattern PR22 set out to kill.
+
+- `crates/agent/src/dashboard/consistency_incidents_today.rs::pr30_events_today_agrees_between_overview_and_sensors_payloads` — runtime cross-endpoint contract: seeds SQLite with 7 events for today + poisons the KG counter to 9_999, asserts both surfaces (canonical_counts::compute and build_sensors_payload) report 7. Any future regression to `graph.total_events_ingested` fails this with a 7 vs 9999 message.
 
 - `crates/agent/src/dashboard/mod.rs::tests::pr22_frontend_no_longer_double_filters_trusted_ips` — frontend `state.hideAllowlisted` JS filter body is gone. Backend is the single source of truth; the JS layer doing it again caused the 2026-05-13 strip-vs-panel mismatch.
 
@@ -646,7 +650,17 @@ The operator's private `.claude-local/RECURRING_BUGS.md` cross-references entrie
 
 - `crates/agent/src/dashboard/canonical_counts.rs::tests::canonical_counts_excludes_self_traffic_ips` — Cloudflare-edge IPs and RFC1918 must not inflate any counter (PR20+PR21 contract end-to-end).
 
-- `crates/agent/src/dashboard/canonical_counts.rs::tests::canonical_counts_reads_events_today_from_kg_ingest_counter` — events_today must come from `graph.total_events_ingested`, NOT from `metrics.edge_count` or `count_file_lines` proxies.
+- `crates/agent/src/dashboard/canonical_counts.rs::tests::canonical_counts_reads_events_today_from_sqlite_per_date_not_kg_counter` — PR30 source-pin: events_today must come from `Store::events_count_for_date(date)` (per-date SQLite). NOT `graph.total_events_ingested` (process-lifetime, off by ~35× on week-old uptime), NOT `metrics.edge_count` (~30× inflated), NOT `count_file_lines` (JSONL sinks removed in spec 016). PR22 originally pinned `total_events_ingested`; PR28 fixed `/api/overview` to SQLite; PR30 made the canonical module match production.
+
+- `crates/agent/src/dashboard/canonical_counts.rs::tests::resolve_events_today_returns_sqlite_value_on_ok_arm` — PR30 helper unit: the Ok arm of the events_today decision returns SQLite's per-date number verbatim, even when the KG counter is large (1M). Pins that the process-lifetime counter never leaks through the happy path.
+
+- `crates/agent/src/dashboard/canonical_counts.rs::tests::resolve_events_today_falls_back_to_kg_counter_on_err_arm` — PR30 helper unit: the Err arm surfaces `graph.total_events_ingested` so the operator sees SOME signal during degraded operation (corrupt DB / schema mismatch). Drives an actual synthetic `StoreError` — pre-refactor the contract was un-exercised because driving a real store to return Err requires filesystem mischief.
+
+- `crates/agent/src/dashboard/canonical_counts.rs::tests::canonical_counts_happy_path_with_empty_sqlite_reports_zero_not_kg_counter` — PR30 end-to-end happy path: with SQLite reachable and empty, canonical compute() returns 0, NOT the KG counter's value (42). A future refactor that re-introduces "graph.total_events_ingested as a fallback when SQLite returns 0" fails here.
+
+- `crates/agent/src/dashboard/sensors.rs::tests::build_sensors_payload_uses_canonical_when_threaded` — PR30 match-arm pin: when a canonical events_today is threaded (Some(13)), the HUD reports 13 even when the KG counter is 1M. The bug PR30 was created to kill manifests as the KG counter leaking past the threaded canonical.
+
+- `crates/agent/src/dashboard/sensors.rs::tests::build_sensors_payload_falls_back_to_kg_counter_when_canonical_none_and_graph_has_data` — PR30 degraded-mode pin for the sensors surface: when canonical is None (no SQLite store reachable) and the KG counter has data (555), the HUD surfaces 555 as best-effort. /api/overview uses the same fallback in its `events_count_fallback` path, so the two surfaces still agree even in degraded mode.
 
 - `crates/agent/src/dashboard/mod.rs::tests::threats_kpi_tile_label_is_blocks_not_blocked` (extended in Wave 10) - the Threats KPI tile reads "Block actions" / "today" (aggregate, decisions) and the sidebar group reads "Currently blocked attackers" (snapshot, unique IPs). Pre-Wave-10 the labels read "Blocks · Today" and "Blocked attackers" — same page, different answers, no copy disclosing the snapshot-vs-aggregate axis. Operator's hard rule (2026-05-05): every label must explicitly disclose window + scope + cardinality unit. The test name predates Wave 10 (kept for git-blame continuity); the docstring has been updated to reflect the new disambiguation pair.
 - `crates/agent/src/dashboard/mod.rs::tests::wave10_live_feed_clips_to_rolling_24h_matching_site_label` - the public live-feed builder (`build_live_feed_response`) clips `real_incidents` to `now - 24h` so the site's hardcoded "(24h)" labels (`Live.tsx:415,422,429`) match the underlying data. Source-grep anchor: pins `cutoff_24h = now - chrono::Duration::hours(24)` AND `i.ts >= cutoff_24h` filter in active code. A future "remove the cutoff for performance" PR fails CI loudly.

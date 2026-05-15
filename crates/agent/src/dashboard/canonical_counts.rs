@@ -44,26 +44,24 @@ use serde::Serialize;
 ///   picker default and the `incidents.ts LIKE 'YYYY-MM-DD%'` query).
 /// * `attackers` = unique external IPs (dedup).
 /// * `incidents` = SQLite row count.
-/// * `events` = sensor-emitted event count, from `graph.total_events_ingested`
-///   (the live counter the sensor increments; replaces both the legacy
-///   `edge_count` proxy and the no-longer-written `events-*.jsonl`
-///   line count).
-// PR22: the foundation lands without a production caller of `compute`
-// — the events_count fix in `data_api.rs` reads
-// `graph.total_events_ingested` directly. Subsequent PRs migrate each
-// endpoint to consume from this module; until then clippy correctly
-// notes the struct/fn are test-only. The allow stays explicit so the
-// next migration PR removes it deliberately.
-#[allow(dead_code)]
+/// * `events` = sensor-emitted event count for the date, from
+///   `Store::events_count_for_date(date)`. PR22 originally documented
+///   `graph.total_events_ingested` here, but that is a process-lifetime
+///   counter — it resets to zero on restart and aggregates every day
+///   the binary has been running. PR28 moved `/api/overview` to the
+///   SQLite per-date count; PR30 makes the canonical module agree.
 #[derive(Debug, Clone, Default, Serialize)]
 pub(super) struct CanonicalCounts {
     pub(super) date: String,
 
     /// Sensor pipeline event volume for the date. Source:
-    /// `graph.total_events_ingested` — the same counter the Sensors HUD
-    /// reads. Pre-PR22 `/api/overview.events_count` used
-    /// `metrics.edge_count` (a 30×–40× inflation) which is why Home
-    /// said 130k while Sensors said 3.7k for the same day.
+    /// `Store::events_count_for_date(date)` — the SQLite `events` table
+    /// filtered by `ts LIKE 'YYYY-MM-DD%'`. Pre-PR22 `/api/overview` used
+    /// `metrics.edge_count` (a 30×–40× inflation). PR22 originally
+    /// pinned `graph.total_events_ingested` here, but that's a
+    /// process-lifetime counter (resets on restart, aggregates every
+    /// uptime day) and caused Home and Sensors HUD to disagree
+    /// (130k vs 3.7k on 2026-05-13). PR30 switched to SQLite per-date.
     pub(super) events_today: u64,
 
     /// SQLite `incidents` table row count for the date, post-filter
@@ -115,7 +113,6 @@ pub(super) struct CanonicalCounts {
 /// Side-channel inputs for the canonical computation. None of these
 /// reach a SQL query — they're operator-facing filters applied to the
 /// in-memory pass.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub(super) struct CountFilters {
     /// Minimum severity rank (0 = no filter, see
@@ -131,14 +128,36 @@ pub(super) struct CountFilters {
     pub(super) hour_filter: Option<(u32, u32)>,
 }
 
+/// Pick the events_today value from the SQLite per-date result, falling
+/// back to the KG ingestion counter when SQLite returns Err.
+///
+/// Pulled out of `compute` so both arms are unit-testable directly. The
+/// Err arm is operationally rare (corrupt DB / schema mismatch) and
+/// driving a real `Store::events_count_for_date` to return Err takes
+/// filesystem mischief that's heavier than the contract being tested.
+fn resolve_events_today(
+    store_result: innerwarden_store::error::Result<u64>,
+    kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
+) -> u64 {
+    match store_result {
+        Ok(n) => n,
+        Err(_) => kg.read().unwrap().total_events_ingested as u64,
+    }
+}
+
 /// Compute the canonical counter snapshot for `date`. Single SQL pass
-/// over SQLite incidents+decisions; reads `events_today` from the live
-/// KG ingestion counter so it agrees with the Sensors HUD source.
+/// over SQLite incidents+decisions; reads `events_today` from
+/// `Store::events_count_for_date` so the per-date semantics agree
+/// across every dashboard surface.
 ///
 /// On store/IO errors returns an empty snapshot with the date set —
 /// downstream handlers fall through to a "no data" UI rather than
 /// crashing the response.
-#[allow(dead_code)]
+///
+/// The `kg` parameter is retained for the fallback path: when the
+/// SQLite store is unavailable (early boot, dev-only mode, store
+/// truncation), the live KG counter is the best signal the operator
+/// has and is preferred over showing zero.
 pub(super) fn compute(
     store: &innerwarden_store::Store,
     kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
@@ -151,14 +170,16 @@ pub(super) fn compute(
         ..Default::default()
     };
 
-    // ── events_today: read the sensor's live counter directly. The
-    //    legacy `metrics.edge_count` proxy inflated this by ~30× because
-    //    each event creates multiple graph edges (incident → ip,
-    //    incident → process, etc.).
-    {
-        let graph = kg.read().unwrap();
-        out.events_today = graph.total_events_ingested as u64;
-    }
+    // ── events_today: SQLite per-date count is the source of truth.
+    //    `graph.total_events_ingested` is a process-lifetime counter —
+    //    it resets to zero on restart and aggregates every day the
+    //    binary has been running. SQLite gives the honest "events
+    //    today" the operator expects. Fall back to the KG counter
+    //    only when SQLite can't answer (unlikely; mostly dev-only).
+    //    Extracted into `resolve_events_today` so both the Ok and the
+    //    Err arm are unit-testable directly (the Err arm is hard to
+    //    reach through a real store without filesystem trickery).
+    out.events_today = resolve_events_today(store.events_count_for_date(date), kg);
 
     // ── incidents + decisions today, with attacker dedup and bucket
     //    classification. Reuses `compute_overview_counts_from_sqlite`
@@ -356,23 +377,127 @@ mod tests {
     }
 
     #[test]
-    fn canonical_counts_reads_events_today_from_kg_ingest_counter() {
-        // Anti-regression for Gap 1 (the 130k vs 3.7k mystery). The
-        // canonical events_today must come from
-        // `graph.total_events_ingested` — the same counter the
-        // Sensors HUD reads — NOT `metrics.edge_count` which inflates
-        // by ~30× because every event creates multiple edges.
+    fn canonical_counts_reads_events_today_from_sqlite_per_date_not_kg_counter() {
+        // PR30: the events_today source moved from
+        // `graph.total_events_ingested` (process-lifetime) to
+        // `Store::events_count_for_date(date)` (per-date). The KG
+        // counter is wrong because:
+        //   * it resets to zero on every restart, so right after a
+        //     restart at 14:00 UTC the operator sees 0 events even if
+        //     the morning had thousands;
+        //   * it aggregates EVERY day the process has been alive, so
+        //     after a week of uptime today's tile reports 7 days of
+        //     events. PR28 already fixed /api/overview to use SQLite;
+        //     this test pins the canonical module to the same source.
+        let store = innerwarden_store::Store::open_memory().unwrap();
+        let date = "2026-05-13";
+
+        // KG counter is set to a wildly wrong value to prove canonical
+        // ignores it when SQLite can answer.
+        let kg = mk_kg();
+        {
+            let mut g = kg.write().unwrap();
+            g.total_events_ingested = 999_999;
+        }
+
+        // Insert 3 events for the target date and 1 for yesterday into
+        // SQLite. Canonical must report 3, not 999_999 (KG), not 4 (cross-date).
+        let day_dt = day().and_hms_opt(12, 0, 0).unwrap().and_utc();
+        let yesterday_dt = day_dt - chrono::Duration::days(1);
+        let mk_event = |ts: DateTime<Utc>| innerwarden_core::event::Event {
+            ts,
+            host: "h".into(),
+            source: "auth_log".into(),
+            kind: "ssh.login".into(),
+            severity: innerwarden_core::event::Severity::Info,
+            summary: String::new(),
+            details: serde_json::json!({}),
+            tags: vec![],
+            entities: vec![],
+        };
+        for i in 0..3 {
+            store
+                .insert_event(&mk_event(day_dt + chrono::Duration::seconds(i)))
+                .unwrap();
+        }
+        store.insert_event(&mk_event(yesterday_dt)).unwrap();
+
+        let counts = compute(&store, &kg, date, &CountFilters::default(), now());
+        assert_eq!(
+            counts.events_today, 3,
+            "events_today must come from Store::events_count_for_date \
+             for the requested date — not the process-lifetime KG counter"
+        );
+    }
+
+    #[test]
+    fn resolve_events_today_returns_sqlite_value_on_ok_arm() {
+        // Ok arm contract: when SQLite gives a per-date count, that's
+        // what we report — even when the KG counter is non-zero (the
+        // common case: process has been running, ingestion counter
+        // has accumulated, but the operator is asking for "today").
+        let kg = mk_kg();
+        {
+            let mut g = kg.write().unwrap();
+            g.total_events_ingested = 1_000_000;
+        }
+        let v = resolve_events_today(Ok(42), &kg);
+        assert_eq!(
+            v, 42,
+            "Ok(n) arm must return n verbatim; the KG counter (1M) is \
+             a process-lifetime number and must not leak through the \
+             happy path. Got {v}"
+        );
+    }
+
+    #[test]
+    fn resolve_events_today_falls_back_to_kg_counter_on_err_arm() {
+        // Err arm contract: this is the actual test of the fallback
+        // behavior the docstring promises. Pre-refactor this contract
+        // was un-exercised because driving `events_count_for_date` to
+        // return Err takes filesystem mischief; extracting the
+        // decision into `resolve_events_today` makes the Err arm
+        // directly testable by passing a synthetic Err.
+        let kg = mk_kg();
+        {
+            let mut g = kg.write().unwrap();
+            g.total_events_ingested = 7_777;
+        }
+        // Synthesize a real `innerwarden_store::error::Error` to drive
+        // the Err arm — any variant works since the canonical module
+        // only inspects ok-vs-err, not the error payload.
+        let err = innerwarden_store::error::StoreError::Migration("synthetic-for-test".into());
+        let v = resolve_events_today(Err(err), &kg);
+        assert_eq!(
+            v, 7_777,
+            "Err(_) arm must surface graph.total_events_ingested so the \
+             operator sees SOME signal during degraded operation. Got {v}"
+        );
+    }
+
+    #[test]
+    fn canonical_counts_happy_path_with_empty_sqlite_reports_zero_not_kg_counter() {
+        // End-to-end happy path on the full `compute()` function with
+        // an empty SQLite store. Replaces the misnamed
+        // `canonical_counts_falls_back_to_kg_counter_when_sqlite_call_errors`
+        // which pre-refactor never actually drove the Err arm. The Err
+        // arm is now exercised by `resolve_events_today_falls_back_to_kg_counter_on_err_arm`;
+        // this test pins the complement: with SQLite reachable AND
+        // empty, the canonical compute() must return 0, NOT the KG
+        // counter, regardless of how high the KG counter is. A future
+        // refactor that re-introduces "graph.total_events_ingested as a
+        // fallback when SQLite returns 0" would fail here.
         let store = innerwarden_store::Store::open_memory().unwrap();
         let kg = mk_kg();
         {
             let mut g = kg.write().unwrap();
-            g.total_events_ingested = 12_345;
+            g.total_events_ingested = 42;
         }
         let counts = compute(&store, &kg, "2026-05-13", &CountFilters::default(), now());
         assert_eq!(
-            counts.events_today, 12_345,
-            "events_today must read from graph.total_events_ingested, \
-             not edge_count or any other proxy"
+            counts.events_today, 0,
+            "with SQLite reachable and empty, canonical must report 0 \
+             (per-date), not the KG counter (42)"
         );
     }
 }

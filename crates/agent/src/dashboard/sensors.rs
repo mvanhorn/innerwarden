@@ -32,32 +32,47 @@ pub(super) async fn api_sensors(State(state): State<DashboardState>) -> Json<ser
     // Briefing/Report paint. Pre-fix the HUD scanned the KG and
     // showed "47 events handled" while the Home tile said something
     // different — a contradiction the auditor flagged on the same
-    // screen reload. The snapshot is computed inline (mirroring
-    // api_overview / api_briefing_generate); when it's unavailable
-    // the HUD falls back to the legacy KG / telemetry path.
-    let snapshot = state.sqlite_store.as_ref().and_then(|store| {
-        let today = super::helpers::resolve_date(None);
-        let now_dt = chrono::Utc::now();
-        let degraded = super::data_api::read_degraded_signals(&state);
-        super::data_api::compute_overview_counts_from_sqlite(
-            store,
-            &today,
-            0,
-            None,
-            // Spec 049 PR4: Sensors HUD does NOT carry a scope picker
-            // — it always renders today's full-day window.
-            None,
-            now_dt,
-            &degraded,
-            &state.data_dir,
-        )
-        .and_then(|counts| counts.snapshot)
-    });
+    // screen reload.
+    //
+    // PR30: route through `canonical_counts::compute` so the
+    // per-date events_today number agrees with /api/overview. The
+    // canonical snapshot is what the cross-endpoint anchor
+    // `every_dashboard_endpoint_reads_canonical_counts` greps for.
+    let (snapshot, events_today_canonical) = state
+        .sqlite_store
+        .as_ref()
+        .map(|store| {
+            let today = super::helpers::resolve_date(None);
+            let now_dt = chrono::Utc::now();
+            let degraded = super::data_api::read_degraded_signals(&state);
+            let snap = super::data_api::compute_overview_counts_from_sqlite(
+                store,
+                &today,
+                0,
+                None,
+                // Spec 049 PR4: Sensors HUD does NOT carry a scope picker
+                // — it always renders today's full-day window.
+                None,
+                now_dt,
+                &degraded,
+                &state.data_dir,
+            )
+            .and_then(|counts| counts.snapshot);
+            let canonical = super::canonical_counts::compute(
+                store,
+                &state.knowledge_graph,
+                &today,
+                &super::canonical_counts::CountFilters::default(),
+                now_dt,
+            );
+            (snap, Some(canonical.events_today))
+        })
+        .unwrap_or((None, None));
 
     let kg = std::sync::Arc::clone(&state.knowledge_graph);
     let data_dir = state.data_dir.clone();
     let result = tokio::task::spawn_blocking(move || {
-        build_sensors_payload(&kg, &data_dir, snapshot.as_ref())
+        build_sensors_payload(&kg, &data_dir, snapshot.as_ref(), events_today_canonical)
     })
     .await
     .unwrap_or_else(|_| serde_json::json!({}));
@@ -80,7 +95,7 @@ pub(super) async fn api_sensors(State(state): State<DashboardState>) -> Json<ser
 /// `build_sensors_payload` via `spawn_blocking`.
 #[allow(dead_code)]
 pub(super) async fn api_sensors_inner(state: &DashboardState) -> serde_json::Value {
-    build_sensors_payload(&state.knowledge_graph, &state.data_dir, None)
+    build_sensors_payload(&state.knowledge_graph, &state.data_dir, None, None)
 }
 
 /// Test-only re-export of `build_sensors_payload` for the cross-surface
@@ -93,51 +108,69 @@ pub(super) fn tests_only_call_build_sensors_payload(
     kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
     data_dir: &std::path::Path,
     snapshot: Option<&super::types::OverviewSnapshot>,
+    events_today_canonical: Option<u64>,
 ) -> serde_json::Value {
-    build_sensors_payload(kg, data_dir, snapshot)
+    build_sensors_payload(kg, data_dir, snapshot, events_today_canonical)
 }
 
 fn build_sensors_payload(
     kg: &std::sync::Arc<std::sync::RwLock<crate::knowledge_graph::KnowledgeGraph>>,
     data_dir: &std::path::Path,
     snapshot: Option<&super::types::OverviewSnapshot>,
+    events_today_canonical: Option<u64>,
 ) -> serde_json::Value {
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
 
     use crate::knowledge_graph::types::{Node, NodeType};
     let graph = kg.read().unwrap();
 
-    // Event telemetry — prefer graph counters, fall back to telemetry snapshot.
-    // Wave 6c: graph.source_counts keys are now `Arc<str>`; convert to
-    // `String` at the boundary so the if/else branch element types
-    // match (the else branch produces `(String, usize)` already).
-    let (total_events_val, sources) = if graph.total_events_ingested > 0 {
+    // Event telemetry.
+    //
+    // PR30: `total_events_val` comes from `canonical_counts::compute`
+    // (SQLite per-date) when the SQLite store is reachable — the same
+    // number /api/overview paints, so the operator no longer sees Home
+    // and Sensors HUD disagree. Pre-PR30 this read `graph.total_events_ingested`
+    // (process-lifetime counter that resets on restart and aggregates
+    // every uptime day) which is what caused the 130k vs 3.7k drift
+    // reported on 2026-05-13.
+    //
+    // The per-source breakdown still comes from `graph.source_counts` /
+    // telemetry — the SQLite events table doesn't carry the source
+    // attribution we need for the HUD chart. That's only an aesthetic
+    // issue (the chart's segment ratios are correct), the total is
+    // what the operator reads against the Home tile.
+    let total_events_val = match events_today_canonical {
+        Some(n) => n as usize,
+        None if graph.total_events_ingested > 0 => graph.total_events_ingested,
+        None => {
+            let telem = crate::telemetry::read_latest_snapshot(data_dir, &today);
+            telem
+                .as_ref()
+                .map(|t| t.events_by_collector.values().sum::<u64>() as usize)
+                .unwrap_or(0)
+        }
+    };
+    let sources: Vec<(String, usize)> = if graph.total_events_ingested > 0 {
         let mut s: Vec<(String, usize)> = graph
             .source_counts
             .iter()
             .map(|(s, &c)| (s.to_string(), c))
             .collect();
         s.sort_by(|a, b| b.1.cmp(&a.1));
-        (graph.total_events_ingested, s)
+        s
     } else {
-        // Fallback: read from telemetry snapshot (has events_by_collector)
         let telem = crate::telemetry::read_latest_snapshot(data_dir, &today);
         match telem {
             Some(t) => {
-                let total = t.events_by_collector.values().sum::<u64>() as usize;
-                // Wave 6b: t.events_by_collector keys are now `Arc<str>`;
-                // the if-branch above produces `(String, usize)` from
-                // graph.source_counts, so convert to `String` here to
-                // keep both branches' element type identical.
                 let mut s: Vec<(String, usize)> = t
                     .events_by_collector
                     .into_iter()
                     .map(|(k, v)| (k.to_string(), v as usize))
                     .collect();
                 s.sort_by(|a, b| b.1.cmp(&a.1));
-                (total, s)
+                s
             }
-            None => (0, vec![]),
+            None => vec![],
         }
     };
 
@@ -729,7 +762,7 @@ mod tests {
             crate::knowledge_graph::KnowledgeGraph::new(),
         ));
         let dir = tempfile::tempdir().expect("tempdir");
-        let payload = build_sensors_payload(&kg, dir.path(), None);
+        let payload = build_sensors_payload(&kg, dir.path(), None, None);
 
         // Required fields: date, total_events, total_incidents, sources,
         // top_kinds, detectors, event_timeline, detector_timeline.
@@ -750,6 +783,59 @@ mod tests {
         }
         assert_eq!(payload["total_events"].as_u64(), Some(0));
         assert_eq!(payload["total_incidents"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn build_sensors_payload_uses_canonical_when_threaded() {
+        // PR30 match branch: `Some(n) => n as usize`. Canonical helper
+        // had already done the SQLite per-date read; the HUD trusts
+        // that number and ignores both the KG counter and the
+        // telemetry-snapshot fallback. Even when the KG counter is
+        // wildly larger (e.g. process has been running for a week),
+        // the canonical value wins.
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::knowledge_graph::KnowledgeGraph::new(),
+        ));
+        {
+            let mut g = kg.write().unwrap();
+            g.total_events_ingested = 1_000_000;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let payload = build_sensors_payload(&kg, dir.path(), None, Some(13));
+        assert_eq!(
+            payload["total_events"].as_u64(),
+            Some(13),
+            "canonical events_today (13) must win over the KG counter \
+             (1_000_000) — Sensors HUD diverging from /api/overview is \
+             the bug PR30 was created to kill"
+        );
+    }
+
+    #[test]
+    fn build_sensors_payload_falls_back_to_kg_counter_when_canonical_none_and_graph_has_data() {
+        // PR30 match branch: `None if graph.total_events_ingested > 0
+        // => graph.total_events_ingested`. Reached when the caller
+        // couldn't compute a canonical value (no SQLite store, very
+        // early boot, dev-only mode) but the KG has ingested events.
+        // Acceptable best-effort number; same fallback /api/overview
+        // uses in `events_count_fallback` at data_api.rs.
+        let kg = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::knowledge_graph::KnowledgeGraph::new(),
+        ));
+        {
+            let mut g = kg.write().unwrap();
+            g.total_events_ingested = 555;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let payload = build_sensors_payload(&kg, dir.path(), None, None);
+        assert_eq!(
+            payload["total_events"].as_u64(),
+            Some(555),
+            "with no canonical value threaded and KG counter non-zero, \
+             the HUD must surface the KG counter as best-effort. This \
+             is the documented degraded-mode contract; /api/overview \
+             uses the same fallback when SQLite is absent."
+        );
     }
 
     // 2026-05-02 audit B1/P1 (Spec 039 P3) anchor: the Sensors HUD
@@ -813,7 +899,7 @@ mod tests {
             }],
         };
 
-        let payload = build_sensors_payload(&kg, dir.path(), Some(&snap));
+        let payload = build_sensors_payload(&kg, dir.path(), Some(&snap), None);
         assert_eq!(
             payload["total_events"].as_u64(),
             Some(14_700_000),
@@ -871,7 +957,7 @@ mod tests {
             crate::knowledge_graph::KnowledgeGraph::new(),
         ));
         let dir = tempfile::tempdir().expect("tempdir");
-        let payload = build_sensors_payload(&kg, dir.path(), None);
+        let payload = build_sensors_payload(&kg, dir.path(), None, None);
         // Total stays 0 (no graph counters AND no telemetry file).
         assert_eq!(payload["total_events"].as_u64(), Some(0));
         let sources = payload["sources"].as_array().expect("sources array");
@@ -890,7 +976,7 @@ mod tests {
 
         let kg = std::sync::Arc::new(std::sync::RwLock::new(g));
         let dir = tempfile::tempdir().expect("tempdir");
-        let payload = build_sensors_payload(&kg, dir.path(), None);
+        let payload = build_sensors_payload(&kg, dir.path(), None, None);
 
         assert_eq!(payload["total_events"].as_u64(), Some(3));
         let sources = payload["sources"].as_array().expect("sources array");
@@ -943,7 +1029,7 @@ mod tests {
 
         let kg = std::sync::Arc::new(std::sync::RwLock::new(g));
         let dir = tempfile::tempdir().expect("tempdir");
-        let payload = build_sensors_payload(&kg, dir.path(), None);
+        let payload = build_sensors_payload(&kg, dir.path(), None, None);
 
         let timeline = payload["event_timeline"].as_object().expect("timeline");
         // Yesterday's `03:15` MUST NOT leak into today's chart even
@@ -999,7 +1085,7 @@ mod tests {
             top_detectors: vec![],
         };
 
-        let payload = build_sensors_payload(&kg, dir.path(), Some(&snap));
+        let payload = build_sensors_payload(&kg, dir.path(), Some(&snap), None);
         assert_eq!(
             payload["total_events"].as_u64(),
             Some(13_177_172),
