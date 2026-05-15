@@ -29,13 +29,13 @@
 //! plainly. The same agent binary on different hosts will surface
 //! different health states; the operator never has to guess.
 //!
-//! PR25 lands the foundation (types + manifest + probe helper + unit
-//! tests). Production callers wire in phase-2 (sensor boot path emits
-//! a `CollectorStatus` per collector). Until then clippy correctly
-//! flags every public item as dead-code in the binary target — the
-//! module-level allow keeps CI green without hiding genuine dead code
-//! elsewhere. The next PR removes the allow as it wires each caller.
-#![allow(dead_code)]
+//! PR25 landed the foundation (types + manifest + probe helper +
+//! unit tests). PR29 wires it: sensor main.rs calls
+//! `build_status` + `write_status_file` at boot, dashboard reads
+//! the JSON. Methods on `CollectorCategory` / `CollectorHealth`
+//! remain unused by the binary (consumed via serde JSON on the agent
+//! side) and stay as readable code for ops / future telemetry
+//! integrations — hence the targeted allows below.
 
 use std::path::PathBuf;
 
@@ -59,6 +59,10 @@ pub enum CollectorCategory {
 }
 
 impl CollectorCategory {
+    // Frontend has its own JS copy of this mapping; kept Rust-side so
+    // future server-rendered surfaces (e.g. `innerwarden ctl health`)
+    // can reuse a single definition.
+    #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Telemetry => "telemetry",
@@ -70,6 +74,7 @@ impl CollectorCategory {
     /// Operator-readable description of why a low count is or is not
     /// concerning for this category. Goes into the HUD tooltip so
     /// operators stop misreading silence as broken.
+    #[allow(dead_code)]
     pub fn silence_meaning(self) -> &'static str {
         match self {
             Self::Telemetry => {
@@ -107,9 +112,14 @@ pub enum CollectorHealth {
     /// Collector ran but lacks OS-level capability (CAP_NET_RAW,
     /// CAP_SYS_ADMIN). Operator-actionable: check the systemd unit's
     /// `AmbientCapabilities` or run with the right user.
+    // Reserved for capability-probe wiring (phase 3); kept in the enum
+    // so the JSON schema is stable across phases.
+    #[allow(dead_code)]
     PermissionDenied,
     /// Collector is enabled in config but not supported on this host's
     /// platform (e.g. fanotify on macOS, ebpf without recent kernel).
+    // Reserved for platform-probe wiring (phase 3).
+    #[allow(dead_code)]
     Unsupported { reason: String },
     /// Collector is disabled in config — explicit operator choice,
     /// not a fault.
@@ -119,6 +129,10 @@ pub enum CollectorHealth {
 impl CollectorHealth {
     /// Short single-word status for the HUD. Maps each variant to a
     /// stable string the frontend keys on.
+    // Frontend renders the badge from the serde-tagged JSON `state`
+    // field directly; this method is kept for symmetric Rust callers
+    // (e.g. `innerwarden ctl health`, future tests).
+    #[allow(dead_code)]
     pub fn label(&self) -> &'static str {
         match self {
             Self::Active => "active",
@@ -132,6 +146,9 @@ impl CollectorHealth {
 
     /// Operator-readable explanation of WHY the collector is in this
     /// state. Renders in the HUD tooltip next to the badge.
+    // Frontend builds tooltips from the JSON `path` / `reason` fields
+    // directly; kept Rust-side for parity with `label()`.
+    #[allow(dead_code)]
     pub fn reason(&self) -> String {
         match self {
             Self::Active => "Running normally.".to_string(),
@@ -269,9 +286,133 @@ pub fn probe_file_source(path: &str, now: chrono::DateTime<chrono::Utc>) -> Coll
     CollectorHealth::Active
 }
 
+/// Spec PR29 — write the boot-time collector health snapshot to a
+/// well-known side-channel JSON file the agent dashboard reads from.
+///
+/// File path: `<data_dir>/collector-health.json`. Schema:
+///
+/// ```json
+/// {
+///   "generated_at": "2026-05-15T03:00:00+00:00",
+///   "host": "instance-x",
+///   "statuses": [
+///     {
+///       "name": "auth_log",
+///       "category": "telemetry",
+///       "health": { "state": "active" },
+///       "source": "/var/log/auth.log"
+///     },
+///     {
+///       "name": "suricata_eve",
+///       "category": "telemetry",
+///       "health": { "state": "source_unavailable", "path": "/var/log/suricata/eve.json" },
+///       "source": "/var/log/suricata/eve.json"
+///     }
+///   ]
+/// }
+/// ```
+///
+/// Atomic write: `<file>.tmp` → rename. Errors are logged and
+/// swallowed; a missing health file means "agent shows the legacy
+/// view", not a crash.
+pub fn write_status_file(
+    data_dir: &std::path::Path,
+    host: &str,
+    statuses: &[CollectorStatus],
+) -> std::io::Result<()> {
+    let payload = serde_json::json!({
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "host": host,
+        "statuses": statuses,
+    });
+    let final_path = data_dir.join("collector-health.json");
+    let tmp_path = data_dir.join("collector-health.json.tmp");
+    let body = serde_json::to_string_pretty(&payload).map_err(std::io::Error::other)?;
+    std::fs::write(&tmp_path, body)?;
+    std::fs::rename(&tmp_path, &final_path)?;
+    Ok(())
+}
+
+/// PR29 — convenience builder for a single status row. Probes the
+/// file if `source` is `Some`, otherwise reports Active (the
+/// collector doesn't have a file-backed source so we can't probe;
+/// telemetry counters will surface a broken collector via low
+/// event count).
+pub fn build_status(
+    name: &'static str,
+    enabled_in_config: bool,
+    source: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> CollectorStatus {
+    let category = category_for(name);
+    let health = if !enabled_in_config {
+        CollectorHealth::DisabledByConfig
+    } else if let Some(path) = source {
+        probe_file_source(path, now)
+    } else {
+        CollectorHealth::Active
+    };
+    CollectorStatus {
+        name: name.to_string(),
+        category,
+        health,
+        source: source.map(|s| s.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_status_file_round_trips_through_json() {
+        // PR29 hot-path: the sensor writes this file at boot and the
+        // agent reads it on every /api/sensors request. Round-trip
+        // anchor pins the JSON shape so a future schema drift fails
+        // CI before reaching prod.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = chrono::Utc::now();
+        let statuses = vec![
+            build_status("auth_log", true, Some("/var/log/auth.log"), now),
+            build_status(
+                "suricata_eve",
+                true,
+                Some("/var/log/does-not-exist.json"),
+                now,
+            ),
+            build_status("ebpf", true, None, now),
+        ];
+        write_status_file(dir.path(), "test-host", &statuses).expect("write");
+
+        let path = dir.path().join("collector-health.json");
+        let body = std::fs::read_to_string(&path).expect("read");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("json");
+
+        assert_eq!(parsed["host"], "test-host");
+        let arr = parsed["statuses"].as_array().expect("statuses array");
+        assert_eq!(arr.len(), 3);
+        // suricata_eve probe must yield source_unavailable for a
+        // missing-on-this-host file. That's the operator-visible
+        // signal the dashboard renders as "SOURCE MISSING".
+        let suricata = arr
+            .iter()
+            .find(|s| s["name"] == "suricata_eve")
+            .expect("suricata row");
+        assert_eq!(suricata["health"]["state"], "source_unavailable");
+        // ebpf has no file source — probe defaults to Active.
+        let ebpf = arr.iter().find(|s| s["name"] == "ebpf").expect("ebpf row");
+        assert_eq!(ebpf["health"]["state"], "active");
+    }
+
+    #[test]
+    fn build_status_disabled_in_config_reports_disabled_health() {
+        // Operator who explicitly disables a collector in config
+        // must see "DISABLED" on the HUD, not "SOURCE MISSING".
+        // Anti-regression for confusing the two cases.
+        let now = chrono::Utc::now();
+        let status = build_status("auth_log", false, Some("/var/log/auth.log"), now);
+        assert!(matches!(status.health, CollectorHealth::DisabledByConfig));
+    }
 
     #[test]
     fn category_for_known_telemetry_collectors() {

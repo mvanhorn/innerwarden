@@ -1125,6 +1125,71 @@ async fn main() -> Result<()> {
         signal(SignalKind::terminate())?
     };
 
+    // PR29 — write the boot-time collector health snapshot. Probes
+    // each file-backed collector's source path, records whether the
+    // path exists / is stale / is missing, and writes the result to
+    // `<data_dir>/collector-health.json` for the agent dashboard to
+    // read. Errors are logged and swallowed: a missing health file
+    // means the dashboard shows the legacy view (per-collector count
+    // only), not a crash.
+    {
+        let now = chrono::Utc::now();
+        let statuses = vec![
+            collector_health::build_status(
+                "auth_log",
+                cfg.collectors.auth_log.enabled,
+                Some(&cfg.collectors.auth_log.path),
+                now,
+            ),
+            collector_health::build_status("journald", cfg.collectors.journald.enabled, None, now),
+            collector_health::build_status(
+                "exec_audit",
+                cfg.collectors.exec_audit.enabled,
+                Some(&cfg.collectors.exec_audit.path),
+                now,
+            ),
+            collector_health::build_status("docker", cfg.collectors.docker.enabled, None, now),
+            collector_health::build_status(
+                "integrity",
+                cfg.collectors.integrity.enabled,
+                None,
+                now,
+            ),
+            collector_health::build_status(
+                "syslog_firewall",
+                cfg.collectors.syslog_firewall.enabled,
+                Some(&cfg.collectors.syslog_firewall.path),
+                now,
+            ),
+            collector_health::build_status(
+                "nginx_access",
+                cfg.collectors.nginx_access.enabled,
+                Some(&cfg.collectors.nginx_access.path),
+                now,
+            ),
+            collector_health::build_status(
+                "nginx_error",
+                cfg.collectors.nginx_error.enabled,
+                Some(&cfg.collectors.nginx_error.path),
+                now,
+            ),
+            // NOTE: suricata_eve and osquery_log appear in some
+            // operator config files but are NOT in the sensor's
+            // CollectorsConfig struct. serde silently ignores those
+            // keys, so the sensor never spawns them. Don't include
+            // them in the probe; they aren't collectors this binary
+            // runs. The right operator action is to remove those
+            // sections from config.toml (or open a tracking PR to
+            // add proper Suricata/Osquery collectors).
+        ];
+        if let Err(e) = collector_health::write_status_file(data_dir, &cfg.agent.host_id, &statuses)
+        {
+            tracing::warn!(error = %e, "failed to write collector-health.json");
+        } else {
+            info!("collector-health.json written ({} entries)", statuses.len());
+        }
+    }
+
     // Main loop: drain events, run detectors, write output
     let mut stats = WriteStats::default();
 

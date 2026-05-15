@@ -70,6 +70,52 @@ function categoryBadge(cat) {
   return '<span class="cat-badge cat-telemetry" title="Always-on telemetry stream — low count signals the collector or its source is broken.">TELEMETRY</span>';
 }
 
+// PR29 — index `data.collector_health.statuses` by name for O(1)
+// lookup. Returns `{}` (empty map) when the sensor didn't write a
+// health file (old sensor binary or non-default deploy).
+function indexHealth(healthBlock) {
+  const map = {};
+  const statuses = (healthBlock && healthBlock.statuses) || [];
+  for (const s of statuses) {
+    if (s && s.name) map[s.name] = s;
+  }
+  return map;
+}
+
+function healthBadge(status) {
+  // PR29 — health pill rendered next to the category badge. Only
+  // emits when the sensor reported a non-Active state for this
+  // collector. The pill carries the operator-readable reason as a
+  // tooltip so they know what to investigate.
+  if (!status || !status.health) return '';
+  const h = status.health;
+  const state = h.state || 'active';
+  if (state === 'active') return '';
+  let label = state.toUpperCase();
+  let cls = 'cat-badge health-warn';
+  let title = '';
+  if (state === 'source_unavailable') {
+    label = 'SOURCE MISSING';
+    title = 'Source file does not exist on this host: ' + (h.path || '?') +
+            '. Install the upstream service or remove this collector from config.';
+  } else if (state === 'source_empty') {
+    label = 'SOURCE STALE';
+    title = 'Source file exists but has not been written to since ' +
+            (h.last_write_iso || 'unknown') + '. Verify the upstream service.';
+  } else if (state === 'permission_denied') {
+    label = 'NO PERMISSION';
+    title = 'Sensor lacks OS-level capability to read this source. Check AmbientCapabilities.';
+  } else if (state === 'unsupported') {
+    label = 'UNSUPPORTED';
+    title = 'Not supported on this host: ' + (h.reason || 'unknown');
+  } else if (state === 'disabled') {
+    label = 'DISABLED';
+    cls = 'cat-badge cat-snapshot';
+    title = 'Disabled in config — operator choice.';
+  }
+  return '<span class="' + cls + '" title="' + title.replace(/"/g, '&quot;') + '">' + label + '</span>';
+}
+
 async function loadSensors() {
   try {
     const data = await loadJson('/api/sensors');
@@ -98,6 +144,11 @@ async function loadSensors() {
       // mapping mirrors `crates/sensor/src/collector_health.rs`.
       const allSources = data.sources || [];
       const totalAll = allSources.length;
+      // PR29 — index per-collector health from the sensor's
+      // side-channel JSON (data.collector_health written by the
+      // sensor at boot). Used by renderSourceRow to add a health
+      // pill when source_unavailable / source_empty / etc.
+      const healthByName = indexHealth(data.collector_health);
 
       // Telemetry with count > 0 = active; telemetry with count = 0
       // is the operator-actionable case (broken / source missing).
@@ -131,6 +182,7 @@ async function loadSensors() {
           s.name +
           '</span>' +
           categoryBadge(collectorCategory(s.name)) +
+          healthBadge(healthByName[s.name]) +
           '<span class="hud-source-count" style="color:' +
           color +
           ';">' +

@@ -262,6 +262,14 @@ fn build_sensors_payload(
         None => (total_events_val, total_incidents),
     };
 
+    // PR29 — read sensor's boot-time collector health snapshot from
+    // the side-channel JSON file the sensor writes at boot. Per-host
+    // probes: tells the operator which configured collectors actually
+    // have their data source reachable. Missing file = sensor doesn't
+    // know about this collector OR isn't running the new code yet;
+    // dashboard falls back to the legacy view (counter-only).
+    let collector_health = read_collector_health_file(data_dir);
+
     serde_json::json!({
         "date": today,
         "total_events": total_events_canonical,
@@ -271,7 +279,21 @@ fn build_sensors_payload(
         "detectors": detectors.iter().map(|(d, c)| serde_json::json!({"name": d, "count": c})).collect::<Vec<_>>(),
         "event_timeline": event_tl_display,
         "detector_timeline": detector_tl_display,
+        "collector_health": collector_health,
     })
+}
+
+/// PR29 — load the boot-time collector health JSON the sensor writes
+/// to `<data_dir>/collector-health.json`. Returns `null` on any error
+/// (file missing, malformed JSON) so the dashboard falls back to its
+/// legacy view rather than crashing the response.
+fn read_collector_health_file(data_dir: &std::path::Path) -> serde_json::Value {
+    let path = data_dir.join("collector-health.json");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return serde_json::Value::Null,
+    };
+    serde_json::from_str::<serde_json::Value>(&content).unwrap_or(serde_json::Value::Null)
 }
 
 /// GET /api/status - E6: system status including data files and responder config.

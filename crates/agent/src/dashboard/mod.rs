@@ -7246,4 +7246,76 @@ mod tests {
              so Cloudflare-edge IPs are also dropped, not just RFC1918."
         );
     }
+
+    #[test]
+    fn pr29_sensor_writes_collector_health_at_boot() {
+        // PR29 phase-2 of the sensor-health work. The sensor binary
+        // must call `collector_health::write_status_file` at boot
+        // (after spawning collectors, before the main loop). Without
+        // this the dashboard's `/api/sensors.collector_health` is
+        // always null and the operator never sees per-host health
+        // (suricata_eve missing on host X but present on host Y).
+        const SENSOR_MAIN: &str = include_str!("../../../sensor/src/main.rs");
+        assert!(
+            SENSOR_MAIN.contains("collector_health::write_status_file"),
+            "PR29 — sensor main.rs must call write_status_file at \
+             boot. Without the call the dashboard falls back to its \
+             legacy per-collector counter view."
+        );
+        assert!(
+            SENSOR_MAIN.contains("collector_health::build_status"),
+            "PR29 — sensor must populate each collector's status via \
+             `build_status(name, enabled, source, now)` so the probe \
+             yields source_unavailable / source_empty / etc when the \
+             host doesn't have the configured source."
+        );
+    }
+
+    #[test]
+    fn pr29_agent_sensors_payload_includes_collector_health() {
+        // Dashboard side of the wire: /api/sensors must surface the
+        // boot health file the sensor wrote. Source-grep that the
+        // payload includes `collector_health` AND that the reader fn
+        // exists.
+        const SENSORS_SRC: &str = include_str!("sensors.rs");
+        assert!(
+            SENSORS_SRC.contains("\"collector_health\": collector_health"),
+            "PR29 — /api/sensors payload must include the \
+             `collector_health` field so the frontend can render \
+             per-collector health pills."
+        );
+        assert!(
+            SENSORS_SRC.contains("fn read_collector_health_file("),
+            "PR29 — agent must define `read_collector_health_file` to \
+             load the sensor's side-channel JSON. Returns Null on \
+             error so the dashboard falls back to the legacy view."
+        );
+    }
+
+    #[test]
+    fn pr29_frontend_renders_health_badge_when_source_unavailable() {
+        // Operator-facing badge: when the sensor reports
+        // `source_unavailable` for a collector, the HUD row must
+        // surface a red "SOURCE MISSING" pill alongside the
+        // category badge. Without this the operator can't tell the
+        // difference between "no events because no data" and "no
+        // events because broken".
+        assert!(
+            JS_SENSORS.contains("function healthBadge(status)"),
+            "PR29 — sensors.js must define a `healthBadge(status)` \
+             renderer so each row carries health context."
+        );
+        assert!(
+            JS_SENSORS.contains("source_unavailable"),
+            "PR29 — healthBadge must map the `source_unavailable` \
+             state to the 'SOURCE MISSING' pill operators see when \
+             a configured collector's source path doesn't exist."
+        );
+        assert!(
+            JS_SENSORS.contains("healthBadge(healthByName[s.name])"),
+            "PR29 — renderSourceRow must call healthBadge with the \
+             indexed status for the row's collector name. Without \
+             this wiring the pill code is dead."
+        );
+    }
 }
