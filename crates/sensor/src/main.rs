@@ -1552,14 +1552,36 @@ fn process_event(
         }
     }
 
-    if let Some(ref mut det) = detectors.integrity_alert {
-        if let Some(incident) = det.process(&ev) {
+    // Post-emit allowlist gate (mirrors kernel_module_load + sudo_abuse
+    // + systemd_persistence + mitre_hunt from PR #647). The detector body
+    // does not thread `dynamic_allowlist` through, so we extract the
+    // incident here and consult `[detectors.integrity_alert]` before writing.
+    let integrity_alert_incident = detectors
+        .integrity_alert
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = integrity_alert_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "integrity_alert")
+        {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
-    if let Some(ref mut det) = detectors.log_tampering {
-        if let Some(incident) = det.process(&ev) {
+    // Post-emit allowlist gate (mirrors kernel_module_load + sudo_abuse
+    // + systemd_persistence + mitre_hunt from PR #647). The detector body
+    // does not thread `dynamic_allowlist` through, so we extract the
+    // incident here and consult `[detectors.log_tampering]` before writing.
+    let log_tampering_incident = detectors
+        .log_tampering
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = log_tampering_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "log_tampering")
+        {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -1594,14 +1616,30 @@ fn process_event(
         }
     }
 
-    if let Some(ref mut det) = detectors.privesc {
-        if let Some(incident) = det.process(&ev) {
+    // Post-emit allowlist gate (mirrors kernel_module_load + sudo_abuse
+    // + systemd_persistence + mitre_hunt from PR #647). The detector body
+    // does not thread `dynamic_allowlist` through, so we extract the
+    // incident here and consult `[detectors.privesc]` before writing.
+    let privesc_incident = detectors.privesc.as_mut().and_then(|d| d.process(&ev));
+    if let Some(incident) = privesc_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "privesc")
+        {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
-    if let Some(ref mut det) = detectors.fileless {
-        if let Some(incident) = det.process(&ev) {
+    // Post-emit allowlist gate (mirrors kernel_module_load + sudo_abuse
+    // + systemd_persistence + mitre_hunt from PR #647). The detector body
+    // does not thread `dynamic_allowlist` through, so we extract the
+    // incident here and consult `[detectors.fileless]` before writing.
+    let fileless_incident = detectors.fileless.as_mut().and_then(|d| d.process(&ev));
+    if let Some(incident) = fileless_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "fileless")
+        {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -1630,8 +1668,16 @@ fn process_event(
         }
     }
 
-    if let Some(ref mut det) = detectors.rootkit {
-        if let Some(incident) = det.process(&ev) {
+    // Post-emit allowlist gate (mirrors kernel_module_load + sudo_abuse
+    // + systemd_persistence + mitre_hunt from PR #647). The detector body
+    // does not thread `dynamic_allowlist` through, so we extract the
+    // incident here and consult `[detectors.rootkit]` before writing.
+    let rootkit_incident = detectors.rootkit.as_mut().and_then(|d| d.process(&ev));
+    if let Some(incident) = rootkit_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "rootkit")
+        {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -1642,8 +1688,19 @@ fn process_event(
         }
     }
 
-    if let Some(ref mut det) = detectors.ssh_key_injection {
-        if let Some(incident) = det.process(&ev) {
+    // Post-emit allowlist gate (mirrors kernel_module_load + sudo_abuse
+    // + systemd_persistence + mitre_hunt from PR #647). The detector body
+    // does not thread `dynamic_allowlist` through, so we extract the
+    // incident here and consult `[detectors.ssh_key_injection]` before writing.
+    let ssh_key_injection_incident = detectors
+        .ssh_key_injection
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = ssh_key_injection_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "ssh_key_injection")
+        {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -1673,8 +1730,19 @@ fn process_event(
         }
     }
 
-    if let Some(ref mut det) = detectors.crontab_persistence {
-        if let Some(incident) = det.process(&ev) {
+    // Post-emit allowlist gate (mirrors kernel_module_load + sudo_abuse
+    // + systemd_persistence + mitre_hunt from PR #647). The detector body
+    // does not thread `dynamic_allowlist` through, so we extract the
+    // incident here and consult `[detectors.crontab_persistence]` before writing.
+    let crontab_persistence_incident = detectors
+        .crontab_persistence
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = crontab_persistence_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "crontab_persistence")
+        {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -1691,8 +1759,19 @@ fn process_event(
         }
     }
 
-    if let Some(ref mut det) = detectors.user_creation {
-        if let Some(incident) = det.process(&ev) {
+    // Post-emit allowlist gate (mirrors kernel_module_load + sudo_abuse
+    // + systemd_persistence + mitre_hunt from PR #647). The detector body
+    // does not thread `dynamic_allowlist` through, so we extract the
+    // incident here and consult `[detectors.user_creation]` before writing.
+    let user_creation_incident = detectors
+        .user_creation
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = user_creation_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "user_creation")
+        {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -1732,14 +1811,36 @@ fn process_event(
         }
     }
 
-    if let Some(ref mut det) = detectors.sensitive_write {
-        if let Some(incident) = det.process(&ev) {
+    // Post-emit allowlist gate (mirrors kernel_module_load + sudo_abuse
+    // + systemd_persistence + mitre_hunt from PR #647). The detector body
+    // does not thread `dynamic_allowlist` through, so we extract the
+    // incident here and consult `[detectors.sensitive_write]` before writing.
+    let sensitive_write_incident = detectors
+        .sensitive_write
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = sensitive_write_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "sensitive_write")
+        {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
-    if let Some(ref mut det) = detectors.discovery_burst {
-        if let Some(incident) = det.process(&ev) {
+    // Post-emit allowlist gate (mirrors kernel_module_load + sudo_abuse
+    // + systemd_persistence + mitre_hunt from PR #647). The detector body
+    // does not thread `dynamic_allowlist` through, so we extract the
+    // incident here and consult `[detectors.discovery_burst]` before writing.
+    let discovery_burst_incident = detectors
+        .discovery_burst
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = discovery_burst_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "discovery_burst")
+        {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -1750,14 +1851,33 @@ fn process_event(
         }
     }
 
-    if let Some(ref mut det) = detectors.container_drift {
-        if let Some(incident) = det.process(&ev) {
+    // Post-emit allowlist gate (mirrors kernel_module_load + sudo_abuse
+    // + systemd_persistence + mitre_hunt from PR #647). The detector body
+    // does not thread `dynamic_allowlist` through, so we extract the
+    // incident here and consult `[detectors.container_drift]` before writing.
+    let container_drift_incident = detectors
+        .container_drift
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = container_drift_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "container_drift")
+        {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
 
-    if let Some(ref mut det) = detectors.host_drift {
-        if let Some(incident) = det.process(&ev) {
+    // Post-emit allowlist gate (mirrors kernel_module_load + sudo_abuse
+    // + systemd_persistence + mitre_hunt from PR #647). The detector body
+    // does not thread `dynamic_allowlist` through, so we extract the
+    // incident here and consult `[detectors.host_drift]` before writing.
+    let host_drift_incident = detectors.host_drift.as_mut().and_then(|d| d.process(&ev));
+    if let Some(incident) = host_drift_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "host_drift")
+        {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }

@@ -734,44 +734,98 @@ impl DynamicAllowlist {
         };
 
         let mut candidates: Vec<String> = Vec::new();
+        let push_if_some = |candidates: &mut Vec<String>, value: Option<String>| match value {
+            Some(v) if !v.is_empty() => candidates.push(v),
+            _ => {}
+        };
+
         match detector_name {
             "kernel_module_load" => {
-                if let Some(m) = pick("module") {
-                    candidates.push(m);
-                }
-                if let Some(c) = pick("comm") {
-                    candidates.push(c);
-                }
+                push_if_some(&mut candidates, pick("module"));
+                push_if_some(&mut candidates, pick("comm"));
             }
             "sudo_abuse" => {
-                if let Some(u) = pick("user") {
-                    candidates.push(u);
-                }
-            }
-            "systemd_persistence" => {
-                if let Some(c) = pick("comm") {
-                    candidates.push(c);
-                }
+                push_if_some(&mut candidates, pick("user"));
             }
             "mitre_hunt" => {
-                if let Some(c) = pick("comm") {
-                    candidates.push(c);
-                }
-                if let Some(k) = pick("kind") {
-                    candidates.push(k);
-                }
+                // mitre_hunt sub-detections vary; allow allowlist by `kind`
+                // (e.g. `destructive_dd` only) without silencing the other
+                // sub-detectors.
+                push_if_some(&mut candidates, pick("kind"));
+                push_if_some(&mut candidates, pick("comm"));
+            }
+            "integrity_alert" => {
+                // `[file.changed]` carries `path` only — no comm. Operators
+                // allowlist by path prefix (e.g. `/etc/cloud/`).
+                push_if_some(&mut candidates, pick("path"));
+            }
+            "crontab_persistence" => {
+                // Two evidence shapes: `crontab_write` has comm + path;
+                // `crontab_command` has comm only. Check both fields.
+                push_if_some(&mut candidates, pick("comm"));
+                push_if_some(&mut candidates, pick("path"));
+            }
+            "sensitive_write" => {
+                // Evidence has comm + filename (not "path"). Allowlist by
+                // either — operators can allow `dpkg` writing anywhere OR
+                // any process writing under `/etc/ld.so.conf.d/`.
+                push_if_some(&mut candidates, pick("comm"));
+                push_if_some(&mut candidates, pick("filename"));
+            }
+            "ssh_key_injection" => {
+                // Evidence has comm + target (target is the authorized_keys
+                // path being modified).
+                push_if_some(&mut candidates, pick("comm"));
+                push_if_some(&mut candidates, pick("target"));
+            }
+            "rootkit" => {
+                // Two shapes: `hidden_process` (comm + binary_path),
+                // `rootkit_artifact` (comm + filename). Cover all three
+                // fields so allowlisting either the process or the file
+                // works.
+                push_if_some(&mut candidates, pick("comm"));
+                push_if_some(&mut candidates, pick("binary_path"));
+                push_if_some(&mut candidates, pick("filename"));
+            }
+            // The remaining detectors emit `comm` as their primary
+            // identifier. Catching them all in one arm rather than
+            // listing each individually keeps the surface small; the
+            // detector_name string still gates whether per_detector
+            // entries apply, so other detectors not in this list are a
+            // no-op regardless.
+            "systemd_persistence"
+            | "log_tampering"
+            | "privesc"
+            | "user_creation"
+            | "host_drift"
+            | "container_drift"
+            | "fileless"
+            | "discovery_burst" => {
+                push_if_some(&mut candidates, pick("comm"));
             }
             _ => {
-                if let Some(c) = pick("comm") {
-                    candidates.push(c);
-                }
+                push_if_some(&mut candidates, pick("comm"));
             }
         }
 
+        // Each candidate is tested two ways:
+        //   - **basename-startswith** so comm-style entries like `sd-pam`
+        //     match `(sd-pam)` / `/usr/sbin/sd-pam`;
+        //   - **full-startswith** so path-style entries like
+        //     `/etc/ld.so.conf.d/` or `/usr/lib/systemd/` match the entire
+        //     evidence path. Picking only basename, as the comm-only path
+        //     did, silently broke every path-based allowlist entry.
         for cand in &candidates {
-            let cand_base = cand.split('/').next_back().unwrap_or(cand.as_str());
-            let cand_base = cand_base.trim_matches(|c: char| c == '(' || c == ')');
-            if entries.iter().any(|e| cand_base.starts_with(e.as_str())) {
+            let full = cand.as_str();
+            let base = full
+                .split('/')
+                .next_back()
+                .unwrap_or(full)
+                .trim_matches(|c: char| c == '(' || c == ')');
+            if entries.iter().any(|e| {
+                let entry = e.as_str();
+                full.starts_with(entry) || base.starts_with(entry)
+            }) {
                 return true;
             }
         }
@@ -1162,6 +1216,176 @@ ignored = 0, 9, 67
             serde_json::json!([{ "module": "anything", "comm": "kmod" }]),
         );
         assert!(!al.suppress_incident_for_detector(&incident, "kernel_module_load"));
+    }
+
+    #[test]
+    fn suppress_incident_for_detector_integrity_alert_matches_path_prefix() {
+        // FP scenario: apt upgrade rewrites /etc/cloud/cloud.cfg or
+        // /etc/ld.so.conf.d/*. Operator allowlists the directory prefix.
+        let dir = std::env::temp_dir().join("iw_test_allowlist_integrity");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("allowlist.toml");
+        std::fs::write(
+            &path,
+            r#"
+[detectors.integrity_alert]
+"/etc/ld.so.conf.d/" = "apt-upgrade rewrites these"
+"#,
+        )
+        .unwrap();
+        let al = DynamicAllowlist::load(&path);
+        let inc = make_incident(
+            "integrity_alert",
+            serde_json::json!([{ "kind": "file.changed", "path": "/etc/ld.so.conf.d/libc.conf" }]),
+        );
+        assert!(al.suppress_incident_for_detector(&inc, "integrity_alert"));
+        let inc2 = make_incident(
+            "integrity_alert",
+            serde_json::json!([{ "kind": "file.changed", "path": "/etc/shadow" }]),
+        );
+        assert!(!al.suppress_incident_for_detector(&inc2, "integrity_alert"));
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn suppress_incident_for_detector_sensitive_write_matches_filename_or_comm() {
+        let dir = std::env::temp_dir().join("iw_test_allowlist_sensitive_write");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("allowlist.toml");
+        std::fs::write(
+            &path,
+            r#"
+[detectors.sensitive_write]
+"dpkg" = "apt-internal config writer"
+"/etc/cron.d/" = "package-installed cron jobs"
+"#,
+        )
+        .unwrap();
+        let al = DynamicAllowlist::load(&path);
+        // matched by comm
+        let inc = make_incident(
+            "sensitive_write",
+            serde_json::json!([{ "comm": "dpkg", "filename": "/etc/sudoers.d/foo" }]),
+        );
+        assert!(al.suppress_incident_for_detector(&inc, "sensitive_write"));
+        // matched by filename prefix
+        let inc2 = make_incident(
+            "sensitive_write",
+            serde_json::json!([{ "comm": "nano", "filename": "/etc/cron.d/postgresql" }]),
+        );
+        assert!(al.suppress_incident_for_detector(&inc2, "sensitive_write"));
+        // attacker-style write still fires
+        let inc3 = make_incident(
+            "sensitive_write",
+            serde_json::json!([{ "comm": "bash", "filename": "/etc/shadow" }]),
+        );
+        assert!(!al.suppress_incident_for_detector(&inc3, "sensitive_write"));
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn suppress_incident_for_detector_ssh_key_injection_matches_target_path() {
+        let dir = std::env::temp_dir().join("iw_test_allowlist_ssh_key");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("allowlist.toml");
+        std::fs::write(
+            &path,
+            r#"
+[detectors.ssh_key_injection]
+"/home/ubuntu/.ssh/authorized_keys" = "operator manages own key file"
+"#,
+        )
+        .unwrap();
+        let al = DynamicAllowlist::load(&path);
+        let inc = make_incident(
+            "ssh_key_injection",
+            serde_json::json!([{
+                "comm": "ssh-keygen",
+                "target": "/home/ubuntu/.ssh/authorized_keys",
+                "pattern": "AAAAB3..."
+            }]),
+        );
+        assert!(al.suppress_incident_for_detector(&inc, "ssh_key_injection"));
+        // attacker writing to a different user
+        let inc2 = make_incident(
+            "ssh_key_injection",
+            serde_json::json!([{
+                "comm": "bash",
+                "target": "/root/.ssh/authorized_keys",
+                "pattern": "AAAAB3..."
+            }]),
+        );
+        assert!(!al.suppress_incident_for_detector(&inc2, "ssh_key_injection"));
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn suppress_incident_for_detector_rootkit_matches_binary_path() {
+        let dir = std::env::temp_dir().join("iw_test_allowlist_rootkit");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("allowlist.toml");
+        std::fs::write(
+            &path,
+            r#"
+[detectors.rootkit]
+"/usr/lib/systemd/" = "legitimate systemd-internal binaries"
+"#,
+        )
+        .unwrap();
+        let al = DynamicAllowlist::load(&path);
+        let inc = make_incident(
+            "rootkit",
+            serde_json::json!([{
+                "kind": "hidden_process",
+                "comm": "(sd-pam)",
+                "binary_path": "/usr/lib/systemd/systemd"
+            }]),
+        );
+        assert!(al.suppress_incident_for_detector(&inc, "rootkit"));
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn suppress_incident_for_detector_crontab_persistence_matches_comm_or_path() {
+        let dir = std::env::temp_dir().join("iw_test_allowlist_cron");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("allowlist.toml");
+        std::fs::write(
+            &path,
+            r#"
+[detectors.crontab_persistence]
+"dpkg" = "apt installs ship cron jobs"
+"/etc/cron.daily/" = "Ubuntu maintenance jobs"
+"#,
+        )
+        .unwrap();
+        let al = DynamicAllowlist::load(&path);
+        // matched by comm
+        let inc = make_incident(
+            "crontab_persistence",
+            serde_json::json!([{
+                "kind": "crontab_write",
+                "comm": "dpkg",
+                "path": "/etc/cron.d/postgresql"
+            }]),
+        );
+        assert!(al.suppress_incident_for_detector(&inc, "crontab_persistence"));
+        // matched by path prefix
+        let inc2 = make_incident(
+            "crontab_persistence",
+            serde_json::json!([{
+                "kind": "crontab_write",
+                "comm": "rsyslog-rotate",
+                "path": "/etc/cron.daily/logrotate"
+            }]),
+        );
+        assert!(al.suppress_incident_for_detector(&inc2, "crontab_persistence"));
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
     }
 
     #[test]
