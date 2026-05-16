@@ -639,12 +639,32 @@ fn cmd_install_classifier_with_target(
     println!();
 
     if expected_sha.starts_with("TBD") {
-        println!(
-            "WARNING: pinned SHA-256 not published yet. Pass --sha256 explicitly or wait \
-             for the release to be cut. Refusing to install without a real hash."
-        );
+        // The compiled-in SHA is a placeholder because the model release
+        // (tag `classifier-v1` / artefact `minilm-l6.tar.gz`) has not been
+        // published yet — see InnerWarden/innerwarden#642 for status. Two
+        // workarounds:
+        //   - operator-side: pass `--url <signed-url> --sha256 <hex>` to
+        //     install from a private mirror that has the artefact;
+        //   - wait for the release to land and rerun `install-warden`.
+        // Either way we refuse to install without a real hash so we never
+        // silently ship an unverified model file.
+        println!("WARNING: pinned SHA-256 not published yet. The `classifier-v1` release that");
+        println!("         ships the model artefact has not been cut — see issue #642");
+        println!("         (https://github.com/InnerWarden/innerwarden/issues/642) for status.");
+        println!();
+        println!("To install today, pass both flags so the integrity check still runs:");
+        println!("  sudo innerwarden install-warden --url <mirror-url> --sha256 <hex-digest>");
+        println!();
+        println!("Refusing to install without a verified hash. The agent will fall back to the");
+        println!("configured cloud AI provider for `Decide` until the local classifier lands.");
+        // Test anchor (line 1188): the error string must contain
+        // "requires --sha256" so the existing
+        // cmd_install_classifier_with_target_requires_sha_until_pinned
+        // test still catches this branch.
         anyhow::bail!(
-            "Local Warden install requires --sha256 until the release artifact is pinned"
+            "Local Warden install requires --sha256: the compiled-in pin is a placeholder \
+             until the `classifier-v1` release lands (see InnerWarden/innerwarden#642). \
+             Pass --url and --sha256 from a trusted mirror, or wait for the release."
         );
     }
 

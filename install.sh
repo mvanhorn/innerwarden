@@ -1161,9 +1161,33 @@ if [[ "${CANARY}" -eq 1 ]] && [[ "${IW_VERSION}" != "canary" ]]; then
 fi
 
 # SEC-019: Install telemetry is opt-in only.
-# Set INNERWARDEN_TELEMETRY=1 to send an anonymous install ping (version + OS + arch).
+# Opt in with: export INNERWARDEN_TELEMETRY=1
+#
+# What we collect when you opt in:
+#   - the release version you are installing (e.g. v0.13.4)
+#   - the OS family (uname -s — Linux or Darwin)
+#   - the CPU arch (uname -m — x86_64 / aarch64 / arm64)
+#
+# What we never collect:
+#   - your IP. The server hashes (ip + UTC day + a server-side secret)
+#     into a one-way installation_id and discards the raw IP. The hash
+#     is used only to dedup multiple pings from the same host on the
+#     same day so the install count is not inflated by retries.
+#   - any host identifier, agent state, config, license, or runtime data
+#
+# Server side: /api/ping is a public endpoint that returns 204 and
+# writes one row into the app_events table. Aggregations live behind
+# the admin DB_ADMIN_TOKEN. Source:
+# https://github.com/InnerWarden/innerwarden-site/blob/master/pages/api/ping.ts
+#
+# The curl is backgrounded with a 5 s timeout and `-fsS` so it never
+# blocks the install or writes to stdout. If the request fails (DNS,
+# network, server down), the install completes silently regardless.
 if [[ "${INNERWARDEN_TELEMETRY:-0}" == "1" ]]; then
-  curl -s "https://innerwarden.com/api/ping?v=${IW_VERSION}&os=${OS_TYPE}&arch=${ARCH}" >/dev/null 2>&1 &
+  curl -fsS \
+    -m 5 \
+    "https://innerwarden.com/api/ping?v=${IW_VERSION}&os=${OS_TYPE}&arch=${ARCH}" \
+    >/dev/null 2>&1 &
 fi
 
 # Show welcome, then auto-run setup
