@@ -1509,8 +1509,15 @@ fn process_event(
         }
     }
 
-    if let Some(ref mut det) = detectors.sudo_abuse {
-        if let Some(incident) = det.process(&ev) {
+    // Same post-emit allowlist gate as kernel_module_load above.
+    // Operator-reported FP: `apt upgrade` causes the `ubuntu` user to
+    // exceed the sudo-rate threshold during normal maintenance.
+    let sudo_incident = detectors.sudo_abuse.as_mut().and_then(|d| d.process(&ev));
+    if let Some(incident) = sudo_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "sudo_abuse")
+        {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -1647,8 +1654,21 @@ fn process_event(
         }
     }
 
-    if let Some(ref mut det) = detectors.kernel_module_load {
-        if let Some(incident) = det.process(&ev) {
+    // Post-emit allowlist gate (operator-reported 2026-05-16): the legit
+    // boot-time module loads (bcache, dm_raid, iscsi_*, cxgb*, libcrc32c)
+    // fire every apt upgrade. Detector body doesn't thread the allowlist
+    // through, so we extract the incident here and consult per_detector
+    // before writing. as_mut().and_then(…) releases the &mut borrow on
+    // detectors.kernel_module_load before we read .dynamic_allowlist.
+    let kmod_incident = detectors
+        .kernel_module_load
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = kmod_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "kernel_module_load")
+        {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -1677,8 +1697,19 @@ fn process_event(
         }
     }
 
-    if let Some(ref mut det) = detectors.systemd_persistence {
-        if let Some(incident) = det.process(&ev) {
+    // Same post-emit allowlist gate as kernel_module_load above.
+    // Operator-reported FPs: `systemctl daemon-reload` and
+    // `systemctl --quiet is-enabled crowdsec` (needrestart calls these
+    // on every apt upgrade) lit up systemd_persistence as Medium.
+    let systemd_incident = detectors
+        .systemd_persistence
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = systemd_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "systemd_persistence")
+        {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -1751,8 +1782,17 @@ fn process_event(
         }
     }
 
-    if let Some(ref mut det) = detectors.mitre_hunt {
-        if let Some(incident) = det.process(&ev) {
+    // Same post-emit allowlist gate as kernel_module_load above.
+    // Operator-reported FP: `mitre_hunt::destructive_dd` fires whenever
+    // the operator runs `dd` for legitimate reasons (cloning disks,
+    // writing installer media). Operators allowlist `dd` per-detector
+    // with `[detectors.mitre_hunt] dd = "operator allow-list"`.
+    let mitre_incident = detectors.mitre_hunt.as_mut().and_then(|d| d.process(&ev));
+    if let Some(incident) = mitre_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "mitre_hunt")
+        {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }

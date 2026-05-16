@@ -688,6 +688,96 @@ impl DynamicAllowlist {
         false
     }
 
+    /// Returns true when an incident should be suppressed based on the
+    /// per-detector allowlist (`[detectors.<NAME>]` section in
+    /// `allowlist.toml`). The post-emit hook lets detectors that don't
+    /// thread the allowlist into their own `process()` body still honour
+    /// `[detectors.<NAME>]` entries — operator-reported on 2026-05-16
+    /// after `apt upgrade` lit up `kernel_module_load`,
+    /// `systemd_persistence`, `sudo_abuse`, and `mitre_hunt::destructive_dd`
+    /// for completely legitimate boot / maintenance activity.
+    ///
+    /// Field-extraction rules per detector:
+    ///   - `kernel_module_load`: `module` (e.g. `bcache`, `dm_raid`),
+    ///     then `comm` (e.g. `kmod`, `modprobe`).
+    ///   - `sudo_abuse`: `user` (e.g. `ubuntu`).
+    ///   - `systemd_persistence`: `comm` (e.g. `systemctl`).
+    ///   - `mitre_hunt`: `comm` (covers `destructive_dd` — operator can
+    ///     allowlist `dd` if they need to image disks during maintenance).
+    ///
+    /// Any non-empty match against `per_detector[<name>]` suppresses the
+    /// incident. `starts_with` matching mirrors `is_process_allowed`, so
+    /// `kmod` allowlists everything starting with `kmod` and `systemctl`
+    /// suppresses every `systemctl …` invocation.
+    pub fn suppress_incident_for_detector(
+        &self,
+        incident: &innerwarden_core::incident::Incident,
+        detector_name: &str,
+    ) -> bool {
+        let Some(entries) = self.per_detector.get(detector_name) else {
+            return false;
+        };
+        if entries.is_empty() {
+            return false;
+        }
+
+        let evidence = incident.evidence.get(0);
+        let Some(first) = evidence else {
+            return false;
+        };
+
+        let pick = |key: &str| -> Option<String> {
+            first
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        };
+
+        let mut candidates: Vec<String> = Vec::new();
+        match detector_name {
+            "kernel_module_load" => {
+                if let Some(m) = pick("module") {
+                    candidates.push(m);
+                }
+                if let Some(c) = pick("comm") {
+                    candidates.push(c);
+                }
+            }
+            "sudo_abuse" => {
+                if let Some(u) = pick("user") {
+                    candidates.push(u);
+                }
+            }
+            "systemd_persistence" => {
+                if let Some(c) = pick("comm") {
+                    candidates.push(c);
+                }
+            }
+            "mitre_hunt" => {
+                if let Some(c) = pick("comm") {
+                    candidates.push(c);
+                }
+                if let Some(k) = pick("kind") {
+                    candidates.push(k);
+                }
+            }
+            _ => {
+                if let Some(c) = pick("comm") {
+                    candidates.push(c);
+                }
+            }
+        }
+
+        for cand in &candidates {
+            let cand_base = cand.split('/').next_back().unwrap_or(cand.as_str());
+            let cand_base = cand_base.trim_matches(|c: char| c == '(' || c == ')');
+            if entries.iter().any(|e| cand_base.starts_with(e.as_str())) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Check if an IP is dynamically allowlisted.
     pub fn is_ip_allowed(&self, ip: &str) -> bool {
         if self.ips.contains(ip) {
@@ -875,6 +965,224 @@ ignored = 0, 9, 67
         assert!(!al.is_port_ignored(80));
 
         // Cleanup
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    fn make_incident(
+        detector: &str,
+        evidence: serde_json::Value,
+    ) -> innerwarden_core::incident::Incident {
+        innerwarden_core::incident::Incident {
+            ts: chrono::Utc::now(),
+            host: "test".to_string(),
+            incident_id: format!("{detector}:test"),
+            severity: innerwarden_core::event::Severity::High,
+            title: "test".to_string(),
+            summary: "test".to_string(),
+            evidence,
+            recommended_checks: vec![],
+            tags: vec![],
+            entities: vec![],
+        }
+    }
+
+    #[test]
+    fn suppress_incident_for_detector_kernel_module_matches_module_name() {
+        // Operator-reported FP: apt upgrade triggers kernel_module_load
+        // for bcache / dm_raid / iscsi_* / cxgb*. Allowlisting any of these
+        // as a per-detector entry suppresses the incident.
+        let dir = std::env::temp_dir().join("iw_test_allowlist_suppress_kmod");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("allowlist.toml");
+        std::fs::write(
+            &path,
+            r#"
+[detectors.kernel_module_load]
+"bcache" = "Ubuntu boot — block-layer cache"
+"dm_raid" = "Ubuntu boot — software RAID"
+"iscsi_" = "Ubuntu boot — iSCSI subsystem"
+"#,
+        )
+        .unwrap();
+        let al = DynamicAllowlist::load(&path);
+
+        let incident = make_incident(
+            "kernel_module_load",
+            serde_json::json!([{ "module": "bcache", "comm": "kmod" }]),
+        );
+        assert!(al.suppress_incident_for_detector(&incident, "kernel_module_load"));
+
+        // prefix match
+        let incident = make_incident(
+            "kernel_module_load",
+            serde_json::json!([{ "module": "iscsi_tcp", "comm": "kmod" }]),
+        );
+        assert!(al.suppress_incident_for_detector(&incident, "kernel_module_load"));
+
+        // non-allowlisted module still fires
+        let incident = make_incident(
+            "kernel_module_load",
+            serde_json::json!([{ "module": "evil_rootkit", "comm": "kmod" }]),
+        );
+        assert!(!al.suppress_incident_for_detector(&incident, "kernel_module_load"));
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn suppress_incident_for_detector_kernel_module_matches_loader_comm() {
+        let dir = std::env::temp_dir().join("iw_test_allowlist_suppress_kmod_comm");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("allowlist.toml");
+        std::fs::write(
+            &path,
+            r#"
+[detectors.kernel_module_load]
+"kmod" = "kernel built-in loader"
+"#,
+        )
+        .unwrap();
+        let al = DynamicAllowlist::load(&path);
+
+        let incident = make_incident(
+            "kernel_module_load",
+            serde_json::json!([{ "module": "any_module", "comm": "kmod" }]),
+        );
+        assert!(al.suppress_incident_for_detector(&incident, "kernel_module_load"));
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn suppress_incident_for_detector_sudo_abuse_matches_user() {
+        // Operator-reported FP: apt upgrade by ubuntu user trips the
+        // sudo_abuse counter. Allowlisting the user suppresses.
+        let dir = std::env::temp_dir().join("iw_test_allowlist_suppress_sudo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("allowlist.toml");
+        std::fs::write(
+            &path,
+            r#"
+[detectors.sudo_abuse]
+"ubuntu" = "Operator user — apt upgrades and maintenance"
+"#,
+        )
+        .unwrap();
+        let al = DynamicAllowlist::load(&path);
+
+        let incident = make_incident(
+            "sudo_abuse",
+            serde_json::json!([{ "user": "ubuntu", "count": 3 }]),
+        );
+        assert!(al.suppress_incident_for_detector(&incident, "sudo_abuse"));
+
+        let incident = make_incident(
+            "sudo_abuse",
+            serde_json::json!([{ "user": "attacker", "count": 3 }]),
+        );
+        assert!(!al.suppress_incident_for_detector(&incident, "sudo_abuse"));
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn suppress_incident_for_detector_systemd_persistence_matches_comm() {
+        // Operator-reported FP: `systemctl daemon-reload` (needrestart
+        // hits this on every apt upgrade) and `systemctl --quiet
+        // is-enabled crowdsec` trip systemd_persistence.
+        let dir = std::env::temp_dir().join("iw_test_allowlist_suppress_systemd");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("allowlist.toml");
+        std::fs::write(
+            &path,
+            r#"
+[detectors.systemd_persistence]
+"systemctl" = "Operator-driven systemctl invocations"
+"#,
+        )
+        .unwrap();
+        let al = DynamicAllowlist::load(&path);
+
+        let incident = make_incident(
+            "systemd_persistence",
+            serde_json::json!([{ "comm": "systemctl", "kind": "exec.command" }]),
+        );
+        assert!(al.suppress_incident_for_detector(&incident, "systemd_persistence"));
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn suppress_incident_for_detector_mitre_hunt_matches_kind() {
+        // mitre_hunt's evidence carries the sub-detector identity in
+        // `kind` (e.g. `destructive_dd`). Operators allowlist by kind so
+        // they can keep mitre_hunt enabled for everything else while
+        // silencing the one sub-detector that fires on legitimate `dd`
+        // use during maintenance.
+        let dir = std::env::temp_dir().join("iw_test_allowlist_suppress_mitre");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("allowlist.toml");
+        std::fs::write(
+            &path,
+            r#"
+[detectors.mitre_hunt]
+"destructive_dd" = "Operator uses dd for legit disk imaging"
+"#,
+        )
+        .unwrap();
+        let al = DynamicAllowlist::load(&path);
+
+        let incident = make_incident(
+            "mitre_hunt",
+            serde_json::json!([{ "kind": "destructive_dd", "command": "dd if=/dev/zero of=/dev/sdc bs=1M" }]),
+        );
+        assert!(al.suppress_incident_for_detector(&incident, "mitre_hunt"));
+
+        // Other mitre_hunt sub-detections still fire.
+        let incident = make_incident(
+            "mitre_hunt",
+            serde_json::json!([{ "kind": "credential_dump", "command": "cat /etc/shadow" }]),
+        );
+        assert!(!al.suppress_incident_for_detector(&incident, "mitre_hunt"));
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn suppress_incident_for_detector_returns_false_when_no_entries() {
+        let al = DynamicAllowlist::load(Path::new("/nonexistent/allowlist.toml"));
+        let incident = make_incident(
+            "kernel_module_load",
+            serde_json::json!([{ "module": "anything", "comm": "kmod" }]),
+        );
+        assert!(!al.suppress_incident_for_detector(&incident, "kernel_module_load"));
+    }
+
+    #[test]
+    fn suppress_incident_for_detector_handles_empty_evidence() {
+        let dir = std::env::temp_dir().join("iw_test_allowlist_suppress_empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("allowlist.toml");
+        std::fs::write(
+            &path,
+            r#"
+[detectors.kernel_module_load]
+"bcache" = "test"
+"#,
+        )
+        .unwrap();
+        let al = DynamicAllowlist::load(&path);
+
+        // No evidence elements — must not panic and must return false.
+        let incident = make_incident("kernel_module_load", serde_json::json!([]));
+        assert!(!al.suppress_incident_for_detector(&incident, "kernel_module_load"));
+
         std::fs::remove_file(&path).ok();
         std::fs::remove_dir(&dir).ok();
     }
