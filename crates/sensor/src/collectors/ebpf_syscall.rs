@@ -96,6 +96,29 @@ fn resolve_ppid(pid: u32) -> u32 {
     0
 }
 
+/// Spec 050-PR1 follow-up to #662: resolve the parent PID with kernel-
+/// first precedence. Every relevant eBPF event struct carries `ppid`
+/// already populated from `task_struct->real_parent->tgid` by the
+/// kernel probe; reading it costs zero. Only fall through to
+/// `resolve_ppid` (a userspace /proc read) when the kernel value is
+/// missing (zero) — which is rare and indicates either an older
+/// sensor build that didn't populate the field, or an event for a
+/// task whose parent was already reaped.
+///
+/// Pre-fix the userspace path was the **only** path, so short-lived
+/// processes (whoami, id — execute in microseconds) returned ppid=0
+/// because /proc/<pid>/status was gone by the time userspace read it.
+/// Smoke test 2026-05-17 on Oracle prod captured 10 disguised recon
+/// execs all with ppid=0; `discovery_anomaly` requires ppid > 0 for
+/// per-parent grouping and so never accumulated the burst.
+fn resolve_ppid_kernel_first(kernel_ppid: u32, pid: u32) -> u32 {
+    if kernel_ppid != 0 {
+        kernel_ppid
+    } else {
+        resolve_ppid(pid)
+    }
+}
+
 /// Extract container ID from /proc/<pid>/cgroup. Returns None for host processes.
 fn resolve_container_id(pid: u32) -> Option<String> {
     let path = format!("/proc/{pid}/cgroup");
@@ -1598,6 +1621,17 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
                 1 if data.len() >= 352 => {
                     let pid = read_u32!(data, 4..8);
                     let uid = read_u32!(data, 12..16);
+                    // Spec 050-PR1 follow-up to #662: prefer the
+                    // kernel-provided ppid (already in the eBPF event
+                    // struct at offset 20-24, copied from
+                    // task_struct->real_parent->pid). Falling back to
+                    // `resolve_ppid()` (/proc/<pid>/status) silently
+                    // returns 0 for short-lived processes — whoami / id
+                    // exit in microseconds, before userspace can read.
+                    // Smoke test 2026-05-17 confirmed: 10 disguised
+                    // recon execs all landed with ppid=0, blocking
+                    // discovery_anomaly's ppid-pivoted grouping.
+                    let kernel_ppid = read_u32!(data, 20..24);
                     let cgroup_id = read_u64!(data, 24..32);
                     let comm = bytes_to_string(&data[32..96]);
                     let filename = bytes_to_string(&data[96..352]);
@@ -1606,7 +1640,7 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
                         continue;
                     }
 
-                    let ppid = resolve_ppid(pid);
+                    let ppid = resolve_ppid_kernel_first(kernel_ppid, pid);
                     let container_id = resolve_container_id(pid);
 
                     Some(execve_to_event(
@@ -1627,6 +1661,11 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
                 2 if data.len() >= 104 => {
                     let pid = read_u32!(data, 4..8);
                     let uid = read_u32!(data, 12..16);
+                    // Kernel ppid at offset 16-20 (see layout comment
+                    // above). Same rationale as kind=1 — /proc lookup
+                    // races with short-lived processes; kernel value is
+                    // sourced from task_struct and always valid.
+                    let kernel_ppid = read_u32!(data, 16..20);
                     let cgroup_id = read_u64!(data, 24..32);
                     let comm = bytes_to_string(&data[32..96]);
                     let addr_raw = read_u32!(data, 96..100);
@@ -1641,7 +1680,7 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
                         continue;
                     }
 
-                    let ppid = resolve_ppid(pid);
+                    let ppid = resolve_ppid_kernel_first(kernel_ppid, pid);
                     let container_id = resolve_container_id(pid);
 
                     Some(connect_to_event(
@@ -1662,6 +1701,8 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
                 3 if data.len() >= 348 => {
                     let pid = read_u32!(data, 4..8);
                     let uid = read_u32!(data, 8..12);
+                    // Kernel ppid at offset 12-16.
+                    let kernel_ppid = read_u32!(data, 12..16);
                     let cgroup_id = read_u64!(data, 16..24);
                     let comm = bytes_to_string(&data[24..88]);
                     let filename = bytes_to_string(&data[88..344]);
@@ -1671,7 +1712,7 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
                         continue;
                     }
 
-                    let ppid = resolve_ppid(pid);
+                    let ppid = resolve_ppid_kernel_first(kernel_ppid, pid);
                     let container_id = resolve_container_id(pid);
 
                     Some(file_open_to_event(
@@ -1691,6 +1732,8 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
                 4 if data.len() >= 348 => {
                     let pid = read_u32!(data, 4..8);
                     let uid = read_u32!(data, 8..12);
+                    // Kernel ppid at offset 12-16 (same layout as kind=3).
+                    let kernel_ppid = read_u32!(data, 12..16);
                     let cgroup_id = read_u64!(data, 16..24);
                     let comm = bytes_to_string(&data[24..88]);
                     let filename = bytes_to_string(&data[88..344]);
@@ -1700,7 +1743,7 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
                         continue;
                     }
 
-                    let ppid = resolve_ppid(pid);
+                    let ppid = resolve_ppid_kernel_first(kernel_ppid, pid);
                     let container_id = resolve_container_id(pid);
 
                     Some(file_open_to_event(
@@ -2831,6 +2874,56 @@ mod tests {
         // (pid 1 is always the init process on the host)
         if cfg!(target_os = "linux") {
             assert!(resolve_container_id(1).is_none());
+        }
+    }
+
+    // ── spec 050-PR1 follow-up #662 follow-up: kernel-first ppid resolution ──
+    //
+    // The eBPF event struct already carries `task_struct->real_parent->tgid`;
+    // userspace must prefer it over a /proc/<pid>/status race-y read. Smoke
+    // test 2026-05-17 captured 10 disguised recon execs (whoami, id, ...)
+    // all landing with ppid=0 because /proc read happened after the
+    // short-lived processes had exited.
+
+    #[test]
+    fn resolve_ppid_kernel_first_uses_kernel_value_when_nonzero() {
+        // Pass a clearly-nonexistent pid so the /proc fallback would
+        // return 0; assert the function still returns the kernel value.
+        let kernel_ppid = 12345;
+        let result = resolve_ppid_kernel_first(kernel_ppid, 4_000_000_000);
+        assert_eq!(
+            result, kernel_ppid,
+            "kernel-provided ppid must win over /proc fallback"
+        );
+    }
+
+    #[test]
+    fn resolve_ppid_kernel_first_falls_back_to_proc_when_kernel_zero() {
+        // Kernel value = 0 → fall back to /proc. The fallback for a
+        // nonexistent pid is also 0; the contract is that the function
+        // is correctly DELEGATING (not crashing, not panicking).
+        let result = resolve_ppid_kernel_first(0, 4_000_000_000);
+        assert_eq!(
+            result, 0,
+            "fallback for nonexistent pid yields 0 (delegation contract)"
+        );
+    }
+
+    #[test]
+    fn resolve_ppid_kernel_first_falls_back_to_real_proc_data_when_available() {
+        // When the pid exists in /proc and kernel value is 0, fall back
+        // and pick up the real ppid. PID 1 (init) is always present
+        // and has ppid 0 — but the systemd PID 1 case is an edge:
+        // anything with PID > 1 has a real ppid. Run only on Linux.
+        if cfg!(target_os = "linux") {
+            let result_for_self = resolve_ppid_kernel_first(0, std::process::id());
+            // The test process has a real parent (the test runner or
+            // cargo). ppid should be nonzero.
+            assert!(
+                result_for_self > 0,
+                "self pid={} via /proc fallback yielded ppid=0, expected nonzero",
+                std::process::id()
+            );
         }
     }
 
