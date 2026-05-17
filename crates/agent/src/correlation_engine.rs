@@ -1969,6 +1969,523 @@ fn builtin_rules() -> Vec<CorrelationRule> {
             min_confidence: 0.95,
             severity: Severity::Critical,
         },
+        // ─── spec 050-PR7 — Cross-tactic chain rules (CL-051 → CL-070) ─────
+        // Wire PR1-6 detectors into MITRE-shaped attack chains. Each rule
+        // pivots on a shared entity (IP / user) across stages where it
+        // helps; uses entity_must_match=false where the chain stages
+        // canonically rotate identity (e.g. wiper precursors).
+
+        // CL-051: Discovery → Privesc — recon-then-elevate.
+        // (T1018 / T1083 / T1046 → T1548.001 / T1548.005 / T1068)
+        CorrelationRule {
+            id: "CL-051".into(),
+            name: "Discovery → Privilege Escalation".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec![
+                        "nmap_scan|wordlist_scan|discovery_anomaly|discovery_burst|port_scan"
+                            .into(),
+                    ],
+                    entity_must_match: true,
+                },
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec![
+                        "setuid_exploit_pattern|capabilities_abuse|privesc|sudo_abuse".into(),
+                    ],
+                    entity_must_match: true,
+                },
+            ],
+            window_secs: 1800,
+            min_confidence: 0.85,
+            severity: Severity::Critical,
+        },
+        // CL-052: Privesc → Lateral Movement — elevate-then-pivot.
+        // (T1548 / T1068 → T1021.004 / T1570)
+        CorrelationRule {
+            id: "CL-052".into(),
+            name: "Privilege Escalation → Lateral Movement".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec![
+                        "setuid_exploit_pattern|capabilities_abuse|privesc".into(),
+                    ],
+                    entity_must_match: true,
+                },
+                RuleStage {
+                    layer: None,
+                    kind_patterns: vec![
+                        "lateral_egress_ssh|lateral_egress_scp_rsync|lateral_movement".into(),
+                    ],
+                    entity_must_match: true,
+                },
+            ],
+            window_secs: 1800,
+            min_confidence: 0.85,
+            severity: Severity::Critical,
+        },
+        // CL-053: Collection → Exfiltration — stage-then-push.
+        // (T1119 / T1115 / T1056.001 → T1048 / T1041)
+        CorrelationRule {
+            id: "CL-053".into(),
+            name: "Collection → Exfiltration".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec![
+                        "clipboard_read|screen_capture|keylogger_bash_trap|automated_file_collection|archive_pwd_protected".into(),
+                    ],
+                    entity_must_match: true,
+                },
+                RuleStage {
+                    layer: None,
+                    kind_patterns: vec![
+                        "lateral_egress_scp_rsync|data_exfiltration|data_exfil_ebpf".into(),
+                    ],
+                    entity_must_match: true,
+                },
+            ],
+            window_secs: 1800,
+            min_confidence: 0.85,
+            severity: Severity::Critical,
+        },
+        // CL-054: Web Shell → C2 — foothold establishes attacker channel.
+        // (T1505.003 → T1572 / T1090 / T1571)
+        CorrelationRule {
+            id: "CL-054".into(),
+            name: "Web Shell → C2 Channel".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec!["web_shell".into()],
+                    entity_must_match: true,
+                },
+                RuleStage {
+                    layer: None,
+                    kind_patterns: vec![
+                        "c2_web_tunnel|c2_protocol_tunneling|c2_non_standard_port|c2_callback".into(),
+                    ],
+                    entity_must_match: true,
+                },
+            ],
+            window_secs: 1800,
+            min_confidence: 0.85,
+            severity: Severity::Critical,
+        },
+        // CL-055: Persistence → Defense Evasion — establish-then-blind.
+        // (T1556 / T1037 → T1562.001)
+        CorrelationRule {
+            id: "CL-055".into(),
+            name: "Persistence → Defense Evasion".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec![
+                        "pam_module_change|startup_script_persistence|systemd_persistence|crontab_persistence|ssh_key_injection".into(),
+                    ],
+                    entity_must_match: true,
+                },
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec![
+                        "auditd_disable|selinux_apparmor_disable|log_tampering".into(),
+                    ],
+                    entity_must_match: true,
+                },
+            ],
+            window_secs: 1800,
+            min_confidence: 0.85,
+            severity: Severity::Critical,
+        },
+        // CL-056: Defense Evasion → Impact — blind-then-wipe (wiper pattern).
+        // (T1562.001 → T1485 / T1561.001 / T1486)
+        CorrelationRule {
+            id: "CL-056".into(),
+            name: "Defense Evasion → Impact (wiper shape)".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec![
+                        "auditd_disable|selinux_apparmor_disable|log_tampering".into(),
+                    ],
+                    entity_must_match: true,
+                },
+                RuleStage {
+                    layer: None,
+                    kind_patterns: vec!["data_destruction_pattern|ransomware".into()],
+                    entity_must_match: true,
+                },
+            ],
+            window_secs: 3600,
+            min_confidence: 0.90,
+            severity: Severity::Critical,
+        },
+        // CL-057: Discovery Burst → Collection — map-then-grab.
+        // (T1083 / T1018 → T1119)
+        CorrelationRule {
+            id: "CL-057".into(),
+            name: "Discovery Burst → Collection".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec![
+                        "discovery_burst|discovery_anomaly|nmap_scan|wordlist_scan".into(),
+                    ],
+                    entity_must_match: true,
+                },
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec![
+                        "archive_pwd_protected|automated_file_collection".into(),
+                    ],
+                    entity_must_match: true,
+                },
+            ],
+            window_secs: 1800,
+            min_confidence: 0.80,
+            severity: Severity::High,
+        },
+        // CL-058: Initial Access → Foothold — exploit-lands-shell.
+        // (T1190 / T1110 / T1078 → T1059)
+        CorrelationRule {
+            id: "CL-058".into(),
+            name: "Initial Access → Foothold".into(),
+            stages: vec![
+                RuleStage {
+                    layer: None,
+                    kind_patterns: vec![
+                        "web_scan|ssh_bruteforce|credential_stuffing|user_agent_scanner".into(),
+                    ],
+                    entity_must_match: true,
+                },
+                RuleStage {
+                    layer: None,
+                    kind_patterns: vec!["web_shell|reverse_shell".into()],
+                    entity_must_match: true,
+                },
+            ],
+            window_secs: 1800,
+            min_confidence: 0.85,
+            severity: Severity::Critical,
+        },
+        // CL-059: Foothold → Persistence — survive-the-reboot.
+        // (T1059 → T1037 / T1556 / T1543.002)
+        CorrelationRule {
+            id: "CL-059".into(),
+            name: "Foothold → Persistence".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec!["reverse_shell|web_shell".into()],
+                    entity_must_match: true,
+                },
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec![
+                        "pam_module_change|startup_script_persistence|systemd_persistence|crontab_persistence|ssh_key_injection".into(),
+                    ],
+                    entity_must_match: true,
+                },
+            ],
+            window_secs: 3600,
+            min_confidence: 0.85,
+            severity: Severity::Critical,
+        },
+        // CL-060: C2 → Discovery — beaconing-then-mapping.
+        // (T1572 / T1571 → T1018 / T1046)
+        CorrelationRule {
+            id: "CL-060".into(),
+            name: "C2 → Internal Discovery".into(),
+            stages: vec![
+                RuleStage {
+                    layer: None,
+                    kind_patterns: vec![
+                        "c2_callback|c2_web_tunnel|c2_protocol_tunneling|c2_non_standard_port".into(),
+                    ],
+                    entity_must_match: true,
+                },
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec![
+                        "nmap_scan|wordlist_scan|discovery_anomaly|discovery_burst|port_scan".into(),
+                    ],
+                    entity_must_match: true,
+                },
+            ],
+            window_secs: 1800,
+            min_confidence: 0.85,
+            severity: Severity::High,
+        },
+        // CL-061: Discovery → C2 — recon-then-callout (precursor shape).
+        CorrelationRule {
+            id: "CL-061".into(),
+            name: "Discovery → C2 Callout".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec![
+                        "nmap_scan|wordlist_scan|discovery_anomaly|discovery_burst|port_scan".into(),
+                    ],
+                    entity_must_match: true,
+                },
+                RuleStage {
+                    layer: None,
+                    kind_patterns: vec![
+                        "c2_callback|c2_web_tunnel|c2_protocol_tunneling|c2_non_standard_port".into(),
+                    ],
+                    entity_must_match: true,
+                },
+            ],
+            window_secs: 1800,
+            min_confidence: 0.80,
+            severity: Severity::High,
+        },
+        // CL-062: Reverse Shell → Privesc — get-shell-then-go-root.
+        // (T1059 → T1548)
+        CorrelationRule {
+            id: "CL-062".into(),
+            name: "Reverse Shell → Privilege Escalation".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec!["reverse_shell|web_shell".into()],
+                    entity_must_match: true,
+                },
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec![
+                        "setuid_exploit_pattern|capabilities_abuse|privesc|sudo_abuse".into(),
+                    ],
+                    entity_must_match: true,
+                },
+            ],
+            window_secs: 1800,
+            min_confidence: 0.85,
+            severity: Severity::Critical,
+        },
+        // CL-063: Privesc → Persistence — root-then-pin.
+        // (T1548 → T1037 / T1556)
+        CorrelationRule {
+            id: "CL-063".into(),
+            name: "Privilege Escalation → Persistence".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec![
+                        "setuid_exploit_pattern|capabilities_abuse|privesc".into(),
+                    ],
+                    entity_must_match: true,
+                },
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec![
+                        "pam_module_change|systemd_persistence|startup_script_persistence|crontab_persistence|ssh_key_injection".into(),
+                    ],
+                    entity_must_match: true,
+                },
+            ],
+            window_secs: 3600,
+            min_confidence: 0.85,
+            severity: Severity::Critical,
+        },
+        // CL-064: Persistence → Lateral Movement — pinned-then-pivot.
+        // (T1037 / T1556 → T1021)
+        CorrelationRule {
+            id: "CL-064".into(),
+            name: "Persistence → Lateral Movement".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec![
+                        "pam_module_change|systemd_persistence|startup_script_persistence|crontab_persistence|ssh_key_injection".into(),
+                    ],
+                    entity_must_match: true,
+                },
+                RuleStage {
+                    layer: None,
+                    kind_patterns: vec!["lateral_egress_ssh|lateral_egress_scp_rsync".into()],
+                    entity_must_match: true,
+                },
+            ],
+            window_secs: 3600,
+            min_confidence: 0.80,
+            severity: Severity::High,
+        },
+        // CL-065: Lateral → Collection — pivot-then-stage on remote.
+        CorrelationRule {
+            id: "CL-065".into(),
+            name: "Lateral → Collection".into(),
+            stages: vec![
+                RuleStage {
+                    layer: None,
+                    kind_patterns: vec!["lateral_egress_ssh".into()],
+                    entity_must_match: true,
+                },
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec![
+                        "archive_pwd_protected|automated_file_collection|clipboard_read".into(),
+                    ],
+                    entity_must_match: true,
+                },
+            ],
+            window_secs: 1800,
+            min_confidence: 0.80,
+            severity: Severity::High,
+        },
+        // CL-066: Collection → Lateral Exfil — stage-then-push (T1048.001).
+        CorrelationRule {
+            id: "CL-066".into(),
+            name: "Collection → Lateral Exfiltration".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec![
+                        "archive_pwd_protected|automated_file_collection|clipboard_read".into(),
+                    ],
+                    entity_must_match: true,
+                },
+                RuleStage {
+                    layer: None,
+                    kind_patterns: vec!["lateral_egress_scp_rsync".into()],
+                    entity_must_match: true,
+                },
+            ],
+            window_secs: 1800,
+            min_confidence: 0.85,
+            severity: Severity::Critical,
+        },
+        // CL-067: Full kill chain — Initial Access → Foothold → Persistence
+        // → Defense Evasion → Impact. The complete picture.
+        CorrelationRule {
+            id: "CL-067".into(),
+            name: "Full Kill Chain (5-stage)".into(),
+            stages: vec![
+                RuleStage {
+                    layer: None,
+                    kind_patterns: vec![
+                        "web_scan|ssh_bruteforce|credential_stuffing".into(),
+                    ],
+                    entity_must_match: true,
+                },
+                RuleStage {
+                    layer: None,
+                    kind_patterns: vec!["web_shell|reverse_shell".into()],
+                    entity_must_match: true,
+                },
+                RuleStage {
+                    layer: None,
+                    kind_patterns: vec![
+                        "pam_module_change|startup_script_persistence|systemd_persistence|crontab_persistence".into(),
+                    ],
+                    entity_must_match: false,
+                },
+                RuleStage {
+                    layer: None,
+                    kind_patterns: vec![
+                        "auditd_disable|selinux_apparmor_disable|log_tampering".into(),
+                    ],
+                    entity_must_match: false,
+                },
+                RuleStage {
+                    layer: None,
+                    kind_patterns: vec!["data_destruction_pattern|ransomware".into()],
+                    entity_must_match: false,
+                },
+            ],
+            window_secs: 7200, // 2 hours
+            min_confidence: 0.95,
+            severity: Severity::Critical,
+        },
+        // CL-068: Wiper Precursor — blind-then-map-then-wipe.
+        // Distinct from CL-056 by inserting a discovery burst between
+        // evasion and impact (the textbook nation-state wiper shape).
+        CorrelationRule {
+            id: "CL-068".into(),
+            name: "Wiper Precursor (evasion + discovery + impact)".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec![
+                        "auditd_disable|selinux_apparmor_disable".into(),
+                    ],
+                    entity_must_match: false,
+                },
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec![
+                        "nmap_scan|wordlist_scan|discovery_anomaly|discovery_burst".into(),
+                    ],
+                    entity_must_match: false,
+                },
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec!["data_destruction_pattern".into()],
+                    entity_must_match: false,
+                },
+            ],
+            window_secs: 1800,
+            min_confidence: 0.85,
+            severity: Severity::Critical,
+        },
+        // CL-069: Insider Exfil — interactive shell + collection +
+        // lateral_egress_scp_rsync. Entity-pivoted on shared IP/uid.
+        CorrelationRule {
+            id: "CL-069".into(),
+            name: "Insider Exfiltration Pattern".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec!["shell.command_exec".into()],
+                    entity_must_match: true,
+                },
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec![
+                        "archive_pwd_protected|automated_file_collection".into(),
+                    ],
+                    entity_must_match: true,
+                },
+                RuleStage {
+                    layer: None,
+                    kind_patterns: vec!["lateral_egress_scp_rsync".into()],
+                    entity_must_match: true,
+                },
+            ],
+            window_secs: 3600,
+            min_confidence: 0.80,
+            severity: Severity::High,
+        },
+        // CL-070: PAM Credential Theft Chain — PAM tamper + subsequent
+        // successful auth + outbound ssh pivot. Identity rotates between
+        // PAM-write (attacker uid) and login-success (victim creds), so
+        // entity_must_match=false on cross-stage hops.
+        CorrelationRule {
+            id: "CL-070".into(),
+            name: "PAM Credential Theft → Lateral Pivot".into(),
+            stages: vec![
+                RuleStage {
+                    layer: Some(Layer::Userspace),
+                    kind_patterns: vec!["pam_module_change".into()],
+                    entity_must_match: false,
+                },
+                RuleStage {
+                    layer: None,
+                    kind_patterns: vec!["ssh.login_success|suspicious_login".into()],
+                    entity_must_match: false,
+                },
+                RuleStage {
+                    layer: None,
+                    kind_patterns: vec!["lateral_egress_ssh".into()],
+                    entity_must_match: false,
+                },
+            ],
+            window_secs: 3600,
+            min_confidence: 0.85,
+            severity: Severity::Critical,
+        },
     ]
 }
 
@@ -2143,7 +2660,8 @@ mod tests {
     #[test]
     fn engine_starts_empty() {
         let engine = CorrelationEngine::new();
-        assert_eq!(engine.rule_count(), 47);
+        // 47 original (CL-001 → CL-047) + 20 spec 050-PR7 (CL-051 → CL-070).
+        assert_eq!(engine.rule_count(), 67);
         assert_eq!(engine.pending_count(), 0);
     }
 
@@ -2685,5 +3203,236 @@ mod tests {
                 "comm {comm:?} must NOT be suppressed - it is plausible attacker tooling"
             );
         }
+    }
+
+    // ─── spec 050-PR7 — Cross-tactic chain rule tests (CL-051 → CL-070) ───
+
+    fn assert_chain_fires(engine: &mut CorrelationEngine, expected_rule_id: &str) {
+        let chains = engine.drain_completed();
+        assert!(
+            chains.iter().any(|c| c.rule_id == expected_rule_id),
+            "expected {} to fire — got [{}]",
+            expected_rule_id,
+            chains
+                .iter()
+                .map(|c| c.rule_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    #[test]
+    fn cl_051_discovery_to_privesc() {
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.51";
+        engine.observe(make_event(Layer::Userspace, "nmap_scan", ip));
+        engine.observe(make_event(Layer::Userspace, "setuid_exploit_pattern", ip));
+        assert_chain_fires(&mut engine, "CL-051");
+    }
+
+    #[test]
+    fn cl_052_privesc_to_lateral() {
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.52";
+        engine.observe(make_event(Layer::Userspace, "capabilities_abuse", ip));
+        engine.observe(make_event(Layer::Userspace, "lateral_egress_ssh", ip));
+        assert_chain_fires(&mut engine, "CL-052");
+    }
+
+    #[test]
+    fn cl_053_collection_to_exfil() {
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.53";
+        engine.observe(make_event(
+            Layer::Userspace,
+            "automated_file_collection",
+            ip,
+        ));
+        engine.observe(make_event(Layer::Userspace, "lateral_egress_scp_rsync", ip));
+        assert_chain_fires(&mut engine, "CL-053");
+    }
+
+    #[test]
+    fn cl_054_web_shell_to_c2() {
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.54";
+        engine.observe(make_event(Layer::Userspace, "web_shell", ip));
+        engine.observe(make_event(Layer::Userspace, "c2_web_tunnel", ip));
+        assert_chain_fires(&mut engine, "CL-054");
+    }
+
+    #[test]
+    fn cl_055_persistence_to_defense_evasion() {
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.55";
+        engine.observe(make_event(Layer::Userspace, "pam_module_change", ip));
+        engine.observe(make_event(Layer::Userspace, "auditd_disable", ip));
+        assert_chain_fires(&mut engine, "CL-055");
+    }
+
+    #[test]
+    fn cl_056_defense_evasion_to_impact() {
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.56";
+        engine.observe(make_event(Layer::Userspace, "auditd_disable", ip));
+        engine.observe(make_event(Layer::Userspace, "data_destruction_pattern", ip));
+        assert_chain_fires(&mut engine, "CL-056");
+    }
+
+    #[test]
+    fn cl_057_discovery_burst_to_collection() {
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.57";
+        engine.observe(make_event(Layer::Userspace, "discovery_burst", ip));
+        engine.observe(make_event(Layer::Userspace, "archive_pwd_protected", ip));
+        assert_chain_fires(&mut engine, "CL-057");
+    }
+
+    #[test]
+    fn cl_058_initial_access_to_foothold() {
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.58";
+        engine.observe(make_event(Layer::Userspace, "ssh_bruteforce", ip));
+        engine.observe(make_event(Layer::Userspace, "reverse_shell", ip));
+        assert_chain_fires(&mut engine, "CL-058");
+    }
+
+    #[test]
+    fn cl_059_foothold_to_persistence() {
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.59";
+        engine.observe(make_event(Layer::Userspace, "reverse_shell", ip));
+        engine.observe(make_event(
+            Layer::Userspace,
+            "startup_script_persistence",
+            ip,
+        ));
+        assert_chain_fires(&mut engine, "CL-059");
+    }
+
+    #[test]
+    fn cl_060_c2_to_discovery() {
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.60";
+        engine.observe(make_event(Layer::Userspace, "c2_callback", ip));
+        engine.observe(make_event(Layer::Userspace, "nmap_scan", ip));
+        assert_chain_fires(&mut engine, "CL-060");
+    }
+
+    #[test]
+    fn cl_061_discovery_to_c2() {
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.61";
+        engine.observe(make_event(Layer::Userspace, "wordlist_scan", ip));
+        engine.observe(make_event(Layer::Userspace, "c2_protocol_tunneling", ip));
+        assert_chain_fires(&mut engine, "CL-061");
+    }
+
+    #[test]
+    fn cl_062_reverse_shell_to_privesc() {
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.62";
+        engine.observe(make_event(Layer::Userspace, "reverse_shell", ip));
+        engine.observe(make_event(Layer::Userspace, "setuid_exploit_pattern", ip));
+        assert_chain_fires(&mut engine, "CL-062");
+    }
+
+    #[test]
+    fn cl_063_privesc_to_persistence() {
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.63";
+        engine.observe(make_event(Layer::Userspace, "setuid_exploit_pattern", ip));
+        engine.observe(make_event(Layer::Userspace, "pam_module_change", ip));
+        assert_chain_fires(&mut engine, "CL-063");
+    }
+
+    #[test]
+    fn cl_064_persistence_to_lateral() {
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.64";
+        engine.observe(make_event(Layer::Userspace, "systemd_persistence", ip));
+        engine.observe(make_event(Layer::Userspace, "lateral_egress_ssh", ip));
+        assert_chain_fires(&mut engine, "CL-064");
+    }
+
+    #[test]
+    fn cl_065_lateral_to_collection() {
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.65";
+        engine.observe(make_event(Layer::Userspace, "lateral_egress_ssh", ip));
+        engine.observe(make_event(Layer::Userspace, "clipboard_read", ip));
+        assert_chain_fires(&mut engine, "CL-065");
+    }
+
+    #[test]
+    fn cl_066_collection_to_lateral_exfil() {
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.66";
+        engine.observe(make_event(
+            Layer::Userspace,
+            "automated_file_collection",
+            ip,
+        ));
+        engine.observe(make_event(Layer::Userspace, "lateral_egress_scp_rsync", ip));
+        assert_chain_fires(&mut engine, "CL-066");
+    }
+
+    #[test]
+    fn cl_067_full_kill_chain() {
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.67";
+        engine.observe(make_event(Layer::Userspace, "ssh_bruteforce", ip));
+        engine.observe(make_event(Layer::Userspace, "reverse_shell", ip));
+        engine.observe(make_event(Layer::Userspace, "pam_module_change", ip));
+        engine.observe(make_event(Layer::Userspace, "auditd_disable", ip));
+        engine.observe(make_event(Layer::Userspace, "data_destruction_pattern", ip));
+        assert_chain_fires(&mut engine, "CL-067");
+    }
+
+    #[test]
+    fn cl_068_wiper_precursor() {
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.68";
+        engine.observe(make_event(Layer::Userspace, "selinux_apparmor_disable", ip));
+        engine.observe(make_event(Layer::Userspace, "discovery_anomaly", ip));
+        engine.observe(make_event(Layer::Userspace, "data_destruction_pattern", ip));
+        assert_chain_fires(&mut engine, "CL-068");
+    }
+
+    #[test]
+    fn cl_069_insider_exfil() {
+        let mut engine = CorrelationEngine::new();
+        let ip = "10.0.0.69";
+        engine.observe(make_event(Layer::Userspace, "shell.command_exec", ip));
+        engine.observe(make_event(
+            Layer::Userspace,
+            "automated_file_collection",
+            ip,
+        ));
+        engine.observe(make_event(Layer::Userspace, "lateral_egress_scp_rsync", ip));
+        assert_chain_fires(&mut engine, "CL-069");
+    }
+
+    #[test]
+    fn cl_070_pam_credential_theft_chain() {
+        let mut engine = CorrelationEngine::new();
+        // PAM tamper from attacker_ip, then victim auth success, then
+        // lateral pivot — identity rotates, entity_must_match=false.
+        engine.observe(make_event(
+            Layer::Userspace,
+            "pam_module_change",
+            "10.0.0.70",
+        ));
+        engine.observe(make_event(
+            Layer::Userspace,
+            "ssh.login_success",
+            "10.0.0.71",
+        ));
+        engine.observe(make_event(
+            Layer::Userspace,
+            "lateral_egress_ssh",
+            "10.0.0.72",
+        ));
+        assert_chain_fires(&mut engine, "CL-070");
     }
 }
