@@ -140,6 +140,13 @@ struct DetectorSet {
     nmap_scan: Option<detectors::nmap_scan::NmapScanDetector>,
     wordlist_scan: Option<detectors::wordlist_scan::WordlistScanDetector>,
     discovery_anomaly: Option<detectors::discovery_anomaly::DiscoveryAnomalyDetector>,
+    // spec 050-PR2 — Collection
+    clipboard_read: Option<detectors::clipboard_read::ClipboardReadDetector>,
+    screen_capture: Option<detectors::screen_capture::ScreenCaptureDetector>,
+    keylogger_bash_trap: Option<detectors::keylogger_bash_trap::KeyloggerBashTrapDetector>,
+    archive_pwd_protected: Option<detectors::archive_pwd_protected::ArchivePwdProtectedDetector>,
+    automated_file_collection:
+        Option<detectors::automated_file_collection::AutomatedFileCollectionDetector>,
 }
 
 #[derive(Default)]
@@ -742,6 +749,29 @@ async fn main() -> Result<()> {
         discovery_anomaly: Some({
             info!("discovery_anomaly detector enabled (context-aware recon burst)");
             detectors::discovery_anomaly::DiscoveryAnomalyDetector::new(&cfg.agent.host_id, 10, 30)
+        }),
+        // spec 050-PR2 — Collection
+        clipboard_read: Some({
+            info!("clipboard_read detector enabled (xclip/xsel/wl-paste on headless host)");
+            detectors::clipboard_read::ClipboardReadDetector::new(&cfg.agent.host_id)
+        }),
+        screen_capture: Some({
+            info!("screen_capture detector enabled (scrot/grim/flameshot on headless host)");
+            detectors::screen_capture::ScreenCaptureDetector::new(&cfg.agent.host_id)
+        }),
+        keylogger_bash_trap: Some({
+            info!("keylogger_bash_trap detector enabled (shell startup file write + trap pattern)");
+            detectors::keylogger_bash_trap::KeyloggerBashTrapDetector::new(&cfg.agent.host_id)
+        }),
+        archive_pwd_protected: Some({
+            info!("archive_pwd_protected detector enabled (T1560.001 staging archives)");
+            detectors::archive_pwd_protected::ArchivePwdProtectedDetector::new(&cfg.agent.host_id)
+        }),
+        automated_file_collection: Some({
+            info!("automated_file_collection detector enabled (T1119 find sweeps of user data)");
+            detectors::automated_file_collection::AutomatedFileCollectionDetector::new(
+                &cfg.agent.host_id,
+            )
         }),
     };
 
@@ -2023,6 +2053,75 @@ fn process_event(
         if !detectors
             .dynamic_allowlist
             .suppress_incident_for_detector(&incident, "discovery_anomaly")
+        {
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    // spec 050-PR2 — Collection detectors. All five accept the
+    // event-loop event directly; post-emit allowlist consultation
+    // mirrors PR1's pattern so operators can tune via
+    // `[detectors.<name>]` without recompile.
+    let clipboard_read_incident = detectors
+        .clipboard_read
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = clipboard_read_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "clipboard_read")
+        {
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    let screen_capture_incident = detectors
+        .screen_capture
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = screen_capture_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "screen_capture")
+        {
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    let keylogger_bash_trap_incident = detectors
+        .keylogger_bash_trap
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = keylogger_bash_trap_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "keylogger_bash_trap")
+        {
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    let archive_pwd_protected_incident = detectors
+        .archive_pwd_protected
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = archive_pwd_protected_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "archive_pwd_protected")
+        {
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    let automated_file_collection_incident = detectors
+        .automated_file_collection
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = automated_file_collection_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "automated_file_collection")
         {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }

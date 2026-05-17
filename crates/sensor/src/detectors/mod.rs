@@ -250,6 +250,13 @@ pub mod discovery_anomaly;
 pub mod nmap_scan;
 pub mod wordlist_scan;
 
+// spec 050-PR2 — Collection
+pub mod archive_pwd_protected;
+pub mod automated_file_collection;
+pub mod clipboard_read;
+pub mod keylogger_bash_trap;
+pub mod screen_capture;
+
 #[cfg(test)]
 mod tests {
     use super::*;
