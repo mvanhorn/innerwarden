@@ -257,6 +257,11 @@ pub mod clipboard_read;
 pub mod keylogger_bash_trap;
 pub mod screen_capture;
 
+// spec 050-PR3 — C2 variants
+pub mod c2_non_standard_port;
+pub mod c2_protocol_tunneling;
+pub mod c2_web_tunnel;
+
 #[cfg(test)]
 mod tests {
     use super::*;

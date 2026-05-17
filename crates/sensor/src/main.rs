@@ -147,6 +147,10 @@ struct DetectorSet {
     archive_pwd_protected: Option<detectors::archive_pwd_protected::ArchivePwdProtectedDetector>,
     automated_file_collection:
         Option<detectors::automated_file_collection::AutomatedFileCollectionDetector>,
+    // spec 050-PR3 — C2 variants
+    c2_web_tunnel: Option<detectors::c2_web_tunnel::C2WebTunnelDetector>,
+    c2_protocol_tunneling: Option<detectors::c2_protocol_tunneling::C2ProtocolTunnelingDetector>,
+    c2_non_standard_port: Option<detectors::c2_non_standard_port::C2NonStandardPortDetector>,
 }
 
 #[derive(Default)]
@@ -772,6 +776,19 @@ async fn main() -> Result<()> {
             detectors::automated_file_collection::AutomatedFileCollectionDetector::new(
                 &cfg.agent.host_id,
             )
+        }),
+        // spec 050-PR3 — C2 variants
+        c2_web_tunnel: Some({
+            info!("c2_web_tunnel detector enabled (ngrok/cloudflared/bore + tunnel DNS)");
+            detectors::c2_web_tunnel::C2WebTunnelDetector::new(&cfg.agent.host_id)
+        }),
+        c2_protocol_tunneling: Some({
+            info!("c2_protocol_tunneling detector enabled (DNS/ICMP/SSH-forward tunneling)");
+            detectors::c2_protocol_tunneling::C2ProtocolTunnelingDetector::new(&cfg.agent.host_id)
+        }),
+        c2_non_standard_port: Some({
+            info!("c2_non_standard_port detector enabled (T1571 listeners outside well-known set)");
+            detectors::c2_non_standard_port::C2NonStandardPortDetector::new(&cfg.agent.host_id)
         }),
     };
 
@@ -2122,6 +2139,46 @@ fn process_event(
         if !detectors
             .dynamic_allowlist
             .suppress_incident_for_detector(&incident, "automated_file_collection")
+        {
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    // spec 050-PR3 — C2 variants
+    let c2_web_tunnel_incident = detectors
+        .c2_web_tunnel
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = c2_web_tunnel_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "c2_web_tunnel")
+        {
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    let c2_protocol_tunneling_incident = detectors
+        .c2_protocol_tunneling
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = c2_protocol_tunneling_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "c2_protocol_tunneling")
+        {
+            write_incident(sqlite, stats, incident, syslog, dedup_cache);
+        }
+    }
+
+    let c2_non_standard_port_incident = detectors
+        .c2_non_standard_port
+        .as_mut()
+        .and_then(|d| d.process(&ev));
+    if let Some(incident) = c2_non_standard_port_incident {
+        if !detectors
+            .dynamic_allowlist
+            .suppress_incident_for_detector(&incident, "c2_non_standard_port")
         {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
