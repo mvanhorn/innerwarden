@@ -18,10 +18,16 @@
 //! the same host can read that file and start using the APIs without
 //! manual operator setup.
 //!
-//! The file lives next to the agent's other published artefacts
-//! (`incidents-*.jsonl`, `summary-*.md`, etc.) so the existing
-//! `data_dir` permissions on `/var/lib/innerwarden` (0755) make it
-//! readable by unprivileged AI agent processes.
+//! The file lives in `/run/innerwarden/` — the FHS-standard location
+//! for runtime / discovery data. We do NOT put it under `data_dir`
+//! (`/var/lib/innerwarden`): in production that directory is created
+//! with mode `0770 innerwarden:innerwarden`, which blocks traversal
+//! by peer AI agents that run as `ubuntu` or any other non-privileged
+//! user — the exact failure mode the operator hit on 2026-05-18:
+//! "o arquivo de discovery em /var/lib/innerwarden/agent-discovery.json
+//! deu Permission denied neste ambiente." Putting the file in `/run`
+//! also matches the semantic: it's runtime state, recreated on every
+//! agent boot, so vanishing after reboot is correct.
 
 use std::path::{Path, PathBuf};
 
@@ -29,6 +35,13 @@ use anyhow::Result;
 use serde_json::json;
 
 pub const DISCOVERY_FILENAME: &str = "agent-discovery.json";
+
+/// Canonical runtime directory for the discovery file in production.
+/// Lives in `/run` so peer AI agents (running as `ubuntu` etc.) can
+/// always traverse into it. The agent runs as root, so it can mkdir
+/// and chmod this on every boot — no systemd `RuntimeDirectory=`
+/// setup required.
+pub const PROD_DISCOVERY_DIR: &str = "/run/innerwarden";
 
 /// Canonical path of the discovery file inside the agent's data
 /// directory. Public so tests and `ctl` can both refer to the same
@@ -118,13 +131,16 @@ pub fn build_discovery_payload(
     })
 }
 
-/// Write the discovery file. The file is created with `0644` perms so
-/// non-root AI agents can read it; only the agent process (running as
-/// root in production) can update it. Fail-soft: callers should log
-/// the error but not crash the agent boot — the dashboard still works
+/// Write the discovery file. The parent directory is created if
+/// missing AND chmod'd to `0755` so peer AI agents running as a
+/// non-privileged user can traverse into it (the original `0644`
+/// file mode is useless if the directory itself is `0700`/`0770` —
+/// that's the exact bug we hit on prod, see module doc). The file
+/// itself is written with `0644`. Fail-soft: callers should log the
+/// error but not crash the agent boot — the dashboard still works
 /// without this hint file.
 pub fn write_discovery(
-    data_dir: &Path,
+    runtime_dir: &Path,
     dashboard_bind: &str,
     tls_enabled: bool,
     agent_version: &str,
@@ -135,18 +151,22 @@ pub fn write_discovery(
         agent_version,
         chrono::Utc::now(),
     );
-    let path = discovery_path(data_dir);
+    let path = discovery_path(runtime_dir);
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    std::fs::create_dir_all(runtime_dir)?;
+    // World-traversable so peer agents can reach the file inside.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(runtime_dir)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(runtime_dir, perms)?;
     }
 
     let body = serde_json::to_string_pretty(&payload)?;
     std::fs::write(&path, body)?;
 
-    // 0644 so unprivileged AI agents can read it. The agent process
-    // owns the data_dir so this chmod is always a noop for us; the
-    // important thing is that other processes can read.
+    // 0644 so unprivileged AI agents can read it.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -282,6 +302,49 @@ mod tests {
             mode, 0o644,
             "discovery file must be world-readable (0644); unprivileged AI agents need to read it"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_discovery_chmods_parent_dir_world_traversable() {
+        // Regression anchor for the 2026-05-18 prod bug: the discovery
+        // file was world-readable (0644) but lived in a 0770 dir, so
+        // peer agents got "Permission denied" no matter how loose the
+        // file mode was. The writer must now chmod the parent dir to
+        // 0755 so traversal works for any local UID.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Start the runtime dir with a restrictive mode so we can
+        // observe whether write_discovery actually loosens it.
+        let runtime = tmp.path().join("innerwarden");
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let pre_mode = std::fs::metadata(&runtime).unwrap().permissions().mode() & 0o777;
+        assert_eq!(pre_mode, 0o700, "test fixture should start at 0700");
+
+        write_discovery(&runtime, "0.0.0.0:8787", true, "0.13.6")
+            .expect("write_discovery should chmod the parent");
+
+        let post_mode = std::fs::metadata(&runtime).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            post_mode, 0o755,
+            "write_discovery must leave the runtime dir world-traversable"
+        );
+    }
+
+    #[test]
+    fn write_discovery_creates_parent_dir_if_missing() {
+        // The agent boot path passes /run/innerwarden which does not
+        // exist on a fresh host. The writer must mkdir -p, not fail.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let runtime = tmp.path().join("nested").join("innerwarden");
+        assert!(!runtime.exists(), "test fixture: dir does not exist yet");
+
+        let path = write_discovery(&runtime, "0.0.0.0:8787", true, "0.13.6")
+            .expect("write_discovery should mkdir -p the runtime dir");
+
+        assert!(path.exists());
+        assert_eq!(path.parent(), Some(runtime.as_path()));
     }
 
     #[test]

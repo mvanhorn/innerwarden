@@ -615,15 +615,28 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
             None => dashboard::TwoFactorSettings::default(),
         };
 
-        // 2026-05-18 fix: write the discovery hint file BEFORE
-        // spawning the dashboard task, so any AI agent process on the
-        // box (OpenClaw, Codex CLI, n8n, etc.) can read it the moment
-        // the dashboard is reachable. Fail-soft: a write error here
-        // (read-only volume, exotic FS) must not abort agent boot —
-        // the dashboard still works, we just lose the discovery
-        // affordance for peer agents.
+        // 2026-05-18 fix: write the discovery hint file to
+        // /run/innerwarden/ BEFORE spawning the dashboard task, so
+        // any AI agent process on the box (OpenClaw, Codex CLI, n8n,
+        // etc.) can read it the moment the dashboard is reachable.
+        //
+        // The earlier ship of this code put the file under
+        // `cli.data_dir` (/var/lib/innerwarden). That dir is created
+        // by the install script as 0770 innerwarden:innerwarden — so
+        // even with the file at 0644, peer agents running as
+        // `ubuntu` could not traverse into the dir to reach it. The
+        // operator saw "Permission denied" from OpenClaw on the
+        // first day. /run/innerwarden/ is created world-traversable
+        // (0755) by `write_discovery` itself, no install-script
+        // change required.
+        //
+        // Fail-soft: a write error here (read-only volume, exotic
+        // FS) must not abort agent boot — the dashboard still works,
+        // we just lose the discovery affordance for peer agents.
+        let discovery_runtime_dir =
+            std::path::Path::new(crate::agent_discovery::PROD_DISCOVERY_DIR);
         match crate::agent_discovery::write_discovery(
-            &cli.data_dir,
+            discovery_runtime_dir,
             &cli.dashboard_bind,
             !cli.insecure_no_tls,
             env!("CARGO_PKG_VERSION"),
