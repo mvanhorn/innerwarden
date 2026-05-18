@@ -344,6 +344,22 @@ pub fn check_kernel_version() -> CheckResult {
 mod tests {
     use super::*;
 
+    fn kernel_state(
+        version: &str,
+        kallsyms_hash: Option<&str>,
+        modules: &[&str],
+        cmdline: &str,
+    ) -> KernelState {
+        KernelState {
+            version: version.into(),
+            kallsyms_hash: kallsyms_hash.map(str::to_string),
+            symbol_count: 100000,
+            modules: modules.iter().map(|m| (*m).to_string()).collect(),
+            cmdline: cmdline.into(),
+            cmdline_hash: hex::encode(Sha256::digest(cmdline.as_bytes())),
+        }
+    }
+
     #[test]
     fn capture_state() {
         let state = KernelState::capture();
@@ -392,6 +408,73 @@ mod tests {
         assert!(drifts
             .iter()
             .any(|d| d.component == "kallsyms" && d.severity == KernelDriftSeverity::Critical));
+    }
+
+    #[test]
+    fn version_and_cmdline_drift_detection() {
+        let baseline = kernel_state(
+            "Linux 6.1",
+            Some("abc123"),
+            &["ext4"],
+            "root=/dev/sda1 quiet",
+        );
+        let current = kernel_state(
+            "Linux 6.2",
+            Some("abc123"),
+            &["ext4"],
+            "root=/dev/sda1 nokaslr",
+        );
+
+        let drifts = detect_kernel_drift(&current, &baseline);
+
+        assert!(drifts.iter().any(|d| {
+            d.component == "kernel_version"
+                && d.severity == KernelDriftSeverity::Suspicious
+                && d.detail.contains("Linux 6.1")
+                && d.detail.contains("Linux 6.2")
+        }));
+        assert!(drifts.iter().any(|d| {
+            d.component == "cmdline" && d.severity == KernelDriftSeverity::Suspicious
+        }));
+    }
+
+    #[test]
+    fn kallsyms_drift_is_ignored_when_baseline_missing_hash() {
+        let baseline = kernel_state("Linux 6.1", None, &["ext4"], "root=/dev/sda1");
+        let current = kernel_state("Linux 6.1", Some("new_hash"), &["ext4"], "root=/dev/sda1");
+
+        let drifts = detect_kernel_drift(&current, &baseline);
+
+        assert!(!drifts.iter().any(|d| d.component == "kallsyms"));
+    }
+
+    #[test]
+    fn module_drift_details_limit_to_first_ten_modules() {
+        let baseline = kernel_state("Linux 6.1", Some("abc123"), &[], "root=/dev/sda1");
+        let current = kernel_state(
+            "Linux 6.1",
+            Some("abc123"),
+            &[
+                "mod00", "mod01", "mod02", "mod03", "mod04", "mod05", "mod06", "mod07", "mod08",
+                "mod09", "mod10", "mod11",
+            ],
+            "root=/dev/sda1",
+        );
+
+        let drift = detect_kernel_drift(&current, &baseline)
+            .into_iter()
+            .find(|d| d.component == "modules")
+            .expect("new module drift");
+
+        assert!(drift.detail.contains("12 new module(s)"));
+        assert!(drift.detail.contains("mod09"));
+        assert!(!drift.detail.contains("mod10"));
+    }
+
+    #[test]
+    fn truncate_preserves_short_and_cuts_long_strings() {
+        assert_eq!(truncate("short", 10), "short");
+        assert_eq!(truncate("abcdef", 3), "abc");
     }
 
     #[test]
