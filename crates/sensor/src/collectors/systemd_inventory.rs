@@ -191,10 +191,15 @@ mod tests {
     #[test]
     fn test_suspicious_paths() {
         assert!(is_suspicious_path("/tmp/evil.service"));
+        assert!(is_suspicious_path("/var/tmp/payload.service"));
         assert!(is_suspicious_path("/dev/shm/backdoor.service"));
         assert!(is_suspicious_path(
             "/home/user/.config/systemd/user/mal.service"
         ));
+        assert!(is_suspicious_path(
+            "/root/.config/systemd/user/rootkit.service"
+        ));
+        assert!(!is_suspicious_path("/tmpdir/legit.service"));
         assert!(!is_suspicious_path("/etc/systemd/system/nginx.service"));
         assert!(!is_suspicious_path("/usr/lib/systemd/system/sshd.service"));
     }
@@ -310,5 +315,32 @@ network.service loaded active running Network Manager
         assert_eq!(details["sub_state"], "running");
         assert_eq!(details["fragment_path"], "/tmp/malicious.service");
         assert_eq!(details["suspicious_path"], true);
+    }
+
+    #[test]
+    fn build_event_marks_non_suspicious_unit_details() {
+        let unit = SystemdUnit {
+            name: "nginx.service".to_string(),
+            load_state: "loaded".to_string(),
+            active_state: "inactive".to_string(),
+            sub_state: "dead".to_string(),
+            fragment_path: "/etc/systemd/system/nginx.service".to_string(),
+        };
+
+        let event = build_event(
+            &unit,
+            "new_systemd_unit",
+            Severity::High,
+            "host456",
+            "New unit",
+        );
+
+        assert_eq!(event.kind, "system.new_systemd_unit");
+        assert_eq!(event.severity, Severity::High);
+        assert_eq!(event.details["unit_name"], "nginx.service");
+        assert_eq!(event.details["active_state"], "inactive");
+        assert_eq!(event.details["sub_state"], "dead");
+        assert_eq!(event.details["suspicious_path"], false);
+        assert_eq!(event.entities[0].value, "nginx.service");
     }
 }
