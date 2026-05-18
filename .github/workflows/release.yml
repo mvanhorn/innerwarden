@@ -243,9 +243,15 @@ jobs:
           # on ubuntu-latest, so we drop the `pip install -q cryptography`
           # step that Scorecard flagged for being unpinned by hash. The
           # signing semantics are identical — Ed25519PrivateKey.sign(digest)
-          # in Python and `openssl pkeyutl -sign -rawin` on a 32-byte
-          # SHA-256 digest both produce the same 64-byte signature, since
-          # ed25519 signs raw bytes (no internal pre-hashing).
+          # in Python and `openssl pkeyutl -sign -rawin -in <digest_file>`
+          # on a 32-byte SHA-256 digest both produce the same 64-byte
+          # signature, since ed25519 signs raw bytes (no internal pre-hashing).
+          #
+          # Wave 2026-05-18 fix: `openssl pkeyutl -sign -rawin` needs a
+          # SEEKABLE input — passing the digest via a pipe fails with
+          # `unable to determine file size for oneshot operation` on
+          # openssl 3.x (caught by the v0.14.0 release attempt). Solution:
+          # write the digest to a temp file and pass it via `-in`.
           echo "$RELEASE_SIGNING_KEY" > /tmp/sign-key.pem
           chmod 600 /tmp/sign-key.pem
           for binary in dist/innerwarden-*; do
@@ -253,11 +259,11 @@ jobs:
             [[ "$binary" == *.sig ]] && continue
             [[ "$binary" == */install.sh ]] && continue
             echo "signing $(basename $binary)..."
-            openssl dgst -sha256 -binary "$binary" \
-              | openssl pkeyutl -sign -inkey /tmp/sign-key.pem -rawin \
+            openssl dgst -sha256 -binary "$binary" > /tmp/sign-digest.bin
+            openssl pkeyutl -sign -inkey /tmp/sign-key.pem -rawin -in /tmp/sign-digest.bin \
               | base64 -w 0 > "${binary}.sig"
           done
-          rm -f /tmp/sign-key.pem
+          rm -f /tmp/sign-key.pem /tmp/sign-digest.bin
           echo "=== Signed assets ==="
           ls dist/*.sig 2>/dev/null
 
@@ -536,21 +542,25 @@ jobs:
           # Scorecard PinnedDependencies fix (mirror of the Linux block
           # above): drop `pip install -q cryptography` in favour of the
           # pre-installed openssl CLI. macOS-latest ships LibreSSL 3.3.6+
-          # which supports `pkeyutl -sign -rawin`. `base64 | tr -d \\n`
-          # is the cross-platform stand-in for `base64 -w 0` (BSD base64
-          # uses `-b 0` not `-w 0`; the tr is portable).
+          # which supports `pkeyutl -sign -rawin -in <file>`. `base64 |
+          # tr -d \\n` is the cross-platform stand-in for `base64 -w 0`
+          # (BSD base64 uses `-b 0` not `-w 0`; the tr is portable).
+          #
+          # Wave 2026-05-18 fix: same pipe-vs-file gotcha as the Linux
+          # block — `-rawin` reads from stdin only if stdin is seekable,
+          # which a pipe is not. Use a temp digest file instead.
           echo "$RELEASE_SIGNING_KEY" > /tmp/sign-key.pem
           chmod 600 /tmp/sign-key.pem
           for binary in dist/innerwarden-*; do
             [[ "$binary" == *.sha256 ]] && continue
             [[ "$binary" == *.sig ]] && continue
             echo "signing $(basename $binary)..."
-            openssl dgst -sha256 -binary "$binary" \
-              | openssl pkeyutl -sign -inkey /tmp/sign-key.pem -rawin \
+            openssl dgst -sha256 -binary "$binary" > /tmp/sign-digest.bin
+            openssl pkeyutl -sign -inkey /tmp/sign-key.pem -rawin -in /tmp/sign-digest.bin \
               | base64 \
               | tr -d '\n' > "${binary}.sig"
           done
-          rm -f /tmp/sign-key.pem
+          rm -f /tmp/sign-key.pem /tmp/sign-digest.bin
 
       # ── SLSA v1 build provenance attestation (macOS) ──────────────────────
       - name: Attest build provenance for macOS binaries
