@@ -170,10 +170,23 @@ mod tests {
         let lines = vec!["hello".to_string(), "world".to_string()];
         let boxed = box_lines(lines, 80);
         // Should have border lines (top + bottom) + 2 content lines
-        assert!(boxed.len() >= 4);
-        // Borders contain + and -
-        assert!(boxed.first().unwrap().contains('+'));
-        assert!(boxed.last().unwrap().contains('+'));
+        assert_eq!(boxed.len(), 4);
+        // Wide terminals indent the information box away from the edge.
+        assert!(boxed.first().unwrap().starts_with("    +"));
+        assert!(boxed.last().unwrap().starts_with("    +"));
+        assert!(boxed[1].contains("hello"));
+        assert!(boxed[2].contains("world"));
+    }
+
+    #[test]
+    fn box_lines_wraps_without_offset_when_space_is_tight() {
+        let lines = vec!["hello".to_string()];
+        let boxed = box_lines(lines, 9);
+
+        assert_eq!(boxed.len(), 3);
+        assert_eq!(boxed[0], "+-------+");
+        assert_eq!(boxed[1], "| hello |");
+        assert_eq!(boxed[2], "+-------+");
     }
 
     #[test]
@@ -189,7 +202,30 @@ mod tests {
         let screen = build_screen(80, 5);
         assert!(!screen.is_empty());
         let joined = screen.join("\n");
+        assert!(joined.contains("Installed successfully"));
+        assert!(joined.contains("Observe-only mode is ON by default"));
+        assert!(joined.contains("Run: innerwarden setup"));
         assert!(joined.contains("Kernel hooks active: 5"));
+    }
+
+    #[test]
+    fn build_screen_shows_initializing_when_hooks_are_zero() {
+        let screen = build_screen(80, 0);
+        let joined = screen.join("\n");
+
+        assert!(joined.contains("Kernel hooks: initializing"));
+        assert!(!joined.contains("Kernel hooks active: 0"));
+    }
+
+    #[test]
+    fn build_screen_wide_terminal_uses_ascii_logo() {
+        let screen = build_screen(100, 1);
+
+        assert_eq!(screen[0], LOGO_WIDE[0]);
+        assert_eq!(screen[1], LOGO_WIDE[1]);
+        assert!(screen
+            .iter()
+            .any(|line| line.contains("Kernel hooks active: 1")));
     }
 
     #[test]
