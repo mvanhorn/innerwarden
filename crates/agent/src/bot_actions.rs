@@ -600,6 +600,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quick_block_returns_warning_when_skill_not_allowed() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let mut cfg = config::AgentConfig::default();
+        cfg.responder.enabled = true;
+        cfg.responder.block_backend = "ufw".to_string();
+        cfg.responder.allowed_skills = Vec::new();
+
+        let handled = handle_telegram_action_callback(
+            &approval("__quick_block__:203.0.113.46", ""),
+            dir.path(),
+            &cfg,
+            &mut state,
+        )
+        .await;
+
+        assert!(handled);
+        assert!(!state.blocklist.contains("203.0.113.46"));
+    }
+
+    #[tokio::test]
     async fn honeypot_callback_monitor_path_consumes_pending_choice() {
         let dir = TempDir::new().expect("tempdir");
         let mut state = crate::tests::triage_test_state(dir.path());
@@ -624,6 +645,51 @@ mod tests {
 
         assert!(handled);
         assert!(!state.pending_honeypot_choices.contains_key("198.51.100.55"));
+    }
+
+    #[tokio::test]
+    async fn honeypot_callback_returns_warning_for_unknown_choice() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let cfg = config::AgentConfig::default();
+
+        let handled = handle_telegram_action_callback(
+            &approval("__hpot__:198.51.100.56", "monitor"),
+            dir.path(),
+            &cfg,
+            &mut state,
+        )
+        .await;
+
+        assert!(handled);
+        assert!(!state.pending_honeypot_choices.contains_key("198.51.100.56"));
+    }
+
+    #[tokio::test]
+    async fn honeypot_callback_ignore_path_consumes_pending_choice() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut state = crate::tests::triage_test_state(dir.path());
+        let cfg = config::AgentConfig::default();
+        state.pending_honeypot_choices.insert(
+            "198.51.100.57".to_string(),
+            crate::PendingHoneypotChoice {
+                ip: "198.51.100.57".to_string(),
+                incident_id: "inc-hpot-ignore".to_string(),
+                incident: crate::tests::test_incident("198.51.100.57"),
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+            },
+        );
+
+        let handled = handle_telegram_action_callback(
+            &approval("__hpot__:198.51.100.57", "ignore"),
+            dir.path(),
+            &cfg,
+            &mut state,
+        )
+        .await;
+
+        assert!(handled);
+        assert!(!state.pending_honeypot_choices.contains_key("198.51.100.57"));
     }
 
     #[tokio::test]
