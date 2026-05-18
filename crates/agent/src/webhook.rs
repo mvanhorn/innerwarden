@@ -245,6 +245,20 @@ mod tests {
         }
     }
 
+    fn test_guard_alert() -> crate::dashboard::AgentGuardAlert {
+        crate::dashboard::AgentGuardAlert {
+            ts: chrono::Utc::now(),
+            agent_name: "agent-a".to_string(),
+            command: "rm -rf /tmp/demo".to_string(),
+            risk_score: 92,
+            severity: "high".to_string(),
+            recommendation: "review".to_string(),
+            signals: vec!["destructive".to_string()],
+            atr_rule_ids: vec!["ATR-1".to_string()],
+            explanation: "test alert".to_string(),
+        }
+    }
+
     #[test]
     fn pagerduty_format_has_required_fields() {
         let inc = test_incident();
@@ -324,5 +338,105 @@ mod tests {
             redact_url("https://hooks.slack.com/T123/B456"),
             "https://hooks.slack.com/T123/B456"
         );
+    }
+
+    #[tokio::test]
+    async fn send_incident_posts_default_payload_and_treats_2xx_as_success() {
+        let server = mockito::Server::new_async().await;
+        let mut server = server;
+        let m = server
+            .mock("POST", "/incident")
+            .match_header(
+                "content-type",
+                mockito::Matcher::Regex("application/json.*".to_string()),
+            )
+            .with_status(204)
+            .create_async()
+            .await;
+
+        send_incident(
+            &format!("{}/incident", server.url()),
+            2,
+            &test_incident(),
+            "default",
+        )
+        .await
+        .expect("default webhook succeeds");
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn send_incident_pagerduty_strips_query_from_post_url() {
+        let server = mockito::Server::new_async().await;
+        let mut server = server;
+        let m = server
+            .mock("POST", "/v2/enqueue")
+            .with_status(202)
+            .create_async()
+            .await;
+        let url = format!(
+            "{}/v2/enqueue?routing_key=route-1&token=secret",
+            server.url()
+        );
+
+        send_incident(&url, 2, &test_incident(), "pagerduty")
+            .await
+            .expect("pagerduty webhook succeeds");
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn send_incident_non_2xx_is_logged_but_not_returned_as_error() {
+        let server = mockito::Server::new_async().await;
+        let mut server = server;
+        let m = server
+            .mock("POST", "/opsgenie")
+            .with_status(503)
+            .with_body("temporarily unavailable")
+            .create_async()
+            .await;
+
+        send_incident(
+            &format!("{}/opsgenie", server.url()),
+            2,
+            &test_incident(),
+            "opsgenie",
+        )
+        .await
+        .expect("non-2xx responses are fail-open");
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn agent_guard_alert_empty_url_is_noop() {
+        send_agent_guard_alert("", 2, &test_guard_alert(), "default")
+            .await
+            .expect("empty URL is intentionally ignored");
+    }
+
+    #[tokio::test]
+    async fn agent_guard_alert_posts_payload_and_treats_non_2xx_as_success() {
+        let server = mockito::Server::new_async().await;
+        let mut server = server;
+        let m = server
+            .mock("POST", "/guard")
+            .match_header(
+                "content-type",
+                mockito::Matcher::Regex("application/json.*".to_string()),
+            )
+            .with_status(429)
+            .with_body("rate limited")
+            .create_async()
+            .await;
+
+        send_agent_guard_alert(
+            &format!("{}/guard", server.url()),
+            2,
+            &test_guard_alert(),
+            "default",
+        )
+        .await
+        .expect("agent guard webhook is fail-open on non-2xx");
+        m.assert_async().await;
     }
 }
