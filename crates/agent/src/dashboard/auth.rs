@@ -598,6 +598,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_basic_auth_allows_colons_inside_password() {
+        // "admin:secret:with:colons" encoded; split_once must only split
+        // the username separator and preserve the rest of the password.
+        let header = "Basic YWRtaW46c2VjcmV0OndpdGg6Y29sb25z";
+        let (user, pass) = parse_basic_auth(header).expect("should parse valid auth");
+        assert_eq!(user, "admin");
+        assert_eq!(pass, "secret:with:colons");
+    }
+
+    #[test]
+    fn parse_basic_auth_rejects_non_utf8_payload() {
+        let header = "Basic //4=";
+        assert!(parse_basic_auth(header).is_none());
+    }
+
+    #[test]
     fn test_extract_bearer_token() {
         let req = Request::builder()
             .header(header::AUTHORIZATION, "Bearer xyz123")
@@ -610,6 +626,28 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(extract_bearer_token(&req2), None);
+    }
+
+    #[test]
+    fn extract_bearer_token_rejects_empty_wrong_case_and_invalid_header() {
+        let empty = Request::builder()
+            .header(header::AUTHORIZATION, "Bearer ")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(extract_bearer_token(&empty), Some(""));
+
+        let wrong_case = Request::builder()
+            .header(header::AUTHORIZATION, "bearer xyz123")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(extract_bearer_token(&wrong_case), None);
+
+        let mut invalid = Request::builder().body(Body::empty()).unwrap();
+        invalid.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_bytes(b"Bearer \xff").expect("opaque header bytes"),
+        );
+        assert_eq!(extract_bearer_token(&invalid), None);
     }
 
     #[test]
@@ -666,6 +704,28 @@ mod tests {
         req3.headers_mut()
             .insert("x-forwarded-for", "1.1.1.1".parse().unwrap());
         assert_eq!(extract_client_ip(&req3, &trusted), "10.0.0.5");
+    }
+
+    #[test]
+    fn extract_client_ip_uses_real_ip_and_ignores_empty_forwarded_for() {
+        let trusted = vec!["127.0.0.1".parse().unwrap()];
+        let mut req = Request::builder().body(Body::empty()).unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(std::net::SocketAddr::new(
+                "127.0.0.1".parse().unwrap(),
+                8080,
+            )));
+        req.headers_mut()
+            .insert("x-forwarded-for", "   ".parse().unwrap());
+        req.headers_mut()
+            .insert("x-real-ip", "203.0.113.44".parse().unwrap());
+        assert_eq!(extract_client_ip(&req, &trusted), "203.0.113.44");
+    }
+
+    #[test]
+    fn extract_client_ip_returns_unknown_without_connect_info() {
+        let req = Request::builder().body(Body::empty()).unwrap();
+        assert_eq!(extract_client_ip(&req, &[]), "unknown");
     }
 
     #[test]
