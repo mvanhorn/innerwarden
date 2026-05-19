@@ -317,7 +317,24 @@ fn record_suppressed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use innerwarden_core::entities::{EntityRef, EntityType};
     use innerwarden_core::event::Severity;
+    use innerwarden_core::incident::Incident;
+
+    fn incident(incident_id: &str, entities: Vec<EntityRef>) -> Incident {
+        Incident {
+            ts: chrono::Utc::now(),
+            host: "test-host".to_string(),
+            incident_id: incident_id.to_string(),
+            severity: Severity::High,
+            title: "test incident".to_string(),
+            summary: "synthetic notification fixture".to_string(),
+            evidence: serde_json::json!({}),
+            recommended_checks: vec![],
+            tags: vec![],
+            entities,
+        }
+    }
 
     // Test 1: Full permutation of passes_channel_filter
     #[test]
@@ -424,5 +441,78 @@ mod tests {
         assert!(severity_rank(&Severity::Critical) >= min_rank);
         // Medium does NOT meet High threshold
         assert!(severity_rank(&Severity::Medium) < min_rank);
+    }
+
+    #[test]
+    fn record_suppressed_persists_reason_detector_and_primary_entity() {
+        let dir = tempfile::tempdir().unwrap();
+        let incident = incident(
+            "ssh_bruteforce:185.234.1.1:window",
+            vec![EntityRef::user("alice"), EntityRef::ip("185.234.1.1")],
+        );
+
+        record_suppressed(dir.path(), &incident, SuppressReason::Cooldown);
+
+        let events = notification_pipeline::feedback_store::load(dir.path());
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            FeedbackEvent::Suppressed {
+                detector,
+                entity_type,
+                incident_id,
+                reason,
+                ..
+            } => {
+                assert_eq!(detector, "ssh_bruteforce");
+                assert_eq!(entity_type, &EntityType::User);
+                assert_eq!(incident_id, "ssh_bruteforce:185.234.1.1:window");
+                assert_eq!(*reason, SuppressReason::Cooldown);
+            }
+            other => panic!("expected suppressed event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_suppressed_defaults_to_ip_when_incident_has_no_entities() {
+        let dir = tempfile::tempdir().unwrap();
+        let incident = incident("environment_noise", vec![]);
+
+        record_suppressed(dir.path(), &incident, SuppressReason::Environment);
+
+        let events = notification_pipeline::feedback_store::load(dir.path());
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            FeedbackEvent::Suppressed {
+                detector,
+                entity_type,
+                reason,
+                ..
+            } => {
+                assert_eq!(detector, "environment_noise");
+                assert_eq!(entity_type, &EntityType::Ip);
+                assert_eq!(*reason, SuppressReason::Environment);
+            }
+            other => panic!("expected suppressed event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_suppressed_uses_empty_detector_for_empty_incident_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let incident = incident("", vec![EntityRef::ip("185.234.1.1")]);
+
+        record_suppressed(dir.path(), &incident, SuppressReason::Grouped);
+
+        let events = notification_pipeline::feedback_store::load(dir.path());
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            FeedbackEvent::Suppressed {
+                detector, reason, ..
+            } => {
+                assert!(detector.is_empty());
+                assert_eq!(*reason, SuppressReason::Grouped);
+            }
+            other => panic!("expected suppressed event, got {other:?}"),
+        }
     }
 }
