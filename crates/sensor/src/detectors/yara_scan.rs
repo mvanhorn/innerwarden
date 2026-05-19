@@ -797,4 +797,145 @@ condition: any
         let matches = scan_content(content, &rules);
         assert!(matches.is_empty());
     }
+
+    fn test_rule(id: &str, condition: MatchCondition) -> ScanRule {
+        ScanRule {
+            id: id.into(),
+            name: format!("Rule {id}"),
+            severity: Severity::High,
+            strings: vec!["needle".into()],
+            hex_patterns: vec![parse_hex_pattern("de ad ?? ef")],
+            condition,
+            tags: vec!["test_tag".into()],
+        }
+    }
+
+    fn exec_event(filename: &Path, ts: DateTime<Utc>) -> Event {
+        Event {
+            ts,
+            host: "test-host".into(),
+            source: "ebpf".into(),
+            kind: "process.exec".into(),
+            severity: Severity::Info,
+            summary: "exec".into(),
+            details: serde_json::json!({
+                "filename": filename.display().to_string(),
+                "pid": 4242,
+                "comm": "payload",
+            }),
+            tags: vec![],
+            entities: vec![],
+        }
+    }
+
+    #[test]
+    fn scan_content_all_condition_combines_string_and_hex_matches() {
+        let rules = vec![test_rule("ALL", MatchCondition::All)];
+
+        assert_eq!(
+            scan_content(b"prefix NEEDLE bytes \xde\xad\x01\xef", &rules).len(),
+            1
+        );
+        assert!(scan_content(b"prefix NEEDLE but no matching bytes", &rules).is_empty());
+        assert!(scan_content(b"\xde\xad\x01\xef but no string", &rules).is_empty());
+    }
+
+    #[test]
+    fn parse_rule_yaml_defaults_unknown_severity_and_condition() {
+        let yaml = r#"
+id: TEST-DEFAULTS
+name: Defaults
+severity: unknown
+strings: [needle]
+condition: sometimes
+"#;
+
+        let rule = parse_rule_yaml(yaml).expect("rule with strings should parse");
+        assert_eq!(rule.severity, Severity::High);
+        assert_eq!(rule.condition, MatchCondition::Any);
+        assert_eq!(rule.strings, vec!["needle"]);
+    }
+
+    #[test]
+    fn parse_rule_yaml_rejects_rules_without_patterns_or_required_fields() {
+        assert!(parse_rule_yaml("id: ONLY-ID\nstrings: [needle]\n").is_none());
+        assert!(parse_rule_yaml("id: EMPTY\nname: Empty\ntags: [meta]\n").is_none());
+        assert!(serde_yaml_to_json("# comment only\n\n").is_none());
+    }
+
+    #[test]
+    fn load_rules_loads_yaml_files_and_keeps_builtin_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("custom.yaml"),
+            "id: CUSTOM-1\nname: Custom\nseverity: low\nstrings:\n  - needle\ncondition: all\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("ignored.txt"), "id: IGNORED\n").unwrap();
+
+        let rules = load_rules(dir.path());
+
+        let custom = rules.iter().find(|r| r.id == "CUSTOM-1").unwrap();
+        assert_eq!(custom.severity, Severity::Low);
+        assert_eq!(custom.condition, MatchCondition::All);
+        assert!(rules.iter().any(|r| r.id == "MAL-001"));
+        assert!(!rules.iter().any(|r| r.id == "IGNORED"));
+    }
+
+    #[test]
+    fn detector_emits_incident_then_respects_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = dir.path().join("payload.bin");
+        std::fs::write(&payload, b"prefix needle bytes \xde\xad\x01\xef").unwrap();
+        std::fs::write(
+            dir.path().join("custom.yml"),
+            "id: CUSTOM-2\nname: Custom Malware\nseverity: critical\nstrings:\n  - needle\nhex_patterns:\n  - \"de ad ?? ef\"\ncondition: all\ntags: [custom, malware]\n",
+        )
+        .unwrap();
+
+        let mut detector = YaraScanDetector::new("host-a", dir.path(), 60);
+        let now = Utc::now();
+        let first = detector
+            .process(&exec_event(&payload, now))
+            .expect("matching payload should emit an incident");
+
+        assert_eq!(first.host, "host-a");
+        assert_eq!(first.severity, Severity::Critical);
+        assert!(first.incident_id.starts_with("yara_scan:CUSTOM-2:4242:"));
+        assert!(first.title.contains("Custom Malware"));
+        assert!(first.tags.contains(&"yara".to_string()));
+        assert!(first.tags.contains(&"custom".to_string()));
+        assert_eq!(
+            first.entities,
+            vec![EntityRef::path(payload.display().to_string())]
+        );
+
+        let second = detector.process(&exec_event(&payload, now + Duration::seconds(30)));
+        assert!(
+            second.is_none(),
+            "same file should be suppressed during cooldown"
+        );
+    }
+
+    #[test]
+    fn detector_marks_clean_binary_known_good_after_first_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = dir.path().join("clean.bin");
+        std::fs::write(&payload, b"ordinary utility").unwrap();
+        std::fs::write(
+            dir.path().join("custom.yml"),
+            "id: CUSTOM-3\nname: Custom Malware\nstrings:\n  - needle\n",
+        )
+        .unwrap();
+
+        let mut detector = YaraScanDetector::new("host-a", dir.path(), 60);
+        assert!(detector
+            .process(&exec_event(&payload, Utc::now()))
+            .is_none());
+        assert_eq!(detector.known_hashes.len(), 1);
+        assert!(detector
+            .process(&exec_event(&payload, Utc::now()))
+            .is_none());
+        assert_eq!(detector.known_hashes.len(), 1);
+    }
 }
