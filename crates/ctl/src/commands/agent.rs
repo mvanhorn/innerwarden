@@ -877,10 +877,10 @@ pub(crate) fn cmd_agent(cli: &Cli, command: Option<&AgentCommand>) -> Result<()>
 mod tests {
     use super::*;
     use clap::Parser;
-    use std::io::{ErrorKind, Read, Write};
+    use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     fn test_cli(temp: &TempDir) -> Cli {
@@ -910,27 +910,30 @@ mod tests {
     fn start_one_shot_json_server(
         response_body: &'static str,
     ) -> (String, thread::JoinHandle<String>) {
+        // Blocking accept on a default (blocking) listener: the kernel
+        // wakes the spawned thread immediately when a client connects.
+        //
+        // Prior version used `set_nonblocking(true)` + a 10ms-poll loop
+        // with a 5s userspace deadline. Under cargo-test parallelism
+        // (the ctl crate runs 1100+ tests concurrently), the spawned
+        // thread could be descheduled long enough that the client's own
+        // 5s `ureq` global timeout fired before the polling loop caught
+        // the connection. The result was a flake that hit
+        // `fetch_connected_pids_parses_real_response_shape` on PRs #713,
+        // #725, and main's post-merge run for `95aeb362`.
+        //
+        // Blocking accept removes the userspace polling latency entirely
+        // — the thread sits in a kernel wait, woken by the listener's
+        // socket becoming readable. The `read_timeout` on the accepted
+        // stream is the safety net so a misbehaving client doesn't hang
+        // the test for cargo's full default timeout.
         let listener = TcpListener::bind("127.0.0.1:0").expect("test should bind local server");
         let addr = listener.local_addr().expect("test should read local addr");
-        listener
-            .set_nonblocking(true)
-            .expect("test should make listener nonblocking");
         let handle = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let (mut stream, _) = loop {
-                match listener.accept() {
-                    Ok(pair) => break pair,
-                    Err(err)
-                        if err.kind() == ErrorKind::WouldBlock && Instant::now() < deadline =>
-                    {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                        panic!("test server timed out waiting for dashboard request");
-                    }
-                    Err(err) => panic!("test should accept request: {err}"),
-                }
-            };
+            let (mut stream, _) = listener.accept().expect("test should accept request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("test should set read timeout");
             let mut buf = [0_u8; 4096];
             let n = stream.read(&mut buf).expect("test should read request");
             let request = String::from_utf8_lossy(&buf[..n]).to_string();
