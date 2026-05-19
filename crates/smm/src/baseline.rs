@@ -311,6 +311,91 @@ mod tests {
     }
 
     #[test]
+    fn save_creates_parent_directories() {
+        let baseline = FirmwareBaseline {
+            captured_at: "2026-01-01T00:00:00Z".into(),
+            hostname: "nested-host".into(),
+            bios: BiosBaseline {
+                vendor: "Vendor".into(),
+                version: "2.0".into(),
+                date: "02/02/2026".into(),
+                release: "2.0".into(),
+            },
+            acpi_tables: vec![],
+            pcrs: BTreeMap::new(),
+            spi_hash: Some("feedface".into()),
+            smi_count: Some(7),
+            secure_boot: Some(false),
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("missing")
+            .join("firmware")
+            .join("baseline.json");
+        baseline.save(&path).unwrap();
+
+        let loaded = FirmwareBaseline::load(&path).unwrap();
+        assert_eq!(loaded.hostname, "nested-host");
+        assert_eq!(loaded.spi_hash.as_deref(), Some("feedface"));
+        assert_eq!(loaded.secure_boot, Some(false));
+    }
+
+    #[test]
+    fn load_reports_missing_file_and_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.json");
+        assert!(FirmwareBaseline::load(&missing).is_err());
+
+        let invalid = dir.path().join("invalid.json");
+        fs::write(&invalid, "not json").unwrap();
+        assert!(FirmwareBaseline::load(&invalid).is_err());
+    }
+
+    #[test]
+    fn baseline_roundtrip_preserves_optional_and_collection_fields() {
+        let baseline = FirmwareBaseline {
+            captured_at: "2026-03-04T05:06:07Z".into(),
+            hostname: "full-host".into(),
+            bios: BiosBaseline {
+                vendor: "FullVendor".into(),
+                version: "3.0".into(),
+                date: "03/04/2026".into(),
+                release: "3.0".into(),
+            },
+            acpi_tables: vec![
+                AcpiTableBaseline {
+                    name: "DSDT".into(),
+                    size: 4096,
+                    sha256: "a".repeat(64),
+                },
+                AcpiTableBaseline {
+                    name: "SSDT".into(),
+                    size: 2048,
+                    sha256: "b".repeat(64),
+                },
+            ],
+            pcrs: BTreeMap::from([(0, "pcr0".into()), (7, "pcr7".into())]),
+            spi_hash: Some("spi-hash".into()),
+            smi_count: Some(123),
+            secure_boot: Some(true),
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("baseline.json");
+        baseline.save(&path).unwrap();
+
+        let loaded = FirmwareBaseline::load(&path).unwrap();
+        assert_eq!(loaded.captured_at, "2026-03-04T05:06:07Z");
+        assert_eq!(loaded.bios.release, "3.0");
+        assert_eq!(loaded.acpi_tables[1].name, "SSDT");
+        assert_eq!(loaded.pcrs.get(&7).map(String::as_str), Some("pcr7"));
+        assert_eq!(loaded.smi_count, Some(123));
+        assert_eq!(loaded.secure_boot, Some(true));
+    }
+
+    #[test]
     fn drift_detection_bios_update() {
         let baseline = FirmwareBaseline {
             captured_at: "2026-01-01T00:00:00Z".into(),
