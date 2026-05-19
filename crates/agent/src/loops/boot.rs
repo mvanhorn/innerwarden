@@ -2565,6 +2565,16 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                     false
                 }
                 _ = firmware_ticker.tick() => {
+                    // Diagnostic (2026-05-19): firmware_tick observed silent
+                    // on Oracle prod for 13+ h despite cfg.firmware.enabled=true
+                    // and binary containing all firmware_tick code paths. Log
+                    // unconditionally so we can distinguish "arm never selected"
+                    // from "selected but skipped" from "selected but emitted nothing".
+                    info!(
+                        enabled = cfg.firmware.enabled,
+                        poll_secs = cfg.firmware.poll_secs,
+                        "firmware_ticker.tick() fired"
+                    );
                     if cfg.firmware.enabled {
                         firmware_tick::process_firmware_tick(&cli.data_dir, &cfg, &mut state)
                             .await;
@@ -2572,6 +2582,12 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                     false
                 }
                 _ = hypervisor_ticker.tick() => {
+                    // Same diagnostic as firmware_ticker above (sister arm).
+                    info!(
+                        enabled = cfg.hypervisor.enabled,
+                        poll_secs = cfg.hypervisor.poll_secs,
+                        "hypervisor_ticker.tick() fired"
+                    );
                     if cfg.hypervisor.enabled {
                         hypervisor_tick::process_hypervisor_tick(&cli.data_dir, &cfg, &mut state)
                             .await;
