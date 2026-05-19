@@ -23,12 +23,22 @@ Include:
 - Impact (what an attacker can do)
 - Whether responder was enabled (`dry_run = true` or `false`)
 
-## What We Do
+## What We Do — SLA
 
-- Acknowledge within 48 hours
-- Validate and assess severity
-- Fix and release a patched version
-- Credit the reporter (unless they prefer anonymity)
+| Stage | Target | Notes |
+| --- | --- | --- |
+| Acknowledgement | **48 hours** | A human reads your report and confirms receipt. |
+| Initial triage | **30 days** | Severity assigned, owner named, tentative fix timeline shared. |
+| Fix for Critical / High | **90 days** | Patched release published. Active in-the-wild exploitation triggers the IR runbook (hours-not-days response). |
+| Fix for Medium | **120 days** | Patch or documented mitigation. |
+| Fix for Low | next release cycle | Bundled into normal cadence. |
+| Public disclosure | within 14 days of fix | Joint advisory via GHSA; CVE where applicable; reporter credited unless they prefer anonymity. |
+
+Inner Warden is solo-maintained today. The commitments above are the policy we hold ourselves to. If we cannot hit a milestone we tell you why and propose a new date — silence is not an acceptable response from us.
+
+For the full disclosure policy (severity definitions, scope, safe-harbour language, what we ask of reporters), see the [**Vulnerability Disclosure Policy**](https://github.com/InnerWarden/innerwarden/wiki/Vulnerability-Disclosure-Policy) on the wiki.
+
+For project-level incident response (what happens if our signing key, CI, or release pipeline is compromised), see the [**Incident Response Runbook**](https://github.com/InnerWarden/innerwarden/wiki/Incident-Response).
 
 ## Supply Chain
 
