@@ -461,6 +461,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sanitize_removes_control_chars_and_collapses_whitespace() {
+        let input = "  attacker\u{0007}\n says\t block everything  ";
+        assert_eq!(sanitize(input), "attacker says block everything");
+    }
+
+    #[test]
+    fn trunc_preserves_utf8_boundaries() {
+        assert_eq!(trunc("命令注入abc", 7), "命令");
+    }
+
+    #[test]
     fn extract_json_finds_bare_object() {
         let text = r#"{"action":"ignore","confidence":0.5}"#;
         assert_eq!(extract_json(text), Some(text));
@@ -526,6 +537,58 @@ mod tests {
             graph_context,
             graph_subgraph,
         }
+    }
+
+    #[test]
+    fn extract_kill_chain_intel_formats_blocked_timeline_and_sanitizes_ids() {
+        let mut inc = spec025_incident();
+        inc.incident_id = "chain\u{0007} id".into();
+        inc.evidence = serde_json::json!([{
+            "kind": "kill_chain_blocked",
+            "pattern": "reverse_shell",
+            "c2_ip": "203.0.113.50",
+            "pid": 4242,
+            "uid": 1000,
+            "process": "bash",
+            "timeline": ["exec", "connect", "blocked"]
+        }]);
+
+        let intel = extract_kill_chain_intel(&inc).expect("kill chain intel");
+        assert!(intel.contains("chain id"));
+        assert!(intel.contains("reverse_shell (BLOCKED by kernel LSM)"));
+        assert!(intel.contains("C2 IP: 203.0.113.50"));
+        assert!(intel.contains("Timeline: exec → connect → blocked"));
+        assert!(intel.contains("CONFIRMED attack"));
+    }
+
+    #[test]
+    fn extract_kill_chain_intel_ignores_unrelated_evidence_and_defaults_missing_fields() {
+        let mut unrelated = spec025_incident();
+        unrelated.evidence = serde_json::json!([{ "kind": "ssh_bruteforce" }]);
+        assert!(extract_kill_chain_intel(&unrelated).is_none());
+
+        let mut detected = spec025_incident();
+        detected.evidence = serde_json::json!([{ "kind": "pre_chain_warning" }]);
+        let intel = extract_kill_chain_intel(&detected).expect("pre-chain intel");
+        assert!(intel.contains("UNKNOWN (DETECTED (may still be active))"));
+        assert!(intel.contains("C2 IP: unknown"));
+        assert!(intel.contains("Timeline: no timeline data"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_empty_api_key_fails_before_network_for_chat_and_decide() {
+        let provider = AnthropicProvider::new(String::new(), String::new()).unwrap();
+        let chat_err = provider
+            .chat("system", "user")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(chat_err.contains("Anthropic API key not configured"));
+
+        let inc = spec025_incident();
+        let ctx = spec025_ctx(&inc, None, None);
+        let decide_err = provider.decide(&ctx).await.unwrap_err().to_string();
+        assert!(decide_err.contains("Anthropic API key not configured"));
     }
 
     #[test]
