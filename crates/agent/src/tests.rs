@@ -5,6 +5,7 @@ use crate::loops::slow_loop::{
 };
 use crate::process::incidents::process_incidents;
 use crate::process::telegram_approval::process_telegram_approval;
+use clap::Parser;
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -1708,6 +1709,91 @@ fn narrative_accumulator_resets_on_date_change() {
     assert_eq!(acc.total_events, 0);
     assert!(acc.events_by_kind.is_empty());
     assert_eq!(acc.date, "2026-01-02");
+}
+
+#[test]
+fn cli_parses_validate_config_only_with_required_config_path() {
+    let cli = Cli::try_parse_from([
+        "innerwarden-agent",
+        "--validate-config-only",
+        "--config",
+        "/tmp/agent.toml",
+    ])
+    .expect("validate config args should parse");
+
+    assert!(cli.validate_config_only);
+    assert_eq!(
+        cli.config.as_deref(),
+        Some(std::path::Path::new("/tmp/agent.toml"))
+    );
+    assert!(!cli.once);
+    assert!(!cli.dashboard);
+}
+
+#[test]
+fn cli_parses_dashboard_tls_and_report_options() {
+    let cli = Cli::try_parse_from([
+        "innerwarden-agent",
+        "--data-dir",
+        "/tmp/iw",
+        "--dashboard",
+        "--dashboard-bind",
+        "0.0.0.0:8787",
+        "--tls-cert",
+        "/tmp/cert.pem",
+        "--tls-key",
+        "/tmp/key.pem",
+        "--report",
+        "--report-dir",
+        "/tmp/reports",
+    ])
+    .expect("dashboard args should parse");
+
+    assert_eq!(cli.data_dir, PathBuf::from("/tmp/iw"));
+    assert!(cli.dashboard);
+    assert_eq!(cli.dashboard_bind, "0.0.0.0:8787");
+    assert_eq!(cli.tls_cert.as_deref(), Some("/tmp/cert.pem"));
+    assert_eq!(cli.tls_key.as_deref(), Some("/tmp/key.pem"));
+    assert!(cli.report);
+    assert_eq!(
+        cli.report_dir.as_deref(),
+        Some(std::path::Path::new("/tmp/reports"))
+    );
+}
+
+#[test]
+fn cli_parses_hidden_honeypot_sandbox_options() {
+    let cli = Cli::try_parse_from([
+        "innerwarden-agent",
+        "--honeypot-sandbox-runner",
+        "--honeypot-sandbox-spec",
+        "/tmp/spec.json",
+        "--honeypot-sandbox-result",
+        "/tmp/result.json",
+    ])
+    .expect("hidden sandbox args should parse");
+
+    assert!(cli.honeypot_sandbox_runner);
+    assert_eq!(
+        cli.honeypot_sandbox_spec.as_deref(),
+        Some(std::path::Path::new("/tmp/spec.json"))
+    );
+    assert_eq!(
+        cli.honeypot_sandbox_result.as_deref(),
+        Some(std::path::Path::new("/tmp/result.json"))
+    );
+}
+
+#[test]
+fn cli_default_values_match_safe_runtime_defaults() {
+    let cli = Cli::try_parse_from(["innerwarden-agent"]).expect("defaults should parse");
+
+    assert_eq!(cli.data_dir, PathBuf::from("/var/lib/innerwarden"));
+    assert_eq!(cli.dashboard_bind, "127.0.0.1:8787");
+    assert_eq!(cli.interval, 30);
+    assert!(cli.config.is_none());
+    assert!(cli.report_dir.is_none());
+    assert!(!cli.insecure_no_tls);
 }
 
 // ── Wave 9f anchors (2026-05-04) — journald-detection contract ─────────
