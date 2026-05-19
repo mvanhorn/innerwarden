@@ -401,8 +401,23 @@ fn event_to_atom(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use innerwarden_core::{entities::EntityRef, event::Event};
     use innerwarden_dna::fingerprint::ThreatDna;
     use tempfile::TempDir;
+
+    fn event(kind: &str, details: serde_json::Value, entities: Vec<EntityRef>) -> Event {
+        Event {
+            ts: chrono::Utc::now(),
+            host: "test-host".to_string(),
+            source: "test".to_string(),
+            kind: kind.to_string(),
+            summary: "test event".to_string(),
+            severity: innerwarden_core::event::Severity::Info,
+            details,
+            tags: Vec::new(),
+            entities,
+        }
+    }
 
     fn dna_store_with_entries(entries: Vec<ThreatDna>) -> (TempDir, DnaStore) {
         let dir = TempDir::new().expect("tempdir");
@@ -449,6 +464,101 @@ mod tests {
     //   4. ThreatDna with empty `source_ip` is skipped — defensive
     //      against a stale row from a previous agent version
     //      polluting the index with a blank-string key.
+
+    #[test]
+    fn event_to_atom_converts_supported_event_kinds_and_prefers_trimmed_details_ip() {
+        let cases = [
+            (
+                "shell.command_exec",
+                serde_json::json!({"src_ip":" 203.0.113.10 ","cmdline":"cat /etc/shadow","comm":"bash"}),
+                "exec:Other",
+                "bash",
+            ),
+            (
+                "process.exec",
+                serde_json::json!({"ip":"198.51.100.10","comm":"/bin/sh"}),
+                "exec:Shell",
+                "/bin/sh",
+            ),
+            (
+                "network.outbound_connect",
+                serde_json::json!({"src_ip":"203.0.113.11","dst_port":22}),
+                "connect:Ssh",
+                "",
+            ),
+            (
+                "network.connection",
+                serde_json::json!({"src_ip":"203.0.113.12","port":443}),
+                "connect:Http",
+                "",
+            ),
+            (
+                "file.read_access",
+                serde_json::json!({"src_ip":"203.0.113.13","path":"/etc/passwd"}),
+                "file:Credentials",
+                "",
+            ),
+            (
+                "file.open",
+                serde_json::json!({"src_ip":"203.0.113.14","filename":"/tmp/note.txt"}),
+                "file:Tmp",
+                "",
+            ),
+            (
+                "auth.login_success",
+                serde_json::json!({"src_ip":"203.0.113.15"}),
+                "login:success",
+                "",
+            ),
+            (
+                "auth.login_failure",
+                serde_json::json!({"src_ip":"203.0.113.16"}),
+                "login:failure",
+                "",
+            ),
+            (
+                "privilege.escalation",
+                serde_json::json!({"src_ip":"203.0.113.17"}),
+                "privesc",
+                "",
+            ),
+        ];
+
+        for (kind, details, expected_key, expected_comm) in cases {
+            let (source_ip, _atom, atom_key, comm) =
+                event_to_atom(&event(kind, details, Vec::new())).expect("supported event kind");
+            assert_eq!(atom_key, expected_key, "kind {kind}");
+            assert_eq!(comm, expected_comm, "kind {kind}");
+            assert!(source_ip
+                .as_deref()
+                .expect("details IP should be present")
+                .starts_with(|c: char| c.is_ascii_digit()));
+        }
+    }
+
+    #[test]
+    fn event_to_atom_uses_entity_ip_when_details_ip_is_blank() {
+        let ev = event(
+            "auth.login_failure",
+            serde_json::json!({"src_ip":"   "}),
+            vec![EntityRef::ip(" 198.51.100.25 ")],
+        );
+        let (source_ip, _atom, atom_key, _comm) = event_to_atom(&ev).expect("login failure atom");
+
+        assert_eq!(source_ip.as_deref(), Some("198.51.100.25"));
+        assert_eq!(atom_key, "login:failure");
+    }
+
+    #[test]
+    fn event_to_atom_ignores_unknown_event_kind() {
+        let ev = event(
+            "dns.query",
+            serde_json::json!({"src_ip":"203.0.113.30","query":"example.test"}),
+            Vec::new(),
+        );
+
+        assert!(event_to_atom(&ev).is_none());
+    }
 
     #[test]
     fn rebuild_dna_ip_index_is_empty_on_fresh_store() {
