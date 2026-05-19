@@ -3120,6 +3120,155 @@ mod tests {
     }
 
     #[test]
+    fn cli_global_flags_apply_across_grouped_commands() {
+        let cli = Cli::try_parse_from([
+            "innerwarden",
+            "--data-dir",
+            "/tmp/iw-data",
+            "--dry-run",
+            "get",
+            "decisions",
+            "--days",
+            "5",
+            "--action",
+            "block_ip",
+        ])
+        .expect("parse cli");
+
+        assert_eq!(cli.data_dir, PathBuf::from("/tmp/iw-data"));
+        assert!(cli.dry_run);
+        match cli.command {
+            Some(Command::Get {
+                command:
+                    Some(GetCommand::Decisions {
+                        days,
+                        action: Some(action),
+                    }),
+            }) => {
+                assert_eq!(days, 5);
+                assert_eq!(action, "block_ip");
+            }
+            _ => panic!("expected get decisions command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_stream_defaults_and_overrides() {
+        let default_cli = Cli::try_parse_from(["innerwarden", "stream"]).expect("parse cli");
+        match default_cli.command {
+            Some(Command::Stream { r#type, interval }) => {
+                assert_eq!(r#type, "incidents");
+                assert_eq!(interval, 2);
+            }
+            _ => panic!("expected stream command"),
+        }
+
+        let custom_cli = Cli::try_parse_from([
+            "innerwarden",
+            "stream",
+            "--type",
+            "events",
+            "--interval",
+            "9",
+        ])
+        .expect("parse cli");
+        match custom_cli.command {
+            Some(Command::Stream { r#type, interval }) => {
+                assert_eq!(r#type, "events");
+                assert_eq!(interval, 9);
+            }
+            _ => panic!("expected stream command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_action_block_and_requires_reason() {
+        let cli = Cli::try_parse_from([
+            "innerwarden",
+            "action",
+            "block",
+            "203.0.113.10",
+            "--reason",
+            "operator investigation",
+        ])
+        .expect("parse cli");
+        match cli.command {
+            Some(Command::Action {
+                command: Some(ActionCommand::Block { ip, reason }),
+            }) => {
+                assert_eq!(ip, "203.0.113.10");
+                assert_eq!(reason, "operator investigation");
+            }
+            _ => panic!("expected action block command"),
+        }
+
+        let err = match Cli::try_parse_from(["innerwarden", "action", "block", "203.0.113.10"]) {
+            Ok(_) => panic!("missing reason should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn cli_parses_config_nested_commands() {
+        let ai_cli = Cli::try_parse_from([
+            "innerwarden",
+            "config",
+            "ai",
+            "openrouter",
+            "--model",
+            "qwen/qwen3",
+            "--base-url",
+            "https://openrouter.ai/api",
+        ])
+        .expect("parse cli");
+        match ai_cli.command {
+            Some(Command::Config {
+                command:
+                    Some(ConfigAllCommand::Ai {
+                        provider: Some(provider),
+                        model: Some(model),
+                        base_url: Some(base_url),
+                        key: None,
+                    }),
+            }) => {
+                assert_eq!(provider, "openrouter");
+                assert_eq!(model, "qwen/qwen3");
+                assert_eq!(base_url, "https://openrouter.ai/api");
+            }
+            _ => panic!("expected config ai command"),
+        }
+
+        let mesh_cli =
+            Cli::try_parse_from(["innerwarden", "config", "mesh", "status"]).expect("parse cli");
+        match mesh_cli.command {
+            Some(Command::Config {
+                command:
+                    Some(ConfigAllCommand::Mesh {
+                        command: MeshCommand::Status,
+                    }),
+            }) => {}
+            _ => panic!("expected config mesh status command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_setup_mode_and_rejects_unknown_mode() {
+        let cli =
+            Cli::try_parse_from(["innerwarden", "setup", "--mode", "advanced"]).expect("parse cli");
+        match cli.command {
+            Some(Command::Setup { mode }) => assert_eq!(mode, "advanced"),
+            _ => panic!("expected setup command"),
+        }
+
+        let err = match Cli::try_parse_from(["innerwarden", "setup", "--mode", "expert"]) {
+            Ok(_) => panic!("invalid setup mode should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
     fn cli_parses_install_warden_defaults() {
         let cli = Cli::try_parse_from(["innerwarden", "install-warden"]).expect("parse cli");
         match cli.command {
