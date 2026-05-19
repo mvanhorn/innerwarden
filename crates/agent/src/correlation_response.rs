@@ -704,6 +704,35 @@ mod tests {
     use super::*;
     use crate::knowledge_graph::{graph::KnowledgeGraph, types::*};
 
+    fn add_incident(
+        graph: &mut KnowledgeGraph,
+        detector: &str,
+        ts: chrono::DateTime<chrono::Utc>,
+    ) -> NodeId {
+        graph.add_node(Node::Incident {
+            incident_id: format!(
+                "{detector}:test:{}",
+                ts.timestamp_nanos_opt().unwrap_or_default()
+            ),
+            detector: detector.into(),
+            severity: "High".into(),
+            title: detector.into(),
+            summary: "".into(),
+            ts,
+            mitre_ids: vec![],
+            decision: None,
+            confidence: None,
+            decision_reason: None,
+            decision_target: None,
+            auto_executed: false,
+            is_allowlisted: false,
+            false_positive: false,
+            fp_reporter: None,
+            fp_reported_at: None,
+            research_only: false,
+        })
+    }
+
     // `drop_invalid_repeat_offender` is the gate that keeps corrupted
     // `ip-reputation.json` entries from ever reaching the block pipeline.
     // Cover every production-seen failure shape + the happy path.
@@ -912,6 +941,76 @@ mod tests {
         assert_eq!(result[0].1.len(), 2);
         assert!(result[0].1.contains(&"port_scan".to_string()));
         assert!(result[0].1.contains(&"ssh_bruteforce".to_string()));
+    }
+
+    #[test]
+    fn find_multi_technique_ignores_non_triggeredby_edges_and_non_ip_targets() {
+        let mut graph = KnowledgeGraph::new();
+        let now = chrono::Utc::now();
+
+        let ip = graph.ensure_ip("4.4.4.4", now);
+        let domain = graph.ensure_domain("example.test");
+        let ssh = add_incident(&mut graph, "ssh_bruteforce", now);
+        let web = add_incident(&mut graph, "web_scan", now);
+        let dns = add_incident(&mut graph, "dns_probe", now);
+
+        graph.add_edge(Edge::new(ssh, ip, Relation::CorrelatedWith, now));
+        graph.add_edge(Edge::new(web, domain, Relation::TriggeredBy, now));
+        graph.add_edge(Edge::new(dns, ip, Relation::TriggeredBy, now));
+
+        let result = find_multi_technique_ips(&graph, now - chrono::Duration::minutes(30));
+        assert!(
+            result.is_empty(),
+            "only TriggeredBy edges to Ip nodes should count toward multi-technique correlation"
+        );
+    }
+
+    #[test]
+    fn find_multi_technique_sorts_detector_names_for_stable_payloads() {
+        let mut graph = KnowledgeGraph::new();
+        let now = chrono::Utc::now();
+        let ip = graph.ensure_ip("7.7.7.7", now);
+
+        for detector in ["z_last", "a_first", "m_middle"] {
+            let inc = add_incident(&mut graph, detector, now);
+            graph.add_edge(Edge::new(inc, ip, Relation::TriggeredBy, now));
+        }
+
+        let result = find_multi_technique_ips(&graph, now - chrono::Duration::minutes(30));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "7.7.7.7");
+        assert_eq!(
+            result[0].1,
+            vec![
+                "a_first".to_string(),
+                "m_middle".to_string(),
+                "z_last".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn find_multi_technique_keeps_cutoff_boundary_incidents() {
+        let mut graph = KnowledgeGraph::new();
+        let now = chrono::Utc::now();
+        let cutoff = now - chrono::Duration::minutes(30);
+        let ip = graph.ensure_ip("8.8.4.4", now);
+
+        let boundary = add_incident(&mut graph, "boundary_detector", cutoff);
+        let recent = add_incident(&mut graph, "recent_detector", now);
+        graph.add_edge(Edge::new(boundary, ip, Relation::TriggeredBy, cutoff));
+        graph.add_edge(Edge::new(recent, ip, Relation::TriggeredBy, now));
+
+        let result = find_multi_technique_ips(&graph, cutoff);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].1,
+            vec![
+                "boundary_detector".to_string(),
+                "recent_detector".to_string()
+            ],
+            "incidents exactly at cutoff are still inside the correlation window"
+        );
     }
 
     #[test]
