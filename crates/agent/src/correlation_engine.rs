@@ -383,7 +383,10 @@ impl CorrelationEngine {
     }
 
     /// Create a CorrelationEvent from SMM firmware scan results.
-    #[allow(dead_code)]
+    /// Called from `firmware_tick::process_firmware_tick` for each
+    /// Critical/Warning check and each correlated threat, so CL-043
+    /// (Ring -2 + Ring -1 deep compromise) can match against real
+    /// firmware signal alongside hypervisor and kernel events.
     pub fn firmware_event(kind: &str, details: serde_json::Value) -> CorrelationEvent {
         CorrelationEvent {
             ts: Utc::now(),

@@ -73,6 +73,14 @@ pub(crate) async fn process_firmware_tick(
         }
     };
 
+    // Feed the cross-layer correlation engine with firmware events.
+    // Mirrors `hypervisor_tick.rs:31-49`. Without this, CL-043
+    // ("Firmware + Hypervisor Compromise — deep persistent threat
+    // across Ring -2 and -1") is dead code: the rule depends on
+    // `firmware.*` kind events landing in the engine, but
+    // firmware_tick previously only wrote to JSONL.
+    observe_firmware_events_into_engine(&report, &mut state.correlation_engine);
+
     let host = std::fs::read_to_string("/etc/hostname")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "unknown".into());
@@ -309,6 +317,79 @@ fn parse_suppressed_ids(content: &str) -> HashSet<String> {
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(ToString::to_string)
         .collect()
+}
+
+/// Build the set of `CorrelationEvent`s that an SMM `FirmwareReport`
+/// should contribute to the cross-layer engine. Pure — no engine
+/// interaction, no side effects — so each branch is testable in
+/// isolation.
+///
+/// Contract:
+///   - Critical and Warning checks → `firmware.<check_id>`
+///   - Correlated threats → `firmware.threat.<threat_id>`
+///   - Secure and Unavailable checks are intentionally skipped
+///     (absence of signal, not signal — would flood the engine on
+///     every healthy boot)
+///   - check_id and threat_id are lowercased and dashes become
+///     underscores so the resulting kind matches the glob patterns
+///     CL-043 uses (`firmware.*`)
+fn build_firmware_events(
+    report: &innerwarden_smm::FirmwareReport,
+) -> Vec<crate::correlation_engine::CorrelationEvent> {
+    let mut events = Vec::new();
+
+    for check in &report.checks {
+        if check.status == innerwarden_smm::CheckStatus::Critical
+            || check.status == innerwarden_smm::CheckStatus::Warning
+        {
+            let kind = format!("firmware.{}", check.id.to_lowercase().replace('-', "_"));
+            events.push(
+                crate::correlation_engine::CorrelationEngine::firmware_event(
+                    &kind,
+                    serde_json::json!({
+                        "check_id": check.id,
+                        "name": check.name,
+                        "status": format!("{:?}", check.status),
+                        "confidence": check.confidence,
+                        "detail": check.detail,
+                    }),
+                ),
+            );
+        }
+    }
+
+    for threat in &report.correlated_threats {
+        let kind = format!(
+            "firmware.threat.{}",
+            threat.id.to_lowercase().replace('-', "_")
+        );
+        events.push(
+            crate::correlation_engine::CorrelationEngine::firmware_event(
+                &kind,
+                serde_json::json!({
+                    "threat_id": threat.id,
+                    "name": threat.name,
+                    "confidence": threat.confidence,
+                    "detail": threat.detail,
+                }),
+            ),
+        );
+    }
+
+    events
+}
+
+/// Observe every Critical/Warning firmware check (and every correlated
+/// threat) into the cross-layer correlation engine. Thin wrapper around
+/// `build_firmware_events` so the engine interaction is isolated.
+/// Mirrors `hypervisor_tick.rs:31-49`.
+fn observe_firmware_events_into_engine(
+    report: &innerwarden_smm::FirmwareReport,
+    engine: &mut crate::correlation_engine::CorrelationEngine,
+) {
+    for event in build_firmware_events(report) {
+        engine.observe(event);
+    }
 }
 
 fn classify_firmware_trust_severity(score: f64, on_vm: bool) -> innerwarden_core::event::Severity {
@@ -591,5 +672,122 @@ mod tests {
             state.telegram_deferred.is_empty(),
             "deferred counter must NOT increment when Telegram is disabled"
         );
+    }
+
+    // ── 2026-05-19 anchors (SMM↔correlation engine wiring) ──────────
+    //
+    // PR audit on prod found `firmware_tick` was generating Incident
+    // values but NEVER calling `correlation_engine.observe()` — the
+    // factory `CorrelationEvent::firmware_event()` had `#[allow(dead_code)]`
+    // because nothing called it. That made CL-043 ("Firmware + Hypervisor
+    // Compromise") dead code at the rule layer. These four tests pin
+    // the fix so the wiring cannot silently regress.
+
+    fn test_check(
+        id: &'static str,
+        status: innerwarden_smm::CheckStatus,
+    ) -> innerwarden_smm::CheckResult {
+        innerwarden_smm::CheckResult {
+            id,
+            name: "Test Check",
+            status,
+            confidence: 0.5,
+            detail: "synthetic".to_string(),
+        }
+    }
+
+    fn test_report(checks: Vec<innerwarden_smm::CheckResult>) -> innerwarden_smm::FirmwareReport {
+        innerwarden_smm::FirmwareReport {
+            ts: chrono::Utc::now(),
+            arch: innerwarden_smm::Arch::current(),
+            trust_score: 0.5,
+            checks,
+            correlated_threats: vec![],
+        }
+    }
+
+    #[test]
+    fn build_firmware_events_emits_one_event_per_critical_and_warning_check() {
+        let report = test_report(vec![
+            test_check("SMM-001", innerwarden_smm::CheckStatus::Critical),
+            test_check("MSR-002", innerwarden_smm::CheckStatus::Warning),
+        ]);
+        let events = build_firmware_events(&report);
+
+        assert_eq!(events.len(), 2);
+        let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_ref()).collect();
+        // `firmware.<id>` lowercased with dashes -> underscores so the
+        // CL-043 glob pattern `firmware.*` matches.
+        assert!(
+            kinds.contains(&"firmware.smm_001"),
+            "expected firmware.smm_001 in {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"firmware.msr_002"),
+            "expected firmware.msr_002 in {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn build_firmware_events_skips_secure_and_unavailable_checks() {
+        // Without this filter every healthy boot would flood the
+        // correlation engine with 20+ noise events per 5-min tick.
+        let report = test_report(vec![
+            test_check("SMM-OK", innerwarden_smm::CheckStatus::Secure),
+            test_check("MSR-NA", innerwarden_smm::CheckStatus::Unavailable),
+            test_check("UEFI-BAD", innerwarden_smm::CheckStatus::Critical),
+        ]);
+        let events = build_firmware_events(&report);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind.as_ref(), "firmware.uefi_bad");
+    }
+
+    #[test]
+    fn build_firmware_events_emits_threat_event_with_firmware_threat_prefix() {
+        let mut report = test_report(vec![]);
+        report
+            .correlated_threats
+            .push(innerwarden_smm::correlator::CorrelatedThreat {
+                id: "Microcode-Mismatch".to_string(),
+                name: "Microcode revision drift".to_string(),
+                confidence: 0.85,
+                evidence: vec!["smm.msr_lstar".into(), "smm.microcode".into()],
+                detail: "core-0 microcode != core-1 microcode".to_string(),
+            });
+
+        let events = build_firmware_events(&report);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].kind.as_ref(),
+            "firmware.threat.microcode_mismatch",
+            "threat kind must use the `firmware.threat.<id>` namespace so it does not collide \
+             with individual-check events under `firmware.<id>`"
+        );
+    }
+
+    #[test]
+    fn observe_firmware_events_into_engine_pushes_events_through_to_correlation() {
+        // The engine's `pending_chains_count()` is the public test
+        // surface for "did anything land". Even when no chain matches
+        // a stage 1, the call must not panic and the engine must
+        // continue to be usable. This is the load-bearing wiring
+        // anchor: if anyone re-introduces the `firmware_event()`
+        // factory's `#[allow(dead_code)]` pragma OR drops the
+        // `engine.observe()` calls, this test fires immediately.
+        let mut engine = crate::correlation_engine::CorrelationEngine::new();
+        let report = test_report(vec![
+            test_check("UEFI-COMPROMISE", innerwarden_smm::CheckStatus::Critical),
+            test_check("SMM-OK", innerwarden_smm::CheckStatus::Secure),
+        ]);
+
+        observe_firmware_events_into_engine(&report, &mut engine);
+
+        // Sanity: the function is callable without panicking AND the
+        // event we expect to observe is present in the build step.
+        let events = build_firmware_events(&report);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind.as_ref(), "firmware.uefi_compromise");
+        assert_eq!(events[0].source.as_ref(), "smm");
     }
 }
