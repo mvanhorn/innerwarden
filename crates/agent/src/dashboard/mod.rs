@@ -1377,9 +1377,9 @@ mod tests {
 
     /// Spec 051 PR1 — Community feedback banner.
     ///
-    /// "Inner Warden has no phone-home" is load-bearing branding, but it
-    /// also means the project owner has no signal whether anyone is using
-    /// it. The banner is the polite ask. These anchors pin:
+    /// "Zero telemetry by design" is load-bearing branding, but it also
+    /// means the project owner has no signal whether anyone is using it.
+    /// The banner is the direct ask. These anchors pin:
     ///   - the `homeCommunityBanner` block exists in `index.html`
     ///   - the dismiss buttons are present with the exact CSS classes
     ///     `home.js` queries for (`.community-banner-remind`,
@@ -1402,7 +1402,7 @@ mod tests {
             "id=\"homeCommunityBanner\"",
             "community-banner-remind",
             "community-banner-dismiss",
-            "Inner Warden has no phone-home",
+            "Inner Warden has zero telemetry. By design.",
         ] {
             assert!(
                 INDEX_HTML.contains(needle),
@@ -1415,7 +1415,7 @@ mod tests {
             "github.com/InnerWarden/innerwarden",
             "github.com/InnerWarden/innerwarden/discussions",
             "github.com/InnerWarden/innerwarden/issues",
-            "maicon.burn@gmail.com",
+            "feedback@innerwarden.com",
             "Good first issues",
         ] {
             assert!(
