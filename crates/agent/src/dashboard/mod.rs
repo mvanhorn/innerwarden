@@ -646,6 +646,7 @@ pub async fn serve(
         .route("/js/helpers.js", get(serve_js_helpers))
         .route("/js/state.js", get(serve_js_state))
         .route("/js/nav.js", get(serve_js_nav))
+        .route("/js/community-banner.js", get(serve_js_community_banner))
         .route("/js/home.js", get(serve_js_home))
         .route("/js/threats.js", get(serve_js_threats))
         .route("/js/journey.js", get(serve_js_journey))
@@ -1087,6 +1088,7 @@ js_handler!(serve_js_icons, JS_ICONS);
 js_handler!(serve_js_helpers, JS_HELPERS);
 js_handler!(serve_js_state, JS_STATE);
 js_handler!(serve_js_nav, JS_NAV);
+js_handler!(serve_js_community_banner, JS_COMMUNITY_BANNER);
 js_handler!(serve_js_home, JS_HOME);
 js_handler!(serve_js_threats, JS_THREATS);
 js_handler!(serve_js_journey, JS_JOURNEY);
@@ -1116,6 +1118,7 @@ const JS_ICONS: &str = include_str!("frontend/js/icons.js");
 const JS_HELPERS: &str = include_str!("frontend/js/helpers.js");
 const JS_STATE: &str = include_str!("frontend/js/state.js");
 const JS_NAV: &str = include_str!("frontend/js/nav.js");
+const JS_COMMUNITY_BANNER: &str = include_str!("frontend/js/community-banner.js");
 const JS_HOME: &str = include_str!("frontend/js/home.js");
 const JS_THREATS: &str = include_str!("frontend/js/threats.js");
 const JS_JOURNEY: &str = include_str!("frontend/js/journey.js");
@@ -1371,6 +1374,116 @@ mod tests {
     // markup MUST NOT come back, (b) the renderers that survived stay
     // wired up, and (c) the AI Briefing generate path is intact since
     // it's the single piece of narrative the operator relies on.
+
+    /// Spec 051 PR1 — Community feedback banner.
+    ///
+    /// "Inner Warden has no phone-home" is load-bearing branding, but it
+    /// also means the project owner has no signal whether anyone is using
+    /// it. The banner is the polite ask. These anchors pin:
+    ///   - the `homeCommunityBanner` block exists in `index.html`
+    ///   - the dismiss buttons are present with the exact CSS classes
+    ///     `home.js` queries for (`.community-banner-remind`,
+    ///     `.community-banner-dismiss`)
+    ///   - the standalone JS module is wired through include_str! and
+    ///     exposes the three pure helpers tests + home.js rely on
+    ///   - the localStorage keys match the spec (`iw:community-banner:dismissed`
+    ///     and `iw:community-banner:remind-until`)
+    ///   - the channel set required by spec §3.5 (GitHub, email, plus
+    ///     placeholder for Discord/Telegram) is present in the banner copy
+    ///   - `home.js` calls `renderCommunityBanner()` during its render
+    ///   - external links carry `rel="noopener noreferrer"` (spec §4)
+    ///
+    /// Drift catcher for accidental deletion in a future dashboard
+    /// refactor.
+    #[test]
+    fn spec_051_community_feedback_banner_is_wired() {
+        // (1) The banner block + dismiss buttons exist in index.html.
+        for needle in [
+            "id=\"homeCommunityBanner\"",
+            "community-banner-remind",
+            "community-banner-dismiss",
+            "Inner Warden has no phone-home",
+        ] {
+            assert!(
+                INDEX_HTML.contains(needle),
+                "Spec 051 banner missing `{needle}` from index.html — silent regression"
+            );
+        }
+
+        // (2) Each channel from spec §3.5 has its link in the banner copy.
+        for channel in [
+            "github.com/InnerWarden/innerwarden",
+            "github.com/InnerWarden/innerwarden/discussions",
+            "github.com/InnerWarden/innerwarden/issues",
+            "maicon.burn@gmail.com",
+            "Good first issues",
+        ] {
+            assert!(
+                INDEX_HTML.contains(channel),
+                "Spec 051 channel `{channel}` missing from banner copy"
+            );
+        }
+
+        // (3) External links open in a new tab without leaking opener.
+        // Counts only matter as "more than one" — every <a> with an
+        // external href must carry the rel attributes.
+        let banner_block_start = INDEX_HTML
+            .find("id=\"homeCommunityBanner\"")
+            .expect("banner block must exist");
+        let banner_block_end = INDEX_HTML[banner_block_start..]
+            .find("status-hero")
+            .map(|i| banner_block_start + i)
+            .expect("status-hero must follow the banner block");
+        let banner_block = &INDEX_HTML[banner_block_start..banner_block_end];
+        let external_link_count = banner_block.matches("target=\"_blank\"").count();
+        let secured_link_count = banner_block.matches("rel=\"noopener noreferrer\"").count();
+        assert!(
+            external_link_count >= 4,
+            "Spec 051 banner expected >=4 external links, got {external_link_count}"
+        );
+        assert_eq!(
+            external_link_count, secured_link_count,
+            "Every external link in the banner must carry rel=noopener noreferrer (spec §4)"
+        );
+
+        // (4) The standalone JS module is wired and exposes the helpers.
+        for needle in [
+            "function shouldShowCommunityBanner",
+            "function dismissForever",
+            "function remindIn30Days",
+            "function renderCommunityBanner",
+            "iw:community-banner:dismissed",
+            "iw:community-banner:remind-until",
+        ] {
+            assert!(
+                JS_COMMUNITY_BANNER.contains(needle),
+                "community-banner.js must contain `{needle}`"
+            );
+        }
+        // 30 days = 30 * 24 * 60 * 60 * 1000 ms — pinning the literal
+        // protects against an accidental refactor that "tidies up" the
+        // constant into the wrong unit.
+        assert!(
+            JS_COMMUNITY_BANNER.contains("30 * 24 * 60 * 60 * 1000"),
+            "30-day remind interval literal must be preserved"
+        );
+
+        // (5) home.js calls renderCommunityBanner during render.
+        assert!(
+            JS_HOME.contains("renderCommunityBanner"),
+            "home.js must invoke renderCommunityBanner() on Home render"
+        );
+
+        // (6) The router serves the module. js_handler macro inlines
+        // the body but the route registration is the operator-visible
+        // contract.
+        // Verified at construction time elsewhere; here we just pin
+        // the include_str! const.
+        assert!(
+            !JS_COMMUNITY_BANNER.is_empty(),
+            "JS_COMMUNITY_BANNER must be included via include_str! and non-empty"
+        );
+    }
 
     #[test]
     fn pr_home_slim_orphan_ids_are_gone_from_index_html() {

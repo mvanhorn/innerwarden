@@ -2801,3 +2801,112 @@
       font-weight: 600;
       color: var(--text);
     }
+
+    /* ── Spec 051 PR1 — Community feedback banner ─────────────────────
+       Honest, slightly vulnerable; not a warning. Borrows the rounded
+       container shape from .home-alert-banner but drops the icon column
+       and warn colours, gains a vertical body with sub-sections and a
+       two-button action row. */
+    .home-community-banner {
+      margin: 10px 0 18px;
+      padding: 16px 20px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: var(--card);
+    }
+    .home-community-banner-body {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      min-width: 0;
+    }
+    .home-community-banner-title {
+      font-size: 0.94rem;
+      font-weight: 700;
+      color: var(--text);
+      line-height: 1.4;
+    }
+    .home-community-banner-sub {
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+    .home-community-banner-section {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding-top: 4px;
+    }
+    .home-community-banner-section-title {
+      font-size: 0.62rem;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--dim);
+      font-weight: 700;
+    }
+    .home-community-banner-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      font-size: 0.82rem;
+      color: var(--text);
+    }
+    .home-community-banner-line {
+      font-size: 0.82rem;
+      color: var(--text);
+    }
+    .home-community-banner a {
+      color: var(--accent);
+      text-decoration: none;
+      border-bottom: 1px dashed transparent;
+    }
+    .home-community-banner a:hover,
+    .home-community-banner a:focus-visible {
+      border-bottom-color: var(--accent);
+      outline: none;
+    }
+    .home-community-banner-actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      padding-top: 6px;
+    }
+    .community-banner-remind,
+    .community-banner-dismiss {
+      cursor: pointer;
+      padding: 6px 14px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: transparent;
+      color: var(--muted);
+      font-size: 0.72rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      font-family: inherit;
+    }
+    .community-banner-remind:hover,
+    .community-banner-remind:focus-visible {
+      border-color: var(--accent);
+      color: var(--accent);
+      outline: none;
+    }
+    .community-banner-dismiss:hover,
+    .community-banner-dismiss:focus-visible {
+      border-color: var(--dim);
+      color: var(--text);
+      outline: none;
+    }
+    @media (max-width: 640px) {
+      .home-community-banner {
+        padding: 14px 14px;
+      }
+      .home-community-banner-actions {
+        flex-direction: column;
+      }
+      .community-banner-remind,
+      .community-banner-dismiss {
+        width: 100%;
+      }
+    }

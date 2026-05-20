@@ -58,6 +58,11 @@ async function loadHome() {
     renderReviewBanner(overview);
     renderActivityStrip(overview, totalEventsScanned);
     renderOnboardingTip(overview);
+    // Spec 051 PR1 — Community banner: no telemetry by design, so this
+    // is the polite ask. Gated by localStorage; safe to call every render.
+    if (typeof renderCommunityBanner === 'function') {
+      renderCommunityBanner();
+    }
 
     // Phase 12 (QA fix #1): keep the persistent header pill in sync
     // with runtime SystemHealth. Without this, the green "PROTECTED"
