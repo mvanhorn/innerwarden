@@ -1230,6 +1230,8 @@ pub(crate) async fn run_agent(cli: crate::Cli) -> Result<()> {
                 &cli.data_dir.join("shield"),
                 &cfg.shield.bpf_path,
                 cfg.shield.dry_run,
+                &cfg.shield.cloudflare_failover,
+                &cfg.shield.origin_lockdown,
             ))
         } else {
             None

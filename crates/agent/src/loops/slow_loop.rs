@@ -1254,7 +1254,7 @@ pub(crate) async fn process_narrative_tick(
             .map(|(ip, p)| (ip.clone(), p.risk_score))
             .collect();
         let (_drops, shield_incidents, shield_blocked) =
-            shield_inline::process_events(shield, &events_entries, &ip_risks);
+            shield_inline::process_events(shield, &events_entries, &ip_risks).await;
         shield_inline::write_incidents(data_dir, &shield_incidents);
         let gate_counter = state.telemetry.gate_suppressed_counter();
         shield_inline::notify_telegram(

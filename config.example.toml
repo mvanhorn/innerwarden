@@ -84,3 +84,41 @@ enabled = false
 # suspicious sudo commands by same user in window
 threshold = 3
 window_seconds = 300
+
+[shield]
+# Inline DDoS shield: rate limiting, SYN tracking, auto-escalation state
+# machine (Normal -> Elevated -> UnderAttack -> Critical), XDP wire-speed
+# blocking. Always on by default.
+enabled = true
+bpf_path = "/sys/fs/bpf/innerwarden"
+# Dry-run skips real bpftool calls (useful in dev / CI).
+dry_run = false
+
+[shield.cloudflare_failover]
+# Auto-toggle the Cloudflare DNS proxy ("orange cloud") when shield
+# escalation reaches UnderAttack / Critical. The site briefly falls
+# behind Cloudflare's anti-DDoS edge, then flips back to direct when
+# the attack subsides.
+#
+# Default `dry_run = true` records what the toggle WOULD do without
+# touching the Cloudflare API. Flip to false only after auditing the
+# state-transition log for at least a week (an over-eager toggle
+# briefly shows Cloudflare's challenge page to legitimate visitors).
+enabled = false
+dry_run = true
+api_token = ""               # Cloudflare API token with Zone.DNS:Edit
+zone_id = ""                 # 32-char hex from the dashboard URL
+record_id = ""               # DNS record id (GET /zones/{zone}/dns_records?name=...)
+activate_on = ["UnderAttack", "Critical"]
+min_proxy_duration_secs = 300
+
+[shield.origin_lockdown]
+# Insert iptables rules that drop direct-to-origin TCP/80 and TCP/443
+# during UnderAttack / Critical, forcing all HTTP(S) through Cloudflare's
+# edge. Closes the bypass vector where an attacker who knows the real
+# origin IP can punch around Cloudflare.
+#
+# Default `dry_run = true` because a misconfigured Cloudflare CIDR set
+# can lock the operator out of their own server.
+enabled = false
+dry_run = true

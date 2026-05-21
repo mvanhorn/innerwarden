@@ -5,12 +5,16 @@ use std::sync::atomic::AtomicU64;
 use tracing::{info, warn};
 
 use innerwarden_shield::attack_classifier::AttackClassifier;
+use innerwarden_shield::cloudflare_failover::{CloudflareFailover, CloudflareFailoverConfig};
 use innerwarden_shield::escalation::{EscalationConfig, EscalationEngine, EscalationState};
+use innerwarden_shield::origin_lockdown::OriginLockdown;
 use innerwarden_shield::rate_limiter::{IpRateLimiter, RateLimitDecision, RateLimiterConfig};
 use innerwarden_shield::store::Store;
 use innerwarden_shield::syn_tracker::{SynFloodConfig, SynFloodDetector};
 use innerwarden_shield::tcp_fingerprint::TcpFingerprinter;
 use innerwarden_shield::xdp_manager::XdpManager;
+
+use crate::config::{ShieldCloudflareFailoverConfig, ShieldOriginLockdownConfig};
 
 /// Shield state held in the agent.
 #[allow(dead_code)]
@@ -24,10 +28,28 @@ pub(crate) struct ShieldState {
     pub store: Store,
     pub tick_counter: u64,
     default_rl_config: RateLimiterConfig,
+    /// Cloudflare DNS proxy auto-toggle. `None` when disabled in config.
+    cloudflare_failover: Option<CloudflareFailover>,
+    /// True when the failover is wired but should only log, not call
+    /// the Cloudflare API. New deploys default to true; flip to false
+    /// after a week of clean state-transition logs.
+    cf_failover_dry_run: bool,
+    /// iptables CF-only origin lockdown. `None` when disabled in config.
+    origin_lockdown: Option<OriginLockdown>,
+    /// Same dry-run gate for the lockdown — a misconfigured CIDR set
+    /// can lock the operator out of their own host, so this stays true
+    /// until the operator explicitly opts in.
+    lockdown_dry_run: bool,
 }
 
 impl ShieldState {
-    pub fn new(shield_dir: &Path, bpf_path: &str, dry_run: bool) -> Self {
+    pub fn new(
+        shield_dir: &Path,
+        bpf_path: &str,
+        dry_run: bool,
+        cf_failover_cfg: &ShieldCloudflareFailoverConfig,
+        lockdown_cfg: &ShieldOriginLockdownConfig,
+    ) -> Self {
         std::fs::create_dir_all(shield_dir).ok();
         let store = Store::new(shield_dir);
         let xdp = XdpManager::new(bpf_path).with_dry_run(dry_run);
@@ -47,6 +69,38 @@ impl ShieldState {
 
         let rl_config = RateLimiterConfig::default();
 
+        // 2026-05-21: instantiate Cloudflare auto-failover when configured.
+        // The crate already encapsulates the API call + min-duration
+        // hysteresis; `dry_run` is enforced at the call site below so the
+        // pre-roll-out audit window still produces real state-transition
+        // logs.
+        let cloudflare_failover = if cf_failover_cfg.enabled
+            && !cf_failover_cfg.api_token.is_empty()
+            && !cf_failover_cfg.zone_id.is_empty()
+            && !cf_failover_cfg.record_id.is_empty()
+        {
+            Some(CloudflareFailover::new(CloudflareFailoverConfig {
+                enabled: true,
+                api_token: cf_failover_cfg.api_token.clone(),
+                zone_id: cf_failover_cfg.zone_id.clone(),
+                record_id: cf_failover_cfg.record_id.clone(),
+                activate_on: cf_failover_cfg.activate_on.clone(),
+                min_proxy_duration_secs: cf_failover_cfg.min_proxy_duration_secs,
+            }))
+        } else {
+            None
+        };
+
+        // Origin lockdown: kept inert (no init, no iptables touches) when
+        // disabled. `OriginLockdown::new` does not call into iptables on
+        // its own; the activate/deactivate methods do, and we gate them
+        // behind `lockdown_dry_run` below.
+        let origin_lockdown = if lockdown_cfg.enabled {
+            Some(OriginLockdown::new())
+        } else {
+            None
+        };
+
         Self {
             rate_limiter: IpRateLimiter::new(rl_config.clone()),
             syn_detector: SynFloodDetector::new(SynFloodConfig::default()),
@@ -57,6 +111,10 @@ impl ShieldState {
             store,
             tick_counter: 0,
             default_rl_config: rl_config,
+            cloudflare_failover,
+            cf_failover_dry_run: cf_failover_cfg.dry_run,
+            origin_lockdown,
+            lockdown_dry_run: lockdown_cfg.dry_run,
         }
     }
 }
@@ -65,7 +123,14 @@ impl ShieldState {
 /// Returns the number of drops, any new incidents, and IPs that were blocked by the shield.
 /// `ip_risk_scores` provides attacker intel risk scores (0-100) for known IPs;
 /// IPs with risk > 60 get 2x tighter rate limits (pre-emptive defense).
-pub(crate) fn process_events(
+///
+/// 2026-05-21: became `async` so the Cloudflare DNS-proxy auto-toggle
+/// (`CloudflareFailover::check_and_toggle`) can `.await` the
+/// `PATCH /zones/{zone_id}/dns_records/{record_id}` call inline on
+/// escalation transitions. The toggle is gated behind a dry-run flag
+/// (default `true`) so the first deploys only log the would-be
+/// flips — see `ShieldCloudflareFailoverConfig`.
+pub(crate) async fn process_events(
     shield: &mut ShieldState,
     events: &[innerwarden_core::event::Event],
     ip_risk_scores: &std::collections::HashMap<String, u8>,
@@ -191,6 +256,46 @@ pub(crate) fn process_events(
             config.bucket_refill_rate *= factor;
             config.window_max_rate = (config.window_max_rate as f64 * factor).max(1.0) as u64;
             shield.rate_limiter.reset_config(config);
+
+            // 2026-05-21: drive the panic-mode responses that were
+            // dead code before the inline migration shipped without
+            // wiring them.
+            //
+            // 1. Cloudflare DNS proxy toggle (orange-cloud the site
+            //    on UnderAttack / Critical, grey-cloud back on calm).
+            //    Honours `min_proxy_duration_secs` internally so a
+            //    flap does not produce two API calls within seconds.
+            if let Some(cf) = shield.cloudflare_failover.as_mut() {
+                if shield.cf_failover_dry_run {
+                    info!(
+                        state = %transition.to,
+                        "shield: cloudflare_failover DRY_RUN — would toggle proxy"
+                    );
+                } else {
+                    let toggled = cf.check_and_toggle(transition.to).await;
+                    if toggled {
+                        info!(
+                            state = %transition.to,
+                            "shield: cloudflare_failover proxy state changed"
+                        );
+                    }
+                }
+            }
+
+            // 2. iptables CF-only origin lockdown (drops direct-to-origin
+            //    HTTP/HTTPS while shield is UnderAttack/Critical, so an
+            //    attacker who knows the real origin IP cannot bypass
+            //    the Cloudflare edge).
+            if let Some(ld) = shield.origin_lockdown.as_mut() {
+                if shield.lockdown_dry_run {
+                    info!(
+                        state = %transition.to,
+                        "shield: origin_lockdown DRY_RUN — would toggle iptables CF-only rules"
+                    );
+                } else {
+                    ld.check_and_toggle(transition.to);
+                }
+            }
 
             // Create incident for the transition
             let severity = match transition.to {
@@ -372,7 +477,13 @@ mod tests {
 
     fn make_shield_state(config: RateLimiterConfig) -> (tempfile::TempDir, ShieldState) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut shield = ShieldState::new(dir.path(), "/sys/fs/bpf/innerwarden", true);
+        let mut shield = ShieldState::new(
+            dir.path(),
+            "/sys/fs/bpf/innerwarden",
+            true,
+            &ShieldCloudflareFailoverConfig::default(),
+            &ShieldOriginLockdownConfig::default(),
+        );
         shield.rate_limiter.reset_config(config);
         (dir, shield)
     }
@@ -411,18 +522,25 @@ mod tests {
         store.save_state(&persisted).expect("save shield state");
         store.save_ddos_history(&[]).expect("save ddos history");
 
-        let shield = ShieldState::new(dir.path(), "/sys/fs/bpf/innerwarden", true);
+        let shield = ShieldState::new(
+            dir.path(),
+            "/sys/fs/bpf/innerwarden",
+            true,
+            &ShieldCloudflareFailoverConfig::default(),
+            &ShieldOriginLockdownConfig::default(),
+        );
         assert_eq!(shield.escalation.state(), EscalationState::Elevated);
         assert_eq!(shield.tick_counter, 0);
     }
 
-    #[test]
-    fn process_events_under_limit_allows_without_block_mutation() {
+    #[tokio::test]
+    async fn process_events_under_limit_allows_without_block_mutation() {
         // Invariant: traffic under both limiters must be allowed and keep block state untouched.
         let (_dir, mut shield) = make_shield_state(rl_config(10.0, 0.0, 10, 10));
         let events = vec![network_event("198.51.100.10", "network.tcp", 128)];
 
-        let (drops, incidents, blocked_ips) = process_events(&mut shield, &events, &HashMap::new());
+        let (drops, incidents, blocked_ips) =
+            process_events(&mut shield, &events, &HashMap::new()).await;
 
         assert_eq!(drops, 0);
         assert!(incidents.is_empty());
@@ -431,8 +549,8 @@ mod tests {
         assert_eq!(shield.tick_counter, 1);
     }
 
-    #[test]
-    fn process_events_at_limit_keeps_boundary_packet_allowed() {
+    #[tokio::test]
+    async fn process_events_at_limit_keeps_boundary_packet_allowed() {
         // Invariant: packets that land exactly on configured limits should still be allowed.
         let (_dir, mut shield) = make_shield_state(rl_config(2.0, 0.0, 10, 2));
         let events = vec![
@@ -440,7 +558,8 @@ mod tests {
             network_event("198.51.100.11", "network.tcp", 64),
         ];
 
-        let (drops, incidents, blocked_ips) = process_events(&mut shield, &events, &HashMap::new());
+        let (drops, incidents, blocked_ips) =
+            process_events(&mut shield, &events, &HashMap::new()).await;
 
         let metrics = shield.rate_limiter.get_metrics();
         assert_eq!(drops, 0);
@@ -451,8 +570,8 @@ mod tests {
         assert_eq!(metrics.total_dropped, 0);
     }
 
-    #[test]
-    fn process_events_burst_eligible_returns_challenge_without_drop() {
+    #[tokio::test]
+    async fn process_events_burst_eligible_returns_challenge_without_drop() {
         // Invariant: a single-tripped limiter (burst-only pressure) must challenge, not drop.
         let (_dir, mut shield) = make_shield_state(rl_config(1.0, 0.0, 10, 10));
         let events = vec![
@@ -461,7 +580,7 @@ mod tests {
         ];
 
         let (drops, _incidents, blocked_ips) =
-            process_events(&mut shield, &events, &HashMap::new());
+            process_events(&mut shield, &events, &HashMap::new()).await;
 
         let metrics = shield.rate_limiter.get_metrics();
         assert_eq!(drops, 0);
@@ -472,15 +591,15 @@ mod tests {
         assert!(shield.xdp.get_blocklist_entries().is_empty());
     }
 
-    #[test]
-    fn process_events_window_rollover_resets_window_pressure() {
+    #[tokio::test]
+    async fn process_events_window_rollover_resets_window_pressure() {
         // Invariant: once the sliding window expires, new traffic should be evaluated fresh.
         let (_dir, mut shield) = make_shield_state(rl_config(5_000.0, 5_000.0, 1, 1));
         let ip = "198.51.100.13";
         let burst: Vec<_> = (0..1_200)
             .map(|_| network_event(ip, "network.tcp", 64))
             .collect();
-        process_events(&mut shield, &burst, &HashMap::new());
+        process_events(&mut shield, &burst, &HashMap::new()).await;
         let before_rollover = shield.rate_limiter.get_metrics();
         assert!(
             before_rollover.total_challenged > 0,
@@ -490,7 +609,7 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(2_100));
         let later = vec![network_event(ip, "network.tcp", 64)];
-        process_events(&mut shield, &later, &HashMap::new());
+        process_events(&mut shield, &later, &HashMap::new()).await;
 
         let after_rollover = shield.rate_limiter.get_metrics();
         assert_eq!(
@@ -504,8 +623,8 @@ mod tests {
         assert_eq!(after_rollover.total_dropped, before_rollover.total_dropped);
     }
 
-    #[test]
-    fn process_events_drop_path_blocks_ip_and_updates_drop_counters() {
+    #[tokio::test]
+    async fn process_events_drop_path_blocks_ip_and_updates_drop_counters() {
         // Invariant: when both limiters fail, the packet is dropped and the IP is blocklisted.
         let (_dir, mut shield) = make_shield_state(rl_config(1.0, 0.0, 10, 0));
         let ip = "198.51.100.14";
@@ -515,7 +634,7 @@ mod tests {
         ];
 
         let (drops, _incidents, blocked_ips) =
-            process_events(&mut shield, &events, &HashMap::new());
+            process_events(&mut shield, &events, &HashMap::new()).await;
 
         let metrics = shield.rate_limiter.get_metrics();
         assert_eq!(drops, 1);
@@ -527,7 +646,7 @@ mod tests {
         // Already-blocked traffic must continue to count as dropped.
         let follow_up = vec![network_event(ip, "network.tcp", 64)];
         let (second_drops, _incidents, _blocked_ips) =
-            process_events(&mut shield, &follow_up, &HashMap::new());
+            process_events(&mut shield, &follow_up, &HashMap::new()).await;
         assert_eq!(second_drops, 1);
         assert_eq!(shield.rate_limiter.get_metrics().total_dropped, 2);
     }
@@ -609,5 +728,93 @@ mod tests {
         assert_eq!(deferred.get("shield").copied(), Some(1));
         assert_eq!(counter.load(Ordering::Relaxed), 1);
         assert_eq!(burst_tracker.count(), 1);
+    }
+
+    /// 2026-05-21 anchor: ShieldState wires `CloudflareFailover` whenever the
+    /// operator supplied API token + zone + record. Pre-fix the inline
+    /// shield migration shipped without instantiating the failover at all
+    /// (the crate's `cloudflare_failover` module was dead code), so a
+    /// volumetric DDoS escalation never reached for the orange-cloud
+    /// API. This test pins the instantiation contract.
+    #[test]
+    fn shield_state_constructs_cloudflare_failover_when_credentials_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cf = ShieldCloudflareFailoverConfig {
+            enabled: true,
+            dry_run: true,
+            api_token: "t".into(),
+            zone_id: "z".into(),
+            record_id: "r".into(),
+            activate_on: vec!["Critical".into()],
+            min_proxy_duration_secs: 300,
+        };
+        let lockdown = ShieldOriginLockdownConfig::default();
+        let shield = ShieldState::new(dir.path(), "/sys/fs/bpf/innerwarden", true, &cf, &lockdown);
+        assert!(
+            shield.cloudflare_failover.is_some(),
+            "failover must be wired when token+zone+record are set"
+        );
+        assert!(
+            shield.cf_failover_dry_run,
+            "dry-run flag must propagate into ShieldState"
+        );
+    }
+
+    /// 2026-05-21 anchor: missing credentials silently disable the failover
+    /// (`None`), so the dry-run audit window cannot accidentally call into
+    /// the Cloudflare API with empty config and surface a 401.
+    #[test]
+    fn shield_state_skips_cloudflare_failover_when_credentials_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Enabled, but token + record_id empty — must NOT instantiate.
+        let cf = ShieldCloudflareFailoverConfig {
+            enabled: true,
+            dry_run: true,
+            api_token: String::new(),
+            zone_id: "z".into(),
+            record_id: String::new(),
+            activate_on: vec![],
+            min_proxy_duration_secs: 0,
+        };
+        let lockdown = ShieldOriginLockdownConfig::default();
+        let shield = ShieldState::new(dir.path(), "/sys/fs/bpf/innerwarden", true, &cf, &lockdown);
+        assert!(
+            shield.cloudflare_failover.is_none(),
+            "failover must not instantiate without API token + record_id"
+        );
+    }
+
+    /// 2026-05-21 anchor: `origin_lockdown.enabled = true` must wire the
+    /// OriginLockdown into ShieldState; the dry-run gate is enforced at
+    /// the call site, not at construction time.
+    #[test]
+    fn shield_state_constructs_origin_lockdown_when_enabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lockdown = ShieldOriginLockdownConfig {
+            enabled: true,
+            dry_run: true,
+        };
+        let shield = ShieldState::new(
+            dir.path(),
+            "/sys/fs/bpf/innerwarden",
+            true,
+            &ShieldCloudflareFailoverConfig::default(),
+            &lockdown,
+        );
+        assert!(shield.origin_lockdown.is_some());
+        assert!(shield.lockdown_dry_run);
+    }
+
+    #[test]
+    fn shield_state_skips_origin_lockdown_when_disabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shield = ShieldState::new(
+            dir.path(),
+            "/sys/fs/bpf/innerwarden",
+            true,
+            &ShieldCloudflareFailoverConfig::default(),
+            &ShieldOriginLockdownConfig::default(),
+        );
+        assert!(shield.origin_lockdown.is_none());
     }
 }
