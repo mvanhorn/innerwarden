@@ -63,7 +63,7 @@ https://github.com/user-attachments/assets/3acf547d-9c5c-4f83-bcfa-22ba68e21741
 
 I built Inner Warden because I wanted something that could detect a reverse shell at the kernel level, block the attacker, deploy a honeypot, and alert me on Telegram, all in under 5 seconds, with zero external dependencies. So I built it.
 
-Solo developer. Apache-2.0. If this project helps protect your servers, [give it a star](https://github.com/InnerWarden/innerwarden/stargazers) so others can find it.
+Apache-2.0. If this project helps protect your servers, [give it a star](https://github.com/InnerWarden/innerwarden/stargazers) so others can find it.
 
 ---
 
