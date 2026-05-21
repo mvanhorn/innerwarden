@@ -151,6 +151,15 @@ $SSH 'set -e
   sudo chown innerwarden:innerwarden /var/lib/innerwarden/jeprof 2>/dev/null || true
   sudo chmod 750 /var/lib/innerwarden/jeprof 2>/dev/null || true
   sudo find /var/lib/innerwarden/jeprof -type f -mtime +7 -delete 2>/dev/null || true
+  # 2026-05-21: refresh the canonical jemalloc tuning drop-in on every
+  # deploy so a stale `prof_active:true` cannot survive across builds.
+  # The drop-in lives at `examples/systemd/innerwarden-watchdog.service.d/jeprof.conf`
+  # in the repo; here we install it idempotently. systemctl
+  # daemon-reload happens later in the watchdog-dance block.
+  sudo mkdir -p /etc/systemd/system/innerwarden-watchdog.service.d 2>/dev/null || true
+  sudo install -m 0644 -o root -g root \
+    /home/ubuntu/innerwarden/examples/systemd/innerwarden-watchdog.service.d/jeprof.conf \
+    /etc/systemd/system/innerwarden-watchdog.service.d/jeprof.conf 2>/dev/null || true
   sudo rm -rf /home/ubuntu/innerwarden/target/release/incremental 2>/dev/null || true
   sudo find /var/lib/innerwarden -maxdepth 1 -name "graph-snapshot-*.json*" -mtime +5 -delete 2>/dev/null || true
   if [ -d /var/lib/innerwarden/pcap ]; then
@@ -264,8 +273,12 @@ install_one() {
     # unit running it (the unit is "loaded; disabled"); the watchdog
     # is responsible for the next spawn. Starting the watchdog will
     # cause it to fork the new agent binary within seconds.
+    #
+    # daemon-reload picks up any refreshed drop-in (notably
+    # `jeprof.conf` from step [0/4]) so the new agent boots with the
+    # canonical MALLOC_CONF instead of whatever was in memory before.
     echo "  Restarting innerwarden-watchdog (re-spawns innerwarden-agent)."
-    $SSH "sudo systemctl start innerwarden-watchdog && sleep 6 && sudo systemctl is-active innerwarden-watchdog"
+    $SSH "sudo systemctl daemon-reload && sudo systemctl start innerwarden-watchdog && sleep 6 && sudo systemctl is-active innerwarden-watchdog"
   elif [ -n "$svc" ]; then
     $SSH "sudo systemctl start $svc && sleep 2 && sudo systemctl is-active $svc"
   fi
