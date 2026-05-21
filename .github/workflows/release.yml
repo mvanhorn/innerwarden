@@ -223,6 +223,30 @@ jobs:
               echo "      Verify --features local-classifier is on the cargo zigbuild command."
               fail=1
             fi
+
+            # eBPF bytecode embedded in the sensor (ebpf-embedded feature).
+            # `crates/sensor/src/collectors/ebpf_syscall.rs` at startup logs
+            # `"eBPF collector: using embedded bytecode (N bytes)"` ONLY when
+            # the bytecode was baked in via include_bytes!. Without the
+            # feature the sensor falls back to looking for the bytecode
+            # at /usr/local/lib/innerwarden/innerwarden-ebpf (which does
+            # not exist on a release-installed host) and silently runs
+            # with zero kernel hooks — RSS drops from ~178 MB to ~50 MB
+            # and every detector that depends on eBPF events (privesc,
+            # c2_callback, container_escape, log_tampering, ...) goes
+            # dark. Hard fail since 2026-05-21 when a manual deploy
+            # caught this regression in prod.
+            sensor="dist/innerwarden-sensor-linux-${arch}"
+            if [ -f "$sensor" ]; then
+              echo "--- $sensor ---"
+              if ! strings "$sensor" | grep -q "eBPF collector: using embedded bytecode"; then
+                echo "FAIL: $sensor missing ebpf-embedded marker"
+                echo "      eBPF subsystem would be inert; the sensor runs with zero kernel hooks."
+                echo "      Verify --features ebpf-embedded is on the sensor's cargo zigbuild command,"
+                echo "      AND that the sensor-ebpf bytecode build ran before the sensor build."
+                fail=1
+              fi
+            fi
           done
 
           if [[ $fail -ne 0 ]]; then
