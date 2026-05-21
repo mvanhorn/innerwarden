@@ -512,21 +512,21 @@ fn attach_lsm(bpf: &mut aya::Ebpf) {
 
             let btf = aya::Btf::from_sys_fs().ok();
             if let Err(e) = lsm.load("bprm_check_security", &btf.as_ref().unwrap()) {
-                // 2026-05-21: do not claim a specific root cause in the log.
-                // The previous message ("add lsm=bpf to boot cmdline") was
-                // wrong on hosts whose `/proc/cmdline` already had bpf in
-                // the LSM list — the load can also fail for BTF mismatch,
-                // verifier rejection, or aya version skew. Log the raw
-                // aya error so the operator can grep it and act.
+                // 2026-05-21 v2: previous diagnostic used `error = %e`
+                // (Display) which produced the empty `F_ERROR = None`
+                // structured field on Oracle prod — aya's `ProgramError`
+                // Display impl is lossy for the variant that's actually
+                // firing. Inline the Debug-formatted error into the
+                // MESSAGE body so it shows up in plain journalctl output.
                 //
                 // Diagnostic hints the operator should check first:
                 //   grep bpf /sys/kernel/security/lsm   # bpf present?
                 //   ls /sys/kernel/btf/vmlinux           # BTF available?
                 //   uname -r                             # kernel ≥ 5.7?
                 info!(
-                    error = %e,
-                    "innerwarden_lsm_exec: failed to load bprm_check_security hook \
-                     — see /sys/kernel/security/lsm, /sys/kernel/btf/vmlinux, kernel >= 5.7"
+                    "innerwarden_lsm_exec: failed to load bprm_check_security hook: {:?} \
+                     — see /sys/kernel/security/lsm, /sys/kernel/btf/vmlinux, kernel >= 5.7",
+                    e
                 );
                 return;
             }
