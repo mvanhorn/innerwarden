@@ -257,10 +257,25 @@ pub struct ProcessExitEvent {
 }
 
 /// Reasons a PID gets registered in BLOCKED_PIDS by the agent.
-/// Surfaced in `LsmDecisionEvent.reason` for operator triage.
+/// Pre-Spec-053 these were intended for `LsmDecisionEvent.reason`. With
+/// PR-A (2026-05-22) the `reason` field is now repurposed as `hook_id`
+/// (see `LSM_HOOK_*` below) — the kernel hook always knows WHICH hook
+/// fired but does NOT know WHY the agent decided to block. The original
+/// reason now lives in agent-side logging only.
 pub const LSM_REASON_KILL_CHAIN: u32 = 1;
 pub const LSM_REASON_MANUAL: u32 = 2;
 pub const LSM_REASON_RULE: u32 = 3;
+
+/// Identifies WHICH LSM hook fired a block decision. Encoded in the
+/// (otherwise unused) `LsmDecisionEvent.reason` field so the userspace
+/// agent can distinguish blocks from different hooks without needing
+/// separate SyscallKind variants for each. The constants are stable
+/// part of the wire format — never renumber, only append.
+pub const LSM_HOOK_BPRM_CHECK_SECURITY: u32 = 1;
+pub const LSM_HOOK_CREATE_USER_NS: u32 = 2;
+pub const LSM_HOOK_PTRACE_ACCESS_CHECK: u32 = 3;
+pub const LSM_HOOK_MMAP_FILE: u32 = 4;
+pub const LSM_HOOK_BPF_PROG_LOAD: u32 = 5;
 
 /// Emitted by `innerwarden_lsm_exec_min` when a process is denied at
 /// `bprm_check_security`. Allow decisions are NOT emitted (every execve
@@ -278,10 +293,79 @@ pub struct LsmDecisionEvent {
     pub pid: u32,
     /// Thread group ID of the calling task at hook time.
     pub tgid: u32,
-    /// Why this PID was registered as blocked. See LSM_REASON_*.
+    /// PR-A semantic shift: this field now encodes WHICH LSM hook fired
+    /// the block (see `LSM_HOOK_*` constants), not the abstract "reason"
+    /// it was originally named for. The kernel hook knows which hook IT
+    /// is — the kernel doesn't know WHY the agent decided to block.
+    /// Kept as `reason` for wire-format stability; userspace dispatch
+    /// at `crates/sensor/src/collectors/ebpf_syscall.rs:1870` reads
+    /// this field as `hook_id`.
     pub reason: u32,
     /// Timestamp (nanoseconds since boot).
     pub ts_ns: u64,
+}
+
+#[cfg(test)]
+mod lsm_hook_id_anchors {
+    //! Spec 053 / PR-A anchors. These pin the LSM_HOOK_* constants as
+    //! part of the wire format so an accidental renumber is caught by
+    //! `cargo test` before it ships to prod and confuses dispatch arms.
+    //! See `crates/sensor/src/collectors/ebpf_syscall.rs:1870` for the
+    //! consumer; the constants are also encoded into LsmDecisionEvent's
+    //! `reason` field by the kernel-side hooks in
+    //! `crates/sensor-ebpf/src/main.rs`.
+
+    use super::{
+        LSM_HOOK_BPF_PROG_LOAD, LSM_HOOK_BPRM_CHECK_SECURITY, LSM_HOOK_CREATE_USER_NS,
+        LSM_HOOK_MMAP_FILE, LSM_HOOK_PTRACE_ACCESS_CHECK,
+    };
+
+    #[test]
+    fn lsm_hook_ids_are_stable_wire_format() {
+        // Renumbering these is a wire-format break — kernel-side .o emits
+        // these constants; userspace dispatches by them. Add NEW values
+        // only by appending. Never reuse a freed slot.
+        assert_eq!(LSM_HOOK_BPRM_CHECK_SECURITY, 1);
+        assert_eq!(LSM_HOOK_CREATE_USER_NS, 2);
+        assert_eq!(LSM_HOOK_PTRACE_ACCESS_CHECK, 3);
+        assert_eq!(LSM_HOOK_MMAP_FILE, 4);
+        assert_eq!(LSM_HOOK_BPF_PROG_LOAD, 5);
+    }
+
+    #[test]
+    fn lsm_hook_ids_are_unique() {
+        let all = [
+            LSM_HOOK_BPRM_CHECK_SECURITY,
+            LSM_HOOK_CREATE_USER_NS,
+            LSM_HOOK_PTRACE_ACCESS_CHECK,
+            LSM_HOOK_MMAP_FILE,
+            LSM_HOOK_BPF_PROG_LOAD,
+        ];
+        let mut sorted = all.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            all.len(),
+            "LSM_HOOK_* constants must be unique"
+        );
+    }
+
+    #[test]
+    fn lsm_hook_ids_never_reuse_zero() {
+        // 0 is reserved as "unknown / sentinel" so dispatch arms can
+        // detect uninitialised reads or older sensors that didn't tag.
+        let all = [
+            LSM_HOOK_BPRM_CHECK_SECURITY,
+            LSM_HOOK_CREATE_USER_NS,
+            LSM_HOOK_PTRACE_ACCESS_CHECK,
+            LSM_HOOK_MMAP_FILE,
+            LSM_HOOK_BPF_PROG_LOAD,
+        ];
+        for h in all {
+            assert_ne!(h, 0, "LSM_HOOK_* may never use 0 (reserved sentinel)");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

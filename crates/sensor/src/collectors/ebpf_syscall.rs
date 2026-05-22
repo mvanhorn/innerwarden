@@ -537,6 +537,35 @@ fn attach_lsm(bpf: &mut aya::Ebpf) {
         }
     }
 
+    // PR-A: create_user_ns LSM hook — container escape detection.
+    // Defaults to observe; blocks only when caller PID is in BLOCKED_PIDS
+    // (populated by agent's kill chain detector). Safe to enable in prod
+    // because legitimate userns creators (Chrome, podman, snap, Docker
+    // rootless) are never in BLOCKED_PIDS so they pass through unaffected.
+    match bpf.program_mut("innerwarden_lsm_create_user_ns") {
+        Some(prog) => {
+            let lsm_res: Result<&mut Lsm, _> = prog.try_into();
+            match lsm_res {
+                Ok(lsm) => {
+                    let btf = aya::Btf::from_sys_fs().ok();
+                    if let Some(b) = btf.as_ref() {
+                        if let Err(e) = lsm.load("userns_create", b) {
+                            warn!("innerwarden_lsm_create_user_ns: failed to load: {:?}", e);
+                        } else if let Err(e) = lsm.attach() {
+                            warn!(error = %e, "innerwarden_lsm_create_user_ns: failed to attach");
+                        } else {
+                            info!("eBPF: innerwarden_lsm_create_user_ns → create_user_ns (PR-A container escape) ✅");
+                        }
+                    }
+                }
+                Err(e) => info!(error = %e, "innerwarden_lsm_create_user_ns: not available as Lsm"),
+            }
+        }
+        None => {
+            info!("innerwarden_lsm_create_user_ns program not found in .o");
+        }
+    }
+
     match bpf.program_mut("innerwarden_lsm_exec") {
         Some(prog) => {
             let lsm_try: Result<&mut Lsm, _> = prog.try_into();
@@ -1839,32 +1868,67 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
                 // the join (next sub-PR), the operator still gets the bare
                 // "lsm.blocked" event in JSONL with pid + tgid + reason.
                 35 if data.len() >= 24 => {
+                    // LSM_HOOK_* wire-format constants — kept in sync with
+                    // crates/sensor-ebpf-types/src/lib.rs anchor tests.
+                    // The sensor crate doesn't directly depend on
+                    // innerwarden-ebpf-types (events are parsed via byte
+                    // offsets, not Rust types), so inline the constants
+                    // here rather than add a workspace dep just for 5 u32s.
+                    const LSM_HOOK_BPRM_CHECK_SECURITY: u32 = 1;
+                    const LSM_HOOK_CREATE_USER_NS: u32 = 2;
+                    const LSM_HOOK_PTRACE_ACCESS_CHECK: u32 = 3;
+                    const LSM_HOOK_MMAP_FILE: u32 = 4;
+                    const LSM_HOOK_BPF_PROG_LOAD: u32 = 5;
                     let pid = read_u32!(data, 4..8);
                     let tgid = read_u32!(data, 8..12);
-                    let reason = read_u32!(data, 12..16);
+                    let hook_id = read_u32!(data, 12..16);
                     // ts_ns is captured by the kernel hook but the userspace
                     // event's `ts` field is the JSONL-canonical UTC time so
                     // operators don't have to translate boot-relative ns.
 
                     let container_id = resolve_container_id(pid);
 
+                    // PR-A: the `reason` field at offset 12 was repurposed
+                    // as `hook_id` (sensor-ebpf-types LSM_HOOK_*) so kind=35
+                    // events from create_user_ns / ptrace_access_check /
+                    // mmap_file / bpf_prog_load all dispatch through this
+                    // one arm. Map to a human-readable hook name + tag.
+                    let (hook_name, source_program) = match hook_id {
+                        LSM_HOOK_BPRM_CHECK_SECURITY => {
+                            ("bprm_check_security", "innerwarden_lsm_exec_min")
+                        }
+                        LSM_HOOK_CREATE_USER_NS => {
+                            ("userns_create", "innerwarden_lsm_create_user_ns")
+                        }
+                        LSM_HOOK_PTRACE_ACCESS_CHECK => {
+                            ("ptrace_access_check", "innerwarden_lsm_ptrace_access")
+                        }
+                        LSM_HOOK_MMAP_FILE => ("mmap_file", "innerwarden_lsm_mmap_file"),
+                        LSM_HOOK_BPF_PROG_LOAD => {
+                            ("bpf_prog_load", "innerwarden_lsm_bpf_prog_load")
+                        }
+                        _ => ("unknown", "unknown"),
+                    };
+
                     // Spec 052 Phase 1d: join with the earlier ExecveEvent
-                    // for the same PID (cached above on kind=1). The
-                    // tracepoint always fires before the LSM hook, so the
-                    // cache entry should be present unless this block is
-                    // somehow racing with cache eviction (unlikely at the
-                    // 5s TTL / 1024-entry capacity). If absent, the event
-                    // still lands with bare pid/tgid context — operators
-                    // can still see SOMETHING was blocked.
-                    let exec_ctx = execve_cache.get(&pid);
+                    // (kind=1) for the same PID — only meaningful for
+                    // bprm_check_security blocks. Other hooks (userns,
+                    // ptrace, mmap, bpf) don't have a corresponding execve
+                    // for the SAME action so join_source stays "n/a".
+                    let join_execve = hook_id == LSM_HOOK_BPRM_CHECK_SECURITY;
+                    let exec_ctx = if join_execve {
+                        execve_cache.get(&pid)
+                    } else {
+                        None
+                    };
 
                     let mut details = serde_json::json!({
                         "pid": pid,
                         "tgid": tgid,
-                        "reason_code": reason,
+                        "hook_id": hook_id,
+                        "hook": hook_name,
                         "action": "blocked",
-                        "hook": "bprm_check_security",
-                        "source_program": "innerwarden_lsm_exec_min",
+                        "source_program": source_program,
                     });
                     if let Some(ref cid) = container_id {
                         details["container_id"] = serde_json::Value::String(cid.to_string());
@@ -1875,9 +1939,11 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
                         details["uid"] = serde_json::Value::from(ctx.uid);
                         details["join_source"] =
                             serde_json::Value::String("execve_tracepoint".to_string());
-                    } else {
+                    } else if join_execve {
                         details["join_source"] =
                             serde_json::Value::String("cache_miss".to_string());
+                    } else {
+                        details["join_source"] = serde_json::Value::String("n/a".to_string());
                     }
 
                     let mut tags = vec![
@@ -1885,11 +1951,15 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
                         "lsm".to_string(),
                         "blocked".to_string(),
                         "spec_052".to_string(),
+                        format!("hook:{hook_name}"),
                     ];
                     let mut entities = vec![];
                     if let Some(ref cid) = container_id {
                         tags.push("container".to_string());
                         entities.push(EntityRef::container(cid));
+                    }
+                    if hook_id == LSM_HOOK_CREATE_USER_NS {
+                        tags.push("container_escape".to_string());
                     }
 
                     let summary = if let Some(ctx) = exec_ctx {
@@ -1900,8 +1970,8 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
                         )
                     } else {
                         format!(
-                            "LSM kernel-block: execve from PID {pid} (TGID {tgid}) \
-                             denied by innerwarden_lsm_exec_min"
+                            "LSM kernel-block: {hook_name} denied for PID {pid} (TGID {tgid}) \
+                             by {source_program}"
                         )
                     };
 

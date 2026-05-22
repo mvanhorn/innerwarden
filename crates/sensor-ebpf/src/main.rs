@@ -926,7 +926,7 @@ pub fn innerwarden_lsm_exec_min(_ctx: LsmContext) -> i32 {
         event.kind = SyscallKind::LsmDecision as u32;
         event.pid = pid;
         event.tgid = tgid;
-        event.reason = 0; // unknown at kernel time; userspace can infer
+        event.reason = innerwarden_ebpf_types::LSM_HOOK_BPRM_CHECK_SECURITY;
         event.ts_ns = unsafe { bpf_ktime_get_ns() };
         entry.submit(0);
     }
@@ -936,6 +936,59 @@ pub fn innerwarden_lsm_exec_min(_ctx: LsmContext) -> i32 {
     // corresponding decision event.
 
     -1 // -EPERM
+}
+
+// ── PR-A: create_user_ns LSM hook (container escape detection) ─────
+//
+// `security_create_user_ns(struct cred *cred)` fires when a process
+// calls `unshare(CLONE_NEWUSER)` or `clone(CLONE_NEWUSER)`. Inside a
+// rootless container, this is the primary vector to gain CAP_SYS_ADMIN
+// in a new namespace — the foundation for most container-escape
+// exploits (CVE-2022-0492 cgroups, CVE-2024-1086, etc).
+//
+// Default behaviour: observe + block only when PID is in BLOCKED_PIDS.
+// We do NOT block unconditionally because legitimate users include
+// Chrome's sandbox, podman rootless, snap confinement, Docker rootless,
+// Firefox sandbox — all create user namespaces on every launch.
+//
+// The agent populates BLOCKED_PIDS via the kill chain detector. If a
+// PID is registered (because PidTracker matched an attack pattern) and
+// that PID then tries to create a user namespace, this hook denies
+// with -EPERM and emits LsmDecisionEvent tagged with
+// LSM_HOOK_CREATE_USER_NS so the operator dashboard can distinguish
+// "blocked exec" from "blocked container escape".
+#[lsm(hook = "userns_create", sleepable)]
+pub fn innerwarden_lsm_create_user_ns(_ctx: LsmContext) -> i32 {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let pid = pid_tgid as u32;
+    let tgid = (pid_tgid >> 32) as u32;
+
+    // INV-LSM-07: TGID first, PID fallback.
+    let blocked_by_tgid = unsafe { BLOCKED_PIDS.get(&tgid) }
+        .copied()
+        .unwrap_or(0)
+        != 0;
+    let blocked_by_pid = !blocked_by_tgid
+        && unsafe { BLOCKED_PIDS.get(&pid) }
+            .copied()
+            .unwrap_or(0)
+            != 0;
+
+    if !(blocked_by_tgid || blocked_by_pid) {
+        return 0; // allow (default for non-attack PIDs — no FPs on Chrome/Docker/etc)
+    }
+
+    if let Some(mut entry) = EVENTS.reserve::<LsmDecisionEvent>(0) {
+        let event = unsafe { &mut *entry.as_mut_ptr() };
+        event.kind = SyscallKind::LsmDecision as u32;
+        event.pid = pid;
+        event.tgid = tgid;
+        event.reason = innerwarden_ebpf_types::LSM_HOOK_CREATE_USER_NS;
+        event.ts_ns = unsafe { bpf_ktime_get_ns() };
+        entry.submit(0);
+    }
+
+    -1 // -EPERM — block container escape attempt
 }
 
 fn try_lsm_exec(ctx: &LsmContext) -> Result<i32, i64> {
