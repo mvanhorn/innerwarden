@@ -37,7 +37,7 @@ ifeq ($(HOST_OS),Linux)
 ifneq ($(HAS_BPF_LINKER),)
 	@echo "[build-ebpf] cd crates/sensor-ebpf && cargo +nightly build --target bpfel-unknown-none …"
 	@cd crates/sensor-ebpf && RUSTFLAGS="" \
-		cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release --features dispatcher
+		cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release
 	@ls -la crates/sensor-ebpf/target/bpfel-unknown-none/release/innerwarden-ebpf
 else
 	@echo "[build-ebpf] bpf-linker not on PATH — skipping bytecode build (sensor will use runtime .o lookup)"

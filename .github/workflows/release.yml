@@ -68,8 +68,7 @@ jobs:
           RUSTFLAGS="" cargo +nightly build \
             --target bpfel-unknown-none \
             -Z build-std=core \
-            --release \
-            --features dispatcher
+            --release
           ls -la target/bpfel-unknown-none/release/innerwarden-ebpf
 
       # ── Build x86_64 ───────────────────────────────────────────────────────

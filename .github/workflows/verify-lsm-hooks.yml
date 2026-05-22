@@ -46,7 +46,7 @@ jobs:
       - name: Build sensor-ebpf
         run: |
           cd crates/sensor-ebpf
-          cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release --features dispatcher
+          cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release
 
       - name: Verify LSM hook sections
         run: ./scripts/verify-lsm-hooks.sh --strict

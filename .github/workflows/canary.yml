@@ -55,8 +55,7 @@ jobs:
           RUSTFLAGS="" cargo +nightly build \
             --target bpfel-unknown-none \
             -Z build-std=core \
-            --release \
-            --features dispatcher
+            --release
 
       - name: Build x86_64
         run: |

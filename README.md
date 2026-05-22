@@ -85,7 +85,7 @@ Apache-2.0. If this project helps protect your servers, [give it a star](https:/
 │                           KERNEL (Ring 0)   │                      │
 │                                                                    │
 │  ┌───────────── ─┐  ┌────────────┐  ┌─────────┐  ┌───────────────┐ │
-│  │23 tracepoints │  │ 10 kprobes │  │  3 LSM  │  │      XDP      │ │
+│  │23 tracepoints │  │ 10 kprobes │  │  5 LSM  │  │      XDP      │ │
 │  │ execve,       │  │ creds,     │  │ exec    │  │  wire-speed   │ │
 │  │ connect,      │  │ MSR, ACPI  │  │ file    │  │  IP blocking  │ │
 │  │ openat,       │  │ timestomp  │  │ bpf     │  │  10M+ pps     │ │
@@ -335,8 +335,7 @@ Plus: `docker_anomaly`, `search_abuse`, `credential_harvest`, `ssh_key_injection
 **eBPF**: 44 kernel programs running inside Linux (5.8+, CO-RE/BTF portable):
 - **23 tracepoints**: execve, connect, openat, ptrace, setuid, bind, mount, memfd_create, init_module, dup2/dup3, listen, mprotect, clone, unlinkat, renameat2, kill, prctl, accept4, sched_process_exit, ioperm, iopl, io_uring_submit, io_uring_create
 - **10 kprobes**: `commit_creds` (privilege escalation), `native_write_msr` (firmware MSR tampering), `acpi_evaluate_object` (ACPI rootkit detection), `do_truncate` (log tampering), plus 6 timing-based rootkit kprobes (Trace of the Times: iterate_dir, filldir64, tcp4_seq_show, proc_pid_readdir kprobe/kretprobe pairs)
-- **3 LSM hooks**: `bprm_check_security` (exec blocking + kill chain with 8 attack patterns), `file_open` (sensitive path write protection), `bpf` (eBPF weaponisation / VoidLink defence)
-- **7 raw tracepoints** on `sys_enter`: tail-call dispatcher routing every syscall through a single attach point to N specialised handlers via ProgramArray
+- **5 LSM kernel-block hooks** (Spec 052/053 + PR-A/B/C/D): `bprm_check_security` (exec blocking via PID→BLOCKED_PIDS map populated by kill chain detector), `userns_create` (container escape — blocks `unshare(CLONE_NEWUSER)` from chain-flagged PIDs), `ptrace_access_check` (process injection — blocks PTRACE_ATTACH/POKETEXT), `bpf_prog` (VoidLink defence — blocks malicious BPF program loads), `mmap_file` (real-time RWX block, replacing 5s `proc_maps` polling). Plus 2 legacy hooks (`file_open`, `bpf`) kept in parallel. All FP-free by design: legitimate users (Chrome sandbox, gdb, JIT compilers, systemd) pass through because they're never in BLOCKED_PIDS.
 - **XDP program**: wire-speed IP blocking at the network driver (10M+ pps drop rate)
 - **Phase 2 firmware hooks**: MSR write guard (LSTAR/SMRR), I/O port access (SPI controller probing), ACPI method execution monitoring
 

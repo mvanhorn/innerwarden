@@ -200,8 +200,7 @@ build_ebpf_bytecode() {
     RUSTFLAGS='' cargo +nightly build \
       --target bpfel-unknown-none \
       -Z build-std=core \
-      --release \
-      --features dispatcher 2>&1 | tail -1"
+      --release 2>&1 | tail -1"
   $SSH "ls -la $REMOTE_DIR/crates/sensor-ebpf/target/bpfel-unknown-none/release/innerwarden-ebpf" \
     || die "eBPF bytecode build did not produce the expected binary"
 }

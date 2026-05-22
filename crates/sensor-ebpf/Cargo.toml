@@ -18,7 +18,6 @@ aya-log-ebpf = "0.1"
 
 [features]
 default = []
-dispatcher = []
 
 [profile.dev]
 opt-level = 3       # eBPF programs need optimization even in dev
