@@ -1083,137 +1083,6 @@ fn attach_tp(bpf: &mut aya::Ebpf, name: &str, category: &str, tp_name: &str) -> 
     false
 }
 
-/// Attach the syscall dispatcher - single raw_tracepoint on sys_enter that
-/// tail-calls per-syscall handlers via a SYSCALL_DISPATCH ProgramArray.
-///
-/// This is more efficient than 18 individual typed tracepoints because the
-/// kernel only fires one BPF program per syscall entry instead of scanning
-/// all tracepoints.
-///
-/// Returns true if the dispatcher was loaded and at least one handler was
-/// inserted into the dispatch table.
-///
-/// aarch64 syscall numbers (from include/uapi/asm-generic/unistd.h):
-///   execve=221, connect=203, openat=56, ptrace=117, setuid=146,
-///   bind=200, mount=40, memfd_create=279, init_module=105, dup2=n/a (dup3=24),
-///   listen=201, mprotect=226, clone=220, unlinkat=35, renameat2=276,
-///   kill=129, prctl=167, accept4=242
-#[cfg(feature = "ebpf")]
-fn attach_dispatcher(bpf: &mut aya::Ebpf) -> bool {
-    use aya::maps::{Array, HashMap, ProgramArray};
-    use aya::programs::RawTracePoint;
-
-    // --- 1. Load and attach the dispatcher to raw_tracepoint/sys_enter ---
-    let dispatcher_ok = if let Some(prog) = bpf.program_mut("innerwarden_dispatcher") {
-        match TryInto::<&mut RawTracePoint>::try_into(prog) {
-            Ok(rtp) => {
-                if let Err(e) = rtp.load() {
-                    warn!(error = %e, "dispatcher: failed to load");
-                    return false;
-                }
-                if let Err(e) = rtp.attach("sys_enter") {
-                    warn!(error = %e, "dispatcher: failed to attach to sys_enter");
-                    return false;
-                }
-                info!("eBPF: innerwarden_dispatcher → raw_tracepoint/sys_enter ✅");
-                true
-            }
-            Err(e) => {
-                warn!(error = %e, "dispatcher: not a RawTracePoint program");
-                return false;
-            }
-        }
-    } else {
-        return false;
-    };
-
-    if !dispatcher_ok {
-        return false;
-    }
-
-    // --- 2. Load each dispatch_* handler as RawTracePoint (no attach - called via tail_call) ---
-    // (name_in_elf, syscall_nr on aarch64)
-    let handlers: &[(&str, u32)] = &[
-        ("dispatch_execve", 221),
-        ("dispatch_connect", 203),
-        ("dispatch_openat", 56),
-        ("dispatch_ptrace", 117),
-        ("dispatch_setuid", 146),
-        ("dispatch_bind", 200),
-        ("dispatch_mount", 40),
-        ("dispatch_memfd_create", 279),
-        ("dispatch_init_module", 105),
-        ("dispatch_dup", 24), // dup3 on aarch64 (no dup2)
-        ("dispatch_listen", 201),
-        ("dispatch_mprotect", 226),
-        ("dispatch_clone", 220),
-        ("dispatch_unlink", 35),  // unlinkat
-        ("dispatch_rename", 276), // renameat2
-        ("dispatch_kill", 129),
-        ("dispatch_prctl", 167),
-        ("dispatch_accept", 242), // accept4
-    ];
-
-    // Load all handlers first (must happen before we borrow the map mutably)
-    for &(name, _) in handlers {
-        if let Some(prog) = bpf.program_mut(name) {
-            if let Ok(rtp) = TryInto::<&mut RawTracePoint>::try_into(prog) {
-                if let Err(e) = rtp.load() {
-                    warn!(error = %e, "dispatch handler {name}: failed to load");
-                }
-            }
-        }
-    }
-
-    // --- 3. Wire handlers into SYSCALL_DISPATCH ProgramArray ---
-    // Use take_map() to transfer ownership - avoids borrow conflict with bpf.program()
-    let mut dispatch_map = match bpf.take_map("SYSCALL_DISPATCH") {
-        Some(map) => match ProgramArray::try_from(map) {
-            Ok(arr) => arr,
-            Err(e) => {
-                warn!(error = %e, "dispatcher: SYSCALL_DISPATCH not a ProgramArray");
-                return false;
-            }
-        },
-        None => {
-            warn!("dispatcher: SYSCALL_DISPATCH map not found");
-            return false;
-        }
-    };
-
-    let mut inserted = 0u32;
-    for &(name, syscall_nr) in handlers {
-        if let Some(prog) = bpf.program(name) {
-            if let Ok(fd) = prog.fd() {
-                if dispatch_map.set(syscall_nr, fd, 0).is_ok() {
-                    inserted += 1;
-                }
-            }
-        }
-    }
-
-    if inserted == 0 {
-        warn!("dispatcher: no handlers wired into SYSCALL_DISPATCH");
-        return false;
-    }
-    info!(count = inserted, "eBPF: SYSCALL_DISPATCH populated");
-
-    // --- 4. Populate SYSCALL_ENABLED map ---
-    if let Some(map) = bpf.take_map("SYSCALL_ENABLED") {
-        if let Ok(mut enabled_map) = HashMap::<_, u32, u32>::try_from(map) {
-            for &(_, syscall_nr) in handlers {
-                let _ = enabled_map.insert(syscall_nr, 1u32, 0);
-            }
-            info!(
-                "eBPF: SYSCALL_ENABLED populated ({} syscalls)",
-                handlers.len()
-            );
-        }
-    }
-
-    true
-}
-
 #[cfg(feature = "ebpf")]
 pub async fn run(tx: mpsc::Sender<Event>, host: String) {
     use aya::maps::RingBuf;
@@ -1268,21 +1137,22 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
     };
 
     // --- Attach syscall handlers: dispatcher mode or individual tracepoints ---
-    let using_dispatcher = if bpf.program("innerwarden_dispatcher").is_some() {
-        info!("eBPF: dispatcher program found - attempting dispatcher mode");
-        attach_dispatcher(&mut bpf)
-    } else {
-        false
-    };
-
-    if using_dispatcher {
-        info!("eBPF: dispatcher mode active - single sys_enter hook with tail calls");
-    } else {
-        // Typed tracepoint mode - attach each handler individually
-        if !using_dispatcher && bpf.program("innerwarden_dispatcher").is_some() {
-            info!("eBPF: dispatcher attach failed - falling back to typed tracepoints");
-        }
-
+    // Spec 053 fix: SKIP the dispatcher entirely on prod. Empirical finding
+    // 2026-05-22: aya 0.13's dispatcher pattern loads dispatch_* tail call
+    // targets, inserts them into SYSCALL_DISPATCH prog_array, post-set lookup
+    // confirms entries persist — yet bpf_tail_call from the dispatcher to
+    // dispatch_execve silently fails (dispatcher.run_cnt = 8M, dispatch_execve.
+    // run_cnt = 0 over many execves on kernel 6.8.0-1052-oracle). Root cause
+    // is likely an attach-type / load-time cookie incompatibility between
+    // aya's RawTracePoint loader and bpf_tail_call's target validation.
+    //
+    // The .o ALSO contains standalone tracepoint handlers (innerwarden_execve,
+    // innerwarden_connect, innerwarden_openat, etc.) which DO work via the
+    // typed-tracepoint code path. Use those exclusively until the dispatcher
+    // bug is root-caused. Doing this means we burn one tracepoint slot per
+    // monitored syscall (still well within kernel limits) but events finally
+    // start flowing.
+    {
         // Core tracepoints (execve, connect, openat)
         attach_tp(
             &mut bpf,

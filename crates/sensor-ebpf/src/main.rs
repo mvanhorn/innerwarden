@@ -629,10 +629,15 @@ fn try_openat(ctx: &TracePointContext) -> Result<(), i64> {
     if !is_sensitive {
         return Ok(());
     }
+    // Spec 053 fix (2026-05-22): do NOT rate-limit sensitive path opens.
+    // Sensitive opens (/etc/shadow, /etc/sudoers, ~/.ssh/*) are rare and
+    // high-signal — they MUST fire kill-chain CHAIN_SENSITIVE_READ for the
+    // DATA_EXFIL detector. Previous behaviour rate-limited cat reading
+    // shadow because cat's libc had already done dozens of openats for
+    // libraries within the 100ms RATE_LIMIT_NS window, silently dropping
+    // the actual sensitive read.
     let pid = bpf_get_current_pid_tgid() as u32;
-    if is_rate_limited(pid) {
-        return Ok(());
-    }
+    let _ = pid;
 
     let pid_tgid = bpf_get_current_pid_tgid();
     let pid = pid_tgid as u32;

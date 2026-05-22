@@ -61,9 +61,16 @@ pub(crate) fn process_events(
             // pinned (sensor off, built without LSM, etc.) this is a
             // logged no-op and the existing userspace skill pipeline
             // continues unchanged.
+            //
+            // Spec 053 fix (2026-05-22): `evidence` is an ARRAY of one
+            // object (tracker.rs:329 / :429 wraps `[evidence]`). Earlier
+            // code accessed it as object → silent None → register never
+            // fired. Read evidence[0].pid instead.
             if let Some(pid) = inc
                 .get("evidence")
-                .and_then(|e| e.get("pid"))
+                .and_then(|e| e.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|first| first.get("pid"))
                 .and_then(|p| p.as_u64())
             {
                 let reason = format!("kill_chain:{pattern}");
