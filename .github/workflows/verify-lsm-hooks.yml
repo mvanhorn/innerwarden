@@ -1,0 +1,52 @@
+name: LSM Hook Sections
+
+# Builds the eBPF object on Linux + asserts every expected LSM hook
+# section is present (Spec 052/053 + PR-A/B/C/D series). Catches:
+#   - someone removes a hook accidentally
+#   - someone renames a hook surface (#[lsm(hook = "X")] → "Y")
+#   - someone changes sleepable attribute on a non-sleepable-allowed hook
+#   - cfg-gating accidentally excludes a hook
+#
+# Pre-PR-A/B/C/D shipped the kernel-block surface had only 3 LSM hooks
+# (Spec 052 minimal + 2 legacy). After PR-D the canonical surface is 7.
+# This script's EXPECTED[] list is the source of truth.
+
+on:
+  pull_request:
+    paths:
+      - 'crates/sensor-ebpf/**'
+      - 'crates/sensor-ebpf-types/**'
+      - 'scripts/verify-lsm-hooks.sh'
+      - '.github/workflows/verify-lsm-hooks.yml'
+  push:
+    branches:
+      - main
+      - development
+
+permissions:
+  contents: read
+
+jobs:
+  verify-lsm-hooks:
+    name: Verify LSM hook sections in eBPF .o
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust nightly + bpf-linker prereqs
+        run: |
+          rustup install nightly --profile minimal
+          rustup component add rust-src --toolchain nightly
+          sudo apt-get update
+          sudo apt-get install -y binutils  # readelf
+
+      - name: Install bpf-linker
+        run: cargo install bpf-linker --locked
+
+      - name: Build sensor-ebpf
+        run: |
+          cd crates/sensor-ebpf
+          cargo +nightly build --target bpfel-unknown-none -Z build-std=core --release --features dispatcher
+
+      - name: Verify LSM hook sections
+        run: ./scripts/verify-lsm-hooks.sh --strict
