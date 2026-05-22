@@ -100,6 +100,11 @@ fn map_handle() -> &'static Mutex<Option<AyaHashMap<MapData, u32, u8>>> {
 /// `None` if the process has already exited (ENOENT) or status parsing
 /// fails — the caller treats that as "couldn't dual-register" and
 /// proceeds with the PID-only registration.
+//
+// dead_code allow on non-Linux: this helper is only called by the Linux
+// register_blocked_pid path and the macOS-gated unit test, neither of
+// which the workspace clippy run sees on the macOS build cfg.
+#[allow(dead_code)]
 fn read_tgid_from_proc(pid: u32) -> Option<u32> {
     let path = format!("/proc/{pid}/status");
     let content = std::fs::read_to_string(&path).ok()?;
@@ -204,6 +209,7 @@ pub fn register_blocked_pid(pid: u32, reason: &str) {
 }
 
 #[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 pub fn unregister_blocked_pid(_pid: u32) {
     // no-op on non-Linux
 }

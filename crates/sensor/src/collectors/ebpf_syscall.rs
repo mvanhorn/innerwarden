@@ -1911,6 +1911,63 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
                         entities: vec![],
                     })
                 }
+                // Spec 052 Phase 1c — LsmDecisionEvent layout (#[repr(C)]):
+                //   kind(4) pid(4) tgid(4) reason(4) ts_ns(8) = 24 bytes
+                // Emitted by `innerwarden_lsm_exec_min` ONLY on block. Carries
+                // no comm/filename/uid — the userspace agent joins by PID
+                // against the existing `innerwarden_execve` event stream
+                // (kind=1) to recover that context. Until the agent ships
+                // the join (next sub-PR), the operator still gets the bare
+                // "lsm.blocked" event in JSONL with pid + tgid + reason.
+                35 if data.len() >= 24 => {
+                    let pid = read_u32!(data, 4..8);
+                    let tgid = read_u32!(data, 8..12);
+                    let reason = read_u32!(data, 12..16);
+                    // ts_ns is captured by the kernel hook but the userspace
+                    // event's `ts` field is the JSONL-canonical UTC time so
+                    // operators don't have to translate boot-relative ns.
+
+                    let container_id = resolve_container_id(pid);
+
+                    let mut details = serde_json::json!({
+                        "pid": pid,
+                        "tgid": tgid,
+                        "reason_code": reason,
+                        "action": "blocked",
+                        "hook": "bprm_check_security",
+                        "source_program": "innerwarden_lsm_exec_min",
+                    });
+                    if let Some(ref cid) = container_id {
+                        details["container_id"] = serde_json::Value::String(cid.to_string());
+                    }
+
+                    let mut tags = vec![
+                        "ebpf".to_string(),
+                        "lsm".to_string(),
+                        "blocked".to_string(),
+                        "spec_052".to_string(),
+                    ];
+                    let mut entities = vec![];
+                    if let Some(ref cid) = container_id {
+                        tags.push("container".to_string());
+                        entities.push(EntityRef::container(cid));
+                    }
+
+                    Some(Event {
+                        ts: chrono::Utc::now(),
+                        host: host.to_string(),
+                        source: "ebpf".to_string(),
+                        kind: "lsm.blocked".to_string(),
+                        severity: Severity::Critical,
+                        summary: format!(
+                            "LSM kernel-block: execve from PID {pid} (TGID {tgid}) \
+                             denied by innerwarden_lsm_exec_min"
+                        ),
+                        details,
+                        tags,
+                        entities,
+                    })
+                }
                 // ProcessExitEvent layout (#[repr(C)]):
                 //   kind(4) pid(4) tgid(4) comm(64) exit_code(4) ts_ns(8)
                 //   Offsets: 0  4  8  12..76  76  80
