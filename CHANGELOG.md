@@ -9,6 +9,29 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.14.3] - 2026-05-23
+
+**Headline:** new `suid_page_cache_integrity` detector closes the entire 2026 Linux kernel page-cache-corruption LPE family — Copy Fail (CVE-2026-31431), Dirty Frag (CVE-2026-43284 + CVE-2026-43500), and Fragnesia (CVE-2026-46300). The detector periodically compares an `O_DIRECT` disk read against a page-cache-served read for a small allowlist of high-value SUID-root binaries; divergence fires a Critical incident. This is the result of v0.14.2's honest lab miss against Copy Fail (see `_innerwarden/innerwarden-cve-lab/cve-2026-31431-copy-fail/RESULTS.md`): we measured what the existing detectors missed, then shipped what would have caught it.
+
+### Added
+
+- **`suid_page_cache_integrity` detector** (#793). Polls `/usr/bin/su`, `sudo`, `passwd`, `chsh`, `chfn`, `mount`, `umount`, `newgrp`, `gpasswd`, `pkexec` every 30 s by default. For each binary it computes SHA-256 via `read()` (page-cache path) and via `O_DIRECT` `read()` (disk path), with `posix_fadvise(POSIX_FADV_DONTNEED)` between the two so the disk read is genuinely from disk. SHA divergence → Critical event `integrity.page_cache_mismatch` + promoted Incident with minute-grained dedup ID, MITRE T1014 + T1068.
+  - Trait-based `PageCacheReader` abstraction (mirrors the `BlockedPidsMap` pattern from spec 052) so the inner scan is unit-testable without a real filesystem.
+  - 6 anchor tests cover: divergence → fires Critical, match → silent, missing binary → no-op, IO error → fail-open with recovery on next poll, real-reader tempfile smoke, run loop with paused tokio clock + cancellation.
+  - Fail-open everywhere: missing files, read errors, fadvise errors all warn and continue. Periodic loop survives task panics.
+  - Config: `[detectors.suid_page_cache_integrity]` with `enabled`, `poll_interval_secs`, `allowlist` keys. Defaults enabled.
+  - Cross-platform: Linux uses `libc::posix_fadvise` + `O_DIRECT` + page-aligned buffer via `posix_memalign`; non-Linux stub falls back to a normal `std::fs::read` so the detector compiles on macOS/Windows builds without `#[cfg]` scattered through call sites.
+
+### Operator-visible numbers
+
+- Workspace version: `0.14.2` → `0.14.3`.
+- Detectors: `76` → `77`.
+- Unit tests: `8010` → `8024`.
+
+### Why this version exists
+
+Patch release driven entirely by a measured product gap, not a feature roadmap. The v0.14.2 release shipped a working LSM kernel-block path but the lab run (PID 950484 GC validation aside, the Copy Fail attempt on the Azure VM) proved the agent had zero visibility into in-kernel page-cache corruption — a class of LPE that bypasses every behavioural hook the agent shipped because the exploited binary's bytes on disk never change, only the cached copy that the kernel actually executes. The Codex offensive run produced result.json, RESULTS.md captured the honest verdict ("missed, root achieved, page-cache corruption visible"), and PR #793 ships the detector that would have caught it. The next lab run will be Run 2 of the same CVE on v0.14.3 — if `suid_page_cache_integrity` fires within the 30 s poll window after the PoC corrupts `/usr/bin/su`, the gap is closed.
+
 ## [0.14.2] - 2026-05-23
 
 **Headline:** 5 LSM kernel-block hooks live in prod with synchronous `-EPERM` enforcement on kernel ≥ 6.4. The "stops attacks mid-keystroke" copy is no longer half-true for the process-exec subset — it's now true for exec, user-namespace creation, ptrace attach, BPF program load, and mmap of sensitive files.
