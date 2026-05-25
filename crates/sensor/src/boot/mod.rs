@@ -17,4 +17,5 @@
 //! calls into these helpers.
 
 pub(crate) mod build_detectors;
+pub(crate) mod event_loop;
 pub(crate) mod spawn_collectors;

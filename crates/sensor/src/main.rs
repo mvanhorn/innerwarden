@@ -16,7 +16,7 @@ use main_helpers::{
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -236,7 +236,7 @@ async fn main() -> Result<()> {
             ))
         }
     };
-    let (tx, mut rx) = mpsc::channel(1024);
+    let (tx, rx) = mpsc::channel(1024);
 
     // Shared state - updated by collectors, read on shutdown for persistence.
     let shared_auth_offset = Arc::new(AtomicU64::new(0));
@@ -310,7 +310,7 @@ async fn main() -> Result<()> {
 
     // SIGTERM listener (Unix only)
     #[cfg(unix)]
-    let mut sigterm = {
+    let sigterm = {
         use tokio::signal::unix::{signal, SignalKind};
         signal(SignalKind::terminate())?
     };
@@ -380,94 +380,30 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Main loop: drain events, run detectors, write output
-    let mut stats = WriteStats::default();
-
-    // Cross-detector dedup cache: PID -> (last_incident_ts, severity_rank).
-    // Prevents multiple detectors from emitting incidents for the same PID
-    // within a 10-second window. Only the highest severity is kept.
-    let mut dedup_cache: HashMap<u32, (chrono::DateTime<chrono::Utc>, u8)> = HashMap::new();
-
-    'main: loop {
-        // Receive next event or signal
+    // Main loop + shutdown. Moved to crates/sensor/src/boot/event_loop.rs
+    // in PR5b3 (2026-05-25). Drains rx until the channel closes or a
+    // signal fires, then snapshots every shared-cursor Arc into the
+    // State and writes it to disk.
+    boot::event_loop::run_event_loop(
+        rx,
+        &sqlite_writer,
+        &mut detectors,
+        &mut syslog_writer,
+        &mut threat_datasets,
+        &mut state,
+        &state_path,
         #[cfg(unix)]
-        let received = tokio::select! {
-            event = rx.recv() => event,
-            _ = tokio::signal::ctrl_c() => {
-                info!("SIGINT received - shutting down");
-                break 'main;
-            }
-            _ = sigterm.recv() => {
-                info!("SIGTERM received - shutting down");
-                break 'main;
-            }
-        };
-
-        #[cfg(not(unix))]
-        let received = tokio::select! {
-            event = rx.recv() => event,
-            _ = tokio::signal::ctrl_c() => {
-                info!("SIGINT received - shutting down");
-                break 'main;
-            }
-        };
-
-        let Some(ev) = received else {
-            info!("all collectors stopped");
-            break 'main;
-        };
-
-        // Periodic dataset reload (every hour)
-        threat_datasets.maybe_reload();
-
-        event_dispatch::process_event(
-            ev,
-            &sqlite_writer,
-            &mut detectors,
-            &mut stats,
-            &mut syslog_writer,
-            &mut dedup_cache,
-            &threat_datasets,
-        );
-    }
-
-    info!(
-        events_written = stats.events_written,
-        incidents_written = stats.incidents_written,
-        "sensor stopped"
-    );
-
-    // Persist collector state using the latest values from the shared Arcs
-    let auth_offset = shared_auth_offset.load(Ordering::Relaxed);
-    state.set_cursor("auth_log", serde_json::json!(auth_offset));
-
-    let integrity_hashes = shared_integrity_hashes.lock().unwrap().clone();
-    if !integrity_hashes.is_empty() {
-        state.set_cursor("integrity", serde_json::to_value(&integrity_hashes)?);
-    }
-
-    if let Some(cursor) = shared_journald_cursor.lock().unwrap().clone() {
-        state.set_cursor("journald", serde_json::json!(cursor));
-    }
-
-    if let Some(since) = shared_docker_since.lock().unwrap().clone() {
-        state.set_cursor("docker", serde_json::json!(since));
-    }
-
-    let exec_audit_offset = shared_exec_audit_offset.load(Ordering::Relaxed);
-    state.set_cursor("exec_audit", serde_json::json!(exec_audit_offset));
-
-    let nginx_offset = shared_nginx_offset.load(Ordering::Relaxed);
-    state.set_cursor("nginx_access", serde_json::json!(nginx_offset));
-
-    let nginx_error_offset = shared_nginx_error_offset.load(Ordering::Relaxed);
-    state.set_cursor("nginx_error", serde_json::json!(nginx_error_offset));
-
-    let syslog_firewall_offset = shared_syslog_firewall_offset.load(Ordering::Relaxed);
-    state.set_cursor("syslog_firewall", serde_json::json!(syslog_firewall_offset));
-
-    state.save(&state_path)?;
-    info!(auth_offset, "state saved");
+        sigterm,
+        shared_auth_offset,
+        shared_integrity_hashes,
+        shared_journald_cursor,
+        shared_docker_since,
+        shared_exec_audit_offset,
+        shared_nginx_offset,
+        shared_nginx_error_offset,
+        shared_syslog_firewall_offset,
+    )
+    .await?;
 
     Ok(())
 }
