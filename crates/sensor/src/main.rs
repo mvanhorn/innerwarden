@@ -3,6 +3,7 @@ mod collectors;
 mod config;
 mod detectors;
 mod main_helpers;
+mod seccomp;
 mod sinks;
 mod tracing_init;
 
@@ -18,11 +19,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-// `anyhow::Context` is only consumed by the Linux-gated
-// `apply_seccomp_profile` helper. Gating the import keeps non-Linux
-// dev builds from tripping `unused_imports` under `-D warnings`.
-#[cfg(target_os = "linux")]
-use anyhow::Context;
 use clap::Parser;
 use collectors::{
     auth_log::AuthLogCollector, cloudtrail::CloudTrailCollector, docker::DockerCollector,
@@ -1277,7 +1273,7 @@ async fn main() -> Result<()> {
     {
         let seccomp_path = data_dir.join("sensor.seccomp.json");
         if seccomp_path.exists() {
-            match apply_seccomp_profile(&seccomp_path) {
+            match seccomp::apply_seccomp_profile(&seccomp_path) {
                 Ok(count) => info!(
                     syscalls_allowed = count,
                     "seccomp profile applied — sensor hardened"
@@ -2632,228 +2628,11 @@ fn write_incident(
     }
 }
 
-/// Apply a seccomp-BPF profile from a JSON file (Active Defence feature).
-/// The profile specifies allowed syscalls; everything else returns EPERM.
-/// Uses the kernel's seccomp(2) via prctl(PR_SET_SECCOMP) with a BPF filter.
-#[cfg(target_os = "linux")]
-fn apply_seccomp_profile(path: &Path) -> Result<usize> {
-    let data = std::fs::read_to_string(path)
-        .with_context(|| format!("read seccomp profile: {}", path.display()))?;
-
-    // Parse the JSON profile to get the syscall allowlist
-    let profile =
-        serde_json::from_str::<serde_json::Value>(&data).context("parse seccomp profile JSON")?;
-
-    let syscalls = profile["allowed_syscalls"]
-        .as_array()
-        .context("seccomp profile missing allowed_syscalls array")?;
-
-    let count = syscalls.len();
-
-    // Resolve syscall names to numbers using the audit architecture
-    let mut allowed_nrs: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    for name_val in syscalls {
-        if let Some(name) = name_val.as_str() {
-            if let Some(nr) = syscall_name_to_nr(name) {
-                allowed_nrs.insert(nr);
-            } else {
-                tracing::debug!(name, "unknown syscall in seccomp profile — skipping");
-            }
-        }
-    }
-
-    if allowed_nrs.is_empty() {
-        anyhow::bail!("seccomp profile has no resolvable syscalls");
-    }
-
-    // Build BPF filter: allow listed syscalls, return EPERM for others.
-    // Filter structure:
-    //   BPF_STMT(LD|W|ABS, 0)   -- load syscall number from seccomp_data.nr
-    //   BPF_JUMP(JMP|JEQ|K, nr, 0, 1) -- if match, skip to ALLOW
-    //   ... for each allowed syscall ...
-    //   BPF_STMT(RET|K, SECCOMP_RET_ERRNO | EPERM)  -- default: deny
-    //   BPF_STMT(RET|K, SECCOMP_RET_ALLOW)  -- allow
-    let mut filter: Vec<u64> = Vec::new();
-
-    // BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0) -- load syscall nr
-    filter.push(bpf_stmt(0x20, 0)); // BPF_LD|BPF_W|BPF_ABS, offset 0
-
-    let n = allowed_nrs.len();
-    let sorted: Vec<u32> = {
-        let mut v: Vec<u32> = allowed_nrs.into_iter().collect();
-        v.sort();
-        v
-    };
-
-    for (i, &nr) in sorted.iter().enumerate() {
-        // BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, nr, jump_true, jump_false)
-        // jump_true: skip to ALLOW (at end)
-        // jump_false: next instruction
-        let jump_to_allow = (n - i) as u8; // distance to ALLOW instruction
-        filter.push(bpf_jump(0x15, nr, jump_to_allow, 0));
-    }
-
-    // Default: SECCOMP_RET_ERRNO | EPERM (1)
-    filter.push(bpf_stmt(0x06, 0x00050001)); // SECCOMP_RET_ERRNO | 1
-
-    // ALLOW
-    filter.push(bpf_stmt(0x06, 0x7fff0000)); // SECCOMP_RET_ALLOW
-
-    // Convert to sock_filter array (each is 8 bytes: u16 code, u8 jt, u8 jf, u32 k)
-    let filter_bytes: Vec<[u8; 8]> = filter.iter().map(|&v| v.to_ne_bytes()).collect();
-
-    // Set NO_NEW_PRIVS (required before seccomp)
-    let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
-    if ret != 0 {
-        anyhow::bail!(
-            "prctl(PR_SET_NO_NEW_PRIVS) failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-
-    // Apply the BPF program via prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog)
-    #[repr(C)]
-    struct SockFprog {
-        len: u16,
-        filter: *const [u8; 8],
-    }
-
-    let prog = SockFprog {
-        len: filter_bytes.len() as u16,
-        filter: filter_bytes.as_ptr(),
-    };
-
-    let ret = unsafe {
-        libc::prctl(
-            libc::PR_SET_SECCOMP,
-            2, // SECCOMP_MODE_FILTER
-            &prog as *const SockFprog as libc::c_ulong,
-            0,
-            0,
-        )
-    };
-
-    if ret != 0 {
-        anyhow::bail!(
-            "seccomp(FILTER) failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-
-    info!(
-        count,
-        "seccomp filter installed: {} syscalls allowed", count
-    );
-    Ok(count)
-}
-
-#[cfg(target_os = "linux")]
-fn bpf_stmt(code: u16, k: u32) -> u64 {
-    let mut buf = [0u8; 8];
-    buf[0..2].copy_from_slice(&code.to_ne_bytes());
-    // jt=0, jf=0
-    buf[4..8].copy_from_slice(&k.to_ne_bytes());
-    u64::from_ne_bytes(buf)
-}
-
-#[cfg(target_os = "linux")]
-fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> u64 {
-    let mut buf = [0u8; 8];
-    buf[0..2].copy_from_slice(&code.to_ne_bytes());
-    buf[2] = jt;
-    buf[3] = jf;
-    buf[4..8].copy_from_slice(&k.to_ne_bytes());
-    u64::from_ne_bytes(buf)
-}
-
-/// Map syscall names to numbers for the current architecture.
-/// Uses a hardcoded table for aarch64 (the production target).
-/// Falls back to reading /usr/include/asm-generic/unistd.h.
-#[cfg(target_os = "linux")]
-fn syscall_name_to_nr(name: &str) -> Option<u32> {
-    // Common syscalls for aarch64 (Linux 6.x)
-    // See: /usr/include/asm-generic/unistd.h
-    match name {
-        "read" => Some(63),
-        "write" => Some(64),
-        "openat" => Some(56),
-        "close" => Some(57),
-        "fstat" | "newfstatat" => Some(79),
-        "statx" => Some(291),
-        "lseek" => Some(62),
-        "mmap" => Some(222),
-        "mprotect" => Some(226),
-        "munmap" => Some(215),
-        "brk" => Some(214),
-        "ioctl" => Some(29),
-        "pread64" => Some(67),
-        "pwrite64" => Some(68),
-        "writev" => Some(66),
-        "fcntl" => Some(25),
-        "dup" => Some(23),
-        "dup2" => Some(1000), // not on aarch64, use dup3
-        "pipe2" => Some(59),
-        "socket" => Some(198),
-        "bind" => Some(200),
-        "recvfrom" => Some(207),
-        "recvmsg" => Some(212),
-        "sendto" => Some(206),
-        "sendmsg" => Some(211),
-        "setsockopt" => Some(208),
-        "getsockopt" => Some(209),
-        "getsockname" => Some(204),
-        "clone" => Some(220),
-        "clone3" => Some(435),
-        "exit_group" => Some(94),
-        "exit" => Some(93),
-        "wait4" => Some(260),
-        "waitid" => Some(95),
-        "getpid" => Some(172),
-        "gettid" => Some(178),
-        "getuid" => Some(174),
-        "geteuid" => Some(175),
-        "getgid" => Some(176),
-        "getegid" => Some(177),
-        "epoll_create1" => Some(20),
-        "epoll_ctl" => Some(21),
-        "epoll_wait" | "epoll_pwait" => Some(22),
-        "epoll_pwait2" => Some(441),
-        "futex" => Some(98),
-        "set_tid_address" => Some(96),
-        "set_robust_list" => Some(99),
-        "rt_sigaction" => Some(134),
-        "rt_sigprocmask" => Some(135),
-        "rt_sigreturn" => Some(139),
-        "sigaltstack" => Some(132),
-        "clock_gettime" => Some(113),
-        "clock_nanosleep" => Some(115),
-        "nanosleep" => Some(101),
-        "gettimeofday" => Some(169),
-        "getrandom" => Some(278),
-        "madvise" => Some(233),
-        "mremap" => Some(216),
-        "sched_getaffinity" => Some(123),
-        "sched_yield" => Some(124),
-        "prctl" => Some(167),
-        "bpf" => Some(280),
-        "perf_event_open" => Some(241),
-        "getdents64" => Some(61),
-        "ftruncate" => Some(46),
-        "fallocate" => Some(47),
-        "fsync" => Some(82),
-        "fdatasync" => Some(83),
-        "rename" | "renameat2" => Some(276),
-        "unlink" | "unlinkat" => Some(35),
-        "mkdir" | "mkdirat" => Some(34),
-        "access" | "faccessat2" => Some(439),
-        "readlink" | "readlinkat" => Some(78),
-        "rseq" => Some(293),
-        "prlimit64" => Some(261),
-        "sysinfo" => Some(179),
-        "uname" => Some(160),
-        _ => None,
-    }
-}
+// apply_seccomp_profile + bpf_stmt + bpf_jump + syscall_name_to_nr
+// moved to crates/sensor/src/seccomp.rs as part of the 2026-05-25
+// main.rs decomposition PR3. The whole module is Linux-gated and
+// carries byte-level anchor tests for the `struct sock_filter`
+// packing that ARE the seccomp policy.
 
 #[cfg(test)]
 mod tests {
