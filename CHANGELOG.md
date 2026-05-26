@@ -9,6 +9,33 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.14.4] - 2026-05-26
+
+**Headline:** End of the `async fn main` decomposition that started mid-May. Four PRs (#813 → #816) cut sensor::run into a testable `boot_init` + `run_loop` split, config-gated 14 always-on collectors, extracted `DetectorSet` out of `main.rs`, and root-fixed a CL-008 correlation-engine saturation that fired 80 chains in 2 min on every vanilla LAMP/LEMP host the agent ran on (2026-05-26 prod incident).
+
+### Added
+
+- **`sensor::boot_init` + `sensor::run_loop` split** (#813). `pub(crate) async fn run` became `boot_init(cfg) -> Result<SensorContext>` + `run_loop(ctx) -> Result<()>` + a thin wrapper. The split returns a `SensorContext` the test can drop without leaking background work, unblocking integration anchors that the pre-split shape couldn't reach. Three boot-time anchors land in `sensor::tests`: timeout, sqlite-db-created, collector-health-snapshot-written.
+- **`AlwaysOnCollectorConfig` + 14 config gates** (#814). 14 collector spawns in `boot/spawn_collectors.rs` had no config gate — they ran unconditionally and held clones of `tx` alive forever, which made `rx.recv()` never return `None` and `run` end-to-end untestable. Every one now sits behind `if cfg.collectors.X.enabled { … }`, with defaults that preserve production behaviour (omission = on). `CollectorsConfig::all_disabled()` constructor + `Config::test_default` update bring the test surface to true zero state. Three end-to-end anchors test the full `run(cfg)` pipeline including the shutdown path.
+- **`crates/sensor/src/detector_set.rs`** (#815). Pulled the 35 detector type imports + ~100 LoC of `DetectorSet` struct fields out of `main.rs` into a standalone file. `main.rs` is now 141 lines (was 271), of which most are tests and comments — `async fn main` is back to its 5-line CLI → config → `sensor::run` skeleton.
+- **`CL008_SERVICE_DAEMON_COMMS` suppression list** (#816). Apache2, httpd, nginx, caddy, php-fpm (every Debian-tracked version 7.4 → 8.3), mysqld, mysqld_safe, mariadbd, postgres, crowdsec, cscli. CL-008-only carve-out — every other rule still fires on these comms, so a hijacked web stack is still caught by `lateral_movement` / `c2_callback` / etc. Five anchor tests including an anti-leak test that iterates every new comm against five non-CL-008 rules.
+
+### Operator-visible numbers
+
+- Workspace version: `0.14.3` → `0.14.4`.
+- `crates/sensor/src/main.rs`: 271 → 141 lines (-48%).
+- Sensor anchor tests: +6 (3 `boot_init_*` + 3 `run_*` end-to-end).
+- Correlation engine anchor tests: +5 (`cl008_suppressed_when_comm_is_service_daemon_*` × 4 + `service_daemon_suppression_does_not_leak_to_other_rules`).
+- Prod CL-008 chains in the 24 h since deploy: 0 (pre-fix: 80 in 2 min).
+
+### Why this version exists
+
+A refactor series and a hot-fix landed in the same hour because they passed through the same code path. The refactor (#813 → #815) had been in flight since mid-May — the goal was for `sensor::run` to be 100 % testable without the inferno of mocking every always-on collector. PR-F3 (#812, in v0.14.3) shipped the textually-extracted run function but punted on `run_loop` anchors, citing 14 unconditional `tokio::spawn` calls as a blocker. #813 split the function, #814 gated the spawns, #815 finished the cleanup by moving DetectorSet out of `main.rs`. The "untestable" docstring is gone; `run(cfg)` now has six anchors covering boot + spawn + loop + shutdown.
+
+The CL-008 fix (#816) was the prod incident that landed the same hour. The agent on 130.162.171.105 had been firing 80 correlation chains in 2 minutes on the host's own web stack — every nginx → php-fpm → mysqld pipeline matched `file.read + outbound connect` because that is literally how a PHP-backed HTTP request works. The fix shipped in the same release because both touched the same boot-init machinery; testing one validated the other.
+
+Deploy: 130.162.171.105 cut over 2026-05-26 03:11 UTC via `scripts/deploy-prod.sh all`. 44 eBPF programs loaded, dashboard `/livez` returning 200, knowledge graph restored across five shards (~250 K edges), anomaly trainer pulling 7.8 M events from the last week. Pipeline alive 30 s after restart (first post-deploy incident at 03:12:01). Zero panics in the watchdog log, zero CL-008 chains, every other detector firing at baseline rate.
+
 ## [0.14.3] - 2026-05-23
 
 **Headline:** new `suid_page_cache_integrity` detector closes the entire 2026 Linux kernel page-cache-corruption LPE family — Copy Fail (CVE-2026-31431), Dirty Frag (CVE-2026-43284 + CVE-2026-43500), and Fragnesia (CVE-2026-46300). The detector periodically compares an `O_DIRECT` disk read against a page-cache-served read for a small allowlist of high-value SUID-root binaries; divergence fires a Critical incident. This is the result of v0.14.2's honest lab miss against Copy Fail (see `_innerwarden/innerwarden-cve-lab/cve-2026-31431-copy-fail/RESULTS.md`): we measured what the existing detectors missed, then shipped what would have caught it.
