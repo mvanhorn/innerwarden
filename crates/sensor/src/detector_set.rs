@@ -171,3 +171,26 @@ pub(crate) struct DetectorSet {
     pub(crate) system_user_interactive:
         Option<detectors::system_user_interactive::SystemUserInteractiveDetector>,
 }
+
+impl DetectorSet {
+    pub(crate) fn is_incident_suppressed(
+        &self,
+        incident: &innerwarden_core::incident::Incident,
+        detector_name: &str,
+    ) -> bool {
+        let candidates = detectors::allowlists::DynamicAllowlist::extract_evidence_candidates(
+            incident,
+            detector_name,
+        );
+        let refs: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
+        if self
+            .event_pipeline
+            .incident_suppressions
+            .is_suppressed(detector_name, &refs)
+        {
+            return true;
+        }
+        self.dynamic_allowlist
+            .suppress_incident_for_detector(incident, detector_name)
+    }
+}

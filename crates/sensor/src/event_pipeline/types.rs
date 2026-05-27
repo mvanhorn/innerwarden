@@ -36,8 +36,8 @@ pub struct RawRule {
     pub id: String,
     #[serde(default = "default_priority")]
     pub priority: u32,
-    #[serde(rename = "match")]
-    pub match_preds: MatchPredicates,
+    #[serde(default, rename = "match")]
+    pub match_preds: Option<MatchPredicates>,
     pub action: ActionKind,
     #[serde(default)]
     pub drop_reason: Option<String>,
@@ -51,6 +51,15 @@ pub struct RawRule {
     pub sample: Option<f64>,
     #[serde(default)]
     pub score_increment: Option<ScoreIncrementConfig>,
+    #[serde(default)]
+    pub suppress: Option<SuppressConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuppressConfig {
+    pub detector: String,
+    pub values: Vec<String>,
 }
 
 fn default_priority() -> u32 {
@@ -65,6 +74,7 @@ pub enum ActionKind {
     Drop,
     Sample,
     ScoreIncrement,
+    SuppressIncident,
 }
 
 #[derive(Debug, Deserialize)]
@@ -301,6 +311,20 @@ pub fn compile_rule(raw: &RawRule) -> Result<CompiledRule, String> {
             ));
         }
     }
+    if raw.action == ActionKind::SuppressIncident {
+        // Validated and loaded by the caller, not compiled into a CompiledRule.
+        return Err(format!(
+            "rule '{}': suppress_incident rules are handled separately",
+            raw.id
+        ));
+    }
+
+    if raw.match_preds.is_none() {
+        return Err(format!(
+            "rule '{}': match block is required for action {:?}",
+            raw.id, raw.action
+        ));
+    }
 
     let action = match raw.action {
         ActionKind::Emit => CompiledAction::Emit,
@@ -314,9 +338,10 @@ pub fn compile_rule(raw: &RawRule) -> Result<CompiledRule, String> {
                 decay_minutes: si.decay_minutes,
             }
         }
+        ActionKind::SuppressIncident => unreachable!("handled above"),
     };
 
-    let mp = &raw.match_preds;
+    let mp = raw.match_preds.as_ref().unwrap();
 
     let kind_glob = compile_glob_set_opt(mp.kind.as_deref(), &raw.id, "kind")?;
     let comm_glob = compile_glob_set_list_opt(mp.comm_glob.as_deref(), &raw.id, "comm_glob")?;
@@ -357,6 +382,28 @@ pub fn compile_rule(raw: &RawRule) -> Result<CompiledRule, String> {
             .map(|v| v.iter().cloned().collect()),
         pid_score_min: mp.pid_score_min,
     })
+}
+
+pub fn validate_suppress_rule(raw: &RawRule) -> Result<(String, Vec<String>), String> {
+    let sc = raw.suppress.as_ref().ok_or_else(|| {
+        format!(
+            "rule '{}': suppress_incident action requires suppress field",
+            raw.id
+        )
+    })?;
+    if sc.detector.is_empty() {
+        return Err(format!(
+            "rule '{}': suppress.detector must not be empty",
+            raw.id
+        ));
+    }
+    if sc.values.is_empty() {
+        return Err(format!(
+            "rule '{}': suppress.values must not be empty",
+            raw.id
+        ));
+    }
+    Ok((sc.detector.clone(), sc.values.clone()))
 }
 
 fn has_glob_chars(s: &str) -> bool {
@@ -1037,5 +1084,117 @@ rules:
                     .unwrap_or_else(|e| panic!("{name} rule '{}': compile error: {e}", raw.id));
             }
         }
+    }
+
+    #[test]
+    fn compile_rule_rejects_suppress_incident() {
+        let yaml = r#"
+version: 1
+rules:
+  - id: suppress-test
+    action: suppress_incident
+    suppress:
+      detector: kernel_module_load
+      values: [bcache]
+"#;
+        let rf: RuleFile = serde_yaml::from_str(yaml).unwrap();
+        match compile_rule(&rf.rules[0]) {
+            Err(e) => assert!(e.contains("handled separately"), "got: {e}"),
+            Ok(_) => panic!("should have been rejected"),
+        }
+    }
+
+    #[test]
+    fn compile_rule_rejects_missing_match_block() {
+        let yaml = r#"
+version: 1
+rules:
+  - id: no-match
+    action: drop
+"#;
+        let rf: RuleFile = serde_yaml::from_str(yaml).unwrap();
+        match compile_rule(&rf.rules[0]) {
+            Err(e) => assert!(e.contains("match block is required"), "got: {e}"),
+            Ok(_) => panic!("should have been rejected"),
+        }
+    }
+
+    #[test]
+    fn validate_suppress_rule_ok() {
+        let yaml = r#"
+version: 1
+rules:
+  - id: valid-suppress
+    action: suppress_incident
+    suppress:
+      detector: kernel_module_load
+      values: [bcache, dm_raid]
+"#;
+        let rf: RuleFile = serde_yaml::from_str(yaml).unwrap();
+        let result = validate_suppress_rule(&rf.rules[0]);
+        assert!(result.is_ok());
+        let (det, vals) = result.unwrap();
+        assert_eq!(det, "kernel_module_load");
+        assert_eq!(vals, vec!["bcache", "dm_raid"]);
+    }
+
+    #[test]
+    fn validate_suppress_rule_missing_suppress() {
+        let yaml = r#"
+version: 1
+rules:
+  - id: no-suppress-block
+    action: suppress_incident
+"#;
+        let rf: RuleFile = serde_yaml::from_str(yaml).unwrap();
+        assert!(validate_suppress_rule(&rf.rules[0]).is_err());
+    }
+
+    #[test]
+    fn validate_suppress_rule_empty_detector() {
+        let yaml = r#"
+version: 1
+rules:
+  - id: empty-det
+    action: suppress_incident
+    suppress:
+      detector: ""
+      values: [x]
+"#;
+        let rf: RuleFile = serde_yaml::from_str(yaml).unwrap();
+        assert!(validate_suppress_rule(&rf.rules[0]).is_err());
+    }
+
+    #[test]
+    fn validate_suppress_rule_empty_values() {
+        let yaml = r#"
+version: 1
+rules:
+  - id: empty-vals
+    action: suppress_incident
+    suppress:
+      detector: kernel_module_load
+      values: []
+"#;
+        let rf: RuleFile = serde_yaml::from_str(yaml).unwrap();
+        assert!(validate_suppress_rule(&rf.rules[0]).is_err());
+    }
+
+    #[test]
+    fn parse_suppress_config() {
+        let yaml = r#"
+version: 1
+rules:
+  - id: suppress-test
+    action: suppress_incident
+    suppress:
+      detector: sudo_abuse
+      values: [ubuntu, deploy]
+"#;
+        let rf: RuleFile = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(rf.rules[0].action, ActionKind::SuppressIncident);
+        let sc = rf.rules[0].suppress.as_ref().unwrap();
+        assert_eq!(sc.detector, "sudo_abuse");
+        assert_eq!(sc.values, vec!["ubuntu", "deploy"]);
     }
 }

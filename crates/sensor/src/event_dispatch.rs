@@ -269,10 +269,7 @@ pub(crate) fn process_event(
     // exceed the sudo-rate threshold during normal maintenance.
     let sudo_incident = detectors.sudo_abuse.as_mut().and_then(|d| d.process(&ev));
     if let Some(incident) = sudo_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "sudo_abuse")
-        {
+        if !detectors.is_incident_suppressed(&incident, "sudo_abuse") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -316,10 +313,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = integrity_alert_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "integrity_alert")
-        {
+        if !detectors.is_incident_suppressed(&incident, "integrity_alert") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -333,10 +327,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = log_tampering_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "log_tampering")
-        {
+        if !detectors.is_incident_suppressed(&incident, "log_tampering") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -377,10 +368,7 @@ pub(crate) fn process_event(
     // incident here and consult `[detectors.privesc]` before writing.
     let privesc_incident = detectors.privesc.as_mut().and_then(|d| d.process(&ev));
     if let Some(incident) = privesc_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "privesc")
-        {
+        if !detectors.is_incident_suppressed(&incident, "privesc") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -391,10 +379,7 @@ pub(crate) fn process_event(
     // incident here and consult `[detectors.fileless]` before writing.
     let fileless_incident = detectors.fileless.as_mut().and_then(|d| d.process(&ev));
     if let Some(incident) = fileless_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "fileless")
-        {
+        if !detectors.is_incident_suppressed(&incident, "fileless") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -429,10 +414,7 @@ pub(crate) fn process_event(
     // incident here and consult `[detectors.rootkit]` before writing.
     let rootkit_incident = detectors.rootkit.as_mut().and_then(|d| d.process(&ev));
     if let Some(incident) = rootkit_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "rootkit")
-        {
+        if !detectors.is_incident_suppressed(&incident, "rootkit") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -452,10 +434,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = ssh_key_injection_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "ssh_key_injection")
-        {
+        if !detectors.is_incident_suppressed(&incident, "ssh_key_injection") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -477,10 +456,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = kmod_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "kernel_module_load")
-        {
+        if !detectors.is_incident_suppressed(&incident, "kernel_module_load") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -494,10 +470,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = crontab_persistence_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "crontab_persistence")
-        {
+        if !detectors.is_incident_suppressed(&incident, "crontab_persistence") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -523,10 +496,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = user_creation_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "user_creation")
-        {
+        if !detectors.is_incident_suppressed(&incident, "user_creation") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -540,10 +510,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = systemd_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "systemd_persistence")
-        {
+        if !detectors.is_incident_suppressed(&incident, "systemd_persistence") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -575,10 +542,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = sensitive_write_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "sensitive_write")
-        {
+        if !detectors.is_incident_suppressed(&incident, "sensitive_write") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -606,10 +570,7 @@ pub(crate) fn process_event(
         // mitre_hunt from PR #647). The pre-emit gate above handles
         // the *event* level; this handles the *incident* level for
         // operators allowlisting specific outcomes.
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "discovery_burst")
-        {
+        if !detectors.is_incident_suppressed(&incident, "discovery_burst") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -629,10 +590,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = container_drift_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "container_drift")
-        {
+        if !detectors.is_incident_suppressed(&incident, "container_drift") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -643,10 +601,7 @@ pub(crate) fn process_event(
     // incident here and consult `[detectors.host_drift]` before writing.
     let host_drift_incident = detectors.host_drift.as_mut().and_then(|d| d.process(&ev));
     if let Some(incident) = host_drift_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "host_drift")
-        {
+        if !detectors.is_incident_suppressed(&incident, "host_drift") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -684,10 +639,7 @@ pub(crate) fn process_event(
     // with `[detectors.mitre_hunt] dd = "operator allow-list"`.
     let mitre_incident = detectors.mitre_hunt.as_mut().and_then(|d| d.process(&ev));
     if let Some(incident) = mitre_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "mitre_hunt")
-        {
+        if !detectors.is_incident_suppressed(&incident, "mitre_hunt") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -734,10 +686,7 @@ pub(crate) fn process_event(
         detectors.nmap_scan.as_mut().and_then(|d| d.process(&ev))
     };
     if let Some(incident) = nmap_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "nmap_scan")
-        {
+        if !detectors.is_incident_suppressed(&incident, "nmap_scan") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -747,10 +696,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = wordlist_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "wordlist_scan")
-        {
+        if !detectors.is_incident_suppressed(&incident, "wordlist_scan") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -760,10 +706,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = discovery_anomaly_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "discovery_anomaly")
-        {
+        if !detectors.is_incident_suppressed(&incident, "discovery_anomaly") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -777,10 +720,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = clipboard_read_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "clipboard_read")
-        {
+        if !detectors.is_incident_suppressed(&incident, "clipboard_read") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -790,10 +730,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = screen_capture_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "screen_capture")
-        {
+        if !detectors.is_incident_suppressed(&incident, "screen_capture") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -803,10 +740,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = keylogger_bash_trap_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "keylogger_bash_trap")
-        {
+        if !detectors.is_incident_suppressed(&incident, "keylogger_bash_trap") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -816,10 +750,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = archive_pwd_protected_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "archive_pwd_protected")
-        {
+        if !detectors.is_incident_suppressed(&incident, "archive_pwd_protected") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -829,10 +760,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = automated_file_collection_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "automated_file_collection")
-        {
+        if !detectors.is_incident_suppressed(&incident, "automated_file_collection") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -843,10 +771,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = c2_web_tunnel_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "c2_web_tunnel")
-        {
+        if !detectors.is_incident_suppressed(&incident, "c2_web_tunnel") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -856,10 +781,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = c2_protocol_tunneling_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "c2_protocol_tunneling")
-        {
+        if !detectors.is_incident_suppressed(&incident, "c2_protocol_tunneling") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -869,10 +791,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = c2_non_standard_port_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "c2_non_standard_port")
-        {
+        if !detectors.is_incident_suppressed(&incident, "c2_non_standard_port") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -883,10 +802,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = setuid_exploit_pattern_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "setuid_exploit_pattern")
-        {
+        if !detectors.is_incident_suppressed(&incident, "setuid_exploit_pattern") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -896,10 +812,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = capabilities_abuse_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "capabilities_abuse")
-        {
+        if !detectors.is_incident_suppressed(&incident, "capabilities_abuse") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -909,10 +822,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = lateral_egress_ssh_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "lateral_egress_ssh")
-        {
+        if !detectors.is_incident_suppressed(&incident, "lateral_egress_ssh") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -922,10 +832,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = lateral_egress_scp_rsync_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "lateral_egress_scp_rsync")
-        {
+        if !detectors.is_incident_suppressed(&incident, "lateral_egress_scp_rsync") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -936,10 +843,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = pam_module_change_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "pam_module_change")
-        {
+        if !detectors.is_incident_suppressed(&incident, "pam_module_change") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -949,10 +853,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = auditd_disable_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "auditd_disable")
-        {
+        if !detectors.is_incident_suppressed(&incident, "auditd_disable") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -962,10 +863,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = selinux_apparmor_disable_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "selinux_apparmor_disable")
-        {
+        if !detectors.is_incident_suppressed(&incident, "selinux_apparmor_disable") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -975,10 +873,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = startup_script_persistence_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "startup_script_persistence")
-        {
+        if !detectors.is_incident_suppressed(&incident, "startup_script_persistence") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -989,10 +884,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = data_destruction_pattern_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "data_destruction_pattern")
-        {
+        if !detectors.is_incident_suppressed(&incident, "data_destruction_pattern") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -1003,10 +895,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = symlink_hijack_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "symlink_hijack")
-        {
+        if !detectors.is_incident_suppressed(&incident, "symlink_hijack") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
@@ -1016,10 +905,7 @@ pub(crate) fn process_event(
         .as_mut()
         .and_then(|d| d.process(&ev));
     if let Some(incident) = system_user_interactive_incident {
-        if !detectors
-            .dynamic_allowlist
-            .suppress_incident_for_detector(&incident, "system_user_interactive")
-        {
+        if !detectors.is_incident_suppressed(&incident, "system_user_interactive") {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }

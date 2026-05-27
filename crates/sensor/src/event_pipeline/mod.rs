@@ -20,7 +20,11 @@ use std::time::{Instant, SystemTime};
 use innerwarden_core::event::Event;
 use tracing::{info, warn};
 
-use types::{compile_rule, CompiledAction, CompiledRule, RuleFile};
+use std::collections::HashSet;
+
+use types::{
+    compile_rule, validate_suppress_rule, ActionKind, CompiledAction, CompiledRule, RuleFile,
+};
 
 pub const BUILTIN_PACKS: &[(&str, &str)] = &[
     (
@@ -57,6 +61,55 @@ pub struct EventPipeline {
     sample_counter: u64,
     counters: HashMap<String, RuleCounters>,
     pid_scores: HashMap<u32, PidScoreEntry>,
+    pub incident_suppressions: IncidentSuppressionSet,
+}
+
+pub struct IncidentSuppressionSet {
+    by_detector: HashMap<String, HashSet<String>>,
+}
+
+impl IncidentSuppressionSet {
+    fn new() -> Self {
+        Self {
+            by_detector: HashMap::new(),
+        }
+    }
+
+    fn add(&mut self, detector: String, values: Vec<String>) {
+        let entry = self.by_detector.entry(detector).or_default();
+        for v in values {
+            entry.insert(v);
+        }
+    }
+
+    pub fn is_suppressed(&self, detector_name: &str, values: &[&str]) -> bool {
+        let Some(allowed) = self.by_detector.get(detector_name) else {
+            return false;
+        };
+        values.iter().any(|v| {
+            let v = *v;
+            if v.is_empty() {
+                return false;
+            }
+            if allowed.contains(v) {
+                return true;
+            }
+            let basename = v.rsplit('/').next().unwrap_or(v);
+            if basename != v && allowed.contains(basename) {
+                return true;
+            }
+            allowed.iter().any(|a| v.starts_with(a.as_str()))
+        })
+    }
+
+    pub fn detector_count(&self) -> usize {
+        self.by_detector.len()
+    }
+
+    #[allow(dead_code)]
+    pub fn detectors(&self) -> impl Iterator<Item = (&String, &HashSet<String>)> {
+        self.by_detector.iter()
+    }
 }
 
 struct PidScoreEntry {
@@ -84,6 +137,7 @@ impl EventPipeline {
             sample_counter: 0,
             counters: HashMap::new(),
             pid_scores: HashMap::new(),
+            incident_suppressions: IncidentSuppressionSet::new(),
         };
         pipeline.reload();
         pipeline
@@ -100,6 +154,7 @@ impl EventPipeline {
             sample_counter: 0,
             counters: HashMap::new(),
             pid_scores: HashMap::new(),
+            incident_suppressions: IncidentSuppressionSet::new(),
         }
     }
 
@@ -190,12 +245,16 @@ impl EventPipeline {
 
     fn reload(&mut self) {
         let mut rules_by_id: HashMap<String, CompiledRule> = HashMap::new();
+        let mut suppressions = IncidentSuppressionSet::new();
 
         for (name, yaml) in BUILTIN_PACKS {
             match load_rules_from_yaml(yaml, name) {
-                Ok(compiled) => {
-                    for rule in compiled {
+                Ok(loaded) => {
+                    for rule in loaded.event_rules {
                         rules_by_id.insert(rule.id.clone(), rule);
+                    }
+                    for (detector, values) in loaded.suppressions {
+                        suppressions.add(detector, values);
                     }
                 }
                 Err(e) => warn!("event_pipeline: built-in pack {name} failed to load: {e}"),
@@ -204,9 +263,12 @@ impl EventPipeline {
 
         if self.rules_dir.is_dir() {
             match load_rules_from_dir(&self.rules_dir) {
-                Ok(on_disk) => {
-                    for rule in on_disk {
+                Ok(loaded) => {
+                    for rule in loaded.event_rules {
                         rules_by_id.insert(rule.id.clone(), rule);
+                    }
+                    for (detector, values) in loaded.suppressions {
+                        suppressions.add(detector, values);
                     }
                 }
                 Err(e) => warn!("event_pipeline: failed to read rules dir: {e}"),
@@ -217,10 +279,16 @@ impl EventPipeline {
         rules.sort_by_key(|r| std::cmp::Reverse(r.priority));
 
         let count = rules.len();
+        let suppress_count = suppressions.detector_count();
         self.rules = rules;
+        self.incident_suppressions = suppressions;
         self.last_mtime = dir_max_mtime(&self.rules_dir);
 
-        info!(rules = count, "event_pipeline reloaded");
+        info!(
+            rules = count,
+            suppress_detectors = suppress_count,
+            "event_pipeline reloaded"
+        );
     }
 
     pub fn should_persist(&mut self, event: &mut Event) -> bool {
@@ -389,7 +457,12 @@ fn bump(counters: &mut HashMap<String, RuleCounters>, id: &str, kind: Counter) {
     }
 }
 
-fn load_rules_from_yaml(yaml: &str, source_name: &str) -> Result<Vec<CompiledRule>, String> {
+struct LoadedRules {
+    event_rules: Vec<CompiledRule>,
+    suppressions: Vec<(String, Vec<String>)>,
+}
+
+fn load_rules_from_yaml(yaml: &str, source_name: &str) -> Result<LoadedRules, String> {
     let rf: RuleFile =
         serde_yaml::from_str(yaml).map_err(|e| format!("{source_name}: YAML parse error: {e}"))?;
 
@@ -401,7 +474,8 @@ fn load_rules_from_yaml(yaml: &str, source_name: &str) -> Result<Vec<CompiledRul
     }
 
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let mut compiled = Vec::new();
+    let mut event_rules = Vec::new();
+    let mut suppressions = Vec::new();
     for raw in &rf.rules {
         if raw.disabled {
             info!(rule = %raw.id, "event_pipeline: rule disabled, skipping");
@@ -413,15 +487,25 @@ fn load_rules_from_yaml(yaml: &str, source_name: &str) -> Result<Vec<CompiledRul
                 continue;
             }
         }
-        match compile_rule(raw) {
-            Ok(rule) => compiled.push(rule),
-            Err(e) => warn!(source = source_name, "event_pipeline: {e}"),
+        if raw.action == ActionKind::SuppressIncident {
+            match validate_suppress_rule(raw) {
+                Ok((detector, values)) => suppressions.push((detector, values)),
+                Err(e) => warn!(source = source_name, "event_pipeline: {e}"),
+            }
+        } else {
+            match compile_rule(raw) {
+                Ok(rule) => event_rules.push(rule),
+                Err(e) => warn!(source = source_name, "event_pipeline: {e}"),
+            }
         }
     }
-    Ok(compiled)
+    Ok(LoadedRules {
+        event_rules,
+        suppressions,
+    })
 }
 
-fn load_rules_from_dir(dir: &Path) -> Result<Vec<CompiledRule>, String> {
+fn load_rules_from_dir(dir: &Path) -> Result<LoadedRules, String> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .map_err(|e| format!("read_dir {}: {e}", dir.display()))?
         .filter_map(|e| e.ok())
@@ -435,7 +519,10 @@ fn load_rules_from_dir(dir: &Path) -> Result<Vec<CompiledRule>, String> {
 
     entries.sort_by_key(|e| e.file_name());
 
-    let mut all_rules = Vec::new();
+    let mut all = LoadedRules {
+        event_rules: Vec::new(),
+        suppressions: Vec::new(),
+    };
     for entry in entries {
         let path = entry.path();
         let name = path
@@ -445,13 +532,16 @@ fn load_rules_from_dir(dir: &Path) -> Result<Vec<CompiledRule>, String> {
             .to_string();
         match std::fs::read_to_string(&path) {
             Ok(yaml) => match load_rules_from_yaml(&yaml, &name) {
-                Ok(rules) => all_rules.extend(rules),
+                Ok(loaded) => {
+                    all.event_rules.extend(loaded.event_rules);
+                    all.suppressions.extend(loaded.suppressions);
+                }
                 Err(e) => warn!("event_pipeline: {e}"),
             },
             Err(e) => warn!(file = %name, "event_pipeline: read error: {e}"),
         }
     }
-    Ok(all_rules)
+    Ok(all)
 }
 
 fn dir_max_mtime(dir: &Path) -> Option<SystemTime> {
@@ -1358,5 +1448,162 @@ rules:
             per_event_ns,
             per_event_ns as f64 / 1000.0
         );
+    }
+
+    #[test]
+    fn suppress_incident_rules_load_from_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+version: 1
+rules:
+  - id: allow-bcache-kmod
+    action: suppress_incident
+    suppress:
+      detector: kernel_module_load
+      values: [bcache, dm_raid, dm_mirror]
+  - id: allow-ubuntu-sudo
+    action: suppress_incident
+    suppress:
+      detector: sudo_abuse
+      values: [ubuntu]
+"#;
+        std::fs::write(dir.path().join("10-suppress.yml"), yaml).unwrap();
+        let pipeline = EventPipeline::new(dir.path(), true);
+
+        assert!(pipeline
+            .incident_suppressions
+            .is_suppressed("kernel_module_load", &["bcache"]));
+        assert!(pipeline
+            .incident_suppressions
+            .is_suppressed("kernel_module_load", &["dm_raid"]));
+        assert!(pipeline
+            .incident_suppressions
+            .is_suppressed("sudo_abuse", &["ubuntu"]));
+        assert!(!pipeline
+            .incident_suppressions
+            .is_suppressed("sudo_abuse", &["root"]));
+        assert!(!pipeline
+            .incident_suppressions
+            .is_suppressed("port_scan", &["nmap"]));
+    }
+
+    #[test]
+    fn suppress_incident_coexists_with_event_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+version: 1
+rules:
+  - id: custom-drop
+    match:
+      source: ebpf
+      comm: noisy-app
+      kind: file.read_access
+    action: drop
+  - id: allow-bcache
+    action: suppress_incident
+    suppress:
+      detector: kernel_module_load
+      values: [bcache]
+"#;
+        std::fs::write(dir.path().join("10-mixed.yml"), yaml).unwrap();
+        let mut pipeline = EventPipeline::new(dir.path(), true);
+
+        // Event rule works
+        let mut ev = make_event(
+            "ebpf",
+            "file.read_access",
+            serde_json::json!({"comm": "noisy-app", "pid": 1}),
+        );
+        assert!(!pipeline.should_persist(&mut ev));
+
+        // Suppress rule works
+        assert!(pipeline
+            .incident_suppressions
+            .is_suppressed("kernel_module_load", &["bcache"]));
+    }
+
+    #[test]
+    fn suppress_incident_invalid_missing_suppress_block() {
+        let yaml = r#"
+version: 1
+rules:
+  - id: bad-suppress
+    action: suppress_incident
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("10-bad.yml"), yaml).unwrap();
+        let pipeline = EventPipeline::new(dir.path(), true);
+        // Should not crash, bad rule skipped
+        assert!(!pipeline
+            .incident_suppressions
+            .is_suppressed("anything", &["x"]));
+    }
+
+    #[test]
+    fn suppress_incident_empty_values_rejected() {
+        let yaml = r#"
+version: 1
+rules:
+  - id: bad-empty-values
+    action: suppress_incident
+    suppress:
+      detector: kernel_module_load
+      values: []
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("10-bad.yml"), yaml).unwrap();
+        let pipeline = EventPipeline::new(dir.path(), true);
+        assert!(!pipeline
+            .incident_suppressions
+            .is_suppressed("kernel_module_load", &["bcache"]));
+    }
+
+    #[test]
+    fn suppress_incident_prefix_matching() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+version: 1
+rules:
+  - id: allow-apt-paths
+    action: suppress_incident
+    suppress:
+      detector: integrity_alert
+      values: ["/etc/apt/", "/etc/ld.so.conf.d/"]
+"#;
+        std::fs::write(dir.path().join("10-suppress.yml"), yaml).unwrap();
+        let pipeline = EventPipeline::new(dir.path(), true);
+
+        assert!(pipeline
+            .incident_suppressions
+            .is_suppressed("integrity_alert", &["/etc/apt/sources.list"]));
+        assert!(pipeline
+            .incident_suppressions
+            .is_suppressed("integrity_alert", &["/etc/ld.so.conf.d/libc.conf"]));
+        assert!(!pipeline
+            .incident_suppressions
+            .is_suppressed("integrity_alert", &["/etc/ssh/sshd_config"]));
+    }
+
+    #[test]
+    fn suppress_incident_basename_matching() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = r#"
+version: 1
+rules:
+  - id: allow-systemctl
+    action: suppress_incident
+    suppress:
+      detector: systemd_persistence
+      values: [systemctl]
+"#;
+        std::fs::write(dir.path().join("10-suppress.yml"), yaml).unwrap();
+        let pipeline = EventPipeline::new(dir.path(), true);
+
+        assert!(pipeline
+            .incident_suppressions
+            .is_suppressed("systemd_persistence", &["/usr/bin/systemctl"]));
+        assert!(pipeline
+            .incident_suppressions
+            .is_suppressed("systemd_persistence", &["systemctl"]));
     }
 }

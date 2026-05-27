@@ -709,6 +709,63 @@ impl DynamicAllowlist {
     /// incident. `starts_with` matching mirrors `is_process_allowed`, so
     /// `kmod` allowlists everything starting with `kmod` and `systemctl`
     /// suppresses every `systemctl …` invocation.
+    pub fn extract_evidence_candidates(
+        incident: &innerwarden_core::incident::Incident,
+        detector_name: &str,
+    ) -> Vec<String> {
+        let Some(first) = incident.evidence.get(0) else {
+            return Vec::new();
+        };
+        let pick = |key: &str| -> Option<String> {
+            first
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        };
+        let mut candidates: Vec<String> = Vec::new();
+        let push_if_some = |candidates: &mut Vec<String>, value: Option<String>| match value {
+            Some(v) if !v.is_empty() => candidates.push(v),
+            _ => {}
+        };
+        match detector_name {
+            "kernel_module_load" => {
+                push_if_some(&mut candidates, pick("module"));
+                push_if_some(&mut candidates, pick("comm"));
+            }
+            "sudo_abuse" => {
+                push_if_some(&mut candidates, pick("user"));
+            }
+            "mitre_hunt" => {
+                push_if_some(&mut candidates, pick("kind"));
+                push_if_some(&mut candidates, pick("comm"));
+            }
+            "integrity_alert" => {
+                push_if_some(&mut candidates, pick("path"));
+            }
+            "crontab_persistence" => {
+                push_if_some(&mut candidates, pick("comm"));
+                push_if_some(&mut candidates, pick("path"));
+            }
+            "sensitive_write" => {
+                push_if_some(&mut candidates, pick("comm"));
+                push_if_some(&mut candidates, pick("filename"));
+            }
+            "ssh_key_injection" => {
+                push_if_some(&mut candidates, pick("comm"));
+                push_if_some(&mut candidates, pick("target"));
+            }
+            "rootkit" => {
+                push_if_some(&mut candidates, pick("comm"));
+                push_if_some(&mut candidates, pick("binary_path"));
+                push_if_some(&mut candidates, pick("filename"));
+            }
+            _ => {
+                push_if_some(&mut candidates, pick("comm"));
+            }
+        }
+        candidates
+    }
+
     pub fn suppress_incident_for_detector(
         &self,
         incident: &innerwarden_core::incident::Incident,
@@ -721,92 +778,7 @@ impl DynamicAllowlist {
             return false;
         }
 
-        let evidence = incident.evidence.get(0);
-        let Some(first) = evidence else {
-            return false;
-        };
-
-        let pick = |key: &str| -> Option<String> {
-            first
-                .get(key)
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        };
-
-        let mut candidates: Vec<String> = Vec::new();
-        let push_if_some = |candidates: &mut Vec<String>, value: Option<String>| match value {
-            Some(v) if !v.is_empty() => candidates.push(v),
-            _ => {}
-        };
-
-        match detector_name {
-            "kernel_module_load" => {
-                push_if_some(&mut candidates, pick("module"));
-                push_if_some(&mut candidates, pick("comm"));
-            }
-            "sudo_abuse" => {
-                push_if_some(&mut candidates, pick("user"));
-            }
-            "mitre_hunt" => {
-                // mitre_hunt sub-detections vary; allow allowlist by `kind`
-                // (e.g. `destructive_dd` only) without silencing the other
-                // sub-detectors.
-                push_if_some(&mut candidates, pick("kind"));
-                push_if_some(&mut candidates, pick("comm"));
-            }
-            "integrity_alert" => {
-                // `[file.changed]` carries `path` only — no comm. Operators
-                // allowlist by path prefix (e.g. `/etc/cloud/`).
-                push_if_some(&mut candidates, pick("path"));
-            }
-            "crontab_persistence" => {
-                // Two evidence shapes: `crontab_write` has comm + path;
-                // `crontab_command` has comm only. Check both fields.
-                push_if_some(&mut candidates, pick("comm"));
-                push_if_some(&mut candidates, pick("path"));
-            }
-            "sensitive_write" => {
-                // Evidence has comm + filename (not "path"). Allowlist by
-                // either — operators can allow `dpkg` writing anywhere OR
-                // any process writing under `/etc/ld.so.conf.d/`.
-                push_if_some(&mut candidates, pick("comm"));
-                push_if_some(&mut candidates, pick("filename"));
-            }
-            "ssh_key_injection" => {
-                // Evidence has comm + target (target is the authorized_keys
-                // path being modified).
-                push_if_some(&mut candidates, pick("comm"));
-                push_if_some(&mut candidates, pick("target"));
-            }
-            "rootkit" => {
-                // Two shapes: `hidden_process` (comm + binary_path),
-                // `rootkit_artifact` (comm + filename). Cover all three
-                // fields so allowlisting either the process or the file
-                // works.
-                push_if_some(&mut candidates, pick("comm"));
-                push_if_some(&mut candidates, pick("binary_path"));
-                push_if_some(&mut candidates, pick("filename"));
-            }
-            // The remaining detectors emit `comm` as their primary
-            // identifier. Catching them all in one arm rather than
-            // listing each individually keeps the surface small; the
-            // detector_name string still gates whether per_detector
-            // entries apply, so other detectors not in this list are a
-            // no-op regardless.
-            "systemd_persistence"
-            | "log_tampering"
-            | "privesc"
-            | "user_creation"
-            | "host_drift"
-            | "container_drift"
-            | "fileless"
-            | "discovery_burst" => {
-                push_if_some(&mut candidates, pick("comm"));
-            }
-            _ => {
-                push_if_some(&mut candidates, pick("comm"));
-            }
-        }
+        let candidates = Self::extract_evidence_candidates(incident, detector_name);
 
         // Each candidate is tested two ways:
         //   - **basename-startswith** so comm-style entries like `sd-pam`
