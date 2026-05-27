@@ -408,4 +408,84 @@ mod tests {
         assert_eq!(detector_to_categories("search_abuse"), "21");
         assert_eq!(detector_to_categories("sudo_abuse"), "15");
     }
+
+    #[test]
+    fn detector_categories_only_digits_and_commas() {
+        // Sanity path: AbuseIPDB rejects categories that aren't a comma-separated
+        // list of digits. Every mapping (including the fallback) must satisfy
+        // that shape, otherwise reports drop silently with no confidence score.
+        let detectors = [
+            "ssh_bruteforce",
+            "credential_stuffing",
+            "port_scan",
+            "web_scan",
+            "scanner_ua",
+            "search_abuse",
+            "execution_guard",
+            "sudo_abuse",
+            "completely_unknown_detector",
+        ];
+        for detector in detectors {
+            let categories = detector_to_categories(detector);
+            assert!(!categories.is_empty(), "{detector} mapped to empty string");
+            assert!(
+                categories.chars().all(|c| c.is_ascii_digit() || c == ','),
+                "{} mapped to {:?}, expected only digits and commas",
+                detector,
+                categories
+            );
+        }
+    }
+
+    /// RAII guard that restores or clears an env var on drop, regardless of test
+    /// outcome. Required because cargo test is multi-threaded and `set_var` is
+    /// shared process-wide; without this, a panic mid-test would leak the value
+    /// into sibling tests in the same binary.
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let original = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.original.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_api_key_prefers_env_when_config_empty() {
+        // Resolution path: when config value is empty, fall through to the
+        // ABUSEIPDB_API_KEY env var. The guard restores the prior value on
+        // drop so cargo test's parallel runner doesn't bleed state.
+        let _guard = EnvVarGuard::set("ABUSEIPDB_API_KEY", "env-key-xyz");
+        let key = resolve_api_key("");
+        assert_eq!(key, "env-key-xyz");
+    }
+
+    #[test]
+    fn resolve_api_key_empty_when_both_unset() {
+        // Resolution path: when both config and env are empty, the helper must
+        // return an empty string so the caller's `is_configured()` check can
+        // short-circuit cleanly.
+        let _guard = EnvVarGuard::unset("ABUSEIPDB_API_KEY");
+        let key = resolve_api_key("");
+        assert_eq!(key, "");
+    }
 }
