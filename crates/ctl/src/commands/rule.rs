@@ -490,7 +490,7 @@ fn resolve_rules_dir(data_dir: &Path, sensor_config: &Path) -> PathBuf {
             }
         }
     }
-    data_dir.join("rules/event_pipeline")
+    PathBuf::from("/etc/innerwarden/rules/event_pipeline")
 }
 
 #[cfg(test)]
@@ -503,10 +503,7 @@ mod tests {
             Path::new("/var/lib/innerwarden"),
             Path::new("/nonexistent/config.toml"),
         );
-        assert_eq!(
-            dir,
-            PathBuf::from("/var/lib/innerwarden/rules/event_pipeline")
-        );
+        assert_eq!(dir, PathBuf::from("/etc/innerwarden/rules/event_pipeline"));
     }
 
     #[test]

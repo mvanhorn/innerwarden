@@ -36,7 +36,7 @@ impl Default for EventPipelineConfig {
 }
 
 fn default_event_pipeline_rules_dir() -> String {
-    "rules/event_pipeline".to_string()
+    "/etc/innerwarden/rules/event_pipeline".to_string()
 }
 
 #[derive(Debug, Default, Deserialize)]
