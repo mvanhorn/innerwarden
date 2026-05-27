@@ -106,6 +106,10 @@ impl IncidentSuppressionSet {
         self.by_detector.len()
     }
 
+    pub fn values_for(&self, detector_name: &str) -> Option<&HashSet<String>> {
+        self.by_detector.get(detector_name)
+    }
+
     #[allow(dead_code)]
     pub fn detectors(&self) -> impl Iterator<Item = (&String, &HashSet<String>)> {
         self.by_detector.iter()

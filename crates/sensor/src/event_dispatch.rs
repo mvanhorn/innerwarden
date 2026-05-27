@@ -625,9 +625,15 @@ pub(crate) fn process_event(
     }
 
     if let Some(ref mut det) = detectors.sigma_rule {
-        if let Some(incident) =
-            det.process_with_suppressions(&ev, &detectors.dynamic_allowlist.suppress_sigma_rules)
+        let mut sigma_suppress = detectors.dynamic_allowlist.suppress_sigma_rules.clone();
+        if let Some(yaml_ids) = detectors
+            .event_pipeline
+            .incident_suppressions
+            .values_for("sigma_rule")
         {
+            sigma_suppress.extend(yaml_ids.iter().cloned());
+        }
+        if let Some(incident) = det.process_with_suppressions(&ev, &sigma_suppress) {
             write_incident(sqlite, stats, incident, syslog, dedup_cache);
         }
     }
