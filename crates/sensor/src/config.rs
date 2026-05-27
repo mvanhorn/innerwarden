@@ -14,6 +14,29 @@ pub struct Config {
     pub calibration: CalibrationConfig,
     #[serde(default)]
     pub allowlist: AllowlistConfig,
+    #[serde(default)]
+    pub event_pipeline: EventPipelineConfig,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EventPipelineConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_event_pipeline_rules_dir")]
+    pub rules_dir: String,
+}
+
+impl Default for EventPipelineConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            rules_dir: default_event_pipeline_rules_dir(),
+        }
+    }
+}
+
+fn default_event_pipeline_rules_dir() -> String {
+    "/etc/innerwarden/rules/event_pipeline".to_string()
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1576,6 +1599,7 @@ impl Config {
             },
             calibration: CalibrationConfig::default(),
             allowlist: AllowlistConfig::default(),
+            event_pipeline: EventPipelineConfig::default(),
         }
     }
 }

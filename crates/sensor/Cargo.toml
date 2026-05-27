@@ -28,6 +28,8 @@ tree-sitter = "0.26"
 tree-sitter-bash = "0.25"
 dns-lookup = "2"
 flate2 = "1"
+globset = "0.4"
+serde_yaml = "0.9"
 # eBPF support (Linux only, optional - graceful fallback when not available)
 aya = { version = "0.13", optional = true }
 aya-log = { version = "0.2", optional = true }

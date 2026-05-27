@@ -19,6 +19,8 @@ path = "src/main.rs"
 
 [dependencies]
 innerwarden-agent-guard = { path = "../agent-guard" }
+innerwarden-sensor = { path = "../sensor" }
+serde_yaml = "0.9"
 innerwarden-smm = { path = "../smm" }
 innerwarden-hypervisor = { path = "../hypervisor" }
 innerwarden-store = { path = "../store" }

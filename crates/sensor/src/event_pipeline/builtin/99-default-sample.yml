@@ -1,0 +1,20 @@
+version: 1
+metadata:
+  author: innerwarden built-in
+  description: >
+    Terminal rule for file access events that survived every other gate.
+    Persists 1% as a baseline statistical sample so dashboards still
+    show that the collector is alive and producing data. Drops the other
+    99%. Only applies to file.read_access and file.write_access; all
+    other event kinds pass through at 100%.
+
+rules:
+  - id: sample-remainder-file-ops
+    priority: 0
+    match:
+      source: ebpf
+      kind_in:
+        - file.read_access
+        - file.write_access
+    action: sample
+    sample: 0.01

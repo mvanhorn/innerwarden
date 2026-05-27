@@ -1,0 +1,45 @@
+version: 1
+metadata:
+  author: innerwarden built-in
+  description: >
+    Credential, config, and agent-state file access events are ALWAYS
+    persisted regardless of any downstream drop rule. This is the
+    defensive backstop: even if the operator writes "drop everything",
+    these paths still surface so credential theft, agent tampering,
+    and config exfiltration never go dark.
+
+rules:
+  - id: always-emit-credential-paths
+    priority: 1000
+    match:
+      source: ebpf
+      kind_in:
+        - file.read_access
+        - file.write_access
+        - file.delete
+      path_glob:
+        - "/etc/passwd"
+        - "/etc/shadow"
+        - "/etc/sudoers"
+        - "/etc/sudoers.d/*"
+        - "/etc/ssh/*"
+        - "/etc/innerwarden/*"
+        - "/etc/crontab"
+        - "/etc/cron.d/*"
+        - "/etc/cron.daily/*"
+        - "/etc/cron.hourly/*"
+        - "/etc/cron.monthly/*"
+        - "/etc/cron.weekly/*"
+        - "/var/spool/cron/**"
+        - "/home/*/.ssh/*"
+        - "/root/.ssh/*"
+        - "/home/*/.aws/*"
+        - "/root/.aws/*"
+        - "/home/*/.kube/config*"
+        - "/home/*/.docker/config.json"
+        - "/home/*/.config/gcloud/*"
+        - "/var/lib/innerwarden/license.key"
+        - "/var/lib/innerwarden/agent-state.*"
+    action: force_emit
+    tags:
+      - defensive-allowlist

@@ -1748,10 +1748,12 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
                     let addr_raw = read_u32!(data, 96..100);
                     let port = read_u16!(data, 100..102);
 
-                    // sin_addr.s_addr is in network byte order (big-endian).
-                    // read_u32! uses from_ne_bytes (little-endian on x86),
-                    // so we need to swap back to get the correct IP.
-                    let ip = Ipv4Addr::from(addr_raw.to_be());
+                    // The eBPF program already converts from network byte
+                    // order via u32::from_be_bytes. The ring buffer
+                    // serializes in native order; read_u32! restores the
+                    // same host-endian value. Ipv4Addr::from(u32) expects
+                    // host-endian, so no swap needed.
+                    let ip = Ipv4Addr::from(addr_raw);
 
                     if ip.is_loopback() || ip.is_private() || ip.is_unspecified() {
                         continue;
@@ -2179,8 +2181,7 @@ pub async fn run(tx: mpsc::Sender<Event>, host: String) {
                     let cgroup_id = read_u64!(data, 24..32);
                     let comm = bytes_to_string(&data[32..96]);
 
-                    // Network byte order → host byte order
-                    let ip = std::net::Ipv4Addr::from(addr_raw.to_be());
+                    let ip = std::net::Ipv4Addr::from(addr_raw);
                     let container_id = resolve_container_id(pid);
 
                     // Low ports or INADDR_ANY are more suspicious

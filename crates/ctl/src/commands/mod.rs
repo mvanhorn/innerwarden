@@ -15,6 +15,7 @@ pub(crate) mod reconcile;
 pub(crate) mod replay;
 pub(crate) mod responder;
 pub(crate) mod response;
+pub(crate) mod rule;
 pub(crate) mod setup;
 pub(crate) mod status;
 pub(crate) mod update;

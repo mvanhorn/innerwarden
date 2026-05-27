@@ -168,6 +168,20 @@ enum Command {
         command: Option<SystemCommand>,
     },
 
+    /// Manage event pipeline rules (filter/sample/promote).
+    ///
+    /// The event pipeline controls which events the sensor persists to disk.
+    /// Rules are YAML files in the rules directory, hot-reloaded every 60s.
+    ///
+    /// Examples:
+    ///   innerwarden rule list
+    ///   innerwarden rule disable drop-service-daemon-file-ops
+    ///   innerwarden rule enable drop-service-daemon-file-ops
+    Rule {
+        #[command(subcommand)]
+        command: RuleCommand,
+    },
+
     /// Module management commands
     Module {
         #[command(subcommand)]
@@ -1009,6 +1023,54 @@ enum IntegrateCommand {
         /// How often to check (minutes, default: 10)
         #[arg(long, default_value = "10")]
         interval: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum RuleCommand {
+    /// List rules. Shows all types by default (event_pipeline, sigma, yara, atr).
+    ///
+    /// Examples:
+    ///   innerwarden rule list
+    ///   innerwarden rule list --type sigma
+    ///   innerwarden rule list --type event_pipeline
+    List {
+        /// Filter by rule type: event_pipeline, sigma, yara, atr
+        #[arg(long, short = 't')]
+        r#type: Option<String>,
+    },
+
+    /// Disable a rule by ID (adds `disabled: true` to the YAML file).
+    Disable {
+        /// Rule ID to disable (e.g. drop-service-daemon-file-ops)
+        id: String,
+    },
+
+    /// Enable a previously disabled rule by ID.
+    Enable {
+        /// Rule ID to enable
+        id: String,
+    },
+
+    /// Convert allowlist.toml to event pipeline YAML rules.
+    ///
+    /// Convert allowlist.toml to event pipeline YAML rules.
+    ///
+    /// Process entries become drop rules; per-detector entries become
+    /// suppress_incident rules. IPs/ports remain as comments (not yet
+    /// in the pipeline DSL).
+    ///
+    /// Examples:
+    ///   innerwarden rule migrate-allowlist
+    ///   innerwarden rule migrate-allowlist --output /etc/innerwarden/rules/event_pipeline/20-migrated.yml
+    MigrateAllowlist {
+        /// Path to allowlist.toml (defaults to /etc/innerwarden/allowlist.toml)
+        #[arg(long, default_value = "/etc/innerwarden/allowlist.toml")]
+        input: PathBuf,
+
+        /// Write output to file instead of stdout
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -2491,6 +2553,21 @@ fn main() -> Result<()> {
             yes,
         } => commands::capability::cmd_disable(&cli, &registry, capability, yes),
         Command::List => commands::core::cmd_list(&cli, &registry),
+        Command::Rule { ref command } => match command {
+            RuleCommand::List { ref r#type } => {
+                commands::rule::cmd_rule_list_all(&cli.sensor_config, r#type.as_deref())
+            }
+            RuleCommand::Disable { ref id } => {
+                commands::rule::cmd_rule_disable(&cli.data_dir, &cli.sensor_config, id)
+            }
+            RuleCommand::Enable { ref id } => {
+                commands::rule::cmd_rule_enable(&cli.data_dir, &cli.sensor_config, id)
+            }
+            RuleCommand::MigrateAllowlist {
+                ref input,
+                ref output,
+            } => commands::rule::cmd_migrate_allowlist(input, output.as_deref()),
+        },
         Command::Module { ref command } => dispatch_module(&cli, command),
         Command::Agent { ref command } => commands::agent::cmd_agent(&cli, command.as_ref()),
 

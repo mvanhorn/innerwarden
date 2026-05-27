@@ -1,0 +1,41 @@
+version: 1
+metadata:
+  author: innerwarden built-in
+  description: >
+    Drop file read/write events from web servers, databases, and auth
+    services doing their normal job. These daemons read config and data
+    files on every request, generating millions of low-value events per
+    day on a busy host. The defensive-allowlist (priority 1000) ensures
+    credential/config path reads from these daemons are still persisted.
+
+rules:
+  - id: drop-service-daemon-file-ops
+    priority: 80
+    match:
+      source: ebpf
+      kind_in:
+        - file.read_access
+        - file.write_access
+      comm_in:
+        - apache2
+        - httpd
+        - nginx
+        - caddy
+        - php-fpm
+        - php-fpm7.4
+        - php-fpm8.0
+        - php-fpm8.1
+        - php-fpm8.2
+        - php-fpm8.3
+        - mysqld
+        - mariadbd
+        - postgres
+        - crowdsec
+        - cscli
+        - journald
+        - systemd-journald
+        - systemd-resolved
+        - logrotate
+        - rsyslogd
+    action: drop
+    drop_reason: service-daemon-self-traffic

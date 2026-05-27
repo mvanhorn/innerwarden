@@ -131,7 +131,9 @@ pub(crate) async fn run_event_loop(
 
     info!(
         events_written = stats.events_written,
+        events_dropped = stats.events_dropped,
         incidents_written = stats.incidents_written,
+        pipeline_rules = detectors.event_pipeline.rule_count(),
         "sensor stopped"
     );
 

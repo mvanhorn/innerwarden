@@ -27,7 +27,7 @@
 
 use std::path::Path;
 
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::detector_set::DetectorSet;
@@ -190,9 +190,15 @@ pub(crate) fn build_detector_set(cfg: &Config, data_dir: &Path) -> DetectorSet {
         );
         DistributedSshDetector::new(&cfg.agent.host_id, 8, 300)
     });
-    // Load dynamic allowlist from disk (supplements static const lists).
     let allowlist_path = std::path::Path::new("/etc/innerwarden/allowlist.toml");
     let dynamic_allowlist = detectors::allowlists::DynamicAllowlist::load(allowlist_path);
+    if allowlist_path.exists() {
+        warn!(
+            "allowlist.toml is deprecated. Migrate to YAML rules with: \
+             sudo innerwarden rule migrate-allowlist --output \
+             /etc/innerwarden/rules/event_pipeline/20-migrated-allowlist.yml"
+        );
+    }
 
     // Initialize test external IPs so is_internal_ip() respects overrides.
     detectors::init_test_external_ips(dynamic_allowlist.test_external_ips.clone());
@@ -213,7 +219,23 @@ pub(crate) fn build_detector_set(cfg: &Config, data_dir: &Path) -> DetectorSet {
         );
     }
 
+    let event_pipeline = {
+        let rules_dir = if std::path::Path::new(&cfg.event_pipeline.rules_dir).is_absolute() {
+            std::path::PathBuf::from(&cfg.event_pipeline.rules_dir)
+        } else {
+            data_dir.join(&cfg.event_pipeline.rules_dir)
+        };
+        if cfg.event_pipeline.enabled {
+            info!(rules_dir = %rules_dir.display(), "event_pipeline enabled");
+            crate::event_pipeline::EventPipeline::new(&rules_dir, true)
+        } else {
+            info!("event_pipeline disabled by config");
+            crate::event_pipeline::EventPipeline::new_disabled()
+        }
+    };
+
     DetectorSet {
+        event_pipeline,
         dynamic_allowlist,
         allowlist_last_check: std::time::Instant::now(),
         blocked_ips,
@@ -515,20 +537,24 @@ pub(crate) fn build_detector_set(cfg: &Config, data_dir: &Path) -> DetectorSet {
             None
         },
         yara_scan: Some({
-            let rules_dir = std::path::Path::new("rules/yara");
-            info!("YARA binary scanner enabled");
-            detectors::yara_scan::YaraScanDetector::new(&cfg.agent.host_id, rules_dir, 3600)
+            let rules_dir = [
+                std::path::PathBuf::from("/etc/innerwarden/rules/yara"),
+                std::path::PathBuf::from("rules/yara"),
+            ]
+            .into_iter()
+            .find(|p| p.is_dir())
+            .unwrap_or_else(|| std::path::PathBuf::from("/etc/innerwarden/rules/yara"));
+            info!(path = %rules_dir.display(), "YARA binary scanner enabled");
+            detectors::yara_scan::YaraScanDetector::new(&cfg.agent.host_id, &rules_dir, 3600)
         }),
         sigma_rule: Some({
-            // Try multiple paths for Sigma rules: installed location, then relative
             let rules_dir = [
                 std::path::PathBuf::from("/etc/innerwarden/rules/sigma"),
-                std::path::PathBuf::from("/usr/local/share/innerwarden/rules/sigma"),
                 std::path::PathBuf::from("rules/sigma"),
             ]
             .into_iter()
             .find(|p| p.is_dir())
-            .unwrap_or_else(|| std::path::PathBuf::from("rules/sigma"));
+            .unwrap_or_else(|| std::path::PathBuf::from("/etc/innerwarden/rules/sigma"));
             info!(path = %rules_dir.display(), "Sigma rule engine enabled");
             detectors::sigma_rule::SigmaRuleDetector::new(&cfg.agent.host_id, &rules_dir, 300)
         }),

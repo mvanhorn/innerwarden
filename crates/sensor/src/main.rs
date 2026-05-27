@@ -5,6 +5,7 @@ mod config;
 mod detector_set;
 mod detectors;
 mod event_dispatch;
+mod event_pipeline;
 mod incident_builders;
 mod main_helpers;
 mod seccomp;
@@ -48,6 +49,7 @@ struct Cli {
 #[derive(Default)]
 pub(crate) struct WriteStats {
     pub(crate) events_written: u64,
+    pub(crate) events_dropped: u64,
     pub(crate) incidents_written: u64,
 }
 

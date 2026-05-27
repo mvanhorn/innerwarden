@@ -105,6 +105,14 @@ coverage:
           - "!crates/supervisor/src/main.rs"
           - "!crates/ctl/src/main.rs"
           - "!crates/sensor/src/main.rs"
+          # Sensor dispatch/wiring: process_event dispatches to 79
+          # detectors + writes incidents via SQLite. Unit-testing
+          # requires full detector set + real SQLite store. The
+          # testable logic (event_pipeline, allowlists, detectors)
+          # lives in their own modules and IS unit-tested.
+          - "!crates/sensor/src/event_dispatch.rs"
+          - "!crates/sensor/src/detector_set.rs"
+          - "!crates/sensor/src/boot/build_detectors.rs"
           # FFI boundary to the kernel BPF map at
           # /sys/fs/bpf/innerwarden/blocked_pids. Every line in
           # aya_impl.rs calls into aya which calls into the kernel —
