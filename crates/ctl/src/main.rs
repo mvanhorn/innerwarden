@@ -168,6 +168,20 @@ enum Command {
         command: Option<SystemCommand>,
     },
 
+    /// Manage event pipeline rules (filter/sample/promote).
+    ///
+    /// The event pipeline controls which events the sensor persists to disk.
+    /// Rules are YAML files in the rules directory, hot-reloaded every 60s.
+    ///
+    /// Examples:
+    ///   innerwarden rule list
+    ///   innerwarden rule disable drop-service-daemon-file-ops
+    ///   innerwarden rule enable drop-service-daemon-file-ops
+    Rule {
+        #[command(subcommand)]
+        command: RuleCommand,
+    },
+
     /// Module management commands
     Module {
         #[command(subcommand)]
@@ -1009,6 +1023,24 @@ enum IntegrateCommand {
         /// How often to check (minutes, default: 10)
         #[arg(long, default_value = "10")]
         interval: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum RuleCommand {
+    /// List all event pipeline rules with status and priority.
+    List,
+
+    /// Disable a rule by ID (adds `disabled: true` to the YAML file).
+    Disable {
+        /// Rule ID to disable (e.g. drop-service-daemon-file-ops)
+        id: String,
+    },
+
+    /// Enable a previously disabled rule by ID.
+    Enable {
+        /// Rule ID to enable
+        id: String,
     },
 }
 
@@ -2491,6 +2523,15 @@ fn main() -> Result<()> {
             yes,
         } => commands::capability::cmd_disable(&cli, &registry, capability, yes),
         Command::List => commands::core::cmd_list(&cli, &registry),
+        Command::Rule { ref command } => match command {
+            RuleCommand::List => commands::rule::cmd_rule_list(&cli.data_dir, &cli.sensor_config),
+            RuleCommand::Disable { ref id } => {
+                commands::rule::cmd_rule_disable(&cli.data_dir, &cli.sensor_config, id)
+            }
+            RuleCommand::Enable { ref id } => {
+                commands::rule::cmd_rule_enable(&cli.data_dir, &cli.sensor_config, id)
+            }
+        },
         Command::Module { ref command } => dispatch_module(&cli, command),
         Command::Agent { ref command } => commands::agent::cmd_agent(&cli, command.as_ref()),
 

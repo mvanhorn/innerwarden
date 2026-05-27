@@ -22,7 +22,7 @@ use tracing::{info, warn};
 
 use types::{compile_rule, CompiledAction, CompiledRule, RuleFile};
 
-pub(crate) const BUILTIN_PACKS: &[(&str, &str)] = &[
+pub const BUILTIN_PACKS: &[(&str, &str)] = &[
     (
         "00-defensive-allowlist.yml",
         include_str!("builtin/00-defensive-allowlist.yml"),
