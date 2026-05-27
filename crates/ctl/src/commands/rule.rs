@@ -146,14 +146,28 @@ fn ensure_disabled(content: &str, rule_id: &str) -> String {
         if lines[i].contains(&format!("id: {rule_id}"))
             || lines[i].contains(&format!("id: \"{rule_id}\""))
         {
-            let indent = " ".repeat(lines[i].len() - lines[i].trim_start().len());
+            // The `- id:` line has indent like "    - id: ...".
+            // Sibling fields (priority, match, disabled) align with "id:",
+            // which is 2 characters past the "- ". Use the next non-empty
+            // line's indent, or fall back to id_column position.
+            let id_col = lines[i].find("id:").unwrap_or(0);
+            let field_indent = if let Some(next) = lines[i + 1..]
+                .iter()
+                .take(5)
+                .find(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
+            {
+                " ".repeat(next.len() - next.trim_start().len())
+            } else {
+                " ".repeat(id_col)
+            };
+
             let already_disabled = lines[i + 1..]
                 .iter()
                 .take(10)
                 .take_while(|l| !l.trim_start().starts_with("- id:"))
                 .any(|l| l.trim() == "disabled: true");
             if !already_disabled {
-                lines.insert(i + 1, format!("{indent}disabled: true"));
+                lines.insert(i + 1, format!("{field_indent}disabled: true"));
             }
             break;
         }
@@ -544,6 +558,22 @@ rules:
             "  - id: my-rule\n    priority: 50\n    match:\n      source: ebpf\n    action: drop\n";
         let result = ensure_disabled(content, "my-rule");
         assert!(result.contains("disabled: true"));
+        assert!(
+            result.contains("    disabled: true"),
+            "disabled should align with priority (4-space indent), got:\n{result}"
+        );
+    }
+
+    #[test]
+    fn ensure_disabled_produces_valid_yaml() {
+        let content = "version: 1\nrules:\n  - id: my-rule\n    priority: 50\n    match:\n      source: ebpf\n    action: drop\n";
+        let result = ensure_disabled(content, "my-rule");
+        let parsed: Result<serde_yaml::Value, _> = serde_yaml::from_str(&result);
+        assert!(
+            parsed.is_ok(),
+            "disabled YAML should still parse, got error: {:?}\n---\n{result}",
+            parsed.err()
+        );
     }
 
     #[test]
