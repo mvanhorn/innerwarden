@@ -414,10 +414,8 @@ fn convert_allowlist_to_pipeline_yaml(content: &str) -> String {
         chrono::Utc::now().format("%Y-%m-%d %H:%M UTC")
     ));
     yaml.push_str("#\n");
-    yaml.push_str("# Review and adjust priorities before activating.\n");
-    yaml.push_str("# Per-detector suppressions (below) are informational comments;\n");
-    yaml.push_str("# they map to the existing DynamicAllowlist and remain active there\n");
-    yaml.push_str("# until fully migrated in a future release.\n\n");
+    yaml.push_str("# Review before activating. Process entries become drop rules;\n");
+    yaml.push_str("# per-detector entries become suppress_incident rules.\n\n");
     yaml.push_str("version: 1\n");
     yaml.push_str("metadata:\n");
     yaml.push_str("  description: >-\n");
@@ -457,16 +455,20 @@ fn convert_allowlist_to_pipeline_yaml(content: &str) -> String {
     }
 
     if !per_detector.is_empty() {
-        yaml.push_str("  # Per-detector suppressions (remain in allowlist.toml):\n");
         let mut detectors: Vec<_> = per_detector.iter().collect();
         detectors.sort_by_key(|(k, _)| (*k).clone());
         for (det, entries) in detectors {
-            yaml.push_str(&format!("  # [detectors.{det}]\n"));
+            let rule_id = format!("migrated-suppress-{det}");
+            yaml.push_str(&format!("  - id: {rule_id}\n"));
+            yaml.push_str("    action: suppress_incident\n");
+            yaml.push_str("    suppress:\n");
+            yaml.push_str(&format!("      detector: {det}\n"));
+            yaml.push_str("      values:\n");
             for entry in entries {
-                yaml.push_str(&format!("  #   {entry}\n"));
+                yaml.push_str(&format!("        - \"{entry}\"\n"));
             }
+            yaml.push('\n');
         }
-        yaml.push('\n');
     }
 
     yaml
@@ -644,7 +646,9 @@ ignored = 9, 67
         assert!(yaml.contains("narrate.py"));
         assert!(yaml.contains("action: drop"));
         assert!(yaml.contains("172.18.0.0/16"));
-        assert!(yaml.contains("kernel_module_load"));
+        assert!(yaml.contains("id: migrated-suppress-kernel_module_load"));
+        assert!(yaml.contains("action: suppress_incident"));
+        assert!(yaml.contains("detector: kernel_module_load"));
         assert!(yaml.contains("bcache"));
     }
 

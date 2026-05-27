@@ -27,7 +27,7 @@
 
 use std::path::Path;
 
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::detector_set::DetectorSet;
@@ -190,9 +190,15 @@ pub(crate) fn build_detector_set(cfg: &Config, data_dir: &Path) -> DetectorSet {
         );
         DistributedSshDetector::new(&cfg.agent.host_id, 8, 300)
     });
-    // Load dynamic allowlist from disk (supplements static const lists).
     let allowlist_path = std::path::Path::new("/etc/innerwarden/allowlist.toml");
     let dynamic_allowlist = detectors::allowlists::DynamicAllowlist::load(allowlist_path);
+    if allowlist_path.exists() {
+        warn!(
+            "allowlist.toml is deprecated. Migrate to YAML rules with: \
+             sudo innerwarden rule migrate-allowlist --output \
+             /etc/innerwarden/rules/event_pipeline/20-migrated-allowlist.yml"
+        );
+    }
 
     // Initialize test external IPs so is_internal_ip() respects overrides.
     detectors::init_test_external_ips(dynamic_allowlist.test_external_ips.clone());

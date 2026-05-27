@@ -1045,13 +1045,15 @@ enum RuleCommand {
 
     /// Convert allowlist.toml to event pipeline YAML rules.
     ///
-    /// Reads the legacy allowlist.toml and outputs equivalent pipeline
-    /// rules. Per-detector suppressions and IP/port entries are included
-    /// as comments (not yet supported in the pipeline DSL).
+    /// Convert allowlist.toml to event pipeline YAML rules.
+    ///
+    /// Process entries become drop rules; per-detector entries become
+    /// suppress_incident rules. IPs/ports remain as comments (not yet
+    /// in the pipeline DSL).
     ///
     /// Examples:
     ///   innerwarden rule migrate-allowlist
-    ///   innerwarden rule migrate-allowlist --output rules/event_pipeline/20-migrated.yml
+    ///   innerwarden rule migrate-allowlist --output /etc/innerwarden/rules/event_pipeline/20-migrated.yml
     MigrateAllowlist {
         /// Path to allowlist.toml (defaults to /etc/innerwarden/allowlist.toml)
         #[arg(long, default_value = "/etc/innerwarden/allowlist.toml")]
